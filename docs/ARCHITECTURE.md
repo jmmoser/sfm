@@ -51,6 +51,37 @@ and note the change in your module's README section at the bottom of this file.
 
 Shared types live in `src/core/types.ts` (do not duplicate them).
 
+### 2.1 WebGPU rules for iOS Safari (from docs/research/ios-webgpu.md)
+
+* At most ONE heavy command buffer in flight: submit, then `await device.queue.onSubmittedWorkDone()`
+  (`submitAndWait` in `src/gpu/device.ts`) before the next. Size command buffers to ~2–30 ms of GPU
+  work (tile large images / batch pairs); never ~100 ms+.
+* Create all pipelines up front (pipeline compilation blocks the queue on Safari 26/27) — e.g. in a
+  `create()`/warm-up step, not lazily in the middle of the capture loop.
+* No `vec3` in storage/uniform buffers (use vec4 / scalars); no f32 atomics (use fixed-point i32 or
+  `atomicMin` on u32 bits); no subgroups (not shipped in Safari); `shader-f16` is available but
+  optional; `float32-filterable` only on A17 Pro+ (do not rely on it — filter r8unorm/r16float).
+* Budget 256 MiB per buffer/binding (Safari 26.0–26.1); read `device.limits` for more.
+* Workgroup memory ≤ 32 KiB on iPhone but keep ≤ 16 KiB for portability; 64–256 invocations.
+* `getMappedRange` is a copying cross-process call: read back once per map, small results only.
+* Treat `onSubmittedWorkDone` as "finished", not "succeeded"; GPU work submitted while the page is
+  hidden may be silently dropped — the engine pauses GPU work when `document.hidden`.
+* The whole tab (JS heap + GPU + workers) should stay below ~1.2 GB on iPhone or iOS kills it
+  without warning: stream large data (images, depth maps) through storage with LRU caches.
+
+### 2.2 iOS capture facts (from docs/research/ios-camera.md, ios-sensors.md)
+
+* `facingMode: 'environment'` selects a lens-switching virtual camera — select the physical
+  "Back Camera" by `deviceId` (labels are localised and only available after permission).
+* Settable: zoom (keep 1), torch, whiteBalanceMode, frameRate. NOT settable: focus, exposure.
+* Default 1920×1440 (4:3, full FOV); max 4032×3024. Main-camera HFOV prior ≈ 67–72° (±10%).
+* DeviceMotion on iOS: ~60 Hz fixed, `rotationRate` deg/s (alpha=x, beta=y, gamma=z axes),
+  `interval` in seconds, and BOTH `acceleration` and `accelerationIncludingGravity` have the
+  OPPOSITE sign of the W3C spec (face-up ⇒ z ≈ −9.81). `src/sensors` normalises to the spec sign
+  with a runtime self-check; everything downstream sees spec-sign `ImuSample`s.
+* θ for `R_cam_device` = `(window.orientation + 360) % 360` on iPhone (90 = top edge pointing left).
+  Drop frames for ~500 ms after an orientation change.
+
 ## 3. Directory layout
 
 ```
@@ -496,3 +527,138 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
 
 ## 6. Module notes
 (Authors append short notes here: design decisions, deviations, known limits.)
+
+### `src/io` (export, persistence, sharing)
+
+* **API superset of §4.8** (all documented signatures kept): `decodePLY` also accepts
+  `Uint8Array` and returns header `comments`; `encodeGLB` adds `colorFormat`,
+  `unlitMesh`, `doubleSided`, `generator`, `extras`; `createZip(files, opts?)` adds
+  `lastModified`/`comment`; `saveFile` returns `'shared' | 'downloaded' | 'cancelled'`
+  (`'cancelled'` = user dismissed the iOS share sheet, AbortError). Extras:
+  `createZipBlob` (Blob parts — frame Blobs from IndexedDB are streamed once for the
+  CRC and never copied into one buffer; use this for exports with images on iOS),
+  `readZip`, `crc32`, `parseGLB`, `importColmapText`, `createColmapZip[Blob]`
+  (`sparse/0/*.txt` + `images/<name>`), binary serialisers and `SessionStore` extras
+  (`deleteFrame`, `listBlobKeys`, `listJSONKeys`, `getArrayBuffer`, `sessionBytes`).
+* **PLY**: binary_little_endian writer (`x y z [nx ny nz] red green blue [radius]
+  [confidence]`; meshes `list uchar int vertex_indices`). Reader: ascii / binary LE / BE,
+  any scalar types, fan-triangulates polygons, computes normals for meshes without them,
+  missing colour → grey 200.
+* **GLB**: COLOR_0 = FLOAT VEC3 **linear** (sRGB → linear via the exact EOTF; glTF
+  defines vertex colours as linear) by default — universally supported, no 8-bit-linear
+  banding; `'unorm16'`/`'unorm8'` (normalized VEC4) for smaller files. Y-up conversion
+  `(x,y,z) → (x,z,−y)` on by default (glTF is Y-up). Points: mode 0 + KHR_materials_unlit
+  (in `extensionsUsed` only). Mesh material double-sided, rough, non-metallic.
+* **COLMAP**: RADIAL, `cx+0.5, cy+0.5`, POINTS2D `+0.5`; image names must not contain
+  whitespace (COLMAP's text reader splits on spaces). Ids are written as given (callers
+  may use 0-based ids; COLMAP accepts them).
+* **serialize**: container `'SFMB'` + kind + version; arrays carry a dtype so precision
+  can change without a version bump. Decoders copy by default (each array gets its own
+  ArrayBuffer — safe to transfer individually); `{ zeroCopy: true }` returns views.
+  `float16: true` stores normals/confidence/cost as binary16 (manual, correctly rounded).
+  `DepthMapLike` mirrors `dense/DepthMap` structurally.
+* **SessionStore**: DB `sfm` v1, stores `sessions`, `frames` (info), `frameData` (JPEG),
+  `blobs`, `json`; compound keys `[sessionId, key]`, cascade delete = one transaction with
+  range deletes. Promises resolve on transaction *commit*. `putFrame` requires an existing
+  session and keeps `numFrames`/`updatedAt` in the same transaction. QuotaExceededError →
+  `StorageQuotaError` (transaction aborted, nothing partially written). Timestamps are
+  `Date.now()` (persisted across loads), not `performance.now()`. Works in workers
+  (`requestPersistence()` returns false there — call it from the page after a gesture).
+* **saveFile**: Web Share needs transient user activation on iOS — prepare the Blob first,
+  then call `saveFile` directly in the tap handler; an expired activation (NotAllowedError)
+  falls back to `<a download>`.
+
+### `src/math` (linear algebra, polynomials, rotations, RNG, stats, Sim3)
+
+* **API superset of §4.1** (all documented signatures kept). Extras: `vec3AddScaled`,
+  `vec3NormSq`, `vec3DistSq`, `vec3Set`, `vec3Lerp`, `vec3Angle`; `mat3FromValues`,
+  `mat3FromColumns`, `mat3GetColumn/Row`, `mat3Sub`, `mat3Trace`, `mat3Outer`;
+  `Matrix.zeros`, `transposeMul`, `transposeMulVec`, `frobeniusNorm`, `getRow/Column`;
+  `nullSpace(A, dim)` (n x dim orthonormal basis, column 0 = smallest σ — use it for
+  5-point / 7-point null spaces), `solveLeastSquares(A, b)` (Householder QR);
+  `polyDerivative`, `polyMul`, `polyFromRoots`, `polyEvalErrorBound`,
+  `polyRealRootsSturm`; `quatRotateVec`; `Rng.nextU32/nextDouble/uniform/seed`;
+  `variance`, `rms`; `Sim3` type, `sim3Inverse`, `sim3Compose`.
+* `new Matrix(r, c, f64)` WRAPS a Float64Array (no copy); other array-likes are copied.
+* **SVD**: one-sided Jacobi (Hestenes) with Householder-QR preconditioning when m > n;
+  V = accumulated rotations (orthonormal to ~1e-15 even for rank-deficient input).
+  Singular values ≤ ε‖A‖_F are returned as exactly 0 and their U columns completed.
+  Non-finite input → NaN outputs (no throw). `nullVector`/`nullSpace` for m < n with
+  dim ≤ n − m use the trailing columns of the full Q of Aᵀ = QR (exact null space,
+  ~2 µs for 8x9). `svd3`: U, V orthogonal but det may be −1 (use `orthonormalize`).
+  Timings (Node/V8, x86): nullVector 8x9 ≈ 2 µs, svd 9x9 ≈ 20–25 µs, svd 100x12 ≈ 130 µs,
+  svd3 ≈ 2.5 µs, symEig 12x12 ≈ 35 µs. Scratch buffers are module-level (sync code only).
+* **cholesky** rejects pivots ≤ 1e-15·(original diagonal) (semi-definite / gauge-
+  deficient systems return false instead of garbage); zeroes the strict upper triangle.
+  **luSolve** returns null if a pivot ≤ 4nε·max|original row|. **mat3Inv** returns null
+  if |det| ≤ 1e-14·∏‖rows‖ (scale-safe).
+* **Polynomials — deviation from the "Sturm" note in §4.1**: `polyRealRoots` isolates
+  roots by the critical points (real roots of p′, recursively; p is monotone between
+  them) and refines each bracket with safeguarded Newton (rtsafe) after exact
+  power-of-two scaling of x into [−1, 1]. In stress tests (40k random polynomials of
+  degree 3–20, coefficients spanning 1e±4) it had 0 missed / 0 spurious roots, while
+  the floating-point Sturm variant (still available as `polyRealRootsSturm`) had 1+1,
+  and Cardano/Ferrari closed forms failed on ~2 % of badly scaled cubics/quartics.
+  `solveCubic`/`solveQuartic` therefore delegate to the same robust routine
+  (≈1.4 / 2 µs). Roots are DISTINCT, ascending; multiple roots / clusters that are
+  indistinguishable at the rounding-noise level are reported once.
+* **Rotations**: `mat3ToRotvec` uses atan2(|vee(R−Rᵀ)|/2, (trR−1)/2) and the symmetric
+  part near π (θ > 2π/3); `rotationBetweenVectors` is O(ε) accurate also for nearly
+  antiparallel inputs. `quatSlerp` takes the shortest arc.
+* **Rng**: sfc32 seeded via splitmix32; default seed fixed (0x2545F491). `sample` returns
+  a uniformly random k-subset; the ORDER is not uniformly random for small k (Floyd).
+* **stats**: inputs must be NaN-free. `median`/`percentile`/`mad` copy into a reused
+  scratch buffer (temporary copy above 2¹⁸ elements); `mad` is unscaled.
+* **umeyama**: weights < 0 / NaN count as 0; null if < 3 positive-weight points, zero
+  spread in src or dst, or cross-covariance rank < 2 (σ₂ ≤ 1e-12·√(var_src·var_dst),
+  i.e. collinear to ~1e-6 aspect ratio). Two-pass centring (accurate at ENU offsets).
+
+### `src/features` — CPU part (image utils, SIFT, distribution, matching)
+
+* **API superset of §4.4** (documented signatures kept). Extras: `grayToFloat32`,
+  `resizeFloat32`, `blurFloat32`, `gaussianHalfKernel` (image.ts); `DEFAULT_SIFT_OPTIONS`,
+  `resolveSiftOptions`, `planSift`, `octaveToFull`, `finalizeRootSift` (sift-common.ts —
+  shared with sift-gpu so both produce identical frames/layouts); `releaseSiftCPUMemory`,
+  `lastSiftCPUTimings` (sift-cpu.ts); `selectFeatureIndices`, `selectFeatures`,
+  `subsetFeatureSet`, `sortByScoreDesc`, `gridDims` (distribute.ts — use `selectFeatures`
+  after GPU extraction); `descriptorInvNorms`, `descriptorDot`, `descriptorDistance`,
+  `unitDescriptors`, `matchUsesSIMD` (match.ts); `simdAvailable` (simd.ts).
+* **image.ts**: every function accepts Uint8 (0..255) or Float32 (0..1) gray and returns
+  **Float32 0..1**. `sharpness` = Laplacian variance on the **0..255 scale** (OpenCV
+  convention) of a ≤ 640 px area-downscaled copy. `rotateRGBA90(img, k)` rotates
+  **clockwise** (as displayed) for k > 0: `dst(x', y') = src(y', H−1−x')`.
+* **SIFT conventions** (header of sift-common.ts is normative for sift-gpu): octave o
+  pixel grid `x_proc = x_oct · 2^o` (octave −1 = upsample with up(2i)=in(i),
+  up(2i+1)=mean(in(i), in(i+1)); next octave = decimation of level S); Gaussian level i
+  has σ·2^(i/S); a keypoint at continuous DoG level s has scale σ·2^(s/S) and uses
+  Gaussian level clamp(round(s),1,S) for orientation/descriptor. Reported `scale` follows
+  the Lowe/VLFeat convention (≈ 0.89 × σ of an ideal Gaussian blob). Descriptor layout
+  `(by·4 + bx)·8 + bo`, bins along x' = (cos θ, sin θ), y' = (−sin θ, cos θ), orientation
+  bin bo centred at bo·45° of (gradient angle − θ). `firstOctave`: −1/0 as documented;
+  positive values are folded into an extra area downscale. **Extension**
+  `upsampleBelow` (default 800): with firstOctave 0, processed images whose long side is
+  below it use octave −1 (set 0 to disable).
+* **Selection**: `maxFeatures` counts *oriented* features. Distribution grid ≈
+  maxFeatures/16 cells (aspect-matched), 50 % of the budget as per-cell quotas of the
+  strongest responses, the rest filled globally by response; applied to keypoints before
+  orientation (descriptors are only computed for survivors) and to oriented features at the
+  end. Output sorted by descending score (|DoG| at the refined extremum).
+* **Matching**: similarity = exact integer dot of the quantised bytes × cached inverse
+  norms (mathematically = unit-vector dot; bit-identical between JS and WASM paths).
+  Mutual check has no reverse ratio test; ties → smaller index. Guides: `F` uses
+  x_bᵀ F x_a = 0 (band walked through a grid over b); `H` predictions with w ≤ 0 never
+  match; `positions` NaN = **unconstrained** (searched against all of b).
+* **WASM SIMD** (simd.ts, hand-assembled, 3.4 KB — keep < 4 KB so Chrome allows sync
+  compile on a main thread): separable blur (f32x4), gradient magnitude/atan2 (f32x4),
+  descriptor accumulation (scalar), brute-force dots (i32x4.dot_i16x8_s). Falls back to
+  plain JS when unavailable or when `globalThis.SFM_DISABLE_SIMD = true`. SIFT planes live
+  in a reusable arena (WASM memory): ≈ 110 MB for a 1600×1200 (or < 800 px upsampled)
+  image — call `releaseSiftCPUMemory()` when done; use it from a worker.
+* **Performance** (Node 22, x86, single thread): extraction 1600×1200 → 4096 features
+  ≈ 420 ms (JS-only ≈ 1.4 s); brute-force matching 4000×4000 ≈ 180 ms (JS-only ≈ 2.4 s);
+  guided positions (r = 20 px) ≈ 5–15 ms, guided F (3 px) ≈ 30–45 ms.
+* **Accuracy** (tests): Gaussian-blob localisation bias < 0.03 px in the full-res frame
+  for all processing paths (internal/external downscale, octave −1/0); precision ≥ 0.957
+  and repeatability 0.55–0.99 under rotation 30/90°, scale 0.6/1.5, tilt 40°, photometric
+  change and noise. `testdata.ts` (browser-safe) provides procedural textures, homography
+  warps with anti-aliasing, photometric changes and evaluation helpers for the GPU tests.

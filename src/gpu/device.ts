@@ -33,12 +33,17 @@ const LIMITS_TO_MAXIMISE: (keyof GPUSupportedLimits)[] = [
   'maxComputeInvocationsPerWorkgroup',
   'maxComputeWorkgroupSizeX',
   'maxComputeWorkgroupSizeY',
+  'maxComputeWorkgroupSizeZ',
+  'maxBindGroups',
   'maxStorageBuffersPerShaderStage',
   'maxStorageTexturesPerShaderStage',
   'maxSampledTexturesPerShaderStage',
   'maxTextureDimension2D',
   'maxTextureArrayLayers',
   'maxComputeWorkgroupsPerDimension',
+  // "Lower is better" limits: requesting the adapter's value is valid.
+  'minStorageBufferOffsetAlignment',
+  'minUniformBufferOffsetAlignment',
 ];
 
 let contextPromise: Promise<GPUContext | null> | null = null;
@@ -108,9 +113,14 @@ async function createContext(): Promise<GPUContext | null> {
       }
     }
   });
-  device.addEventListener('uncapturederror', (ev) => {
-    console.error('[gpu] uncaptured error:', (ev as GPUUncapturedErrorEvent).error.message);
-  });
+  // Safari 26.x delivers at most one event per addEventListener registration
+  // (docs/research/ios-webgpu.md §4.3), so re-arm the listener inside itself.
+  const onUncaptured = (ev: Event) => {
+    console.error('[gpu] uncaptured error:', (ev as GPUUncapturedErrorEvent).error?.message);
+    device.removeEventListener('uncapturederror', onUncaptured);
+    device.addEventListener('uncapturederror', onUncaptured);
+  };
+  device.addEventListener('uncapturederror', onUncaptured);
 
   const rawInfo = (adapter as GPUAdapter & { info?: GPUAdapterInfo }).info;
   const info = {
@@ -209,6 +219,17 @@ export class PipelineCache {
  */
 export function gpuIdle(device: GPUDevice): Promise<void> {
   return device.queue.onSubmittedWorkDone();
+}
+
+/**
+ * Submit command buffers and wait until the GPU finished them. iOS Safari can
+ * stall with two or more heavy command buffers in flight (WebKit bug 311598), so
+ * heavy GPU work should go through this helper: one command buffer in flight,
+ * each sized to roughly 2–30 ms of GPU time.
+ */
+export async function submitAndWait(device: GPUDevice, buffers: GPUCommandBuffer[]): Promise<void> {
+  device.queue.submit(buffers);
+  await device.queue.onSubmittedWorkDone();
 }
 
 /** Run `fn` inside an error scope and throw if a validation/OOM error occurred. */
