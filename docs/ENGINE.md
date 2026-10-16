@@ -1,0 +1,125 @@
+# Engine, worker protocol and app integration
+
+Companion to `ARCHITECTURE.md`. Describes the orchestration layer that ties the
+modules together, the worker message protocol and the UI flow.
+
+## 1. Threads
+
+```
+main thread                                   engine worker (module worker)
+───────────                                   ─────────────────────────────
+CameraCapture ─ requestVideoFrameCallback
+FramePump (≤10 Hz, back-pressure) ──frame──▶  PhotogrammetryEngine.processFrame
+MotionSensor / Compass / GeoSensor              ├─ FeaturePipeline (WebGPU SIFT + matcher)
+                                                ├─ KeyframeSelector
+Viewer (three.js) ◀──live update───────────     ├─ FeatureDatabase / CorrespondenceGraph
+UI screens ◀──progress / results──────────      ├─ LiveMapper (incremental SfM, local BA)
+                                                ├─ SessionStore (IndexedDB: JPEGs, models)
+                                                └─ refine / densify / mesh / export
+```
+
+All heavy work runs in the worker: the UI thread only shows video, the viewer and
+the UI. WebGPU is used from the worker. The engine class itself is
+thread-agnostic so the test harness can run it on the main thread.
+
+## 2. `PhotogrammetryEngine` (`src/engine/engine.ts`)
+
+```ts
+interface EngineOptions {
+  mode: 'object' | 'scene' | 'auto';
+  quality: 'fast' | 'balanced' | 'max';
+  sessionId?: string;          // persist frames/models in IndexedDB under this session
+  persist?: boolean;           // default true in the app, false in tests
+  preferGPU?: boolean;         // default true
+  hfovPriorDeg?: number;       // from CameraCapture (lens + aspect)
+}
+
+interface FrameInput {
+  bitmap: ImageBitmap | RGBAImage;  // full resolution, any UI orientation
+  t: number;                        // capture time, ms (performance.now domain)
+  screenAngle: 0 | 90 | 180 | 270;  // θ of ARCHITECTURE §2 when the frame was captured
+  imu: ImuSample[];                 // samples since the previous frame
+  geo?: GeoFix | null;
+  heading?: { heading: number; accuracy: number } | null;
+}
+
+interface LiveUpdate {
+  frameIndex: number;
+  decision: 'keyframe' | 'skip' | 'reject_blur' | 'reject_motion';
+  guidance: 'good' | 'move_slower' | 'more_texture' | 'translate_more' | 'tracking_lost' | 'initializing';
+  tracking: 'initializing' | 'tracking' | 'lost';
+  numKeyframes: number;
+  numRegistered: number;
+  numPoints: number;
+  /** Keypoints of the processed frame in [0,1] normalised image coords (for an overlay), decimated. */
+  overlay?: Float32Array;
+  /** Present when the sparse model changed (decimated to ≤ 50k points). */
+  sparse?: { positions: Float32Array; colors: Uint8Array };
+  cameras?: { pose: Pose; intrinsics: CameraIntrinsics }[];
+  timings: Record<string, number>;
+}
+
+class PhotogrammetryEngine {
+  constructor(opts: EngineOptions)
+  init(): Promise<{ gpu: boolean; adapter?: string }>
+  processFrame(f: FrameInput): Promise<LiveUpdate>
+  finishCapture(): Promise<void>
+  refine(progress?, cancel?): Promise<SparseResult>
+  densify(opts?, progress?, cancel?): Promise<PointCloud>
+  mesh(opts?, progress?, cancel?): Promise<TriangleMesh>
+  exportModel(format: 'ply-points' | 'ply-mesh' | 'glb' | 'colmap-zip'): Promise<Blob>
+  loadSession(id: string): Promise<SessionSummary>
+  dispose(): void
+}
+```
+
+Quality presets (initial values; tuned by e2e results):
+
+| preset | feature max side | max features | dense max side | PM iterations | geom passes |
+|---|---|---|---|---|---|
+| fast | 1024 | 2048 | 800 | 4 | 0 |
+| balanced | 1600 | 4096 | 1280 | 6 | 1 |
+| max | 2048 | 8192 | 1600 | 8 | 2 |
+
+Mode affects keyframe thresholds, TSDF voxel size and depth-range margins; `auto`
+picks object vs scene after initialisation from the scene depth / baseline.
+
+### Frame flow (live)
+1. Rotate to the session's canonical orientation (first frame's θ) when needed;
+   `R_cam_device` for the session follows from θ₀.
+2. Small gray copy (≤ 320 px) → sharpness; IMU angular speed → blur/motion gate.
+3. Features at the preset's working resolution (GPU path takes the ImageBitmap
+   directly). Per-feature colours sampled from a ≤ 640 px RGBA copy.
+4. Match to the last keyframe, guided by the gyro rotation homography
+   `H = K R_c K⁻¹` with `R_c = R_cam_device · R_{d(t)←d(t_kf)} · R_cam_deviceᵀ`;
+   verify with two-view geometry; compute rotation-compensated parallax.
+5. `KeyframeSelector` decision. On keyframe: JPEG to IndexedDB (async), add to DB,
+   match against the previous 6 keyframes + retrieval candidates (+ spatial
+   neighbours when registered), verify, update the graph, `LiveMapper.addKeyframe`.
+
+### Refine
+Train/extend the vocabulary → candidate pairs (sequential 10, retrieval 15,
+spatial 10) → match + verify → `runIncrementalSfM` → keep the better of live vs
+offline → final global BA (focal + k1 + k2) → filter/retriangulate → world
+alignment (`sfm/world.ts`) → persist.
+
+### Dense / mesh
+Views stream from IndexedDB through an LRU image cache; depth maps go through a
+`DepthMapStore` with an LRU memory cache backed by IndexedDB to bound memory on
+phones (Safari tabs get killed above ~1.5–3 GB).
+
+## 3. Worker protocol (`src/workers/protocol.ts`)
+
+Request/response RPC with ids, plus unsolicited events:
+
+* requests: `init`, `frame`, `finishCapture`, `refine`, `densify`, `mesh`,
+  `export`, `loadSession`, `cancel`, `dispose`
+* events: `progress` (ProgressEvent), `live` (LiveUpdate), `log`, `error`
+* large typed arrays and ImageBitmaps are transferred, never copied.
+
+## 4. UI flow (`src/app`)
+
+Home (sessions, new scan, diagnostics) → Setup (mode, quality) → Permissions
+(one tap: motion → camera → location) → Capture (video, guidance, live sparse
+view, counters, finish) → Processing (stages + progress + cancel) → Viewer
+(points / mesh / cameras, EDL, measure, export, run dense / mesh).
