@@ -9,7 +9,9 @@
  * Methods
  *  - `polyRealRoots` (and `solveCubic` / `solveQuartic`, which delegate to it):
  *    the variable is scaled by a power of two R ≥ root bound (exact) so all roots
- *    lie in [−1, 1]; real roots are isolated recursively by the critical points
+ *    lie in [−1, 1] (when deg · log2(max/min root-modulus bound) > 800 bits, the
+ *    modulus range is split into power-of-two bands searched separately, so small
+ *    roots never underflow next to huge ones); real roots are isolated recursively by the critical points
  *    (the real roots of p′, computed the same way): between consecutive critical
  *    points p is monotone, so an interval holds a root iff p changes sign, which is
  *    then found by bracketed, bisection-safeguarded Newton (NR "rtsafe") to full
@@ -23,6 +25,46 @@
  */
 
 const EPS = 2.220446049250313e-16;
+const TWO_P1000 = 2 ** 1000;
+const TWO_M1000 = 2 ** -1000;
+
+// Exponent-bit access (much cheaper than Math.log2 / Math.pow in the hot path).
+const BITS_F64 = new Float64Array(1);
+const BITS_U32 = new Uint32Array(BITS_F64.buffer);
+const HI_WORD = (() => {
+  BITS_F64[0] = 1;
+  return BITS_U32[1] === 0x3ff00000 ? 1 : 0;
+})();
+
+/** floor(log2 |v|) for finite v ≠ 0 (exact). */
+function ilog2(v: number): number {
+  BITS_F64[0] = v;
+  const e = (BITS_U32[HI_WORD] >>> 20) & 0x7ff;
+  return e === 0 ? Math.floor(Math.log2(Math.abs(v))) : e - 1023; // e = 0: subnormal
+}
+
+/** 2^e for integer e. */
+function pow2(e: number): number {
+  if (e >= -1022 && e <= 1023) {
+    BITS_U32[HI_WORD] = (e + 1023) << 20;
+    BITS_U32[HI_WORD ^ 1] = 0;
+    return BITS_F64[0];
+  }
+  return 2 ** e;
+}
+
+/** v · 2^e for integer e, exact unless the RESULT over/underflows (no spurious intermediate overflow). */
+function ldexp(v: number, e: number): number {
+  while (e > 1000) {
+    v *= TWO_P1000;
+    e -= 1000;
+  }
+  while (e < -1000) {
+    v *= TWO_M1000;
+    e += 1000;
+  }
+  return v * pow2(e);
+}
 
 /** Horner evaluation of c (descending powers) at x. */
 export function polyEval(c: ArrayLike<number>, x: number): number {
@@ -126,7 +168,11 @@ function sortAndMerge(roots: number[], c: ArrayLike<number>): number[] {
       const fm = Math.abs(polyEval(c, mid));
       const f1 = Math.abs(polyEval(c, x1)),
         f2 = Math.abs(polyEval(c, x2));
-      if (fm <= Math.max(f1, f2) + 64 * polyEvalErrorBound(c, mid)) {
+      // Same noise criterion as the critical-point test in rootsByCriticalPoints (a
+      // looser one merged resolvable roots, e.g. 1 and 1 + 5e-7 of (x−1)(x−1−5e-7)(x−5)).
+      // Non-finite values (overflow at huge |x|) carry no evidence: keep both.
+      const noise = CLUSTER_NOISE_FACTOR * polyEvalErrorBound(c, mid);
+      if (Number.isFinite(fm) && Number.isFinite(noise) && fm <= Math.max(f1, f2) + noise) {
         if (f2 < f1) out[out.length - 1] = x2; // keep the smaller residual
         continue;
       }
@@ -135,6 +181,23 @@ function sortAndMerge(roots: number[], c: ArrayLike<number>): number[] {
   }
   return out;
 }
+
+/**
+ * A critical value |q(x)| ≤ CLUSTER_NOISE_FACTOR × (rigorous Horner error bound) is
+ * indistinguishable from 0 (multiple root / unresolvable cluster). The bound
+ * 2nε Σ|cᵢ||x|ⁿ⁻ⁱ already over-estimates the actual rounding error, so a factor ~1
+ * is safe for exact multiple roots; the previous factor 8 (64 in sortAndMerge) merged
+ * clearly resolvable close roots.
+ */
+const CLUSTER_NOISE_FACTOR = 1.5;
+
+/**
+ * Iteration cap of rtsafe. A root of magnitude 2^-s inside a bracket of width ~1 needs
+ * up to ~s + 53 bisections (and rtsafe alternates Newton/bisection at worst), so the
+ * cap must cover s up to ~1074 (subnormal range); the previous cap of 300 returned
+ * unconverged garbage for roots below ~1e-90 relative to the bracket.
+ */
+const RTSAFE_MAX_ITERS = 2500;
 
 /**
  * NR "rtsafe": Newton safeguarded by bisection on a bracket [a, b] with a sign
@@ -155,7 +218,7 @@ function rtsafe(c: ArrayLike<number>, a: number, b: number, fa: number): number 
   let dx = dxold;
   let f = evalWithDeriv(c, n, x);
   let df = evalDp;
-  for (let it = 0; it < 300; it++) {
+  for (let it = 0; it < RTSAFE_MAX_ITERS; it++) {
     if (f === 0) return x;
     if (((x - xh) * df - f) * ((x - xl) * df - f) > 0 || Math.abs(2 * f) > Math.abs(dxold * df)) {
       dxold = dx;
@@ -191,17 +254,69 @@ function normaliseMaxAbs(p: Float64Array): Float64Array {
 // ---------------------------------------------------------------------------
 
 interface Prepared {
-  /** Monic coefficients of the (trailing-zero-free) polynomial, degree ≥ 1. */
+  /**
+   * Coefficients of the (leading- and trailing-zero-free) polynomial, degree ≥ 1,
+   * scaled by an exact power of two to max-abs ∈ [1, 2). NOT made monic: dividing by
+   * a tiny leading coefficient could overflow and lose every finite root.
+   */
   p: Float64Array;
   /** p with the stripped zero roots multiplied back in (for final merging). */
   pFull: ArrayLike<number>;
   deg: number;
-  /** Power-of-two scale: x = R y, all roots |y| < 1. */
-  R: number;
-  /** q(y) = p(R y)/R^deg normalised to max-abs 1. */
+  /** log2 of an upper bound on |roots| (Fujiwara). */
+  logUp: number;
+  /** log2 of a lower bound on |nonzero roots| (Fujiwara bound of the reversed polynomial). */
+  logLow: number;
+  /** Single-scale exponent: x = 2^k y maps every root into |y| < 1. */
+  k: number;
+  /** q(y) ∝ p(2^k y), exact power-of-two normalisation (max-abs ∈ [1, 2)). */
   q: Float64Array;
   ya: number;
   yb: number;
+}
+
+/**
+ * Coefficients (descending powers of y) of p(2^k y) (reverse = false) or of
+ * yⁿ p(2^k / y) (reverse = true), multiplied by a common power of two so that the
+ * largest has magnitude in [1, 2). All scalings are exact powers of two computed by
+ * exponent arithmetic, so nothing overflows; only coefficients more than ~2^-1022
+ * below the largest can underflow (they are negligible at |y| ≤ 1).
+ */
+function scaledPoly(p: ArrayLike<number>, k: number, reverse: boolean): Float64Array {
+  const n = p.length - 1;
+  const out = new Float64Array(n + 1);
+  let emax = -Infinity;
+  for (let j = 0; j <= n; j++) {
+    const v = reverse ? p[n - j] : p[j];
+    if (v === 0) continue;
+    const e = ilog2(v) + (reverse ? k * j : -k * j);
+    if (e > emax) emax = e;
+  }
+  for (let j = 0; j <= n; j++) {
+    const v = reverse ? p[n - j] : p[j];
+    out[j] = v === 0 ? 0 : ldexp(v, (reverse ? k * j : -k * j) - emax);
+  }
+  return out;
+}
+
+/**
+ * Upper estimate of log2 of the Fujiwara bound 2·max(|aᵢ/a₀|^{1/i}, |aₙ/(2a₀)|^{1/n}) on
+ * the root moduli of a (reverse = false) or of the reversed polynomial (reverse = true;
+ * its roots are the reciprocals, so the negated result is a LOWER bound on the nonzero
+ * root moduli of a). Uses the exact exponents (log2|v| < ilog2(v) + 1, log2|a₀| ≥ ilog2(a₀)),
+ * so it stays a valid bound (≤ 2 bits looser); no overflow for any finite coefficients.
+ */
+function logFujiwara(a: ArrayLike<number>, reverse: boolean): number {
+  const n = a.length - 1;
+  const l0 = ilog2(reverse ? a[n] : a[0]);
+  let m = -Infinity;
+  for (let i = 1; i <= n; i++) {
+    const v = reverse ? a[n - i] : a[i];
+    if (v === 0) continue;
+    const t = (ilog2(v) + 1 - l0 - (i === n ? 1 : 0)) / i;
+    if (t > m) m = t;
+  }
+  return 1 + m;
 }
 
 /**
@@ -222,44 +337,40 @@ function prepare(c: ArrayLike<number>, lo: number, hi: number, roots: number[]):
   for (let i = start; i < end; i++) if (!Number.isFinite(c[i])) return null;
   if (zeroRoot && lo <= 0 && 0 <= hi) roots.push(0);
   if (deg < 1) return null;
-  const lead = c[start];
+  let emax = -Infinity;
+  for (let i = start; i < end; i++) if (c[i] !== 0) emax = Math.max(emax, ilog2(c[i]));
   const p = new Float64Array(deg + 1);
-  for (let i = 0; i <= deg; i++) p[i] = c[start + i] / lead;
-  for (let i = 0; i <= deg; i++) if (!Number.isFinite(p[i])) return null;
-  // Root bounds (monic): Cauchy 1 + max|p_i|; Fujiwara 2 max(|p_i|^{1/i}, |p_n/2|^{1/n}).
-  let cauchy = 0,
-    fuji = 0;
-  for (let i = 1; i <= deg; i++) {
-    const ai = Math.abs(p[i]);
-    cauchy = Math.max(cauchy, ai);
-    fuji = Math.max(fuji, Math.pow(i === deg ? ai / 2 : ai, 1 / i));
-  }
-  const bound = Math.min(1 + cauchy, 2 * fuji);
-  if (!(bound > 0) || !Number.isFinite(bound)) return null;
-  const R = Math.pow(2, Math.ceil(Math.log2(bound * 1.0001)));
-  if (!(R > 0) || !Number.isFinite(R)) return null;
-  // q_i = p_i / R^i by repeated exact division (no overflow of R^i).
-  const q = new Float64Array(deg + 1);
-  for (let i = 0; i <= deg; i++) {
-    let v = p[i];
-    for (let k = 0; k < i; k++) v /= R;
-    q[i] = v;
-  }
-  normaliseMaxAbs(q);
-  const ya = Math.max(lo / R, -1);
-  const yb = Math.min(hi / R, 1);
+  for (let i = 0; i <= deg; i++) p[i] = ldexp(c[start + i], -emax);
+  // Root-modulus bounds (log2), Fujiwara on p and on the reversed polynomial.
+  const logUp = logFujiwara(p, false);
+  const logLow = -logFujiwara(p, true);
+  if (!Number.isFinite(logUp) || !Number.isFinite(logLow)) return null;
+  const k = Math.ceil(logUp + 1.5e-4); // 2^k ≥ 1.0001 · bound
+  const q = scaledPoly(p, k, false);
+  const ya = Math.max(ldexp(lo, -k), -1);
+  const yb = Math.min(ldexp(hi, -k), 1);
   if (!(ya <= yb)) return null;
-  return { p, pFull: zeroRoot ? polyMul(p, [1, 0]) : p, deg, R, q, ya, yb };
+  return { p, pFull: zeroRoot ? polyMul(p, [1, 0]) : p, deg, logUp, logLow, k, q, ya, yb };
 }
 
-/** Map scaled roots back, polish on the monic polynomial, filter to [lo, hi], merge. */
-function finish(pr: Prepared, yRoots: number[], lo: number, hi: number, roots: number[]): number[] {
-  for (const y of yRoots) {
-    const x = newtonPolish(pr.p, y * pr.R, 3);
+/** Polish candidate roots (x, unscaled) on p, filter to [lo, hi], merge. */
+function finish(pr: Prepared, xs: number[], lo: number, hi: number, roots: number[]): number[] {
+  for (const x0 of xs) {
+    if (!Number.isFinite(x0)) continue;
+    const x = newtonPolish(pr.p, x0, 3);
     if (x >= lo && x <= hi) roots.push(x);
   }
   return sortAndMerge(roots, pr.pFull);
 }
+
+/**
+ * Root-modulus dynamic range (deg · log2(upper/lower bound), in bits) above which a
+ * single scaling x = 2^k y would push the coefficients/terms that determine the
+ * smallest roots towards the underflow threshold (2^-1022). Measured failure before
+ * this guard: degree 10 with a leading coefficient 1e-40, degree 20 with 1e-20, cubic
+ * with 1e-100 (small roots lost or replaced by spurious ones).
+ */
+const SINGLE_SCALE_MAX_BITS = 800;
 
 // ---------------------------------------------------------------------------
 // Critical-point isolation (default)
@@ -268,7 +379,7 @@ function finish(pr: Prepared, yRoots: number[], lo: number, hi: number, roots: n
 /**
  * Distinct real roots of q (degree n ≥ 1, q[0] ≠ 0, coefficients ~O(1)) in [a, b].
  * Recursive on q′; see module header. Roots separated only by critical points at
- * which |q| is within 8× the Horner rounding-error bound are numerically
+ * which |q| is within CLUSTER_NOISE_FACTOR × the Horner rounding-error bound are numerically
  * indistinguishable (a multiple root or an unresolvable cluster) and are reported
  * once — at that critical point (the accurate location of an even-multiplicity
  * root) when there is one.
@@ -321,7 +432,7 @@ function rootsByCriticalPoints(q: Float64Array, a: number, b: number): number[] 
         bestF = 0;
         have = true;
       }
-    } else if (af <= 8 * polyEvalErrorBound(q, x1)) {
+    } else if (af <= CLUSTER_NOISE_FACTOR * polyEvalErrorBound(q, x1)) {
       // Critical value at the noise level: (part of) a multiple root / cluster.
       if (!have || !bestIsCrit || af < bestF) {
         bestX = x1;
@@ -355,17 +466,47 @@ export function polyRealRoots(c: ArrayLike<number>, lo = -Infinity, hi = Infinit
   const roots: number[] = [];
   const pr = prepare(c, lo, hi, roots);
   if (!pr) return roots;
-  const { p, deg } = pr;
+  const { p, deg, k } = pr;
   if (deg === 1) {
-    const x = -p[1];
-    if (x >= lo && x <= hi) roots.push(x);
+    const x = -p[1] / p[0];
+    if (Number.isFinite(x) && x >= lo && x <= hi) roots.push(x);
     return sortAndMerge(roots, pr.pFull);
   }
   if (deg === 2) {
-    for (const x of solveQuadratic(1, p[1], p[2])) if (x >= lo && x <= hi) roots.push(x);
+    for (const x of solveQuadratic(p[0], p[1], p[2])) if (x >= lo && x <= hi) roots.push(x);
     return sortAndMerge(roots, pr.pFull);
   }
-  return finish(pr, rootsByCriticalPoints(pr.q, pr.ya, pr.yb), lo, hi, roots);
+  const xs: number[] = [];
+  if (deg * (pr.logUp - pr.logLow) <= SINGLE_SCALE_MAX_BITS) {
+    for (const y of rootsByCriticalPoints(pr.q, pr.ya, pr.yb)) xs.push(ldexp(y, k));
+    return finish(pr, xs, lo, hi, roots);
+  }
+  // Wide root-modulus range: split the moduli into bands [2^e0, 2^e1] with INTEGER
+  // exponents, each at most SINGLE_SCALE_MAX_BITS / deg bits wide, and search band
+  // (e0, e1] on p(2^e1 y) restricted to e0 ≤ log2|x| ≤ e1, i.e. 2^(e0−e1) ≤ |y| ≤ 1.
+  // Power-of-two scalings leave Horner's rounding unchanged (absent underflow of
+  // negligible coefficients), so adjacent bands see bit-identical scaled values at
+  // their shared boundary: a root cannot fall between two bands; one exactly on a
+  // boundary is found by both and merged.
+  const eLow = Math.floor(pr.logLow),
+    eHigh = k;
+  const nb = Math.ceil((deg * (eHigh - eLow)) / SINGLE_SCALE_MAX_BITS);
+  const w = Math.ceil((eHigh - eLow) / nb);
+  for (let e1 = eHigh; e1 > eLow; e1 -= w) {
+    const e0 = Math.max(e1 - w, eLow);
+    const q = scaledPoly(p, e1, false);
+    const yLo = ldexp(lo, -e1),
+      yHi = ldexp(hi, -e1);
+    const yMin = e0 === eLow ? 0 : pow2(e0 - e1); // lowest band: include the origin
+    // Negative half [−1, −yMin] and positive half [yMin, 1], intersected with [lo, hi].
+    let a = Math.max(-1, yLo),
+      b = Math.min(-yMin, yHi);
+    if (a <= b) for (const y of rootsByCriticalPoints(q, a, b)) xs.push(ldexp(y, e1));
+    a = Math.max(yMin, yLo);
+    b = Math.min(1, yHi);
+    if (a <= b && !(yMin === 0 && b === 0)) for (const y of rootsByCriticalPoints(q, a, b)) xs.push(ldexp(y, e1));
+  }
+  return finish(pr, xs, lo, hi, roots);
 }
 
 // ---------------------------------------------------------------------------
@@ -376,29 +517,42 @@ export function polyRealRoots(c: ArrayLike<number>, lo = -Infinity, hi = Infinit
  * Real roots of a x² + b x + c (distinct, ascending). Uses the cancellation-free
  * form q = −(b + sign(b)√Δ)/2, x₁ = q/a, x₂ = c/q. A discriminant that is within
  * its rounding-error bound of zero is treated as zero (double root reported once).
- * Degenerates to the linear case when a = 0.
+ * Degenerates to the linear case when a = 0. The coefficients are first scaled by
+ * an exact power of two (max-abs ∈ [1, 2)) so b² − 4ac cannot overflow/underflow
+ * (before: (1, 1e200, 1) → [-5e199], (1e300, 3e300, 2e300) → [NaN, NaN]). Non-finite
+ * coefficients → []; roots that overflow are dropped.
  */
 export function solveQuadratic(a: number, b: number, c: number): number[] {
+  if (!Number.isFinite(a) || !Number.isFinite(b) || !Number.isFinite(c)) return [];
   if (a === 0) {
     if (b === 0) return [];
-    return [-c / b];
+    const x = -c / b;
+    return Number.isFinite(x) ? [x] : [];
   }
   if (c === 0) {
     const r = -b / a;
-    if (r === 0) return [0];
+    if (r === 0 || !Number.isFinite(r)) return [0];
     return r < 0 ? [r, 0] : [0, r];
   }
+  const e = -ilog2(Math.max(Math.abs(a), Math.abs(b), Math.abs(c)));
+  a = ldexp(a, e);
+  b = ldexp(b, e);
+  c = ldexp(c, e);
   const b2 = b * b,
     ac4 = 4 * a * c;
   const disc = b2 - ac4;
   const discErr = 4 * EPS * (b2 + Math.abs(ac4));
   if (disc < -discErr) return [];
   // |Δ| at the rounding-noise level: a (numerically) double root.
-  if (disc <= discErr) return [-b / (2 * a)];
+  if (disc <= discErr) {
+    const x = -b / (2 * a);
+    return Number.isFinite(x) ? [x] : [];
+  }
   const sq = Math.sqrt(disc);
   const q = -0.5 * (b + (b >= 0 ? sq : -sq));
-  const x1 = q / a;
+  const x1 = q / a; // may overflow when |a| ≪ |b| (huge root): dropped below
   const x2 = c / q;
+  if (!Number.isFinite(x1)) return [x2];
   if (x1 === x2) return [x1];
   return x1 < x2 ? [x1, x2] : [x2, x1];
 }
@@ -485,7 +639,8 @@ function signChanges(chain: Float64Array[], x: number): number {
  * gcd(p, p′) and is counted once; even-multiplicity roots are located by Sturm
  * bisection and polished by Newton on p′). NOTE: floating-point Sturm chains can
  * lose roots when the remainder sequence cancels (≈1e-4 of random badly scaled
- * inputs in our tests) — prefer `polyRealRoots`.
+ * inputs in our tests) and it uses a single scaling (no band split), so it also loses
+ * small roots next to huge ones (deg · log2(range) ≳ 1000 bits) — prefer `polyRealRoots`.
  */
 export function polyRealRootsSturm(c: ArrayLike<number>, lo = -Infinity, hi = Infinity): number[] {
   if (!(lo <= hi)) return [];
@@ -571,5 +726,11 @@ export function polyRealRootsSturm(c: ArrayLike<number>, lo = -Infinity, hi = In
     stVa.push(va, vm);
     stVb.push(vm, vb);
   }
-  return finish(pr, yRoots, lo, hi, roots);
+  return finish(
+    pr,
+    yRoots.map((y) => ldexp(y, pr.k)),
+    lo,
+    hi,
+    roots,
+  );
 }

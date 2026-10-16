@@ -5,7 +5,7 @@
  *  - Descriptor similarity is the dot product of the unit-L2 RootSIFT vectors
  *    (dequantised /512 and renormalised). It is evaluated EXACTLY as
  *    idot(qa, qb) * invNorm(qa) * invNorm(qb) on the quantised bytes (integer dot,
- *    inverse norms cached per descriptor array in a WeakMap), which is
+ *    inverse norms recomputed per call), which is
  *    mathematically identical to Float32 unit vectors and bit-identical between the
  *    plain-JS and the WASM-SIMD brute-force paths.
  *  - distance = sqrt(max(0, 2 - 2 dot)) (Euclidean distance between unit vectors).
@@ -52,7 +52,8 @@ const unitCache = new WeakMap<Uint8Array, Float32Array>();
 
 /**
  * Unit-L2 Float32 descriptors (dequantised /512 then renormalised) of a FeatureSet,
- * computed once and cached per descriptor array.
+ * computed once and cached per descriptor array (do not modify the descriptors of a
+ * FeatureSet after passing it here — the cache would go stale).
  */
 export function unitDescriptors(fs: FeatureSet): Float32Array {
   const src = fs.descriptors;
@@ -76,19 +77,31 @@ export function unitDescriptors(fs: FeatureSet): Float32Array {
 
 const invNormCache = new WeakMap<Uint8Array, Float64Array>();
 
-/** 1 / L2 norm of each quantised descriptor (0 for all-zero descriptors), cached. */
-export function descriptorInvNorms(fs: FeatureSet): Float64Array {
+/** 1 / L2 norm of each quantised descriptor (0 for all-zero descriptors), uncached. */
+function computeInvNorms(fs: FeatureSet): Float64Array {
   const src = fs.descriptors;
-  let out = invNormCache.get(src);
-  if (out && out.length === fs.count) return out;
   const n = fs.count;
-  out = new Float64Array(n);
+  const out = new Float64Array(n);
   for (let i = 0; i < n; i++) {
     const o = i * D;
     let ss = 0;
     for (let k = 0; k < D; k++) ss += src[o + k] * src[o + k];
     out[i] = ss > 0 ? 1 / Math.sqrt(ss) : 0;
   }
+  return out;
+}
+
+/**
+ * 1 / L2 norm of each quantised descriptor (0 for all-zero descriptors), cached per
+ * descriptor array (treat descriptors as immutable once passed here). The matchers
+ * themselves recompute the norms (O(128 n), negligible next to matching), so a
+ * descriptor buffer that is reused / refilled in place can never yield stale norms.
+ */
+export function descriptorInvNorms(fs: FeatureSet): Float64Array {
+  const src = fs.descriptors;
+  let out = invNormCache.get(src);
+  if (out && out.length === fs.count) return out;
+  out = computeInvNorms(fs);
   invNormCache.set(src, out);
   return out;
 }
@@ -342,8 +355,8 @@ export function matchCPU(a: FeatureSet, b: FeatureSet, opts?: MatchOptions): Mat
   const na = a.count;
   const nb = b.count;
   if (na === 0 || nb === 0) return new Uint32Array(0);
-  const invA = descriptorInvNorms(a);
-  const invB = descriptorInvNorms(b);
+  const invA = computeInvNorms(a);
+  const invB = computeInvNorms(b);
   const st = newState(na, nb);
   let done = false;
   if (matchUsesSIMD()) {
@@ -426,8 +439,8 @@ export function matchGuidedCPU(a: FeatureSet, b: FeatureSet, guide: MatchGuide, 
   if (na === 0 || nb === 0) return new Uint32Array(0);
   const A = a.descriptors;
   const B = b.descriptors;
-  const invA = descriptorInvNorms(a);
-  const invB = descriptorInvNorms(b);
+  const invA = computeInvNorms(a);
+  const invB = computeInvNorms(b);
   const { bestJ, bestDot, secondDot, colBest, colBestI } = newState(na, nb);
 
   const consider = (i: number, ao: number, j: number): void => {
@@ -501,11 +514,22 @@ export function matchGuidedCPU(a: FeatureSet, b: FeatureSet, guide: MatchGuide, 
     radius = guide.maxErrorPx;
     pred = new Float32Array(2 * na);
     const H = guide.H;
+    // H is only defined up to a (possibly negative) scale — e.g. a DLT null vector
+    // or -H. Orient it so that most keypoints of a map with w > 0; w <= 0 then means
+    // "maps to / beyond infinity" independently of the caller's sign convention.
+    let vote = 0;
+    for (let i = 0; i < na; i++) {
+      const w = H[6] * a.keypoints[4 * i] + H[7] * a.keypoints[4 * i + 1] + H[8];
+      if (w > 0) vote++;
+      else if (w < 0) vote--;
+    }
+    const sgn = vote < 0 ? -1 : 1;
     for (let i = 0; i < na; i++) {
       const x = a.keypoints[4 * i];
       const y = a.keypoints[4 * i + 1];
       const w = H[6] * x + H[7] * y + H[8];
-      if (w > 1e-12) {
+      // Tiny |w| gives huge predictions that the bounds test below rejects.
+      if (sgn * w > 0) {
         pred[2 * i] = (H[0] * x + H[1] * y + H[2]) / w;
         pred[2 * i + 1] = (H[3] * x + H[4] * y + H[5]) / w;
       } else {

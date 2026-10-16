@@ -30,6 +30,12 @@ function fmtTimings(): string {
 }
 
 describe('PatchMatchGPU', () => {
+  it('self-test agrees with the CPU reference', async () => {
+    const r = await pm.selfTest();
+    log(`selfTest: ${JSON.stringify(r)}`);
+    expect(r.ok).toBe(true);
+  });
+
   it('near scene 256×192: accurate, and statistically equal to the CPU reference', async () => {
     const W = 256;
     const H = 192;
@@ -128,6 +134,18 @@ describe('PatchMatchGPU', () => {
     expect(tb.submits).toBeGreaterThan(ta.submits);
     expect(Array.from(b.depth)).toEqual(Array.from(a.depth));
     expect(Array.from(b.cost)).toEqual(Array.from(a.cost));
+    // adaptive band controller (normally disabled on software adapters): same result
+    PatchMatchGPU.adaptiveOnSoftware = true;
+    let e: DepthMap;
+    try {
+      e = await pm.compute(ds.views[0], ds.views.slice(1), ds.range, { iterations: 2, targetSubmitMs: 5 });
+    } finally {
+      PatchMatchGPU.adaptiveOnSoftware = false;
+    }
+    const te = pm.lastTimings!;
+    log(`adaptive bands (target 5 ms): ${te.submits} submits, last band ${te.bandRows} rows, max submit ${te.maxSubmitMs.toFixed(1)} ms`);
+    expect(te.submits).toBeGreaterThan(ta.submits);
+    expect(Array.from(e.depth)).toEqual(Array.from(a.depth));
     // chunked readback through a tiny staging buffer gives the same output (fresh
     // instances on both sides: texture-array sizes affect sampling at the ulp level)
     const saved = PatchMatchGPU.stagingBytes;

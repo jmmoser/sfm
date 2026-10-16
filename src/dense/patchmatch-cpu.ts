@@ -72,6 +72,9 @@ export function patchMatchCPU(
   checkRange(range);
   const o = resolvePatchMatchOptions(opts);
   const geo = isGeometricActive(opts, geometric);
+  // the prior initialises the hypotheses whenever it is given (geometric pass, or a
+  // prior-initialised photometric pass with `geometric: false`, e.g. multi-scale)
+  const usePrior = !!geometric;
   const srcs = clampSources(sources, 'patchMatchCPU');
   const W = ref.cam.width;
   const H = ref.cam.height;
@@ -158,7 +161,7 @@ export function patchMatchCPU(
   const cost = new Float32Array(nPix);
   const photo = new Float32Array(nPix);
   const views = new Uint32Array(nPix);
-  if (geo) priorToPlanes(geometric!.prior, W, H, planes);
+  if (usePrior) priorToPlanes(geometric!.prior, W, H, planes, ref.cam);
 
   // per-pixel scratch
   const wk = new Float64Array(NS);
@@ -420,7 +423,7 @@ export function patchMatchCPU(
         const rx = (x - cx) * invF;
         const ry = (y - cy) * invF;
         const pz = planes[4 * idx + 3];
-        let ok = geo && pz >= zMin && pz <= zMax && planes[4 * idx] * rx + planes[4 * idx + 1] * ry + planes[4 * idx + 2] < 0;
+        let ok = usePrior && pz >= zMin && pz <= zMax && planes[4 * idx] * rx + planes[4 * idx + 1] * ry + planes[4 * idx + 2] < 0;
         if (!ok) {
           randomNormal(rx, ry, candN, 0);
           planes[4 * idx] = candN[0];
@@ -474,8 +477,8 @@ export function patchMatchCPU(
 
   for (let it = 0; it < iterations; it++) {
     const tauGood = goodCostThreshold(o, it);
-    const pert = depthPerturbation(o, it, geo);
-    const npert = normalPerturbation(o, it, geo);
+    const pert = depthPerturbation(o, it, usePrior);
+    const npert = normalPerturbation(o, it, usePrior);
     for (let colour = 0; colour < 2; colour++) {
       const seedP = passSeed(o.seed, (geo ? 0x100 : 0) + 2 * it + colour);
       for (let y = 0; y < H; y++) {

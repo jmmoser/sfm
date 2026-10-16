@@ -112,12 +112,17 @@ function axisFilter(srcN: number, dstN: number): AxisFilter {
   return { taps, index, weight };
 }
 
+let rowScratch = new Float32Array(0);
+
 /**
- * Resample a Float32 plane (sw x sh) into `dst` (dw x dh). Separable; area
- * averaging per axis when shrinking, bilinear when enlarging.
+ * Resample a plane (sw x sh) into `dst` (dw x dh). Separable; area averaging per
+ * axis when shrinking, bilinear when enlarging. `src` is Float32 (0..1) or 8-bit
+ * (0..255, scaled by 1/255 on the fly — no full-size Float32 copy is made).
+ * Streams output rows (vertical taps into one source-width row buffer, then the
+ * horizontal taps), so the only scratch memory is a single row.
  */
 export function resizeFloat32(
-  src: Float32Array,
+  src: Float32Array | Uint8Array | Uint8ClampedArray,
   sw: number,
   sh: number,
   dw: number,
@@ -125,42 +130,42 @@ export function resizeFloat32(
   dst?: Float32Array,
 ): Float32Array {
   const out = dst ?? new Float32Array(dw * dh);
+  const scale = src instanceof Float32Array ? 1 : 1 / 255;
   if (sw === dw && sh === dh) {
-    out.set(src.subarray(0, sw * sh));
+    const n = sw * sh;
+    if (scale === 1) out.set(src.subarray(0, n));
+    else for (let i = 0; i < n; i++) out[i] = src[i] * scale;
     return out;
   }
   const fx = axisFilter(sw, dw);
   const fy = axisFilter(sh, dh);
-  // Horizontal pass: sw x sh -> dw x sh.
-  const tmp = new Float32Array(dw * sh);
+  if (rowScratch.length < sw) rowScratch = new Float32Array(sw);
+  const row = rowScratch;
   const tx = fx.taps;
   const ix = fx.index;
   const wx = fx.weight;
-  for (let y = 0; y < sh; y++) {
-    const ro = y * sw;
-    const to = y * dw;
-    for (let x = 0; x < dw; x++) {
-      let acc = 0;
-      const b = x * tx;
-      for (let t = 0; t < tx; t++) acc += wx[b + t] * src[ro + ix[b + t]];
-      tmp[to + x] = acc;
-    }
-  }
-  // Vertical pass: dw x sh -> dw x dh (row-wise accumulation for locality).
   const ty = fy.taps;
   const iy = fy.index;
   const wy = fy.weight;
   for (let y = 0; y < dh; y++) {
-    const oo = y * dw;
+    // Vertical taps: row = scale * Σ_t wy[t] src[iy[t]] (contiguous inner loops).
     const b = y * ty;
-    const w0 = wy[b];
-    const r0 = iy[b] * dw;
-    for (let x = 0; x < dw; x++) out[oo + x] = w0 * tmp[r0 + x];
+    const w0 = wy[b] * scale;
+    const r0 = iy[b] * sw;
+    for (let x = 0; x < sw; x++) row[x] = w0 * src[r0 + x];
     for (let t = 1; t < ty; t++) {
-      const w = wy[b + t];
+      const w = wy[b + t] * scale;
       if (w === 0) continue;
-      const r = iy[b + t] * dw;
-      for (let x = 0; x < dw; x++) out[oo + x] += w * tmp[r + x];
+      const r = iy[b + t] * sw;
+      for (let x = 0; x < sw; x++) row[x] += w * src[r + x];
+    }
+    // Horizontal taps.
+    const oo = y * dw;
+    for (let x = 0; x < dw; x++) {
+      let acc = 0;
+      const bx = x * tx;
+      for (let t = 0; t < tx; t++) acc += wx[bx + t] * row[ix[bx + t]];
+      out[oo + x] = acc;
     }
   }
   return out;
@@ -169,8 +174,7 @@ export function resizeFloat32(
 /** Area-averaging when shrinking, bilinear when enlarging (per axis). Returns Float32 0..1. */
 export function resizeGray(img: GrayImage, w: number, h: number): GrayImage {
   if (!(w >= 1 && h >= 1)) throw new Error(`resizeGray: invalid size ${w}x${h}`);
-  const src = grayToFloat32(img);
-  const data = resizeFloat32(src, img.width, img.height, w, h);
+  const data = resizeFloat32(img.data, img.width, img.height, w, h);
   return { width: w, height: h, data };
 }
 
@@ -295,7 +299,7 @@ export function sharpness(img: GrayImage): number {
     const s = 640 / longSide;
     const nw = Math.max(1, Math.round(w * s));
     const nh = Math.max(1, Math.round(h * s));
-    data = resizeFloat32(grayToFloat32(img), w, h, nw, nh);
+    data = resizeFloat32(img.data, w, h, nw, nh);
     w = nw;
     h = nh;
   } else {
@@ -329,6 +333,7 @@ export function sharpness(img: GrayImage): number {
  * The output data has the same array type as the input.
  */
 export function rotateRGBA90(img: RGBAImage, quarterTurns: number): RGBAImage {
+  if (!Number.isFinite(quarterTurns)) throw new Error(`rotateRGBA90: invalid quarterTurns ${quarterTurns}`);
   const k = (((Math.round(quarterTurns) % 4) + 4) % 4) as 0 | 1 | 2 | 3;
   const { width: W, height: H, data } = img;
   const n = W * H;

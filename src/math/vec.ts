@@ -82,18 +82,23 @@ export function vec3NormSq(a: ArrayLike<number>): number {
   return a[0] * a[0] + a[1] * a[1] + a[2] * a[2];
 }
 
-/** Unit vector in the direction of a. A zero (or non-finite-norm) input yields the zero vector. */
+/**
+ * Unit vector in the direction of a. A zero input yields the zero vector; non-finite
+ * input yields NaN (it was silently mapped to zero, hiding upstream NaNs).
+ */
 export function vec3Normalize(a: ArrayLike<number>, out: Vec3 = new Float64Array(3)): Vec3 {
   const n = vec3Norm(a);
   if (n > 0 && Number.isFinite(n)) {
-    const inv = 1 / n;
-    out[0] = a[0] * inv;
-    out[1] = a[1] * inv;
-    out[2] = a[2] * inv;
-  } else {
+    // Divide (not multiply by 1/n): 1/n overflows for subnormal-range norms.
+    out[0] = a[0] / n;
+    out[1] = a[1] / n;
+    out[2] = a[2] / n;
+  } else if (n === 0) {
     out[0] = 0;
     out[1] = 0;
     out[2] = 0;
+  } else {
+    out[0] = out[1] = out[2] = NaN;
   }
   return out;
 }

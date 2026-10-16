@@ -66,7 +66,10 @@ export class MemoryDepthMapStore implements DepthMapStore {
 
 /** Optional prior + source depth maps for the geometric-consistency (ACMM) pass. */
 export interface GeometricInput {
-  /** Depth map of the reference view used as initialisation (any resolution; resampled). */
+  /**
+   * Depth map of the reference view used as initialisation (any resolution; nearest
+   * resampling per §2, planes re-intersected with the target pixel's ray).
+   */
   prior: DepthMap;
   /** Depth maps of the source views, same order as `sources` (any resolution each; a 0×0 map = unavailable). */
   sourceDepths: DepthMap[];
@@ -94,6 +97,12 @@ export interface PatchMatchOptions {
    * Geometric-consistency (ACMM) mode. Only meaningful when the `geometric`
    * argument (prior + source depth maps) is passed to compute(); when that
    * argument is present, geometric mode is used unless this is explicitly false.
+   * With the argument AND `geometric: false`, a PHOTOMETRIC pass runs that is
+   * initialised from `prior` (sourceDepths are ignored): the multi-scale refinement
+   * step (coarse photometric → this at full resolution with `iterations` ≈ 2 →
+   * geometric pass with full-resolution maps). Do NOT feed coarse maps as
+   * `sourceDepths` of a full-resolution geometric pass: their reprojection error
+   * dominates the cost (measured 62 % vs 88 % within 1 % on the near scene).
    */
   geometric: boolean;
   /** Iterations of the geometric pass (replaces `iterations` in geometric mode). Default 3. */
@@ -124,14 +133,20 @@ export interface PatchMatchOptions {
   perturbationDecay: number;
   /** Lower bound of the relative depth perturbation. Default 0.002. */
   minPerturbation: number;
-  /** Starting relative depth perturbation of the geometric pass (prior already good). Default 0.01. */
+  /** Starting relative depth perturbation when initialised from a prior (geometric or prior-initialised photometric pass). Default 0.01. */
   geometricPerturbation: number;
   /** Minimum weighted variance of a 0..1 grey patch (textureless rejection). Default (0.75/255)². */
   minVariance: number;
   /** RNG seed. Default 1. */
   seed: number;
-  /** GPU only: max (pixels × source views) per queue submission (iOS watchdog). Default 1.5M. */
+  /** GPU only: max (pixels × source views) per command buffer (hard cap / first band). Default 1.5M. */
   maxPixelViewsPerSubmit: number;
+  /**
+   * GPU only: target GPU time per command buffer in ms; band heights adapt to it
+   * (ARCHITECTURE §2.1: ≤ 30 ms in processing mode, 2–8 ms while the camera preview
+   * animates). Ignored on software adapters. Default 20.
+   */
+  targetSubmitMs: number;
 }
 
 export const MAX_PATCHMATCH_SOURCES = 16;
@@ -160,6 +175,7 @@ export const DEFAULT_PATCHMATCH_OPTIONS: Readonly<PatchMatchOptions> = Object.fr
   minVariance: (0.75 / 255) * (0.75 / 255),
   seed: 1,
   maxPixelViewsPerSubmit: 1_500_000,
+  targetSubmitMs: 20,
 });
 
 /** Depth search range (z-depth, same units as poses). */

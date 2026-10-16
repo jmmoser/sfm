@@ -1,14 +1,17 @@
 /**
  * Order statistics and simple summaries. `median`, `percentile`, `mad` never modify
  * their input (they copy into a reused module-level scratch buffer and run
- * quickselect there). Inputs must not contain NaN. Empty input → NaN.
+ * quickselect there). Empty input → NaN. Input containing NaN → NaN (order
+ * statistics of NaN-containing data are undefined; previously garbage was returned).
+ * `quickselect` itself requires NaN-free input.
  */
 
 let scratch = new Float64Array(64);
 /** Inputs larger than this get a temporary copy instead of growing the persistent scratch. */
 const MAX_PERSISTENT_SCRATCH = 1 << 18;
 
-function copyToScratch(v: ArrayLike<number>): Float64Array {
+/** Copy v into scratch; null if v contains NaN. */
+function copyToScratch(v: ArrayLike<number>): Float64Array | null {
   const n = v.length;
   let s: Float64Array;
   if (n > MAX_PERSISTENT_SCRATCH) s = new Float64Array(n);
@@ -16,16 +19,23 @@ function copyToScratch(v: ArrayLike<number>): Float64Array {
     if (scratch.length < n) scratch = new Float64Array(Math.max(n, Math.min(scratch.length * 2, MAX_PERSISTENT_SCRATCH)));
     s = scratch;
   }
-  for (let i = 0; i < n; i++) s[i] = v[i];
-  return s;
+  let nan = false;
+  for (let i = 0; i < n; i++) {
+    const x = v[i];
+    s[i] = x;
+    if (x !== x) nan = true;
+  }
+  return nan ? null : s;
 }
 
 /**
  * In-place selection (Hoare's FIND with median-of-three pivot): returns the k-th
  * smallest element (0-based) of a[0 .. a.length-1] and partially orders `a` so that
  * a[k] holds it, everything before is ≤ and everything after is ≥. Expected O(n).
+ * k outside [0, n) or non-integer → NaN (was `undefined`, typed as number).
  */
 export function quickselect(a: Float64Array | number[], k: number): number {
+  if (!(k >= 0 && k < a.length) || !Number.isInteger(k)) return NaN;
   return selectRange(a, 0, a.length - 1, k);
 }
 
@@ -96,7 +106,8 @@ function medianOfScratch(s: Float64Array, n: number): number {
 export function median(v: ArrayLike<number>): number {
   const n = v.length;
   if (n === 0) return NaN;
-  return medianOfScratch(copyToScratch(v), n);
+  const s = copyToScratch(v);
+  return s ? medianOfScratch(s, n) : NaN;
 }
 
 /**
@@ -106,11 +117,13 @@ export function median(v: ArrayLike<number>): number {
 export function percentile(v: ArrayLike<number>, p: number): number {
   const n = v.length;
   if (n === 0) return NaN;
+  if (p !== p) return NaN;
   const pc = p <= 0 ? 0 : p >= 100 ? 100 : p;
   const pos = (pc / 100) * (n - 1);
   const k = Math.floor(pos);
   const frac = pos - k;
   const s = copyToScratch(v);
+  if (!s) return NaN;
   const lo = selectRange(s, 0, n - 1, k);
   if (frac === 0 || k + 1 >= n) return lo;
   const hiVal = minRange(s, k + 1, n);
@@ -141,6 +154,7 @@ export function mad(v: ArrayLike<number>): number {
   const n = v.length;
   if (n === 0) return NaN;
   const s = copyToScratch(v);
+  if (!s) return NaN;
   const med = medianOfScratch(s, n);
   // Overwrite the scratch prefix with absolute deviations (order is irrelevant).
   for (let i = 0; i < n; i++) s[i] = Math.abs(s[i] - med);

@@ -18,15 +18,23 @@ export interface DistributeOptions {
   quotaFraction?: number;
 }
 
-/** Indices 0..n-1 sorted by descending score (ties: ascending index). */
+/**
+ * Indices 0..n-1 sorted by descending score (ties: ascending index). NaN scores rank
+ * as -Infinity (a NaN-producing comparator would make the whole order unspecified).
+ */
 export function sortByScoreDesc(score: ArrayLike<number>, n: number): Uint32Array {
   const idx = new Uint32Array(n);
-  for (let i = 0; i < n; i++) idx[i] = i;
-  // Pack (score rank key, index) into Float64 pairs would be faster, but n is a few
-  // tens of thousands at most; a comparator sort is fine and stable by construction.
+  const key = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    idx[i] = i;
+    const v = score[i];
+    key[i] = v === v ? v : -Infinity;
+  }
+  // n is a few tens of thousands at most; a comparator sort is fine. The comparator
+  // is consistent (±Infinity ties fall back to the index) and fully deterministic.
   idx.sort((a, b) => {
-    const d = score[b] - score[a];
-    return d !== 0 ? d : a - b;
+    const d = key[b] - key[a];
+    return d > 0 ? 1 : d < 0 ? -1 : a - b;
   });
   return idx;
 }

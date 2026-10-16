@@ -46,7 +46,15 @@ describe('patchMatchCPU', () => {
     const mask = surfaceMask(ds.views[0].cam, ds.gtDepth[0], ds.gtNormal[0]);
     const s1 = evaluateDepthMap(dm, ds.gtDepth[0], ds.gtNormal[0], { mask });
     const s2 = evaluateDepthMap(dm, ds.gtDepth[0], ds.gtNormal[0], { mask, relTol: 0.02 });
-    log(`far 160x120 photometric (range ${ds.range.min.toFixed(1)}–${ds.range.max.toFixed(1)} m): ${lastPatchMatchCPUStats().timeMs.toFixed(0)} ms`);
+    const gt = ds.gtDepth[0].filter((z) => z > 0);
+    const gtMin = gt.reduce((a, b) => Math.min(a, b), Infinity);
+    const gtMax = gt.reduce((a, b) => Math.max(a, b), 0);
+    expect(gtMin).toBeLessThan(8);
+    expect(gtMax).toBeGreaterThan(55);
+    log(
+      `far 160x120 photometric (GT ${gtMin.toFixed(1)}–${gtMax.toFixed(1)} m, search ${ds.range.min.toFixed(1)}–${ds.range.max.toFixed(1)} m): ` +
+        `${lastPatchMatchCPUStats().timeMs.toFixed(0)} ms`,
+    );
     log(`  all GT px     : ${formatDepthStats(evaluateDepthMap(dm, ds.gtDepth[0], ds.gtNormal[0]))}`);
     log(`  surface mask  : ${formatDepthStats(s1)} | within 2%: ${(100 * s2.accurateFraction).toFixed(1)}%`);
     expect(s1.validFraction).toBeGreaterThanOrEqual(0.7);

@@ -234,15 +234,14 @@ export function qr(A: Matrix): { Q: Matrix; R: Matrix } {
   const a = A.data;
   // Scale to max-abs 1 (no overflow in the reflector norms); R is unscaled below.
   const sc = maxAbs(a, m * n);
-  const is = sc > 0 && Number.isFinite(sc) ? 1 / sc : 1;
+  const is = sc > 0 && Number.isFinite(sc) ? safeInv(sc) : 1;
   const Wt = new Float64Array(n * m);
   for (let r = 0; r < m; r++) for (let c = 0; c < n; c++) Wt[c * m + r] = a[r * n + c] * is;
   const tau = new Float64Array(k);
   householderQRt(Wt, m, n, tau);
   const R = new Matrix(k, n);
   const Rd = R.data;
-  const us = is === 1 ? 1 : sc;
-  for (let j = 0; j < k; j++) for (let c = j; c < n; c++) Rd[j * n + c] = Wt[c * m + j] * us;
+  for (let j = 0; j < k; j++) for (let c = j; c < n; c++) Rd[j * n + c] = Wt[c * m + j] / is;
   const Q = new Matrix(m, k);
   const Qd = Q.data;
   const u = new Float64Array(m);
@@ -270,7 +269,7 @@ export function solveLeastSquares(A: Matrix, b: ArrayLike<number>): Float64Array
   // Solve with A/s (s = max|A|, no overflow), then x = x'/s.
   const sc = maxAbs(a, m * n);
   if (!(sc > 0) || !Number.isFinite(sc)) return null;
-  const is = 1 / sc;
+  const is = safeInv(sc);
   const Wt = new Float64Array(n * m);
   for (let r = 0; r < m; r++) for (let c = 0; c < n; c++) Wt[c * m + r] = a[r * n + c] * is;
   const tau = new Float64Array(n);
@@ -472,6 +471,17 @@ function argsortDesc(key: Float64Array, n: number, order: Int32Array): void {
   }
 }
 
+/**
+ * Multiplier that brings data of max-abs `scale` (> 0, finite) to O(1): 1/scale, or
+ * 2^1023 when 1/scale overflows (subnormal scale < 2^-1024; the scaled data then has
+ * max-abs ≥ 2^-52, far from underflow). Callers UNSCALE by dividing by the same factor
+ * (previously 1/scale = Infinity turned every subnormal-scale input into NaN or zeros).
+ */
+function safeInv(scale: number): number {
+  const r = 1 / scale;
+  return r === Infinity ? 8.98846567431158e307 /* 2^1023 */ : r;
+}
+
 function maxAbs(a: ArrayLike<number>, len: number): number {
   let s = 0;
   for (let i = 0; i < len; i++) {
@@ -504,7 +514,7 @@ function svdTall(a: Float64Array, m: number, n: number, wantU: boolean): TallSvd
     if (U) for (let i = 0; i < n; i++) U.data[i * n + i] = 1;
     return { U, S, V };
   }
-  const inv = 1 / scale;
+  const inv = safeInv(scale);
   const nn = n * n;
   scrW = growF64(scrW, nn);
   scrVt = growF64(scrVt, nn);
@@ -561,7 +571,7 @@ function svdTall(a: Float64Array, m: number, n: number, wantU: boolean): TallSvd
   const Vd = V.data;
   for (let j = 0; j < n; j++) {
     const oj = order[j];
-    S[j] = sig[oj] * scale;
+    S[j] = sig[oj] / inv;
     const vo = oj * n;
     for (let r = 0; r < n; r++) Vd[r * n + j] = Vt[vo + r];
   }
@@ -652,7 +662,7 @@ export function nullSpace(A: Matrix, dim: number): Matrix {
     od.fill(NaN);
     return out;
   }
-  const inv = scale > 0 ? 1 / scale : 1;
+  const inv = scale > 0 ? safeInv(scale) : 1;
   if (dim <= n - m) {
     // Householder QR of Aᵀ (n x m). Its columns are the rows of A, i.e. exactly the
     // transposed layout householderQRt expects: copy A as is.
@@ -757,7 +767,7 @@ export function svd3(A: Mat3): { U: Mat3; S: Vec3; V: Mat3 } {
     V[0] = V[4] = V[8] = 1;
     return { U, S, V };
   }
-  const inv = 1 / scale;
+  const inv = safeInv(scale);
   const W = S3_W,
     Vt = S3_VT;
   // Rows of W = columns of A.
@@ -785,7 +795,7 @@ export function svd3(A: Mat3): { U: Mat3; S: Vec3; V: Mat3 } {
   argsortDesc(S3_SIG, 3, S3_ORDER);
   for (let j = 0; j < 3; j++) {
     const oj = S3_ORDER[j];
-    S[j] = S3_SIG[oj] * scale;
+    S[j] = S3_SIG[oj] / inv;
     const o = oj * 3;
     U[j] = W[o];
     U[3 + j] = W[o + 1];
@@ -806,7 +816,7 @@ export function svd3(A: Mat3): { U: Mat3; S: Vec3; V: Mat3 } {
  * rotations (threshold strategy of Numerical Recipes §11.1; the input is
  * symmetrised as (A + Aᵀ)/2). Eigenvalues are returned ASCENDING; column k of the
  * row-major n x n `vectors` (i.e. vectors[r*n + k]) is the unit eigenvector of
- * values[k]. A is not modified.
+ * values[k]. A is not modified. Non-finite input → all-NaN outputs.
  */
 export function symEig(A: Float64Array, n: number): { values: Float64Array; vectors: Float64Array } {
   const nn = n * n;
@@ -823,7 +833,7 @@ export function symEig(A: Float64Array, n: number): { values: Float64Array; vect
     negD = scrEigD.subarray(3 * n, 4 * n);
   for (let i = 0; i < n; i++) {
     for (let j = i; j < n; j++) {
-      const x = i === j ? A[i * n + i] : 0.5 * (A[i * n + j] + A[j * n + i]);
+      const x = i === j ? A[i * n + i] : 0.5 * A[i * n + j] + 0.5 * A[j * n + i]; // no overflow near 1e308
       a[i * n + j] = x;
       a[j * n + i] = x;
     }
@@ -835,6 +845,20 @@ export function symEig(A: Float64Array, n: number): { values: Float64Array; vect
     z[i] = 0;
   }
 
+  let finite = true;
+  for (let i = 0; i < nn; i++) {
+    if (!Number.isFinite(a[i])) {
+      finite = false;
+      break;
+    }
+  }
+  if (!finite) {
+    // Non-finite input: NaN outputs (previously the loop stopped and returned the
+    // untouched diagonal + identity vectors, silently masking the NaN/Inf).
+    const values = new Float64Array(n).fill(NaN);
+    const vectors = new Float64Array(nn).fill(NaN);
+    return { values, vectors };
+  }
   for (let sweep = 0; sweep < 100; sweep++) {
     let sm = 0;
     for (let p = 0; p < n - 1; p++) for (let q = p + 1; q < n; q++) sm += Math.abs(a[p * n + q]);

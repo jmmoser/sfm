@@ -332,3 +332,215 @@ describe('extractSiftCPU — timing', () => {
     expect(fs.count).toBe(4096);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Adversarial convention tests (review): these pin down conventions that plain
+// matching tests cannot see (a consistently wrong sign still matches perfectly),
+// but that the GPU implementation and the SfM code rely on.
+// ---------------------------------------------------------------------------
+
+function wrapAngle(a: number): number {
+  a %= 2 * Math.PI;
+  if (a > Math.PI) a -= 2 * Math.PI;
+  else if (a <= -Math.PI) a += 2 * Math.PI;
+  return a;
+}
+
+function percentile(v: number[], p: number): number {
+  const s = [...v].sort((x, y) => x - y);
+  return s[Math.min(s.length - 1, Math.floor(p * (s.length - 1)))];
+}
+
+/** Matched pairs whose positions agree with H within tol px. */
+function geometricallyCorrect(a: FeatureSet, b: FeatureSet, H: Mat3, tol: number): [number, number][] {
+  const m = matchCPU(a, b);
+  const out: [number, number][] = [];
+  for (let k = 0; k < m.length; k += 2) {
+    const i = m[k];
+    const j = m[k + 1];
+    const xa = a.keypoints[4 * i];
+    const ya = a.keypoints[4 * i + 1];
+    const w = H[6] * xa + H[7] * ya + H[8];
+    const u = (H[0] * xa + H[1] * ya + H[2]) / w;
+    const v = (H[3] * xa + H[4] * ya + H[5]) / w;
+    if (Math.hypot(u - b.keypoints[4 * j], v - b.keypoints[4 * j + 1]) <= tol) out.push([i, j]);
+  }
+  return out;
+}
+
+describe('extractSiftCPU — conventions (adversarial)', () => {
+  it('orientation is measured from +x towards +y (image frame) and scale follows the warp', () => {
+    // similarityAboutCenter(angle) rotates clockwise as displayed (from +x towards +y),
+    // so every orientation must increase by +angle; a flipped sign would give -angle.
+    const W = 640;
+    const Hh = 480;
+    for (const [deg, sc] of [[35, 0.85], [-60, 1.2], [150, 1]] as const) {
+      const p = makeWarpedPair(W, Hh, similarityAboutCenter(W, Hh, deg, sc), 29);
+      const a = extractSiftCPU(p.a);
+      const b = extractSiftCPU(p.b);
+      const pairs = geometricallyCorrect(a, b, p.H, 1.5);
+      expect(pairs.length).toBeGreaterThan(500);
+      const target = (deg * Math.PI) / 180;
+      const dth = pairs.map(([i, j]) => Math.abs(wrapAngle(b.keypoints[4 * j + 3] - a.keypoints[4 * i + 3] - target)));
+      const lr = pairs.map(([i, j]) => Math.log(b.keypoints[4 * j + 2] / a.keypoints[4 * i + 2]));
+      console.log(`[sift] orientation ${deg > 0 ? '+' : ''}${deg}° x${sc}: ${pairs.length} pairs, |Δθ err| p50 ${percentile(dth, 0.5).toFixed(4)} p90 ${percentile(dth, 0.9).toFixed(4)} rad, scale ratio ${(Math.exp(percentile(lr, 0.5)) / sc).toFixed(4)}`);
+      // natural orientation noise is ~1°; a flipped convention would be off by 2·angle
+      expect(percentile(dth, 0.5)).toBeLessThan(0.05);
+      expect(percentile(dth, 0.9)).toBeLessThan(0.2);
+      expect(Math.abs(Math.exp(percentile(lr, 0.5)) / sc - 1)).toBeLessThan(0.02);
+    }
+  });
+
+  it('exact 90° rotation adds π/2 to orientations and preserves descriptors', () => {
+    // Odd height => decimation parity is preserved under the rotation, so the scale
+    // space is (up to float rounding) exactly equivariant.
+    const img = makeTexturedImage(641, 481, 13);
+    const a = extractSiftCPU(img);
+    const b = extractSiftCPU(rotateGray90(img));
+    const H: Mat3 = new Float64Array([0, -1, 480, 1, 0, 0, 0, 0, 1]);
+    const pairs = geometricallyCorrect(a, b, H, 0.05);
+    expect(pairs.length).toBeGreaterThan(0.9 * a.count);
+    const dth = pairs.map(([i, j]) => Math.abs(wrapAngle(b.keypoints[4 * j + 3] - a.keypoints[4 * i + 3] - Math.PI / 2)));
+    expect(percentile(dth, 0.95)).toBeLessThan(1e-3);
+    let identical = 0;
+    for (const [i, j] of pairs) {
+      let d = 0;
+      for (let k = 0; k < DESCRIPTOR_SIZE; k++) d = Math.max(d, Math.abs(a.descriptors[128 * i + k] - b.descriptors[128 * j + k]));
+      if (d <= 1) identical++;
+    }
+    expect(identical).toBeGreaterThan(0.95 * pairs.length);
+  });
+
+  // Descriptor layout (normative for sift-gpu): index (by*4 + bx)*8 + bo, bx along
+  // x' = (cos θ, sin θ), by along y' = (−sin θ, cos θ), bo = bin of (gradient angle − θ).
+  // A dark blob (keypoint) with step edges at known offsets / gradient angles; the
+  // expected bins are derived from the detected θ, so the test does not depend on
+  // which structure dominates the orientation.
+  function layoutImage(withTopEdge: boolean): GrayImage {
+    const W = 128;
+    const H = 128;
+    const sig = (t: number) => 1 / (1 + Math.exp(-t));
+    const d = new Float32Array(W * H);
+    for (let y = 0; y < H; y++)
+      for (let x = 0; x < W; x++) {
+        let v = 0.5 - 0.3 * Math.exp(-((x - 63.3) ** 2 + (y - 64.2) ** 2) / 32);
+        // vertical edge 12 px right of the blob, bright -> dark: gradient angle π
+        v -= 0.3 * sig((x - 75.3) / 0.7);
+        // horizontal edge segment 12 px above the blob, bright below: gradient angle π/2
+        if (withTopEdge) v += 0.12 * sig((y - 52.2) / 0.7) * sig(6 - Math.abs(x - 63.3));
+        d[y * W + x] = v;
+      }
+    return { width: W, height: H, data: d };
+  }
+  const g = globalThis as { SFM_DISABLE_SIMD?: boolean };
+  for (const simd of [true, false]) {
+    for (const withTopEdge of [false, true]) {
+      it(`descriptor layout: rotated bins and orientation direction (${withTopEdge ? 'two edges' : 'one edge'}, ${simd ? 'SIMD' : 'JS'})`, () => {
+        if (!simd) g.SFM_DISABLE_SIMD = true;
+        try {
+          const fs = extractSiftCPU(layoutImage(withTopEdge), { upsampleBelow: 0 });
+          let k = -1;
+          let bd = Infinity;
+          for (let i = 0; i < fs.count; i++) {
+            const dd = Math.hypot(fs.keypoints[4 * i] - 63.3, fs.keypoints[4 * i + 1] - 64.2);
+            if (fs.keypoints[4 * i + 2] > 2 && dd < bd) {
+              bd = dd;
+              k = i;
+            }
+          }
+          expect(bd).toBeLessThan(0.5);
+          const [, , scale, th] = fs.keypoints.subarray(4 * k, 4 * k + 4);
+          const desc = fs.descriptors.subarray(128 * k, 128 * k + 128);
+          const E = (bx: number, by: number, bo: number) => desc[(by * 4 + bx) * 8 + bo] ** 2;
+          // The vertical edge: offset (+12, 0), gradient angle π.
+          const SBP = 3 * scale;
+          const nx = (Math.cos(th) * 12) / SBP;
+          const ny = (-Math.sin(th) * 12) / SBP;
+          const bo = ((Math.round(wrapAngle(Math.PI - th) / (Math.PI / 4)) % 8) + 8) % 8;
+          const half = (bo2: number, axis: 'x' | 'y', lowSide: boolean) => {
+            let e = 0;
+            for (let by = 0; by < 4; by++)
+              for (let bx = 0; bx < 4; bx++) if ((axis === 'x' ? bx : by) < 2 === lowSide) e += E(bx, by, bo2);
+            return e;
+          };
+          let checked = 0;
+          if (Math.abs(nx) > 0.8) {
+            expect(half(bo, 'x', nx < 0)).toBeGreaterThan(2 * half(bo, 'x', nx >= 0));
+            checked++;
+          }
+          if (Math.abs(ny) > 0.8) {
+            expect(half(bo, 'y', ny < 0)).toBeGreaterThan(2 * half(bo, 'y', ny >= 0));
+            // orientation-bin direction: (gradient − θ), not (θ − gradient)
+            const flip = (8 - bo) % 8;
+            if (flip !== bo) expect(half(bo, 'y', ny < 0)).toBeGreaterThan(5 * half(flip, 'y', ny < 0));
+            checked++;
+          }
+          expect(checked).toBeGreaterThan(0);
+        } finally {
+          delete g.SFM_DISABLE_SIMD;
+        }
+      });
+    }
+  }
+
+  it('other scalesPerOctave (S = 2, 4): sub-pixel localisation and DoG scale convention', () => {
+    const { img, blobs } = blobImage(400, 300, 48, 2.5, 6, 1);
+    for (const S of [2, 4]) {
+      for (const upsampleBelow of [800, 0]) {
+        const r = evalBlobs(extractSiftCPU(img, { scalesPerOctave: S, upsampleBelow }), blobs);
+        expect(r.found, `S=${S}`).toBeGreaterThanOrEqual(blobs.length - 1);
+        expect(Math.abs(r.biasX)).toBeLessThan(0.03);
+        expect(Math.abs(r.biasY)).toBeLessThan(0.03);
+        expect(r.rms).toBeLessThan(0.12);
+        // ideal blob: lower bracketing level sigma = σ_blob · 2^(-1/(2S))
+        expect(Math.abs(r.scaleMedian / 2 ** (-1 / (2 * S)) - 1)).toBeLessThan(0.03);
+      }
+    }
+  });
+
+  it('odd sizes, tiny images and extreme aspect ratios produce valid output', () => {
+    for (const [w, h] of [[641, 481], [17, 33], [16, 16], [15, 400], [1001, 23], [23, 1001], [100, 15], [1, 1], [3, 2000]]) {
+      const img = makeTexturedImage(w, h, 3);
+      const fs = extractSiftCPU(img);
+      expect([fs.width, fs.height]).toEqual([w, h]);
+      for (let i = 0; i < fs.count; i++) {
+        const [x, y, s, o] = fs.keypoints.subarray(4 * i, 4 * i + 4);
+        expect(x >= -0.5 && x <= w - 0.5 && y >= -0.5 && y <= h - 0.5, `${w}x${h}`).toBe(true);
+        expect(s > 0 && Number.isFinite(s) && o >= 0 && o < 2 * Math.PI).toBe(true);
+      }
+    }
+  });
+
+  it('a single full-resolution dimension implies the other from the input aspect', () => {
+    const { img, blobs } = blobImage(800, 600, 24, 3, 6, 5);
+    const both = extractSiftCPU(img, {}, 1600, 1200);
+    const onlyW = extractSiftCPU(img, {}, 1600);
+    const onlyH = extractSiftCPU(img, {}, undefined, 1200);
+    for (const fs of [onlyW, onlyH]) {
+      expect([fs.width, fs.height]).toEqual([1600, 1200]);
+      expect(Array.from(fs.keypoints)).toEqual(Array.from(both.keypoints));
+    }
+    const scaled = blobs.map((b) => ({ x: (b.x + 0.5) * 2 - 0.5, y: (b.y + 0.5) * 2 - 0.5, s: 2 * b.s }));
+    expect(evalBlobs(both, scaled).found).toBe(blobs.length);
+    expect(() => extractSiftCPU(img, {}, 0, 0)).toThrow();
+    expect(() => extractSiftCPU(img, {}, NaN)).toThrow();
+  });
+
+  it('Uint8 input with internal downscaling matches the Float32 path', () => {
+    const src = makeTexturedImage(1000, 700, 4);
+    const u8 = new Uint8Array(src.data.length);
+    for (let i = 0; i < u8.length; i++) u8[i] = Math.round(src.data[i] * 255);
+    const f32 = new Float32Array(u8.length);
+    for (let i = 0; i < u8.length; i++) f32[i] = u8[i] / 255;
+    const opts = { maxImageSize: 640, maxFeatures: 1500 };
+    const a = extractSiftCPU({ width: 1000, height: 700, data: u8 }, opts);
+    const b = extractSiftCPU({ width: 1000, height: 700, data: f32 }, opts);
+    expect(Math.abs(a.count - b.count)).toBeLessThanOrEqual(3);
+    let same = 0;
+    const n = Math.min(a.count, b.count);
+    for (let i = 0; i < n; i++) {
+      if (Math.hypot(a.keypoints[4 * i] - b.keypoints[4 * i], a.keypoints[4 * i + 1] - b.keypoints[4 * i + 1]) < 1e-3) same++;
+    }
+    expect(same).toBeGreaterThan(0.98 * n);
+  });
+});

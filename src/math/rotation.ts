@@ -45,7 +45,7 @@ export function quatToMat3(q: ArrayLike<number>, out: Mat3 = new Float64Array(9)
 /**
  * Unit quaternion of a rotation matrix by Shepperd's method (1978): the largest of
  * the four quantities 1±R00±R11±R22 is used for the square root, so the division is
- * always well conditioned. Result is normalised and has w ≥ 0.
+ * always well conditioned. Result is normalised and has w ≥ 0; non-finite input → NaN.
  */
 export function mat3ToQuat(R: ArrayLike<number>, out: Quat = new Float64Array(4)): Quat {
   const r00 = R[0],
@@ -85,7 +85,12 @@ export function mat3ToQuat(R: ArrayLike<number>, out: Quat = new Float64Array(4)
     y = (r12 + r21) / s;
   }
   let n = Math.sqrt(w * w + x * x + y * y + z * z);
-  if (!(n > 0) || !Number.isFinite(n)) {
+  if (!Number.isFinite(n)) {
+    // Non-finite input → NaN (was silently mapped to the identity).
+    out[0] = out[1] = out[2] = out[3] = NaN;
+    return out;
+  }
+  if (!(n > 0)) {
     out[0] = 1;
     out[1] = out[2] = out[3] = 0;
     return out;
@@ -124,10 +129,15 @@ export function quatConj(q: ArrayLike<number>, out: Quat = new Float64Array(4)):
   return out;
 }
 
-/** Normalise to unit length; the zero quaternion maps to the identity [1, 0, 0, 0]. */
+/** Normalise to unit length; the zero quaternion maps to the identity [1, 0, 0, 0]; non-finite input → NaN. */
 export function quatNormalize(q: ArrayLike<number>, out: Quat = new Float64Array(4)): Quat {
-  const n = Math.sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
-  if (!(n > 0) || !Number.isFinite(n)) {
+  let n = Math.sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+  if (!(n > 1e-150 && n < 1e150)) n = Math.hypot(q[0], q[1], q[2], q[3]); // over/underflow-safe
+  if (n !== n || n === Infinity) {
+    out[0] = out[1] = out[2] = out[3] = NaN;
+    return out;
+  }
+  if (!(n > 0)) {
     out[0] = 1;
     out[1] = out[2] = out[3] = 0;
     return out;
@@ -268,6 +278,11 @@ export function mat3ToRotvec(R: ArrayLike<number>, out: Vec3 = new Float64Array(
   const vz = 0.5 * (R[3] - R[1]);
   const s = Math.sqrt(vx * vx + vy * vy + vz * vz);
   const c = 0.5 * (R[0] + R[4] + R[8] - 1);
+  if (!Number.isFinite(s) || !Number.isFinite(c)) {
+    // Non-finite input → NaN (was silently mapped to the zero rotation vector).
+    out[0] = out[1] = out[2] = NaN;
+    return out;
+  }
   const theta = Math.atan2(s, c);
   if (c > -0.5) {
     // θ < 2π/3: v is a well-conditioned axis estimate.
@@ -318,10 +333,15 @@ export function mat3ToRotvec(R: ArrayLike<number>, out: Vec3 = new Float64Array(
   return out;
 }
 
-/** Rotation by `angle` (radians, right-handed) about `axis` (need not be unit; zero axis → identity). */
+/** Rotation by `angle` (radians, right-handed) about `axis` (need not be unit; zero axis → identity; non-finite → NaN). */
 export function axisAngleToMat3(axis: ArrayLike<number>, angle: number, out: Mat3 = new Float64Array(9)): Mat3 {
-  const n = Math.sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
-  if (!(n > 0) || !Number.isFinite(n)) {
+  let n = Math.sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
+  if (!(n > 1e-150 && n < 1e150)) n = Math.hypot(axis[0], axis[1], axis[2]); // over/underflow-safe
+  if (n !== n || n === Infinity) {
+    out.fill(NaN);
+    return out;
+  }
+  if (!(n > 0)) {
     out.fill(0);
     out[0] = out[4] = out[8] = 1;
     return out;
@@ -390,16 +410,23 @@ export function orthonormalize(R: ArrayLike<number>, out: Mat3 = new Float64Arra
  * the angle atan2(|â × b̂|, â·b̂), accurate to O(ε) also for nearly (anti)parallel
  * input. For exactly antiparallel input (|â × b̂| ≤ 1e-150) a rotation by π about an
  * axis perpendicular to â is returned; for exactly parallel input, the identity.
- * Zero input yields the identity.
+ * Zero input yields the identity; non-finite input yields NaN.
  */
 export function rotationBetweenVectors(
   a: ArrayLike<number>,
   b: ArrayLike<number>,
   out: Mat3 = new Float64Array(9),
 ): Mat3 {
-  const na = Math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
-  const nb = Math.sqrt(b[0] * b[0] + b[1] * b[1] + b[2] * b[2]);
-  if (!(na > 0) || !(nb > 0) || !Number.isFinite(na) || !Number.isFinite(nb)) {
+  let na = Math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+  let nb = Math.sqrt(b[0] * b[0] + b[1] * b[1] + b[2] * b[2]);
+  if (!(na > 1e-150 && na < 1e150)) na = Math.hypot(a[0], a[1], a[2]); // over/underflow-safe
+  if (!(nb > 1e-150 && nb < 1e150)) nb = Math.hypot(b[0], b[1], b[2]);
+  if (!Number.isFinite(na) || !Number.isFinite(nb)) {
+    // Non-finite input → NaN (was silently mapped to the identity).
+    out.fill(NaN);
+    return out;
+  }
+  if (!(na > 0) || !(nb > 0)) {
     out.fill(0);
     out[0] = out[4] = out[8] = 1;
     return out;

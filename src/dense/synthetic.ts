@@ -118,11 +118,17 @@ export function lookAt(eye: ArrayLike<number>, target: ArrayLike<number>, up: Ar
   let xz = zx * up[1] - zy * up[0];
   let xn = Math.hypot(xx, xy, xz);
   if (xn < 1e-9) {
-    // looking along up: pick any perpendicular
-    xx = 1;
-    xy = 0;
-    xz = 0;
-    xn = 1;
+    // looking along `up`: use the world axis least aligned with z, made orthogonal
+    // to z (a fixed (1, 0, 0) is not perpendicular to z for an arbitrary `up`)
+    const ax = Math.abs(zx);
+    const ay = Math.abs(zy);
+    const az = Math.abs(zz);
+    const e = ax <= ay && ax <= az ? [1, 0, 0] : ay <= az ? [0, 1, 0] : [0, 0, 1];
+    const d = e[0] * zx + e[1] * zy + e[2] * zz;
+    xx = e[0] - d * zx;
+    xy = e[1] - d * zy;
+    xz = e[2] - d * zz;
+    xn = Math.hypot(xx, xy, xz);
   }
   xx /= xn;
   xy /= xn;

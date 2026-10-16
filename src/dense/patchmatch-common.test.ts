@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  BandController,
   CHECKER_OFFSETS,
   CHECKER_REGION_SIZES,
   GPU_SOURCE_CAMERA_FLOATS,
@@ -204,5 +205,21 @@ describe('patchmatch-common', () => {
   it('converts RGBA to Rec.709 grey', () => {
     const g = rgbaToGray8({ width: 2, height: 1, data: new Uint8ClampedArray([255, 255, 255, 255, 255, 0, 0, 255]) });
     expect(Array.from(g)).toEqual([255, 54]);
+  });
+
+  it('BandController adapts band height to the target time per submission', () => {
+    const c = new BandController(20, 32, 400, 8);
+    expect(c.next()).toBe(32);
+    c.update(32, 64); // 2 ms/row -> 10 rows
+    expect(c.next()).toBe(10);
+    c.update(10, 2); // fast now: 0.2 ms/row -> average 1.1 ms/row -> 18 rows
+    expect(c.next()).toBe(18);
+    for (let i = 0; i < 20; i++) c.update(c.next(), 0.01 * c.next());
+    expect(c.next()).toBe(400); // capped at maxRows
+    for (let i = 0; i < 20; i++) c.update(c.next(), 100 * c.next());
+    expect(c.next()).toBe(8); // floored at minRows
+    const fixed = new BandController(Infinity, 77, 100, 1);
+    fixed.update(77, 1000);
+    expect(fixed.next()).toBe(77);
   });
 });

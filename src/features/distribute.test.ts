@@ -11,6 +11,13 @@ describe('selectFeatureIndices', () => {
     expect(Array.from(sortByScoreDesc(score, 4))).toEqual([1, 3, 2, 0]);
   });
 
+  it('sorts NaN / infinite scores deterministically (NaN ranks as -Infinity)', () => {
+    const score = new Float32Array([0.2, NaN, Infinity, 0.9, NaN, -Infinity, 0.2, Infinity]);
+    expect(Array.from(sortByScoreDesc(score, 8))).toEqual([2, 7, 3, 0, 6, 1, 4, 5]);
+    const idx = selectFeatureIndices([0, 1, 2, 3, 4, 5, 6, 7], [0, 0, 0, 0, 0, 0, 0, 0], score, 8, 10, 10, 3, false);
+    expect(Array.from(idx)).toEqual([2, 7, 3]);
+  });
+
   it('without distribution keeps the strongest', () => {
     const rng = new TestRng(3);
     const n = 500;
@@ -50,6 +57,27 @@ describe('selectFeatureIndices', () => {
     expect(right(plain)).toBe(0);
     // ~half the cells lie in the right half, each with a quota of 8.
     expect(right(dist)).toBeGreaterThan(80);
+  });
+
+  it('handles points on / outside the frame border and extreme aspect ratios', () => {
+    const rng = new TestRng(11);
+    for (const [W, H] of [[3000, 20], [20, 3000], [640, 480]]) {
+      const n = 2000;
+      const x = new Float32Array(n);
+      const y = new Float32Array(n);
+      const s = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        // includes the exact frame edges (-0.5, W-0.5) and slightly outside
+        x[i] = i % 7 === 0 ? (i % 2 ? -0.5 : W - 0.5 + 0.3) : rng.uniform(-0.5, W - 0.5);
+        y[i] = i % 11 === 0 ? (i % 2 ? -0.7 : H - 0.5) : rng.uniform(-0.5, H - 0.5);
+        s[i] = rng.next();
+      }
+      const idx = selectFeatureIndices(x, y, s, n, W, H, 500, true);
+      expect(idx.length).toBe(500);
+      expect(new Set(Array.from(idx)).size).toBe(500);
+      for (let k = 1; k < idx.length; k++) expect(s[idx[k - 1]]).toBeGreaterThanOrEqual(s[idx[k]]);
+      for (const i of idx) expect(i).toBeLessThan(n);
+    }
   });
 
   it('selectFeatures/subsetFeatureSet copy all fields', () => {

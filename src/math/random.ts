@@ -21,14 +21,22 @@ export class Rng {
   /** Scratch for partial Fisher–Yates in `sample` (grown on demand, reused). */
   private perm: Uint32Array = new Uint32Array(0);
 
-  /** @param seed any finite number (integer part of the low 32 bits and of seed/2³² are mixed in). */
+  /**
+   * @param seed any finite number: its integer part's low 32 bits and floor(seed/2³²)
+   *   are mixed in (seeds in [0, 2³²) map to distinct streams; negative seeds no longer
+   *   collide with small positive ones, e.g. −1 vs 0 and −2 vs 1 used to be identical).
+   */
   constructor(seed: number = DEFAULT_SEED) {
     this.seed(seed);
   }
 
   /** Re-seed (resets the cached Gaussian). */
   seed(seed: number): void {
-    let s = Number.isFinite(seed) ? (seed >>> 0) ^ (Math.floor(seed / TWO_POW_32) >>> 0) : DEFAULT_SEED;
+    // High word multiplied by an odd constant before mixing (a plain XOR made the
+    // all-ones high word of negative seeds cancel: −1−k collided with k).
+    let s = Number.isFinite(seed)
+      ? (seed >>> 0) ^ Math.imul(Math.floor(seed / TWO_POW_32) >>> 0, 0x9e3779b1)
+      : DEFAULT_SEED;
     const next = (): number => {
       s = (s + 0x9e3779b9) | 0;
       let z = s;
@@ -98,30 +106,39 @@ export class Rng {
   }
 
   /**
-   * k distinct indices drawn uniformly from [0, n) (a uniformly random k-subset; the
-   * ORDER of the output is not uniformly random for small k). Uses Floyd's algorithm
-   * (Bentley & Floyd, CACM 1987) when k² ≤ n or k ≤ 8 (O(k²), no O(n) memory), and a
-   * partial Fisher–Yates shuffle over a reused scratch buffer otherwise.
-   * Writes the first k entries of `out` when it is given and long enough (else
-   * allocates). Throws RangeError if k > n.
+   * k distinct indices drawn uniformly from [0, n), in uniformly random order (every
+   * ordered k-sample equally likely). Uses Floyd's random-permutation sampling
+   * algorithm (Bentley & Floyd, "A sample of brilliance", CACM 30(9), 1987) when k² ≤ n
+   * or k ≤ 8 (O(k²), no O(n) memory), and a partial Fisher–Yates shuffle over a reused
+   * scratch buffer otherwise. Writes the first k entries of `out` when it is given and
+   * long enough (else allocates). Throws RangeError if k > n.
    */
   sample(n: number, k: number, out?: Uint32Array): Uint32Array {
     if (!(k >= 0) || !(k <= n)) throw new RangeError(`Rng.sample: k=${k} not in [0, n=${n}]`);
     const res = out && out.length >= k ? out : new Uint32Array(k);
     if (k === 0) return res;
     if (k <= 8 || k * k <= n) {
-      // Floyd: for j = n−k … n−1, pick t ∈ [0, j]; insert t, or j if t was taken.
+      // Floyd (permutation variant): for j = n−k … n−1 pick t ∈ [0, j]; if t is new,
+      // PREPEND it, else insert j right after t. (The plain set variant appended, which
+      // made n−1 over-represented in the last slot: biased order for small k.)
       let m = 0;
       for (let j = n - k; j < n; j++) {
         const t = this.int(j + 1);
-        let taken = false;
+        let pos = -1;
         for (let i = 0; i < m; i++) {
           if (res[i] === t) {
-            taken = true;
+            pos = i;
             break;
           }
         }
-        res[m++] = taken ? j : t;
+        if (pos < 0) {
+          for (let i = m; i > 0; i--) res[i] = res[i - 1];
+          res[0] = t;
+        } else {
+          for (let i = m; i > pos + 1; i--) res[i] = res[i - 1];
+          res[pos + 1] = j;
+        }
+        m++;
       }
       return res;
     }

@@ -194,6 +194,97 @@ describe('matchGuidedCPU', () => {
     expect(got).toEqual(naiveMatch(a, b, {}, cand));
   });
 
+  it('F guide agrees with the reference for a finite epipole inside the image (steep + flat lines)', () => {
+    // Lines through an epipole inside the frame take every direction, exercising both
+    // the column walk (flat lines) and the row walk (steep lines) of the band search.
+    for (const seed of [11, 12]) {
+      const { a, b } = randomSets(150, 160, 0.12, seed);
+      const e = [500.3, 400.7, 1];
+      const ex = [0, -e[2], e[1], e[2], 0, -e[0], -e[1], e[0], 0];
+      const A = [0.98, -0.17, 15, 0.17, 0.98, -7, 1e-5, -2e-5, 1];
+      const F = new Float64Array(9);
+      for (let r = 0; r < 3; r++)
+        for (let c = 0; c < 3; c++) F[3 * r + c] = ex[3 * r] * A[c] + ex[3 * r + 1] * A[3 + c] + ex[3 * r + 2] * A[6 + c];
+      for (const tol of [1, 8, 40]) {
+        const cand = (i: number, j: number) => {
+          const xa = a.keypoints[4 * i];
+          const ya = a.keypoints[4 * i + 1];
+          const l = [F[0] * xa + F[1] * ya + F[2], F[3] * xa + F[4] * ya + F[5], F[6] * xa + F[7] * ya + F[8]];
+          return Math.abs(l[0] * b.keypoints[4 * j] + l[1] * b.keypoints[4 * j + 1] + l[2]) <= tol * Math.hypot(l[0], l[1]);
+        };
+        for (const opts of [{ ratio: 0.95, maxDistance: 1.4 }, { ratio: 0.95, maxDistance: 1.4, mutual: false }]) {
+          expect(Array.from(matchGuidedCPU(a, b, { kind: 'F', F, maxErrorPx: tol }, opts))).toEqual(naiveMatch(a, b, opts, cand));
+        }
+      }
+    }
+  });
+
+  it('H guide is invariant to the (possibly negative) scale of H', () => {
+    // Homographies are defined up to scale; a DLT/SVD estimate has an arbitrary sign.
+    const { a, b } = randomSets(120, 130, 0.1, 13);
+    const H = new Float64Array([0.98, -0.05, 12, 0.04, 1.01, -9, 2e-5, -1e-5, 1]);
+    const ref = Array.from(matchGuidedCPU(a, b, { kind: 'H', H, maxErrorPx: 30 }));
+    expect(ref.length).toBeGreaterThan(20);
+    for (const s of [-1, -1e-4, 1e-6, 3e5, -7]) {
+      const Hs = H.map((v) => v * s);
+      expect(Array.from(matchGuidedCPU(a, b, { kind: 'H', H: Hs, maxErrorPx: 30 }))).toEqual(ref);
+    }
+    // and it agrees with the equivalent positions guide
+    const pred = new Float32Array(2 * a.count);
+    for (let i = 0; i < a.count; i++) {
+      const x = a.keypoints[4 * i];
+      const y = a.keypoints[4 * i + 1];
+      const w = H[6] * x + H[7] * y + H[8];
+      pred[2 * i] = (H[0] * x + H[1] * y + H[2]) / w;
+      pred[2 * i + 1] = (H[3] * x + H[4] * y + H[5]) / w;
+    }
+    expect(Array.from(matchGuidedCPU(a, b, { kind: 'positions', predicted: pred, radiusPx: 30 }))).toEqual(ref);
+  });
+
+  it('positions guide handles predictions outside the frame of b', () => {
+    const { a, b } = randomSets(90, 100, 0.12, 14);
+    const pred = new Float32Array(2 * a.count);
+    for (let i = 0; i < a.count; i++) {
+      // shifted left/up by 60 px: many predictions fall outside b (x, y < -0.5)
+      pred[2 * i] = a.keypoints[4 * i] - 60;
+      pred[2 * i + 1] = a.keypoints[4 * i + 1] * 1.1 - 60;
+    }
+    pred[2 * 3] = Infinity;
+    const R = 75;
+    const cand = (i: number, j: number) => {
+      const px = pred[2 * i];
+      const py = pred[2 * i + 1];
+      if (!Number.isFinite(px) || !Number.isFinite(py)) return false;
+      return (b.keypoints[4 * j] - px) ** 2 + (b.keypoints[4 * j + 1] - py) ** 2 <= R * R;
+    };
+    for (const opts of [{}, { mutual: false, ratio: 0.9 }]) {
+      expect(Array.from(matchGuidedCPU(a, b, { kind: 'positions', predicted: pred, radiusPx: R }, opts))).toEqual(
+        naiveMatch(a, b, opts, cand),
+      );
+    }
+  });
+
+  it('never uses stale descriptor norms when a descriptor buffer is refilled in place', () => {
+    const { a, b } = randomSets(60, 70, 0.08, 15);
+    const other = randomSets(60, 70, 0.08, 16).b;
+    // different norms (e.g. other quantisation / zeroed features): scale every other descriptor
+    for (let j = 0; j < other.count; j += 2)
+      for (let k = 0; k < D; k++) other.descriptors[j * D + k] = Math.round(other.descriptors[j * D + k] * (j % 4 ? 0.3 : 0));
+    // warm any per-array caches with the original content
+    matchCPU(a, b);
+    matchGuidedCPU(a, b, { kind: 'positions', predicted: new Float32Array(2 * a.count).fill(NaN), radiusPx: 1 });
+    // a pooled buffer is overwritten with different descriptors (same object, same count)
+    b.descriptors.set(other.descriptors);
+    const fresh: FeatureSet = { ...b, descriptors: new Uint8Array(b.descriptors) };
+    expect(Array.from(matchCPU(a, b, { ratio: 0.95, maxDistance: 1.4 }))).toEqual(
+      Array.from(matchCPU(a, fresh, { ratio: 0.95, maxDistance: 1.4 })),
+    );
+    const g = { kind: 'positions' as const, predicted: new Float32Array(2 * a.count).fill(NaN), radiusPx: 1 };
+    expect(Array.from(matchGuidedCPU(a, b, g, { ratio: 0.95, maxDistance: 1.4 }))).toEqual(
+      Array.from(matchGuidedCPU(a, fresh, g, { ratio: 0.95, maxDistance: 1.4 })),
+    );
+  });
+
   // Real features on a warped pair: guided matching must find at least as many
   // correct matches as unguided matching.
   const W = 640;

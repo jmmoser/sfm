@@ -16,7 +16,7 @@
 import type { FeatureSet, GrayImage } from '../core/types';
 import { DESCRIPTOR_SIZE } from '../core/types';
 import { selectFeatureIndices } from './distribute';
-import { blurFloat32, gaussianHalfKernel, grayToFloat32, resizeFloat32 } from './image';
+import { blurFloat32, gaussianHalfKernel, resizeFloat32 } from './image';
 import { createSimdKernels, simdAvailable } from './simd';
 import type { SimdKernels } from './simd';
 import { finalizeRootSift, octaveToFull, planSift, resolveSiftOptions } from './sift-common';
@@ -816,8 +816,12 @@ export function extractSiftCPU(
 
   const o = resolveSiftOptions(opts);
   if (img.data.length < img.width * img.height) throw new Error('extractSiftCPU: image data shorter than width*height');
-  const FW = fullWidth ?? img.width;
-  const FH = fullHeight ?? img.height;
+  // If only one full-resolution dimension is given, the other follows the input aspect.
+  const FW = fullWidth ?? (fullHeight !== undefined ? Math.round((img.width * fullHeight) / img.height) : img.width);
+  const FH = fullHeight ?? (fullWidth !== undefined ? Math.round((img.height * fullWidth) / img.width) : img.height);
+  if (!(FW > 0 && FH > 0 && Number.isFinite(FW) && Number.isFinite(FH))) {
+    throw new Error(`extractSiftCPU: invalid full-resolution size ${FW}x${FH}`);
+  }
   if (o.maxFeatures === 0) return emptyFeatureSet(FW, FH);
   const plan: SiftPlan = planSift(img.width, img.height, o, FW, FH);
   if (plan.octaves.length === 0) return emptyFeatureSet(FW, FH);
@@ -865,7 +869,8 @@ export function extractSiftCPU(
     if (d instanceof Float32Array) proc.set(d.subarray(0, pw * ph));
     else for (let i = 0, n = pw * ph; i < n; i++) proc[i] = d[i] * (1 / 255);
   } else {
-    resizeFloat32(grayToFloat32(img), img.width, img.height, pw, ph, proc);
+    // Uint8 input is scaled on the fly (no full-size Float32 copy of e.g. a 12 MP frame).
+    resizeFloat32(img.data, img.width, img.height, pw, ph, proc);
   }
   let base: Float32Array;
   if (plan.firstOctave < 0) {

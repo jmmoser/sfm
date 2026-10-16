@@ -84,6 +84,73 @@ describe('resizeGray', () => {
   });
 });
 
+describe('resizeGray — reference checks (review)', () => {
+  /** Exact 2-D box-overlap area average (shrink) / clamped bilinear (enlarge), per axis. */
+  function axisWeights(n: number, m: number): number[][] {
+    const s = m / n;
+    const W: number[][] = [];
+    for (let i = 0; i < m; i++) {
+      const row = new Array(n).fill(0);
+      if (s < 1) {
+        const lo = i / s;
+        const hi = (i + 1) / s;
+        let sum = 0;
+        for (let j = 0; j < n; j++) {
+          const ov = Math.max(0, Math.min(hi, j + 1) - Math.max(lo, j));
+          row[j] = ov;
+          sum += ov;
+        }
+        for (let j = 0; j < n; j++) row[j] /= sum;
+      } else {
+        const x = Math.min(n - 1, Math.max(0, (i + 0.5) / s - 0.5));
+        const j0 = Math.floor(x);
+        const f = x - j0;
+        row[j0] += 1 - f;
+        row[Math.min(n - 1, j0 + 1)] += f;
+      }
+      W.push(row);
+    }
+    return W;
+  }
+
+  it('matches a brute-force separable reference for mixed shrink/enlarge factors', () => {
+    const src = makeTexturedImage(37, 29, 4);
+    for (const [w, h] of [[16, 11], [37, 50], [80, 13], [5, 29], [36, 28]]) {
+      const r = resizeGray(src, w, h);
+      const Wx = axisWeights(37, w);
+      const Wy = axisWeights(29, h);
+      let maxErr = 0;
+      for (let y = 0; y < h; y++)
+        for (let x = 0; x < w; x++) {
+          let v = 0;
+          for (let j = 0; j < 29; j++) {
+            if (!Wy[y][j]) continue;
+            for (let i = 0; i < 37; i++) v += Wy[y][j] * Wx[x][i] * src.data[j * 37 + i];
+          }
+          maxErr = Math.max(maxErr, Math.abs(v - r.data[y * w + x]));
+        }
+      expect(maxErr, `${w}x${h}`).toBeLessThan(1e-5);
+    }
+  });
+
+  it('accepts Uint8 input directly (same result as the Float32 path, no full-size copy)', () => {
+    const src = makeTexturedImage(101, 77, 6);
+    const u8 = new Uint8Array(src.data.length);
+    for (let i = 0; i < u8.length; i++) u8[i] = Math.round(src.data[i] * 255);
+    const f = grayToFloat32({ width: 101, height: 77, data: u8 });
+    for (const [w, h] of [[40, 30], [101, 77], [150, 33], [64, 77]]) {
+      const a = resizeGray({ width: 101, height: 77, data: u8 }, w, h);
+      const b = resizeGray({ width: 101, height: 77, data: f }, w, h);
+      expect(a.data).toBeInstanceOf(Float32Array);
+      for (let i = 0; i < a.data.length; i++) expect(Math.abs(a.data[i] - b.data[i])).toBeLessThan(1e-6);
+    }
+    // sharpness takes the same path
+    const big = new Uint8Array(1300 * 700).map((_, i) => (i * 2654435761) >>> 24);
+    const bigF = grayToFloat32({ width: 1300, height: 700, data: big });
+    expect(sharpness({ width: 1300, height: 700, data: big })).toBeCloseTo(sharpness({ width: 1300, height: 700, data: bigF }), 3);
+  });
+});
+
 describe('gaussianBlur', () => {
   it('preserves constants and mass, and has the expected variance', () => {
     const N = 81;
@@ -167,6 +234,11 @@ describe('rotateRGBA90', () => {
     const r4 = rotateRGBA90(rotateRGBA90(r3, 1), 0);
     expect(Array.from(r4.data)).toEqual(Array.from(img.data));
     expect(r3.width).toBe(H);
+  });
+
+  it('rejects non-finite quarter turns (instead of silently rotating)', () => {
+    expect(() => rotateRGBA90(img, NaN)).toThrow();
+    expect(() => rotateRGBA90(img, Infinity)).toThrow();
   });
 
   it('handles unaligned input views', () => {

@@ -47,6 +47,9 @@ export function resolvePatchMatchOptions(opts?: Partial<PatchMatchOptions>): Res
   for (const k of Object.keys(DEFAULT_PATCHMATCH_OPTIONS) as (keyof PatchMatchOptions)[]) {
     if (o[k] === undefined) (o as unknown as Record<string, unknown>)[k] = DEFAULT_PATCHMATCH_OPTIONS[k];
   }
+  // non-positive / NaN sigmas would make every bilateral weight 0 or NaN
+  if (!(o.sigmaSpatial > 0)) o.sigmaSpatial = DEFAULT_PATCHMATCH_OPTIONS.sigmaSpatial;
+  if (!(o.sigmaColor > 0)) o.sigmaColor = DEFAULT_PATCHMATCH_OPTIONS.sigmaColor;
   o.iterations = Math.max(0, Math.floor(o.iterations));
   o.geometricIterations = Math.max(0, Math.floor(o.geometricIterations));
   o.patchRadius = Math.max(1, Math.floor(o.patchRadius));
@@ -331,22 +334,42 @@ export function checkerOffset(region: number, k: number): [number, number] {
 /**
  * Hypothesis buffer (4 floats per pixel: nx, ny, nz, depth) from a prior depth
  * map at any resolution (nearest; §2 resampling rule). Invalid pixels have depth 0.
+ *
+ * With `cam` (the intrinsics at `width × height`), a resampled plane is
+ * re-intersected with the target pixel's ray (z_p = z_q (n·r_q)/(n·r_p), r_q the
+ * ray through the prior pixel centre), so a slanted plane from a ½-resolution
+ * prior does not carry a depth offset of up to half a coarse pixel along its slope.
  */
-export function priorToPlanes(prior: DepthMap, width: number, height: number, out?: Float32Array): Float32Array {
+export function priorToPlanes(prior: DepthMap, width: number, height: number, out?: Float32Array, cam?: CameraIntrinsics): Float32Array {
   const planes = out ?? new Float32Array(width * height * 4);
   const sx = prior.width / width;
   const sy = prior.height / height;
+  const reproject = !!cam && (prior.width !== width || prior.height !== height);
+  const invF = cam ? 1 / cam.f : 0;
   for (let y = 0; y < height; y++) {
     const py = Math.min(prior.height - 1, Math.max(0, Math.round((y + 0.5) * sy - 0.5)));
     for (let x = 0; x < width; x++) {
       const px = Math.min(prior.width - 1, Math.max(0, Math.round((x + 0.5) * sx - 0.5)));
       const j = py * prior.width + px;
       const i = 4 * (y * width + x);
-      const z = prior.depth[j];
+      let z = prior.depth[j];
       if (z > 0 && Number.isFinite(z)) {
-        planes[i] = prior.normal[3 * j];
-        planes[i + 1] = prior.normal[3 * j + 1];
-        planes[i + 2] = prior.normal[3 * j + 2];
+        const nx = prior.normal[3 * j];
+        const ny = prior.normal[3 * j + 1];
+        const nz = prior.normal[3 * j + 2];
+        if (reproject) {
+          // prior pixel centre in target pixel coordinates (§2 rule, inverse direction)
+          const qx = (px + 0.5) / sx - 0.5;
+          const qy = (py + 0.5) / sy - 0.5;
+          const nrq = nx * (qx - cam!.cx) * invF + ny * (qy - cam!.cy) * invF + nz;
+          const nrp = nx * (x - cam!.cx) * invF + ny * (y - cam!.cy) * invF + nz;
+          const zp = (z * nrq) / nrp;
+          // keep the prior depth when the plane is (nearly) edge-on to this ray
+          if (nrp < 0 && nrq < 0 && zp > 0.5 * z && zp < 2 * z) z = zp;
+        }
+        planes[i] = nx;
+        planes[i + 1] = ny;
+        planes[i + 2] = nz;
         planes[i + 3] = z;
       } else {
         planes[i] = 0;
@@ -406,19 +429,51 @@ export function checkRange(range: DepthRange): void {
   }
 }
 
-/** Relative depth perturbation of iteration `it`. */
-export function depthPerturbation(o: ResolvedPatchMatchOptions, it: number, geometric: boolean): number {
-  const p0 = geometric ? o.geometricPerturbation : o.perturbation;
+/**
+ * Relative depth perturbation of iteration `it`. `fromPrior`: the hypotheses were
+ * initialised from a prior depth map (geometric pass or prior-initialised
+ * photometric pass), which starts from the smaller `geometricPerturbation`.
+ */
+export function depthPerturbation(o: ResolvedPatchMatchOptions, it: number, fromPrior: boolean): number {
+  const p0 = fromPrior ? o.geometricPerturbation : o.perturbation;
   return Math.max(o.minPerturbation, p0 * Math.pow(o.perturbationDecay, it));
 }
 
-/** Normal perturbation (radians) of iteration `it`. */
-export function normalPerturbation(o: ResolvedPatchMatchOptions, it: number, geometric: boolean): number {
-  const p0 = geometric ? o.normalPerturbation * (o.geometricPerturbation / o.perturbation) : o.normalPerturbation;
+/** Normal perturbation (radians) of iteration `it` (scaled like the depth perturbation when `fromPrior`). */
+export function normalPerturbation(o: ResolvedPatchMatchOptions, it: number, fromPrior: boolean): number {
+  // ratio guarded against perturbation = 0 (was a division by zero ⇒ Infinity ⇒ NaN normals)
+  const ratio = o.perturbation > 0 ? Math.min(1, o.geometricPerturbation / o.perturbation) : 1;
+  const p0 = fromPrior ? o.normalPerturbation * ratio : o.normalPerturbation;
   return Math.max(0.01, p0 * Math.pow(o.perturbationDecay, it));
 }
 
 /** ACMH good-cost threshold at iteration `it`. */
 export function goodCostThreshold(o: ResolvedPatchMatchOptions, it: number): number {
   return o.goodCost * Math.exp(-(it * it) / o.goodCostDecay);
+}
+
+/**
+ * Adaptive band height for GPU submissions: rows ≈ target / (measured ms per row,
+ * exponentially averaged), clamped to [minRows, maxRows]. With a non-finite
+ * target it always returns `initialRows`.
+ */
+export class BandController {
+  private msPerRow = 0;
+  constructor(
+    private readonly targetMs: number,
+    private readonly initialRows: number,
+    private readonly maxRows: number,
+    private readonly minRows: number,
+  ) {}
+
+  next(): number {
+    if (!(this.msPerRow > 0) || !Number.isFinite(this.targetMs)) return this.initialRows;
+    return Math.max(this.minRows, Math.min(this.maxRows, Math.floor(this.targetMs / this.msPerRow)));
+  }
+
+  update(rows: number, ms: number): void {
+    if (!Number.isFinite(this.targetMs) || rows <= 0) return;
+    const r = Math.max(ms, 0.05) / rows;
+    this.msPerRow = this.msPerRow > 0 ? 0.5 * this.msPerRow + 0.5 * r : r;
+  }
 }

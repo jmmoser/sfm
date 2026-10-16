@@ -1,21 +1,25 @@
 /**
  * WGSL for PatchMatch MVS (see patchmatch-cpu.ts for the algorithm; this shader
- * mirrors it line by line, including the PCG random streams).
+ * mirrors it, including the PCG random streams).
  *
  * Bindings (group 0, explicit layout in patchmatch-gpu.ts):
- *   0 uniform Params (dynamic offset: one 256-byte block per pass/band)
- *   1 uniform Cams   (16 × SrcCam)
- *   2 texture_2d<f32>       refTex   rgba8unorm, rgb = colour, a = Rec.709 grey
- *   3 texture_2d_array<f32> srcTex   r8unorm grey, one layer per source (linear filtering)
- *   4 sampler (linear, clamp-to-edge)
- *   5 texture_2d_array<f32> srcDepth r32float source depth maps (geometric mode; textureLoad only)
- *   6 storage rw planes : array<vec4f>  (nx, ny, nz, z) per pixel
- *   7 storage rw costs  : array<f32>    total cost (photometric + geometric) used for propagation
- *   8 storage rw photo  : array<f32>    photometric cost (output)
- *   9 storage rw views  : array<u32>    selected-view bit mask
+ *   0  uniform Params (dynamic offset: ring of 256-byte blocks, one per submission)
+ *   1  uniform Cams   (16 × SrcCam)
+ *   2  texture_2d<f32>       refTex   rgba8unorm, rgb = colour, a = Rec.709 grey
+ *   3  texture_2d_array<f32> srcTex   r8unorm grey, one layer per source (linear filtering)
+ *   4  sampler (linear, clamp-to-edge)
+ *   5  texture_2d_array<f32> srcDepth r32float source depth maps (geometric mode; textureLoad only)
+ *   6  storage rw planes : array<vec4f>  (nx, ny, nz, z) per pixel
+ *   7  storage rw costs  : array<f32>    total cost (photometric + geometric) used for propagation
+ *   8  storage rw photo  : array<f32>    photometric cost (output)
+ *   9  storage rw views  : array<u32>    selected-view bit mask
+ *   10 storage rw status : array<u32>    [0] = number of executed dispatches (dropped-work sentinel)
  *
- * Portability: core WebGPU only, workgroup 8×8, no workgroup memory, 4 storage
- * buffers, no f32 atomics.
+ * Portability / Safari: core WebGPU only, workgroup 8×8, no workgroup memory,
+ * 5 storage buffers, no f32 atomics, no vec3 in buffers, no structs passed by
+ * value. The fixed-size patch-window and checkerboard loops are unrolled at
+ * generation time (Safari 26 adds a volatile forward-progress counter to every
+ * WGSL loop and bounds-checks non-constant array indices).
  */
 
 export interface PatchMatchShaderConfig {
@@ -27,10 +31,46 @@ export interface PatchMatchShaderConfig {
 
 /** Byte size of the Params uniform block (must match the struct below). */
 export const PARAMS_BYTES = 128;
-/** Stride between per-pass Params blocks (minUniformBufferOffsetAlignment upper bound). */
+/** Stride between Params blocks (minUniformBufferOffsetAlignment upper bound). */
 export const PARAMS_STRIDE = 256;
 export const WORKGROUP_X = 8;
 export const WORKGROUP_Y = 8;
+/** Windows with more samples than this are generated as loops instead of unrolled. */
+export const MAX_UNROLLED_SAMPLES = 81;
+
+/** ACMH checkerboard offset k of region r (identical to patchmatch-common checkerOffset). */
+function checker(region: number, k: number): [number, number] {
+  let dx: number;
+  let dy: number;
+  if ((region & 1) === 0) {
+    if (k === 0) {
+      dx = 0;
+      dy = -1;
+    } else {
+      const j = (k + 1) >> 1;
+      dx = (k & 1) === 1 ? -j : j;
+      dy = -(1 + j);
+    }
+  } else {
+    dx = 0;
+    dy = -(3 + 2 * k);
+  }
+  switch (region >> 1) {
+    case 1:
+      return [dx, -dy];
+    case 2:
+      return [dy, dx];
+    case 3:
+      return [-dy, dx];
+    default:
+      return [dx, dy];
+  }
+}
+
+const f = (v: number): string => {
+  const s = String(v);
+  return /[.eE]/.test(s) ? s : `${s}.0`;
+};
 
 /**
  * Params layout (32 × 4 bytes), written by patchmatch-gpu.ts:
@@ -41,13 +81,94 @@ export const WORKGROUP_Y = 8;
  *  f32: spatialCoef, pad, pad, pad
  */
 export function patchMatchWGSL(cfg: PatchMatchShaderConfig): string {
-  const np = Math.floor((2 * cfg.patchRadius) / cfg.patchStep) + 1;
+  const offs: number[] = [];
+  for (let i = -cfg.patchRadius; i <= cfg.patchRadius; i += cfg.patchStep) offs.push(i);
+  const np = offs.length;
+  const ns = np * np;
+  const unroll = ns <= MAX_UNROLLED_SAMPLES;
+  const lo = offs[0];
+  const hi = offs[np - 1];
+
+  // ---- reference window (bilateral weights) ----
+  let prepareBody: string;
+  if (unroll) {
+    const lines: string[] = [];
+    let k = 0;
+    for (const dy of offs) {
+      for (const dx of offs) {
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        lines.push(
+          `  t = loadRef(x + (${dx}), y + (${dy})); w = exp(${f(-dist)} * P.spatialCoef - dot(abs(round(t.rgb * 255.0) - crgb), vec3f(1.0)) * P.colorCoef); ` +
+            `wk[${k}] = w; wrk[${k}] = w * t.a; sw += w; swr += w * t.a; swrr += w * t.a * t.a;`,
+        );
+        k++;
+      }
+    }
+    prepareBody = `  var t: vec4f;\n  var w: f32;\n${lines.join('\n')}`;
+  } else {
+    prepareBody = `  var k = 0u;
+  for (var a = 0u; a < ${np}u; a++) {
+    let dy = i32(a) * ${cfg.patchStep} - ${cfg.patchRadius};
+    for (var b = 0u; b < ${np}u; b++) {
+      let dx = i32(b) * ${cfg.patchStep} - ${cfg.patchRadius};
+      let t = loadRef(x + dx, y + dy);
+      let w = exp(-sqrt(f32(dx * dx + dy * dy)) * P.spatialCoef - dot(abs(round(t.rgb * 255.0) - crgb), vec3f(1.0)) * P.colorCoef);
+      wk[k] = w; wrk[k] = w * t.a; sw += w; swr += w * t.a; swrr += w * t.a * t.a;
+      k++;
+    }
+  }`;
+  }
+
+  // ---- warped source window ----
+  let sampleBody: string;
+  if (unroll) {
+    const lines: string[] = [];
+    let k = 0;
+    for (const dy of offs) {
+      lines.push(`  hr = h + ${f(dy)} * hv;`);
+      for (const dx of offs) {
+        lines.push(
+          `  q = hr + ${f(dx)} * hu; v = textureSampleLevel(srcTex, samp, (clamp(q.xy / q.z, vec2f(0.0), sz) + 0.5) * isz, layer, 0.0).r; ` +
+            `sws += wk[${k}] * v; swss += wk[${k}] * v * v; swrs += wrk[${k}] * v;`,
+        );
+        k++;
+      }
+    }
+    sampleBody = `  var hr: vec3f;\n  var q: vec3f;\n  var v: f32;\n${lines.join('\n')}`;
+  } else {
+    sampleBody = `  var k = 0u;
+  for (var a = 0u; a < ${np}u; a++) {
+    let hr = h + f32(i32(a) * ${cfg.patchStep} - ${cfg.patchRadius}) * hv;
+    for (var b = 0u; b < ${np}u; b++) {
+      let q = hr + f32(i32(b) * ${cfg.patchStep} - ${cfg.patchRadius}) * hu;
+      let v = textureSampleLevel(srcTex, samp, (clamp(q.xy / q.z, vec2f(0.0), sz) + 0.5) * isz, layer, 0.0).r;
+      sws += wk[k] * v; swss += wk[k] * v * v; swrs += wrk[k] * v;
+      k++;
+    }
+  }`;
+  }
+
+  // ---- ACMH adaptive checkerboard sampling (unrolled) ----
+  const regionLines: string[] = [];
+  for (let r = 0; r < 8; r++) {
+    const cnt = (r & 1) === 0 ? 7 : 11;
+    regionLines.push(`  best = -1; bestC = 1e30;`);
+    for (let k = 0; k < cnt; k++) {
+      const [dx, dy] = checker(r, k);
+      const conds: string[] = [];
+      if (dx < 0) conds.push(`xi >= ${-dx}`);
+      if (dx > 0) conds.push(`xi < W - ${dx}`);
+      if (dy < 0) conds.push(`yi >= ${-dy}`);
+      if (dy > 0) conds.push(`yi < H - ${dy}`);
+      const qi = `idxi + (${dy * 1}) * W + (${dx})`;
+      regionLines.push(`  if (${conds.join(' && ') || 'true'}) { let qi = ${qi}; let c = costs[qi]; if (c < bestC) { bestC = c; best = qi; } }`);
+    }
+    regionLines.push(`  cr = regionCandidate(best, ray, cxy); candN[${r + 1}] = cr.xyz; candZ[${r + 1}] = cr.w; candOk[${r + 1}] = select(0u, 1u, cr.w > 0.0);`);
+  }
+
   return /* wgsl */ `
 const NMAX: u32 = ${cfg.maxSources}u;
-const NP: u32 = ${np}u;
-const NS: u32 = ${np * np}u;
-const PR: i32 = ${cfg.patchRadius};
-const PSTEP: i32 = ${cfg.patchStep};
+const NS: u32 = ${ns}u;
 const COST_MAX: f32 = 2.0;
 const PI: f32 = 3.14159265358979;
 
@@ -81,6 +202,7 @@ struct Cams { c: array<SrcCam, 16> };
 @group(0) @binding(7) var<storage, read_write> costs: array<f32>;
 @group(0) @binding(8) var<storage, read_write> photo: array<f32>;
 @group(0) @binding(9) var<storage, read_write> views: array<u32>;
+@group(0) @binding(10) var<storage, read_write> status: array<u32>;
 
 var<private> wk: array<f32, NS>;
 var<private> wrk: array<f32, NS>;
@@ -88,6 +210,9 @@ var<private> refMean: f32;
 var<private> refVar: f32;
 var<private> invSumW: f32;
 var<private> rng: u32;
+var<private> candN: array<vec3f, 9>;
+var<private> candZ: array<f32, 9>;
+var<private> candOk: array<u32, 9>;
 
 fn pcg(v: u32) -> u32 {
   let state = v * 747796405u + 2891336453u;
@@ -121,28 +246,11 @@ fn loadRef(x: i32, y: i32) -> vec4f {
 
 // Bilateral weights + weighted reference statistics of the window at (x, y).
 fn prepareRef(x: i32, y: i32) -> bool {
-  let c = loadRef(x, y);
-  let crgb = round(c.rgb * 255.0);
+  let crgb = round(loadRef(x, y).rgb * 255.0);
   var sw = 0.0;
   var swr = 0.0;
   var swrr = 0.0;
-  var k = 0u;
-  for (var a = 0u; a < NP; a++) {
-    let dy = i32(a) * PSTEP - PR;
-    for (var b = 0u; b < NP; b++) {
-      let dx = i32(b) * PSTEP - PR;
-      let t = loadRef(x + dx, y + dy);
-      let r = t.a;
-      let dc = dot(abs(round(t.rgb * 255.0) - crgb), vec3f(1.0));
-      let w = exp(-sqrt(f32(dx * dx + dy * dy)) * P.spatialCoef - dc * P.colorCoef);
-      wk[k] = w;
-      wrk[k] = w * r;
-      sw += w;
-      swr += w * r;
-      swrr += w * r * r;
-      k++;
-    }
-  }
+${prepareBody}
   invSumW = 1.0 / sw;
   refMean = swr * invSumW;
   refVar = swrr * invSumW - refMean * refMean;
@@ -159,40 +267,27 @@ fn hypParams(ray: vec3f, n: vec3f, z: f32) -> vec4f {
 
 // 1 - bilateral weighted NCC of the window warped into source s by H = A - b m^T / delta.
 fn viewCost(s: u32, px: vec2f, hp: vec4f) -> f32 {
-  let cam = cams.c[s];
-  let bs = cam.b.xyz * hp.w;
-  let H0 = cam.A0.xyz - bs.x * hp.xyz;
-  let H1 = cam.A1.xyz - bs.y * hp.xyz;
-  let H2 = cam.A2.xyz - bs.z * hp.xyz;
+  let bs = cams.c[s].b.xyz * hp.w;
+  let H0 = cams.c[s].A0.xyz - bs.x * hp.xyz;
+  let H1 = cams.c[s].A1.xyz - bs.y * hp.xyz;
+  let H2 = cams.c[s].A2.xyz - bs.z * hp.xyz;
   let p = vec3f(px, 1.0);
   let h = vec3f(dot(H0, p), dot(H1, p), dot(H2, p));
-  if (!(h.z > 1e-9)) { return COST_MAX; }
-  let sz = cam.size.xy - 1.0;
-  let c = h.xy / h.z;
-  if (!(c.x >= 0.0 && c.x <= sz.x && c.y >= 0.0 && c.y <= sz.y)) { return COST_MAX; }
   let hu = vec3f(H0.x, H1.x, H2.x);
   let hv = vec3f(H0.y, H1.y, H2.y);
+  // projective depth is affine in the window offset: its minimum is at a corner
+  let zmin = min(min(h.z + ${f(lo)} * hu.z + ${f(lo)} * hv.z, h.z + ${f(hi)} * hu.z + ${f(lo)} * hv.z),
+                 min(h.z + ${f(lo)} * hu.z + ${f(hi)} * hv.z, h.z + ${f(hi)} * hu.z + ${f(hi)} * hv.z));
+  if (!(h.z > 1e-9) || !(zmin > 1e-9)) { return COST_MAX; }
+  let sz = cams.c[s].size.xy - 1.0;
+  let isz = cams.c[s].size.zw;
+  let c = h.xy / h.z;
+  if (!(c.x >= 0.0 && c.x <= sz.x && c.y >= 0.0 && c.y <= sz.y)) { return COST_MAX; }
   let layer = i32(s);
   var sws = 0.0;
   var swss = 0.0;
   var swrs = 0.0;
-  var k = 0u;
-  for (var a = 0u; a < NP; a++) {
-    let dy = f32(i32(a) * PSTEP - PR);
-    let hrow = h + dy * hv;
-    for (var b = 0u; b < NP; b++) {
-      let dx = f32(i32(b) * PSTEP - PR);
-      let q = hrow + dx * hu;
-      if (!(q.z > 1e-9)) { return COST_MAX; }
-      let uv = clamp(q.xy / q.z, vec2f(0.0), sz);
-      let val = textureSampleLevel(srcTex, samp, (uv + 0.5) * cam.size.zw, layer, 0.0).r;
-      let w = wk[k];
-      sws += w * val;
-      swss += w * val * val;
-      swrs += wrk[k] * val;
-      k++;
-    }
-  }
+${sampleBody}
   let ms = sws * invSumW;
   let vs = swss * invSumW - ms * ms;
   if (vs < P.minVar) { return COST_MAX; }
@@ -203,45 +298,39 @@ fn viewCost(s: u32, px: vec2f, hp: vec4f) -> f32 {
 
 // Truncated forward-backward reprojection error against source depth map s.
 fn geoCost(s: u32, px: vec2f, z: f32) -> f32 {
-  let cam = cams.c[s];
   let p = vec3f(px, 1.0);
-  let q = z * vec3f(dot(cam.A0.xyz, p), dot(cam.A1.xyz, p), dot(cam.A2.xyz, p)) + cam.b.xyz;
+  let q = z * vec3f(dot(cams.c[s].A0.xyz, p), dot(cams.c[s].A1.xyz, p), dot(cams.c[s].A2.xyz, p)) + cams.c[s].b.xyz;
   if (!(q.z > 1e-9)) { return P.tau; }
   let ps = q.xy / q.z;
-  let sz = cam.size.xy - 1.0;
+  let sz = cams.c[s].size.xy - 1.0;
   if (!(ps.x >= 0.0 && ps.x <= sz.x && ps.y >= 0.0 && ps.y <= sz.y)) { return P.tau; }
-  if (cam.dsize.z < 1.0 || cam.dsize.w < 1.0) { return P.tau; }
-  let dmax = vec2i(cam.dsize.zw) - vec2i(1);
-  let di = clamp(vec2i(floor((ps + 0.5) * cam.dsize.xy)), vec2i(0), dmax);
+  let ds = cams.c[s].dsize;
+  if (ds.z < 1.0 || ds.w < 1.0) { return P.tau; }
+  let di = clamp(vec2i(floor((ps + 0.5) * ds.xy)), vec2i(0), vec2i(ds.zw) - vec2i(1));
   let zs = textureLoad(srcDepth, di, i32(s), 0).r;
   if (!(zs > 0.0)) { return P.tau; }
   let ph = vec3f(ps, 1.0);
-  let r = zs * vec3f(dot(cam.M0.xyz, ph), dot(cam.M1.xyz, ph), dot(cam.M2.xyz, ph)) + cam.v.xyz;
+  let r = zs * vec3f(dot(cams.c[s].M0.xyz, ph), dot(cams.c[s].M1.xyz, ph), dot(cams.c[s].M2.xyz, ph)) + cams.c[s].v.xyz;
   if (!(r.z > 1e-9)) { return P.tau; }
   return min(length(r.xy / r.z - px), P.tau);
 }
 
-fn checkerOffset(region: u32, k: u32) -> vec2i {
-  var d: vec2i;
-  if ((region & 1u) == 0u) {
-    if (k == 0u) {
-      d = vec2i(0, -1);
-    } else {
-      let j = i32((k + 1u) >> 1u);
-      d = vec2i(select(j, -j, (k & 1u) == 1u), -(1 + j));
-    }
-  } else {
-    d = vec2i(0, -(3 + 2 * i32(k)));
-  }
-  let dir = region >> 1u;
-  if (dir == 1u) { return vec2i(d.x, -d.y); }
-  if (dir == 2u) { return vec2i(d.y, d.x); }
-  if (dir == 3u) { return vec2i(-d.y, d.x); }
-  return d;
+// Plane of neighbour pixel 'best' re-evaluated at this pixel: (n, z) or z = 0 if invalid.
+fn regionCandidate(best: i32, ray: vec3f, cxy: vec2f) -> vec4f {
+  if (best < 0) { return vec4f(0.0); }
+  let W = i32(P.width);
+  let pl = planes[best];
+  let rq = vec3f((vec2f(f32(best % W), f32(best / W)) - cxy) * P.invF, 1.0);
+  let nrp = dot(pl.xyz, ray);
+  if (!(nrp < 0.0)) { return vec4f(0.0); }
+  let zp = pl.w * dot(pl.xyz, rq) / nrp;
+  if (!(zp >= P.zMin && zp <= P.zMax)) { return vec4f(0.0); }
+  return vec4f(pl.xyz, zp);
 }
 
 @compute @workgroup_size(${WORKGROUP_X}, ${WORKGROUP_Y})
 fn init(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x == 0u && gid.y == 0u) { status[0] = status[0] + 1u; }
   let x = gid.x;
   let y = P.rowStart + gid.y;
   if (x >= P.width || y >= P.rowEnd) { return; }
@@ -266,7 +355,8 @@ fn init(@builtin(global_invocation_id) gid: vec3u) {
   let hp = hypParams(ray, pl.xyz, pl.w);
   var sc: array<f32, NMAX>;
   for (var s = 0u; s < P.numSrc; s++) {
-    sc[s] = select(COST_MAX, viewCost(s, px, hp), hp.w > 0.0);
+    sc[s] = COST_MAX;
+    if (hp.w > 0.0) { sc[s] = viewCost(s, px, hp); }
   }
   let K = min(P.topK, P.numSrc);
   var sel = 0u;
@@ -293,6 +383,7 @@ fn init(@builtin(global_invocation_id) gid: vec3u) {
 
 @compute @workgroup_size(${WORKGROUP_X}, ${WORKGROUP_Y})
 fn propagate(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x == 0u && gid.y == 0u) { status[0] = status[0] + 1u; }
   let y = P.rowStart + gid.y;
   if (y >= P.rowEnd) { return; }
   let x = 2u * gid.x + ((y + P.colour) & 1u);
@@ -302,6 +393,7 @@ fn propagate(@builtin(global_invocation_id) gid: vec3u) {
   let xi = i32(x);
   let yi = i32(y);
   let idx = y * P.width + x;
+  let idxi = i32(idx);
   if (!prepareRef(xi, yi)) {
     costs[idx] = COST_MAX;
     photo[idx] = COST_MAX;
@@ -316,43 +408,14 @@ fn propagate(@builtin(global_invocation_id) gid: vec3u) {
   let geo = P.geo != 0u;
 
   // ---- candidates: slot 0 = current, 1..8 = best of each checkerboard region
-  var candN: array<vec3f, 9>;
-  var candZ: array<f32, 9>;
-  var candOk: array<u32, 9>;
   let cur = planes[idx];
   candN[0] = cur.xyz;
   candZ[0] = cur.w;
   candOk[0] = 1u;
-  for (var r = 0u; r < 8u; r++) {
-    let cnt = select(11u, 7u, (r & 1u) == 0u);
-    var best = -1;
-    var bestC = 1e30;
-    for (var k = 0u; k < cnt; k++) {
-      let q = vec2i(xi, yi) + checkerOffset(r, k);
-      if (q.x < 0 || q.y < 0 || q.x >= W || q.y >= H) { continue; }
-      let qi = q.y * W + q.x;
-      let c = costs[qi];
-      if (c < bestC) {
-        bestC = c;
-        best = qi;
-      }
-    }
-    let slot = r + 1u;
-    candOk[slot] = 0u;
-    if (best < 0) { continue; }
-    let qx = best % W;
-    let qy = best / W;
-    let pl = planes[best];
-    let rq = vec3f((vec2f(f32(qx), f32(qy)) - cxy) * P.invF, 1.0);
-    let nrq = dot(pl.xyz, rq);
-    let nrp = dot(pl.xyz, ray);
-    if (!(nrp < 0.0)) { continue; }
-    let zp = pl.w * nrq / nrp;
-    if (!(zp >= P.zMin && zp <= P.zMax)) { continue; }
-    candN[slot] = pl.xyz;
-    candZ[slot] = zp;
-    candOk[slot] = 1u;
-  }
+  var best: i32;
+  var bestC: f32;
+  var cr: vec4f;
+${regionLines.join('\n')}
 
   // ---- per-view costs of the 9 candidates
   var C: array<f32, ${9 * cfg.maxSources}>;
