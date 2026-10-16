@@ -341,13 +341,18 @@ function triAngleCos(C: Float64Array, a: number, b: number, X: ArrayLike<number>
   return den > 0 ? (ax * bx + ay * by + az * bz) / den : 1;
 }
 
-/** Angular error (rad) between the observed normalised point and the ray to X in camera `pose`. */
+/**
+ * Angular error (rad) between the observed normalised point and the ray to X in camera
+ * `pose`; π if X is not in front of the camera (zero depth — e.g. X at the camera
+ * centre, where the angle is undefined — or behind it).
+ */
 export function angularError(pose: Pose, xn: number, yn: number, X: ArrayLike<number>): number {
   const R = pose.R,
     t = pose.t;
   const px = R[0] * X[0] + R[1] * X[1] + R[2] * X[2] + t[0];
   const py = R[3] * X[0] + R[4] * X[1] + R[5] * X[2] + t[1];
   const pz = R[6] * X[0] + R[7] * X[1] + R[8] * X[2] + t[2];
+  if (!(pz > 0)) return Math.PI;
   const c0 = yn * pz - py,
     c1 = px - xn * pz,
     c2 = xn * py - yn * px;
@@ -515,7 +520,7 @@ export class IncrementalTriangulator {
   /** Appends (j, fj) to the correspondence scratch if usable; returns 1 if it has a point. */
   private consider(o: TriangulatorOptions, image: number, j: number, fj: number): number {
     if (j === image) return 0;
-    const ri = this.rec.images.get(j);
+    const ri = this.rec.imageLUT()[j];
     if (!ri || !ri.registered) return 0;
     if (this.bogus(this.rec.cameras.get(ri.cameraId)!, o)) return 0;
     this.ensureCorr(this.cN + 1);
@@ -681,30 +686,70 @@ export class IncrementalTriangulator {
   }
 
   /**
-   * Completes the tracks of the image's points and triangulates its untriangulated
-   * features whose correspondences have no point yet (COLMAP `CompleteImage`).
+   * COLMAP `CompleteImage`, restricted to the image's neighbourhood: (1) the image's
+   * points are extended to corresponding untriangulated observations of registered
+   * images (then breadth-first, completeMaxTransitivity hops); (2) untriangulated
+   * features join a corresponding point they reproject onto; (3) untriangulated
+   * features whose correspondences have no point are triangulated (one RANSAC
+   * estimate, no recursion). Unlike COLMAP, the other elements of the image's tracks
+   * are not re-scanned (`completeAllTracks` does that after global BA).
    */
   completeImage(o: TriangulatorOptions, imageId: number): number {
     this.clearCaches();
     const img = this.rec.images.get(imageId);
-    if (!img || !img.registered) return 0;
+    if (!img || !img.registered || !img.keypoints) return 0;
     if (this.bogus(this.rec.cameras.get(img.cameraId)!, o)) return 0;
+    const g = this.graph;
+    const heads = g.heads(imageId);
+    if (!heads) return 0;
+    const lut = this.rec.imageLUT();
+    const max2 = o.completeMaxReprojErrorPx * o.completeMaxReprojErrorPx;
     let num = 0;
+    let queue: number[] = [];
     const nf = img.point3D.length;
     for (let f = 0; f < nf; f++) {
       const pid = img.point3D[f];
+      const nx = g.nextOf,
+        im = g.imageOf,
+        ft = g.featureOf;
       if (pid >= 0) {
-        num += this.complete(o, pid);
+        for (let e = heads[f]; e >= 0; e = nx[e]) {
+          const j = im[e],
+            fj = ft[e];
+          const rj = lut[j];
+          if (!rj || !rj.registered || rj.point3D[fj] >= 0) continue;
+          if (this.tryComplete(o, pid, j, fj, max2)) {
+            queue.push(j, fj, pid);
+            num++;
+          }
+        }
         continue;
       }
-      if (o.ignoreTwoViewTracks && this.graph.isTwoViewObservation(imageId, f)) continue;
+      // (2) join an existing corresponding point
+      let joined = false,
+        last = -1;
+      for (let e = heads[f]; e >= 0; e = nx[e]) {
+        const rj = lut[im[e]];
+        if (!rj || !rj.registered) continue;
+        const q = rj.point3D[ft[e]];
+        if (q < 0 || q === last) continue;
+        last = q;
+        if (this.tryComplete(o, q, imageId, f, max2)) {
+          queue.push(imageId, f, q);
+          num++;
+          joined = true;
+          break;
+        }
+      }
+      if (joined) continue;
+      // (3) create
+      if (o.ignoreTwoViewTracks && g.isTwoViewObservation(imageId, f)) continue;
       const numTri = this.find(o, imageId, f, o.maxTransitivity);
       if (numTri > 0 || this.cN === 0) continue;
       const n = this.cN;
       this.ensureCorr(n + 1);
       this.cImg[n] = imageId;
       this.cFeat[n] = f;
-      // single estimate, no recursion (COLMAP CompleteImage)
       this.ensureRays(n + 1);
       let m = 0;
       for (let k = 0; k <= n; k++) {
@@ -729,7 +774,51 @@ export class IncrementalTriangulator {
       this.modifiedPoints.add(id);
       num += track.length;
     }
+    for (let hop = 1; hop < o.completeMaxTransitivity && queue.length > 0; hop++) {
+      const prev = queue;
+      queue = [];
+      const nx = g.nextOf,
+        im = g.imageOf,
+        ft = g.featureOf;
+      for (let q = 0; q < prev.length; q += 3) {
+        const h = g.heads(prev[q]);
+        const pid = prev[q + 2];
+        if (!h || !this.rec.points.has(pid)) continue;
+        for (let e = h[prev[q + 1]]; e >= 0; e = nx[e]) {
+          const j = im[e],
+            fj = ft[e];
+          const rj = lut[j];
+          if (!rj || !rj.registered || rj.point3D[fj] >= 0) continue;
+          if (this.tryComplete(o, pid, j, fj, max2)) {
+            queue.push(j, fj, pid);
+            num++;
+          }
+        }
+      }
+    }
     return num;
+  }
+
+  /** True if the point already has an observation in `image`. */
+  private static observes(track: Track[], image: number): boolean {
+    for (let k = 0; k < track.length; k++) if (track[k].image === image) return true;
+    return false;
+  }
+
+  /**
+   * Tries to add (j, fj) to point `pointId` (registered image, no point yet, valid
+   * camera, reprojection error² ≤ max2, point not yet observed in j). Returns success.
+   */
+  private tryComplete(o: TriangulatorOptions, pointId: number, j: number, fj: number, max2: number): boolean {
+    const ri = this.rec.imageLUT()[j];
+    if (!ri || !ri.registered || ri.point3D[fj] >= 0 || !ri.keypoints) return false;
+    const cam = this.rec.cameras.get(ri.cameraId)!;
+    const p = this.rec.points.get(pointId)!;
+    const e2 = reprojectionErrorSq(cam, ri.pose, p.xyz[0], p.xyz[1], p.xyz[2], ri.keypoints[4 * fj], ri.keypoints[4 * fj + 1]);
+    if (!(e2 <= max2) || this.bogus(cam, o) || IncrementalTriangulator.observes(p.track, j)) return false;
+    this.rec.addObservation(pointId, { image: j, feature: fj });
+    this.modifiedPoints.add(pointId);
+    return true;
   }
 
   /**
@@ -741,40 +830,27 @@ export class IncrementalTriangulator {
     const p = this.rec.points.get(pointId);
     if (!p) return 0;
     const g = this.graph;
+    const lut = this.rec.imageLUT();
     const max2 = o.completeMaxReprojErrorPx * o.completeMaxReprojErrorPx;
     let num = 0;
-    let queue: Track[] = p.track.slice();
-    const X0 = p.xyz[0],
-      X1 = p.xyz[1],
-      X2 = p.xyz[2];
+    let queue: number[] = [];
+    for (const el of p.track) queue.push(el.image, el.feature);
     for (let tr = 0; tr < o.completeMaxTransitivity && queue.length > 0; tr++) {
       const prev = queue;
       queue = [];
-      for (const q of prev) {
-        const heads = g.heads(q.image);
+      const nx = g.nextOf,
+        im = g.imageOf,
+        ft = g.featureOf;
+      for (let q = 0; q < prev.length; q += 2) {
+        const heads = g.heads(prev[q]);
         if (!heads) continue;
-        const nx = g.nextOf,
-          im = g.imageOf,
-          ft = g.featureOf;
-        for (let e = heads[q.feature]; e >= 0; e = nx[e]) {
+        for (let e = heads[prev[q + 1]]; e >= 0; e = nx[e]) {
           const j = im[e],
             fj = ft[e];
-          const ri = this.rec.images.get(j);
-          if (!ri || !ri.registered || ri.point3D[fj] >= 0 || !ri.keypoints) continue;
-          const cam = this.rec.cameras.get(ri.cameraId)!;
-          if (this.bogus(cam, o)) continue;
-          const e2 = reprojectionErrorSq(cam, ri.pose, X0, X1, X2, ri.keypoints[4 * fj], ri.keypoints[4 * fj + 1]);
-          if (!(e2 <= max2)) continue;
-          let seen = false;
-          for (const el of p.track)
-            if (el.image === j) {
-              seen = true;
-              break;
-            }
-          if (seen) continue;
-          this.rec.addObservation(pointId, { image: j, feature: fj });
-          this.modifiedPoints.add(pointId);
-          if (tr < o.completeMaxTransitivity - 1) queue.push({ image: j, feature: fj });
+          const ri = lut[j];
+          if (!ri || !ri.registered || ri.point3D[fj] >= 0) continue;
+          if (!this.tryComplete(o, pointId, j, fj, max2)) continue;
+          if (tr < o.completeMaxTransitivity - 1) queue.push(j, fj);
           num++;
         }
       }
@@ -791,23 +867,26 @@ export class IncrementalTriangulator {
     const p = this.rec.points.get(pointId);
     if (!p) return 0;
     const g = this.graph;
+    const lut = this.rec.imageLUT();
     const max2 = o.mergeMaxReprojErrorPx * o.mergeMaxReprojErrorPx;
-    let trialsA = this.mergeTrials.get(pointId);
-    if (!trialsA) {
-      trialsA = new Set();
-      this.mergeTrials.set(pointId, trialsA);
-    }
-    for (const el of p.track) {
+    const nx = g.nextOf,
+      im = g.imageOf,
+      ft = g.featureOf;
+    for (let k = 0; k < p.track.length; k++) {
+      const el = p.track[k];
       const heads = g.heads(el.image);
       if (!heads) continue;
-      for (let e = heads[el.feature]; e >= 0; e = g.nextOf[e]) {
-        const j = g.imageOf[e],
-          fj = g.featureOf[e];
-        const ri = this.rec.images.get(j);
+      for (let e = heads[el.feature]; e >= 0; e = nx[e]) {
+        const ri = lut[im[e]];
         if (!ri || !ri.registered) continue;
-        const qid = ri.point3D[fj];
-        if (qid < 0 || qid === pointId || trialsA.has(qid)) continue;
-        const q = this.rec.points.get(qid)!;
+        const qid = ri.point3D[ft[e]];
+        if (qid < 0 || qid === pointId) continue;
+        let trialsA = this.mergeTrials.get(pointId);
+        if (trialsA?.has(qid)) continue;
+        if (!trialsA) {
+          trialsA = new Set();
+          this.mergeTrials.set(pointId, trialsA);
+        }
         trialsA.add(qid);
         let trialsB = this.mergeTrials.get(qid);
         if (!trialsB) {
@@ -815,34 +894,14 @@ export class IncrementalTriangulator {
           this.mergeTrials.set(qid, trialsB);
         }
         trialsB.add(pointId);
+        const q = this.rec.points.get(qid)!;
         const wa = p.track.length,
           wb = q.track.length;
         const iw = 1 / (wa + wb);
         const M0 = (wa * p.xyz[0] + wb * q.xyz[0]) * iw,
           M1 = (wa * p.xyz[1] + wb * q.xyz[1]) * iw,
           M2 = (wa * p.xyz[2] + wb * q.xyz[2]) * iw;
-        let ok = true;
-        for (const tr of [p.track, q.track]) {
-          for (const t of tr) {
-            const ti = this.rec.images.get(t.image)!;
-            if (!ti.keypoints) continue;
-            const e2 = reprojectionErrorSq(
-              this.rec.cameras.get(ti.cameraId)!,
-              ti.pose,
-              M0,
-              M1,
-              M2,
-              ti.keypoints[4 * t.feature],
-              ti.keypoints[4 * t.feature + 1],
-            );
-            if (!(e2 <= max2)) {
-              ok = false;
-              break;
-            }
-          }
-          if (!ok) break;
-        }
-        if (!ok) continue;
+        if (!this.reprojectsWithin(p.track, M0, M1, M2, max2) || !this.reprojectsWithin(q.track, M0, M1, M2, max2)) continue;
         const numObs = wa + wb;
         const mid = this.rec.mergePoints(pointId, qid);
         this.modifiedPoints.delete(pointId);
@@ -853,6 +912,26 @@ export class IncrementalTriangulator {
       }
     }
     return 0;
+  }
+
+  private reprojectsWithin(track: Track[], X0: number, X1: number, X2: number, max2: number): boolean {
+    const lut = this.rec.imageLUT();
+    for (let k = 0; k < track.length; k++) {
+      const t = track[k];
+      const ti = lut[t.image]!;
+      if (!ti.keypoints) continue;
+      const e2 = reprojectionErrorSq(
+        this.rec.cameras.get(ti.cameraId)!,
+        ti.pose,
+        X0,
+        X1,
+        X2,
+        ti.keypoints[4 * t.feature],
+        ti.keypoints[4 * t.feature + 1],
+      );
+      if (!(e2 <= max2)) return false;
+    }
+    return true;
   }
 
   completeTracks(o: TriangulatorOptions, pointIds: Iterable<number>): number {
@@ -867,15 +946,105 @@ export class IncrementalTriangulator {
     return n;
   }
 
+  /**
+   * Completes all tracks. Equivalent to `complete` on every point, but iterates the
+   * (fewer) untriangulated features of registered images: each such feature joins
+   * the first corresponding point it reprojects onto; then breadth-first through
+   * the graph from the added observations (completeMaxTransitivity hops in total).
+   */
   completeAllTracks(o: TriangulatorOptions): number {
     this.clearCaches();
-    return this.completeTracks(o, [...this.rec.points.keys()]);
+    const g = this.graph;
+    const lut = this.rec.imageLUT();
+    const max2 = o.completeMaxReprojErrorPx * o.completeMaxReprojErrorPx;
+    let num = 0;
+    let queue: number[] = []; // image, feature, point
+    for (const id of this.rec.registeredImageIds()) {
+      const img = lut[id]!;
+      const heads = g.heads(id);
+      if (!heads || !img.keypoints || this.bogus(this.rec.cameras.get(img.cameraId)!, o)) continue;
+      const p3 = img.point3D;
+      const nx = g.nextOf,
+        im = g.imageOf,
+        ft = g.featureOf;
+      for (let f = 0; f < p3.length; f++) {
+        if (p3[f] >= 0) continue;
+        let last = -1;
+        for (let e = heads[f]; e >= 0; e = nx[e]) {
+          const rj = lut[im[e]];
+          if (!rj || !rj.registered) continue;
+          const pid = rj.point3D[ft[e]];
+          if (pid < 0 || pid === last) continue;
+          last = pid;
+          if (this.tryComplete(o, pid, id, f, max2)) {
+            queue.push(id, f, pid);
+            num++;
+            break;
+          }
+        }
+      }
+    }
+    for (let hop = 1; hop < o.completeMaxTransitivity && queue.length > 0; hop++) {
+      const prev = queue;
+      queue = [];
+      const nx = g.nextOf,
+        im = g.imageOf,
+        ft = g.featureOf;
+      for (let q = 0; q < prev.length; q += 3) {
+        const heads = g.heads(prev[q]);
+        const pid = prev[q + 2];
+        if (!heads || !this.rec.points.has(pid)) continue;
+        for (let e = heads[prev[q + 1]]; e >= 0; e = nx[e]) {
+          const j = im[e],
+            fj = ft[e];
+          const rj = lut[j];
+          if (!rj || !rj.registered || rj.point3D[fj] >= 0) continue;
+          if (this.tryComplete(o, pid, j, fj, max2)) {
+            queue.push(j, fj, pid);
+            num++;
+          }
+        }
+      }
+    }
+    return num;
   }
 
+  /**
+   * Merges all mergeable tracks: scans every correspondence edge between registered
+   * images once (image id ascending) and runs `merge` on the point of the lower-id
+   * observation when the two observations belong to different points.
+   */
   mergeAllTracks(o: TriangulatorOptions): number {
     this.clearCaches();
-    return this.mergeTracks(o, [...this.rec.points.keys()]);
+    const g = this.graph;
+    const lut = this.rec.imageLUT();
+    let num = 0;
+    for (const id of this.rec.registeredImageIds()) {
+      const img = lut[id]!;
+      const heads = g.heads(id);
+      if (!heads) continue;
+      const p3 = img.point3D;
+      for (let f = 0; f < p3.length; f++) {
+        const nx = g.nextOf,
+          im = g.imageOf,
+          ft = g.featureOf;
+        for (let e = heads[f]; e >= 0; e = nx[e]) {
+          const pid = p3[f];
+          if (pid < 0) break;
+          const j = im[e];
+          if (j < id) continue;
+          const rj = lut[j];
+          if (!rj || !rj.registered) continue;
+          const q = rj.point3D[ft[e]];
+          if (q < 0 || q === pid) continue;
+          if (this.mergeTrials.get(pid)?.has(q)) continue;
+          num += this.merge(o, pid);
+        }
+      }
+    }
+    return num;
   }
+
 
   /**
    * Re-triangulates image pairs (both registered) whose ratio of triangulated

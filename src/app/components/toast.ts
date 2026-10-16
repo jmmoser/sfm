@@ -5,7 +5,7 @@
 import { h } from '../dom';
 import { icon, type IconName } from '../icons';
 import type { Tone } from '../format';
-import { overlayLayer } from './layers';
+import { modalOpen, overlayLayer } from './layers';
 
 export interface ToastOptions {
   tone?: Tone;
@@ -29,7 +29,7 @@ export function toast(message: string, opts: ToastOptions = {}): void {
   const tone = opts.tone ?? 'neutral';
   const key = `${tone}|${message}`;
   const existing = active.get(key);
-  const duration = opts.durationMs ?? (tone === 'bad' ? 6000 : 3500);
+  const duration = opts.durationMs ?? (tone === 'bad' ? 6000 : 3000);
   if (existing) {
     clearTimeout(existing.timer);
     existing.timer = setTimeout(() => dismiss(key), duration);
@@ -51,9 +51,12 @@ export function toast(message: string, opts: ToastOptions = {}): void {
     });
     el.appendChild(b);
   }
-  toastHost().appendChild(el);
-  // Keep at most 3 visible.
-  while (active.size >= 3) {
+  const host = toastHost();
+  // Over an open sheet / dialog the bottom is taken: show toasts at the top instead.
+  host.classList.toggle('toast-top', modalOpen());
+  host.appendChild(el);
+  // Keep at most 2 visible (the newest replaces the oldest).
+  while (active.size >= 2) {
     const first = active.keys().next().value as string;
     dismiss(first);
   }

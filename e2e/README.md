@@ -156,3 +156,56 @@ Metrics (printed as a table and written to `metrics.json`):
 
 Library use: `import { evaluate, computeMetrics, formatTable, loadDataset } from './e2e/metrics.mjs'`.
 Typed helpers for tests live in `e2e/lib/*.mjs` + `*.d.mts`.
+
+## Dense MVS with ground-truth poses
+
+`node e2e/run-dense-gt.mjs` checks the dense stage (src/dense) on its own. It uses the exact
+poses and intrinsics, so every error it reports comes from MVS or fusion, not from SfM.
+
+```sh
+node e2e/run-dense-gt.mjs [object|yard|all ...] [--max-size 480] [--views N] [--stride N]
+     [--sources 8] [--iterations 6] [--geom-iterations 3] [--no-geometric] [--multiscale]
+     [--tsdf] [--save-maps] [--load-maps RUN] [--fusion-input geo|photo] [--tag NAME]
+     [--set key=json ...] [--no-render] [--no-metrics]
+
+node e2e/run-dense-gt.mjs all --tsdf --save-maps            # reference run (~1.5 h on SwiftShader)
+node e2e/run-dense-gt.mjs object --load-maps object --tag mv2 --set fusion.minViews=2   # fusion only, seconds
+```
+
+The page is `dense-gt.html`, and the logic is in `src/harness/dense-gt/`. `window.runDenseGT(config)` does the following:
+
+1. It takes `maxViews` frames at a fixed stride. The defaults are 24 for object and 30 for yard,
+   spread over the whole trajectory.
+2. It decodes the JPEGs with `createImageBitmap` and an `OffscreenCanvas`, then undistorts them
+   with `undistortImage` to `maxSize`.
+3. It builds the views with the GT poses.
+4. It renders a **GT depth map for every view** with a surfel z-buffer. Each GT sample becomes a
+   disc of radius 1.3 × spacing in the plane of its normal. When a focus set exists, base samples
+   next to it are dropped. Against the dataset's exact depth maps, these surfel maps agree to
+   within 1 % on 98.9 % of pixels.
+5. It derives **sparse points** for `selectSourceViews`. It draws 30 000 random GT samples and
+   keeps those visible in at least 2 views. A sample is visible when it is no more than
+   max(1 %, 1.5 r) behind the surfel z-buffer.
+6. It runs `PatchMatchGPU`: a photometric pass, or the multi-scale recipe with `--multiscale`,
+   followed by a geometric pass.
+7. It runs `fuseDepthMaps`, then `tsdfMesh` on the fusion-filtered maps when `--tsdf` is set.
+
+Output goes to `e2e/out/dense-gt/`:
+
+* `<name>.ply`: the fused cloud.
+* `<name>.mesh.ply`: the mesh.
+* `<name>.result.json`: input for `metrics.mjs`.
+* `<name>.stats.json`: per-view PatchMatch timings and per-stage timings. It also holds the
+  per-view depth accuracy of the photometric, geometric and fused maps. Each is measured against
+  the surfel GT and, where the dataset has one, the exact GT. The file also holds the dense
+  metrics.
+* `<name>/debug/view-*.png`: panels showing the image, GT depth, depth, error, NCC cost and
+  fused pixels.
+* `<name>/render-*.png`: viewer screenshots.
+* `<name>/maps/*.f32`: the depth maps, written with `--save-maps`.
+
+Scoring uses `metrics-core` with `denseAlign: 'none'`, plus these breakdowns:
+
+* completeness restricted to the GT samples visible in the used views;
+* accuracy and completeness by distance to the nearest camera;
+* for object, precision inside and outside the focus box.

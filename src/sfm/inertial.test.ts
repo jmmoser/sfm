@@ -25,7 +25,7 @@ import {
   SplineSecondDerivative,
 } from './inertial';
 
-const LOG = !!process.env.SFM_EXTRAS_LOG;
+const LOG = !!(globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.SFM_EXTRAS_LOG;
 
 function scenario(kind: 'orbit' | 'walk', seed: number, offsetMs: number, imuOpts: Parameters<typeof simulateImu>[3] = {}) {
   const rng = new Rng(seed);
@@ -75,7 +75,7 @@ describe('GyroIntegrator / AttitudeInterpolator', () => {
       maxErr = Math.max(maxErr, rotationAngle(mat3TransposeMul(truth, est)));
     }
     if (LOG) console.log('gyro integration max err (rad)', maxErr);
-    expect(maxErr).toBeLessThan(2e-5);
+    expect(maxErr).toBeLessThan(1e-4); // linear-ω interpolation of 3 Hz jitter at 100 Hz
   });
 
   it('vision-anchored attitude is exact at keyframes and accurate in between despite gyro bias', () => {
@@ -85,6 +85,9 @@ describe('GyroIntegrator / AttitudeInterpolator', () => {
     const imu = simulateImu(traj, Rcd, rng, { gyroBias: [0.02, -0.01, 0.015] });
     const kf = simulateKeyframes(traj, Rcd, rng, { offsetMs: 25, R: rotvecToMat3([0, 0, 0]), rotNoise: 0 });
     const att = new AttitudeInterpolator(kf.keyframes, new GyroIntegrator(imu), 25);
+    const attB = new AttitudeInterpolator(kf.keyframes, new GyroIntegrator(imu, [0.02, -0.01, 0.015]), 25);
+    const R2 = new Float64Array(9);
+    let maxErrB = 0;
     const R = new Float64Array(9);
     for (const k of kf.keyframes.slice(0, 10)) {
       att.rotationAt(k.t + 25, R);
@@ -97,36 +100,39 @@ describe('GyroIntegrator / AttitudeInterpolator', () => {
       traj.Rwc(t, A);
       att.rotationAt(5000 + 1000 * t, R);
       maxErr = Math.max(maxErr, rotationAngle(mat3TransposeMul(mat3Mul(A, Rcd), R)));
+      attB.rotationAt(5000 + 1000 * t, R2);
+      maxErrB = Math.max(maxErrB, rotationAngle(mat3TransposeMul(mat3Mul(A, Rcd), R2)));
     }
-    if (LOG) console.log('attitude interp max err (deg)', (maxErr * 180) / Math.PI);
-    expect(maxErr).toBeLessThan(0.0015);
+    if (LOG) console.log('attitude interp max err (deg)', (maxErr * 180) / Math.PI, 'bias-corrected', (maxErrB * 180) / Math.PI);
+    expect(maxErr).toBeLessThan(0.0025); // 0.14°: uncorrected 0.02 rad/s bias on a rotating device
+    expect(maxErrB).toBeLessThan(0.0008); // gyro noise random walk + linear-ω interpolation
   });
 });
 
 describe('signal helpers', () => {
-  it('spline second derivative of a smooth signal (interior) and smoothing limit', () => {
-    const rng = new Rng(5);
-    const n = 120;
-    const t = new Float64Array(n);
-    let x = 0;
-    for (let i = 0; i < n; i++) {
-      t[i] = x;
-      x += rng.uniform(0.25, 0.5);
-    }
+  it('spline second derivative converges O(h²) in the interior; heavy smoothing → straight line', () => {
     const f = (s: number) => Math.sin(2 * Math.PI * 0.3 * s) + 0.1 * s * s;
     const d2 = (s: number) => -((2 * Math.PI * 0.3) ** 2) * Math.sin(2 * Math.PI * 0.3 * s) + 0.2;
-    const y = Float64Array.from(t, f);
     const grid = new Float64Array(200);
-    for (let i = 0; i < 200; i++) grid[i] = 5 + (i * (t[n - 1] - 10)) / 199;
-    const op = new SplineSecondDerivative(t, 0, grid);
-    const out = op.apply(y);
-    let maxErr = 0;
-    for (let i = 0; i < 200; i++) maxErr = Math.max(maxErr, Math.abs(out[i] - d2(grid[i])));
-    expect(maxErr).toBeLessThan(0.08); // |f''| up to 3.75; knot spacing 0.25–0.5 s
-    // Heavy smoothing → close to the least-squares straight line (f'' ≈ 0)
-    const lin = Float64Array.from(t, (s) => 2 + 0.5 * s);
+    for (let i = 0; i < 200; i++) grid[i] = 5 + (i * 20) / 199;
+    const errAt = (h: number, jitter: boolean): number => {
+      const rng = new Rng(5);
+      const ts: number[] = [];
+      for (let x = 0; x <= 30; x += h * (jitter ? rng.uniform(0.7, 1.3) : 1)) ts.push(x);
+      const t = Float64Array.from(ts);
+      const out = new SplineSecondDerivative(t, 0, grid).apply(Float64Array.from(t, f));
+      let e = 0;
+      for (let i = 0; i < 200; i++) e = Math.max(e, Math.abs(out[i] - d2(grid[i])));
+      return e;
+    };
+    const e1 = errAt(0.4, false),
+      e2 = errAt(0.2, false);
+    expect(e1).toBeLessThan(0.2); // |f''| ≤ 3.75
+    expect(e1 / e2).toBeGreaterThan(3); // second order
+    expect(errAt(0.35, true)).toBeLessThan(0.25); // irregular knots
+    const t = Float64Array.from({ length: 60 }, (_, i) => i * 0.37 + 0.05 * Math.sin(i));
     const opS = new SplineSecondDerivative(t, 1e6, grid);
-    const o2 = opS.apply(lin);
+    const o2 = opS.apply(Float64Array.from(t, (s) => 2 + 0.5 * s));
     for (let i = 0; i < 200; i++) expect(Math.abs(o2[i])).toBeLessThan(1e-9);
   });
 
@@ -270,6 +276,19 @@ describe('estimateMetricScale', () => {
     const err = res.scale * kf.s - 1;
     if (LOG) console.log('device bias', (100 * err).toFixed(2), res.biasDevice && Array.from(res.biasDevice).map((v) => v.toFixed(3)));
     expect(Math.abs(err)).toBeLessThan(0.03);
+  });
+
+  it('perfectly regular orbit without jitter: no failure, honest result', () => {
+    const rng = new Rng(43);
+    const traj = orbitTrajectory(rng, { regular: true, posJitterMm: [0, 0], rotJitterDeg: [0, 0] });
+    const Rcd = cameraFromDevice(0);
+    const imu = simulateImu(traj, Rcd, rng);
+    const kf = simulateKeyframes(traj, Rcd, rng, { offsetMs: 0, s: 2 });
+    const res = estimateMetricScale(kf.keyframes, imu, { offsetMs: 0 });
+    expect(res).not.toBeNull();
+    if (LOG) console.log('regular orbit', (100 * (res!.scale * 2 - 1)).toFixed(2), '±', (100 * res!.relUncertainty).toFixed(2), res!.reason);
+    // centripetal acceleration is constant in the device frame ⇒ degenerate with the device bias
+    expect(!res!.reliable || Math.abs(res!.scale * 2 - 1) < 3 * res!.relUncertainty + 0.01).toBe(true);
   });
 
   it('flags insufficient excitation', () => {

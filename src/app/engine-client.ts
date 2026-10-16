@@ -156,6 +156,8 @@ interface Pending {
   inactivity: boolean;
   onProgress?: ProgressCallback;
   gen: number;
+  fatalOnTimeout: boolean;
+  frame: boolean;
 }
 
 type Setup = { kind: 'init'; options: EngineOptions } | { kind: 'load'; id: string; options?: Partial<EngineOptions> };
@@ -324,6 +326,8 @@ export class EngineClient implements EngineLike {
   setHidden(hidden: boolean): void {
     if (hidden === this.hidden) return;
     this.hidden = hidden;
+    // Pause (hidden) or restart (visible) the request timeouts — see armTimer.
+    for (const [id, p] of this.pending) this.armTimer(id, p);
     if (!this.worker) return; // nothing to tell yet; the state is sent with the next spawn
     void this.call('visibility', { hidden }, { timeoutMs: this.opts.callTimeoutMs, bypassGate: true }).catch(() => undefined);
   }
@@ -438,10 +442,12 @@ export class EngineClient implements EngineLike {
           inactivity,
           onProgress: o.onProgress,
           gen: this.gen,
+          fatalOnTimeout: !!o.fatalOnTimeout,
+          frame: !!o.frame,
         };
         this.pending.set(id, p);
         if (long) this.longOp = id;
-        this.armTimer(id, p, !!o.fatalOnTimeout, !!o.frame);
+        this.armTimer(id, p);
         const req: EngineRequest<M> = { id, method, params };
         try {
           w.postMessage(req, collectTransferables(params));
@@ -455,15 +461,23 @@ export class EngineClient implements EngineLike {
     return this.gate.then(send);
   }
 
-  private armTimer(id: number, p: Pending, fatalOnTimeout: boolean, frame: boolean): void {
+  /**
+   * (Re)start the timeout of a pending request. No timer runs while the page is hidden: iOS
+   * suspends the page and its workers (and drops GPU work), so time spent in the background
+   * must not count — otherwise every request in flight "times out" the moment the user comes
+   * back (a stuck-worker respawn, a failed refine). The full timeout restarts when visible.
+   */
+  private armTimer(id: number, p: Pending): void {
     if (p.timer) clearTimeout(p.timer);
+    p.timer = null;
+    if (this.hidden) return;
     if (!(p.timeoutMs > 0) || !Number.isFinite(p.timeoutMs)) return;
     p.timer = setTimeout(() => {
       if (!this.pending.has(id)) return;
       this.settle(id);
       p.reject(namedError(ENGINE_ERRORS.timeout, `Engine '${p.method}' timed out after ${Math.round(p.timeoutMs / 1000)} s`));
-      if (fatalOnTimeout) this.respawn(`'${p.method}' timed out`, false);
-      else if (frame && ++this.frameTimeouts >= this.opts.maxFrameTimeouts) {
+      if (p.fatalOnTimeout) this.respawn(`'${p.method}' timed out`, false);
+      else if (p.frame && ++this.frameTimeouts >= this.opts.maxFrameTimeouts) {
         this.frameTimeouts = 0;
         this.respawn('frames time out (worker stuck)', false);
       }
@@ -500,7 +514,7 @@ export class EngineClient implements EngineLike {
         const targetId = ev.requestId ?? this.longOp;
         const p = targetId !== null && targetId !== undefined ? this.pending.get(targetId) : undefined;
         if (p) {
-          if (p.inactivity) this.armTimer(targetId as number, p, false, false);
+          if (p.inactivity) this.armTimer(targetId as number, p);
           try {
             p.onProgress?.(pe);
           } catch (e) {

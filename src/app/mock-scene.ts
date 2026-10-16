@@ -167,8 +167,8 @@ function backyardScene(): Prim[] {
       // Roof slopes (normals up/out) and gables.
       quad([x0, y0, hgt], [x1 - x0, 0, 0], [0, ym - y0, ridge], roofQuad(roofC), 10, 6),
       quad([x1, y1, hgt], [x0 - x1, 0, 0], [0, ym - y1, ridge], roofQuad(roofC), 10, 6),
-      { kind: 'tri', a: [x0, y1, hgt], b: [x0, y0, hgt], c: [x0, ym, top], color: (p, rng) => jitter(base, rng, 14) },
-      { kind: 'tri', a: [x1, y0, hgt], b: [x1, y1, hgt], c: [x1, ym, top], color: (p, rng) => jitter(base, rng, 14) },
+      { kind: 'tri', a: [x0, y1, hgt], b: [x0, y0, hgt], c: [x0, ym, top], color: (_p, rng) => jitter(base, rng, 14) },
+      { kind: 'tri', a: [x1, y0, hgt], b: [x1, y1, hgt], c: [x1, ym, top], color: (_p, rng) => jitter(base, rng, 14) },
     ];
   };
   return [
@@ -402,13 +402,14 @@ export interface MockSamples {
   normals: Float32Array;
   /** Trajectory parameter s ∈ [0,1] at which the point becomes visible. */
   reveal: Float32Array;
+  /** Index of the primitive each sample lies on. */
+  prim: Uint16Array;
 }
 
 export class MockScene {
   readonly kind: MockSceneKind;
   private readonly prims: Prim[];
   private readonly areas: number[];
-  private readonly total: number;
   readonly seed: number;
 
   constructor(kind: MockSceneKind, seed = 1) {
@@ -416,7 +417,6 @@ export class MockScene {
     this.seed = seed;
     this.prims = kind === 'object' ? objectScene() : backyardScene();
     this.areas = this.prims.map(primArea);
-    this.total = this.areas.reduce((a, b) => a + b, 0);
   }
 
   /** Typical distance camera → content (m). */
@@ -431,8 +431,9 @@ export class MockScene {
     const colors = new Uint8Array(count * 3);
     const normals = new Float32Array(count * 3);
     const reveal = new Float32Array(count);
+    const prim = new Uint16Array(count);
     // Weight: ground gets less density than objects (like real feature distributions).
-    const w = this.prims.map((p, i) => this.areas[i] * (i === 0 ? (this.kind === 'object' ? 0.35 : 0.08) : 1));
+    const w = this.prims.map((_p, i) => this.areas[i] * (i === 0 ? (this.kind === 'object' ? 0.35 : 0.08) : 1));
     const wsum = w.reduce((a, b) => a + b, 0);
     const cdf: number[] = [];
     let acc = 0;
@@ -446,8 +447,9 @@ export class MockScene {
       normals.set(s.n, 3 * k);
       colors.set(s.c, 3 * k);
       reveal[k] = this.revealKey(s.p);
+      prim[k] = i;
     }
-    return { count, positions, colors, normals, reveal };
+    return { count, positions, colors, normals, reveal, prim };
   }
 
   /** Trajectory parameter from which a point counts as observed. */
@@ -518,9 +520,12 @@ export class MockScene {
     const radii = new Float32Array(count);
     const confidence = new Float32Array(count);
     const rng = new Rng(this.seed + 7);
-    const spacing = Math.sqrt(this.total / count) * (this.kind === 'object' ? 0.55 : 0.75);
+    // Splat radius from the local sample spacing of each primitive (gap-free rendering).
+    const perPrim = new Float64Array(this.prims.length);
+    for (let i = 0; i < count; i++) perPrim[s.prim[i]]++;
+    const spacing = this.areas.map((a, i) => Math.sqrt(a / Math.max(1, perPrim[i])));
     for (let i = 0; i < count; i++) {
-      radii[i] = spacing * (0.8 + 0.4 * rng.next());
+      radii[i] = spacing[s.prim[i]] * (0.75 + 0.25 * rng.next());
       confidence[i] = 0.45 + 0.55 * rng.next();
     }
     return { count, positions: s.positions, colors: s.colors, normals: s.normals, radii, confidence };

@@ -14,7 +14,7 @@
  * (re-read `nextOf` / `imageOf` / `featureOf` after `addTwoView`: the pool may grow).
  */
 import type { MatchPairs } from '../core/types';
-import { pairIds, pairKey } from './database';
+import { isValidImageId, pairIds, pairKey } from './database';
 
 export interface Correspondence {
   image: number;
@@ -58,6 +58,9 @@ export class CorrespondenceGraph {
 
   /** Adds an image with `numFeatures` features (no-op if it already exists with the same count). */
   addImage(id: number, numFeatures: number): void {
+    if (!isValidImageId(id)) throw new RangeError(`CorrespondenceGraph.addImage: bad image id ${id} (integer in [0, 2^20))`);
+    if (!(Number.isInteger(numFeatures) && numFeatures >= 0))
+      throw new RangeError(`CorrespondenceGraph.addImage: bad feature count ${numFeatures}`);
     const old = this.nodes.get(id);
     if (old) {
       if (old.numFeatures !== numFeatures)

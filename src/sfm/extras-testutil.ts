@@ -79,17 +79,29 @@ function evalSines(s: Sines, t: number): number {
   return v;
 }
 
-/** Hand-held orbit around the origin: radius 0.4 m at `orbitHz` (0.2), with position / rotation jitter. */
+/**
+ * Hand-held orbit around the origin: mean radius 0.4 m at `orbitHz` (0.2), with the
+ * irregularities of a real hand-held orbit — angular speed varying ±15 %, radius ±3 cm,
+ * height ±3 cm — plus position jitter (3 sinusoids per axis, `posJitterMm` amplitude,
+ * 0.4–2.5 Hz) and rotation jitter.
+ */
 export function orbitTrajectory(
   rng: Rng,
-  opts: { duration?: number; radius?: number; orbitHz?: number; posJitterMm?: [number, number]; rotJitterDeg?: [number, number] } = {},
+  opts: { duration?: number; radius?: number; orbitHz?: number; posJitterMm?: [number, number]; rotJitterDeg?: [number, number]; regular?: boolean } = {},
 ): SimTrajectory {
   const duration = opts.duration ?? 20;
-  const r = opts.radius ?? 0.4;
+  const r0 = opts.radius ?? 0.4;
   const fo = opts.orbitHz ?? 0.2;
-  const pj = opts.posJitterMm ?? [2, 5];
+  const pj = opts.posJitterMm ?? [3, 6];
   const rj = opts.rotJitterDeg ?? [0.2, 0.6];
+  const irr = opts.regular ? 0 : 1;
   const th0 = rng.uniform(0, 2 * Math.PI);
+  const fs = rng.uniform(0.3, 0.7),
+    ps = rng.uniform(0, 2 * Math.PI);
+  const fr = rng.uniform(0.2, 0.5),
+    pr = rng.uniform(0, 2 * Math.PI);
+  const fh = rng.uniform(0.1, 0.3),
+    ph = rng.uniform(0, 2 * Math.PI);
   const jx = sines(rng, 3, [pj[0] / 1000, pj[1] / 1000], [0.4, 2.5]);
   const jy = sines(rng, 3, [pj[0] / 1000, pj[1] / 1000], [0.4, 2.5]);
   const jz = sines(rng, 3, [pj[0] / 1000, pj[1] / 1000], [0.4, 2.5]);
@@ -100,18 +112,21 @@ export function orbitTrajectory(
   const tw = sines(rng, 2, [0.01, 0.02], [0.05, 0.15]);
   const L = new Float64Array(9),
     J = new Float64Array(9),
-    v = new Float64Array(3);
-  return {
+    v = new Float64Array(3),
+    p = new Float64Array(3);
+  const w0 = 2 * Math.PI * fo;
+  const traj: SimTrajectory = {
     duration,
     pos(t, out) {
-      const th = th0 + 2 * Math.PI * fo * t;
+      // θ' = w0 (1 + 0.15 sin(2π fs t + ps))
+      const th = th0 + w0 * t - irr * ((0.15 * w0) / (2 * Math.PI * fs)) * (Math.cos(2 * Math.PI * fs * t + ps) - Math.cos(ps));
+      const r = r0 + irr * 0.03 * Math.sin(2 * Math.PI * fr * t + pr);
       out[0] = r * Math.cos(th) + evalSines(jx, t);
       out[1] = r * Math.sin(th) + evalSines(jy, t);
-      out[2] = 0.25 + 0.03 * Math.sin(2 * Math.PI * 0.07 * t) + evalSines(jz, t);
+      out[2] = 0.25 + 0.03 * Math.sin(2 * Math.PI * 0.07 * t) + irr * 0.03 * Math.sin(2 * Math.PI * fh * t + ph) + evalSines(jz, t);
     },
     Rwc(t, out) {
-      const p = new Float64Array(3);
-      this.pos(t, p);
+      traj.pos(t, p);
       const tx = evalSines(tw, t),
         ty = evalSines(tw, t + 3.3);
       lookAt(tx - p[0], ty - p[1], -p[2], L);
@@ -122,6 +137,7 @@ export function orbitTrajectory(
       mat3Mul(L, J, out);
     },
   };
+  return traj;
 }
 
 /** Walk: 1 s rest, 2 s ramp to 1.2 m/s, cruise, 2 s ramp down, 1 s rest; 40 m along a gentle arc; 2 Hz bob, 1 Hz sway. */

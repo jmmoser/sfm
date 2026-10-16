@@ -27,7 +27,7 @@ import type {
   TwoViewConfig,
   Vec3,
 } from '../core/types';
-import type { BACameraRefine, BALossType, BAProblem, BAResult } from '../ba/problem';
+import type { BACameraRefine, BALinearSolverType, BALossType, BAProblem, BAResult } from '../ba/problem';
 import { bundleAdjust } from '../ba/solver';
 import { scaleIntrinsics } from '../geometry/camera';
 import { projectToEssential, recoverPose } from '../geometry/essential';
@@ -65,8 +65,18 @@ export interface MapperOptions {
   initMaxErrorPx: number;
   initMaxForwardMotion: number;
   initMaxRegTrials: number;
-  /** Max two-view re-estimations per model search (bounds the cost on video input). */
+  /** Max two-view re-estimations per initial-pair search (bounds the cost on video input). */
   initMaxPairEvaluations: number;
+  /**
+   * Last-resort initialisation (runIncrementalSfM: only when the regular levels gave no
+   * model at all; LiveMapper: after `liveInitFallbackAfter` keyframes without one):
+   * accept pairs with median triangulation angle ≥ initFallbackMinTriAngleDeg and
+   * forward motion < initFallbackMaxForwardMotion. Without it a capture walking
+   * straight ahead (epipole inside the image, small median angles) yields nothing.
+   */
+  initFallback: boolean;
+  initFallbackMinTriAngleDeg: number;
+  initFallbackMaxForwardMotion: number;
   /** Fixed initial pair (optional). */
   initImagePair?: [number, number];
   // ---- registration
@@ -84,6 +94,10 @@ export interface MapperOptions {
   localBALoss: BALossType;
   localBALossScalePx: number;
   localBATimeLimitMs: number;
+  /** Relative cost decrease below which local BA stops (default 1e-4). */
+  localBAFunctionTolerance: number;
+  /** Observations of constant (outside-anchored) points per image in local BA (default 600). */
+  localBAMaxConstantObsPerImage: number;
   // ---- global BA
   globalBAImagesRatio: number;
   globalBAPointsRatio: number;
@@ -94,7 +108,23 @@ export interface MapperOptions {
   globalBAMaxRefinementChange: number;
   globalBALoss: BALossType;
   globalBALossScalePx: number;
+  /**
+   * Linear solver of the global BA. 'auto' (default): block-Jacobi PCG when more than
+   * 150 images are registered and the mean track is longer than 8 (dense reduced
+   * camera matrix: measured 1.5–2× faster than the skyline Cholesky at 160–250
+   * images), otherwise the BA module's own 'auto'.
+   */
+  globalBALinearSolver: BALinearSolverType;
   globalBATimeLimitMs: number;
+  /**
+   * Intermediate global BAs use at most this many observations per track (every
+   * ⌈L/cap⌉-th; Σ m² Schur cost); the final global BA uses all (default 12).
+   */
+  globalBAMaxTrackLength: number;
+  /** BA / filter rounds of intermediate global refinements (the final one uses globalBAMaxRefinements; default 2). */
+  intermediateGlobalBAMaxRefinements: number;
+  /** runIncrementalSfM: global BA runs in slices of this many ms with yields in between (default 500). */
+  globalBASliceMs: number;
   refineFocal: boolean;
   refineDistortion: boolean;
   refinePrincipalPoint: boolean;
@@ -130,7 +160,10 @@ export const DEFAULT_MAPPER_OPTIONS: Readonly<MapperOptions> = Object.freeze({
   initMaxErrorPx: 4,
   initMaxForwardMotion: 0.95,
   initMaxRegTrials: 2,
-  initMaxPairEvaluations: 300,
+  initMaxPairEvaluations: 100,
+  initFallback: true,
+  initFallbackMinTriAngleDeg: 1.5,
+  initFallbackMaxForwardMotion: 0.9999,
   absPoseMaxErrorPx: 12,
   absPoseMinNumInliers: 30,
   absPoseMinInlierRatio: 0.25,
@@ -143,6 +176,8 @@ export const DEFAULT_MAPPER_OPTIONS: Readonly<MapperOptions> = Object.freeze({
   localBALoss: 'soft_l1' as BALossType,
   localBALossScalePx: 1,
   localBATimeLimitMs: Infinity,
+  localBAFunctionTolerance: 1e-4,
+  localBAMaxConstantObsPerImage: 600,
   globalBAImagesRatio: 1.1,
   globalBAPointsRatio: 1.1,
   globalBAImagesFreq: 500,
@@ -151,8 +186,12 @@ export const DEFAULT_MAPPER_OPTIONS: Readonly<MapperOptions> = Object.freeze({
   globalBAMaxRefinements: 5,
   globalBAMaxRefinementChange: 0.005,
   globalBALoss: 'trivial' as BALossType,
+  globalBALinearSolver: 'auto' as BALinearSolverType,
   globalBALossScalePx: 1,
   globalBATimeLimitMs: Infinity,
+  globalBASliceMs: 500,
+  globalBAMaxTrackLength: 12,
+  intermediateGlobalBAMaxRefinements: 2,
   refineFocal: true,
   refineDistortion: true,
   refinePrincipalPoint: false,
@@ -257,7 +296,23 @@ interface BundleConfig {
   /** Points added with ALL their observations (outside images as constant poses). */
   variablePoints: number[];
   refine: (cameraId: number) => BACameraRefine;
+  /** Cap on observations of constant points per image (subsampled; Infinity = all). */
+  maxConstObsPerImage: number;
+  /**
+   * Global BA only (all registered images, no variable points): tracks longer than
+   * this contribute only every ⌈L/cap⌉-th observation (Infinity = all).
+   */
+  trackCap?: number;
 }
+
+/** Cancellation / per-iteration hook forwarded to `bundleAdjust`. */
+interface BAControl {
+  cancel?: CancelToken;
+  onIteration?: (iter: number, cost: number) => void;
+}
+
+/** Two-view re-estimations per chunk of the async initial-pair search. */
+const INIT_CHUNK = 6;
 
 const now = (): number => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 const yieldToEventLoop = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
@@ -328,6 +383,37 @@ function largestRelTranslationAxis(a: Pose, b: Pose): number {
   const r1 = Math.abs(tb[1] - (Rb[3] * w0 + Rb[4] * w1 + Rb[5] * w2));
   const r2 = Math.abs(tb[2] - (Rb[6] * w0 + Rb[7] * w1 + Rb[8] * w2));
   return r0 >= r1 && r0 >= r2 ? 0 : r1 >= r2 ? 1 : 2;
+}
+
+/**
+ * Rejects degenerate absolute poses: non-finite values, or inlier observations so
+ * concentrated (RMS spread < maxErrorPx) that a camera arbitrarily far away explains
+ * them all within the threshold — PnP + refinement then drifts the camera to ~1e8
+ * scene units (seen with coinciding keypoints / tight clusters of wrong matches).
+ */
+function poseIsUsable(pose: Pose, inlierMask: Uint8Array, uv: Float64Array, n: number, maxErrorPx: number): boolean {
+  for (let k = 0; k < 9; k++) if (!Number.isFinite(pose.R[k])) return false;
+  for (let k = 0; k < 3; k++) if (!Number.isFinite(pose.t[k])) return false;
+  let mu = 0,
+    mv = 0,
+    m = 0;
+  for (let k = 0; k < n; k++)
+    if (inlierMask[k]) {
+      mu += uv[2 * k];
+      mv += uv[2 * k + 1];
+      m++;
+    }
+  if (m === 0) return false;
+  mu /= m;
+  mv /= m;
+  let s2 = 0;
+  for (let k = 0; k < n; k++)
+    if (inlierMask[k]) {
+      const du = uv[2 * k] - mu,
+        dv = uv[2 * k + 1] - mv;
+      s2 += du * du + dv * dv;
+    }
+  return Math.sqrt(s2 / m) >= maxErrorPx;
 }
 
 /**
@@ -552,11 +638,14 @@ export class IncrementalMapper {
     };
   }
 
+  /** Two-view re-estimations left in the current `findInitialPair` search. */
+  private initBudget = Infinity;
+
   private initGeometry(a: number, b: number): InitPairGeometry | null {
     const key = pairKey(a, b);
     let g = this.shared.initGeometry.get(key);
     if (g === undefined) {
-      if (this.shared.initEvaluations >= this.opts.initMaxPairEvaluations) return null;
+      this.initBudget--;
       g = this.estimateInitPair(Math.min(a, b), Math.max(a, b)); // oriented min → max
       this.shared.initGeometry.set(key, g);
     }
@@ -587,24 +676,43 @@ export class IncrementalMapper {
     return !!img && !img.registered;
   }
 
+  /** True if the last `findInitialPair` stopped because its evaluation budget ran out. */
+  initSearchExhausted = false;
+
   /**
    * Finds an initial pair satisfying the given thresholds (COLMAP order: first image
    * by number of correspondences; second image by correspondences, preferring pairs
    * whose stored two-view triangulation angle already passes — i.e. pairs further
-   * apart in a video sequence). Each pair is tried once per threshold level.
+   * apart in a video sequence). Each pair is tried once per threshold level. At most
+   * `budget` two-view re-estimations are done (cached results are free); when the
+   * budget runs out, `initSearchExhausted` is set and a later call continues.
    */
-  findInitialPair(minInliers: number, minTriAngleDeg: number, levelKey = `${minInliers}/${minTriAngleDeg}`):
-    | { a: number; b: number; geom: InitPairGeometry }
-    | null {
+  findInitialPair(
+    minInliers: number,
+    minTriAngleDeg: number,
+    levelKey?: string,
+    budget = this.opts.initMaxPairEvaluations,
+    maxForwardMotion = this.opts.initMaxForwardMotion,
+  ): { a: number; b: number; geom: InitPairGeometry } | null {
+    levelKey ??= `${minInliers}/${minTriAngleDeg}/${maxForwardMotion}`;
     const minAngle = minTriAngleDeg * DEG;
+    this.initBudget = budget;
+    this.initSearchExhausted = false;
     const accept = (g: InitPairGeometry | null): g is InitPairGeometry =>
-      !!g && g.numInliers >= minInliers && g.triAngle >= minAngle && g.forwardMotion < this.opts.initMaxForwardMotion;
+      !!g && g.numInliers >= minInliers && g.triAngle >= minAngle && g.forwardMotion < maxForwardMotion;
+    const evaluate = (a: number, b: number): InitPairGeometry | null | undefined => {
+      // undefined = budget exhausted (pair not marked as tried)
+      if (this.initBudget <= 0 && !this.shared.initGeometry.has(pairKey(a, b))) {
+        this.initSearchExhausted = true;
+        return undefined;
+      }
+      this.shared.initPairsTried.add(`${levelKey}:${pairKey(a, b)}`);
+      return this.initGeometry(a, b);
+    };
     if (this.opts.initImagePair) {
       const [a, b] = this.opts.initImagePair;
-      const key = `${levelKey}:${pairKey(a, b)}`;
-      if (this.shared.initPairsTried.has(key)) return null;
-      this.shared.initPairsTried.add(key);
-      const g = this.initGeometry(a, b);
+      if (this.shared.initPairsTried.has(`${levelKey}:${pairKey(a, b)}`)) return null;
+      const g = evaluate(a, b);
       return g && g.numInliers >= 15 ? { a, b, geom: g } : null;
     }
     const firsts = [...this.rec.images.keys()]
@@ -614,7 +722,8 @@ export class IncrementalMapper {
       const cands: { b: number; n: number; ok: boolean }[] = [];
       for (const [b, n] of this.graph.neighbours(a)) {
         if (n < minInliers || !this.initCandidate(b)) continue;
-        const stored = this.db.getTwoView(a, b);
+        // (canonical order: no inverted copy is built / cached; config and angle are symmetric)
+        const stored = this.db.getTwoView(Math.min(a, b), Math.max(a, b));
         if (stored && stored.config === 'panoramic') continue;
         const sa = stored?.triAngle;
         // stored angle far below the threshold: hopeless (skip the re-estimation)
@@ -623,10 +732,9 @@ export class IncrementalMapper {
       }
       cands.sort((x, y) => Number(y.ok) - Number(x.ok) || y.n - x.n || x.b - y.b);
       for (const { b } of cands) {
-        const key = `${levelKey}:${pairKey(a, b)}`;
-        if (this.shared.initPairsTried.has(key)) continue;
-        this.shared.initPairsTried.add(key);
-        const g = this.initGeometry(a, b);
+        if (this.shared.initPairsTried.has(`${levelKey}:${pairKey(a, b)}`)) continue;
+        const g = evaluate(a, b);
+        if (g === undefined) return null;
         if (accept(g)) return { a, b, geom: g };
       }
     }
@@ -812,6 +920,7 @@ export class IncrementalMapper {
       rng: this.rng,
     });
     if (!res || res.numInliers < o.absPoseMinNumInliers || res.numInliers < o.absPoseMinInlierRatio * n) return false;
+    if (!poseIsUsable(res.pose, res.inlierMask, uv, n, o.absPoseMaxErrorPx)) return false;
     this.rec.registerImage(id, res.pose);
     this.onRegistered(id);
     const added = new Set<number>();
@@ -852,6 +961,10 @@ export class IncrementalMapper {
     lossScalePx: number,
     maxIterations: number,
     timeLimitMs: number,
+    functionTolerance = 1e-6,
+    initialLambda?: number,
+    linearSolver: BALinearSolverType = 'auto',
+    control?: BAControl,
   ): { result: BAResult | null; numObs: number } {
     const rec = this.rec;
     const imageSet = new Set(cfg.images);
@@ -898,36 +1011,87 @@ export class IncrementalMapper {
         anyMask = true;
       }
     });
-    // observations
-    const pointIndex = new Map<number, number>();
-    const pointIds: number[] = [];
-    const obsCount: number[] = [];
-    const obsPose: number[] = [],
-      obsPoint: number[] = [],
-      obsUV: number[] = [];
+    // observations (typed scratch buffers; point id → slot table, reset afterwards)
+    this.ensurePointTables(rec);
+    const slot = this.pointSlot,
+      cls = this.pointClass;
+    let nX = 0,
+      nO = 0;
     const getPoint = (pid: number): number => {
-      let k = pointIndex.get(pid);
-      if (k === undefined) {
-        k = pointIds.length;
-        pointIndex.set(pid, k);
-        pointIds.push(pid);
-        obsCount.push(0);
+      let k = slot[pid] - 1;
+      if (k < 0) {
+        k = nX++;
+        slot[pid] = k + 1;
+        if (this.pointIdBuf.length <= k) this.growPointIds();
+        this.pointIdBuf[k] = pid;
+        this.obsCountBuf[k] = 0;
       }
       return k;
     };
-    for (const id of cfg.images) {
+    const pushObs = (pi: number, k: number, u: number, v: number): void => {
+      if (nO >= this.obsPoseBuf.length) this.growObs();
+      this.obsPoseBuf[nO] = pi;
+      this.obsPointBuf[nO] = k;
+      this.obsUVBuf[2 * nO] = u;
+      this.obsUVBuf[2 * nO + 1] = v;
+      this.obsCountBuf[k]++;
+      nO++;
+    };
+    // Points with observations outside the bundle are held constant; their
+    // observations in the bundle images are subsampled to maxConstObsPerImage.
+    // cls[pid]: 0 unknown, 1 constant, 2 free / variable
+    const touched: number[] = [];
+    const constOf = (pid: number): boolean => {
+      let c = cls[pid];
+      if (c === 0) {
+        c = 2;
+        if (!variable.has(pid))
+          for (const el of rec.points.get(pid)!.track)
+            if (!imageSet.has(el.image)) {
+              c = 1;
+              break;
+            }
+        cls[pid] = c;
+        touched.push(pid);
+      }
+      return c === 1;
+    };
+    const capped = cfg.trackCap !== undefined && cfg.trackCap < Infinity;
+    if (capped) {
+      // global BA with long tracks subsampled: every point is free, all its images are in the problem
+      const cap = Math.max(2, cfg.trackCap!);
+      for (const p of rec.points.values()) {
+        const tr = p.track;
+        const L = tr.length;
+        const stride = L > cap ? Math.ceil(L / cap) : 1;
+        let k = -1;
+        for (let i = 0; i < L; i += stride) {
+          const el = tr[i];
+          const pi = poseIndex.get(el.image);
+          if (pi === undefined) continue;
+          if (k < 0) k = getPoint(p.id);
+          const kp = rec.images.get(el.image)!.keypoints!;
+          pushObs(pi, k, kp[4 * el.feature], kp[4 * el.feature + 1]);
+        }
+      }
+    }
+    for (const id of capped ? [] : cfg.images) {
       const img = rec.images.get(id)!;
       const kp = img.keypoints!;
       const pi = poseIndex.get(id)!;
       const p3 = img.point3D;
+      let stride = 1;
+      if (cfg.maxConstObsPerImage < Infinity) {
+        let nConst = 0;
+        for (let f = 0; f < p3.length; f++) if (p3[f] >= 0 && constOf(p3[f])) nConst++;
+        stride = Math.max(1, Math.ceil(nConst / Math.max(1, cfg.maxConstObsPerImage)));
+      }
+      let cc = 0;
       for (let f = 0; f < p3.length; f++) {
         const pid = p3[f];
         if (pid < 0) continue;
-        const k = getPoint(pid);
-        obsPose.push(pi);
-        obsPoint.push(k);
-        obsUV.push(kp[4 * f], kp[4 * f + 1]);
-        obsCount[k]++;
+        if (stride > 1 && constOf(pid) && cc++ % stride !== 0) continue;
+        pushObs(pi, getPoint(pid), kp[4 * f], kp[4 * f + 1]);
       }
     }
     for (const pid of variable) {
@@ -937,23 +1101,22 @@ export class IncrementalMapper {
         if (imageSet.has(el.image)) continue;
         const pi = poseIndex.get(el.image);
         if (pi === undefined) continue;
-        const img = rec.images.get(el.image)!;
-        obsPose.push(pi);
-        obsPoint.push(k);
-        obsUV.push(img.keypoints![4 * el.feature], img.keypoints![4 * el.feature + 1]);
-        obsCount[k]++;
+        const kp = rec.images.get(el.image)!.keypoints!;
+        pushObs(pi, k, kp[4 * el.feature], kp[4 * el.feature + 1]);
       }
     }
-    const nX = pointIds.length;
-    if (obsPose.length === 0 || nX === 0) return { result: null, numObs: 0 };
+    for (const pid of touched) cls[pid] = 0;
+    const ids = this.pointIdBuf;
+    for (let k = 0; k < nX; k++) slot[ids[k]] = 0;
+    if (nO === 0 || nX === 0) return { result: null, numObs: 0 };
     const points = new Float64Array(3 * nX);
     const pointFixed = new Uint8Array(nX);
     for (let k = 0; k < nX; k++) {
-      const p = rec.points.get(pointIds[k])!;
+      const p = rec.points.get(ids[k])!;
       points[3 * k] = p.xyz[0];
       points[3 * k + 1] = p.xyz[1];
       points[3 * k + 2] = p.xyz[2];
-      if (!variable.has(pointIds[k]) && obsCount[k] < p.track.length) pointFixed[k] = 1;
+      if (!capped && !variable.has(ids[k]) && this.obsCountBuf[k] < p.track.length) pointFixed[k] = 1;
     }
     const problem: BAProblem = {
       cameras,
@@ -964,25 +1127,71 @@ export class IncrementalMapper {
       translationFixedMask: anyMask ? tmask : undefined,
       points,
       pointFixed,
-      obsPose: Uint32Array.from(obsPose),
-      obsPoint: Uint32Array.from(obsPoint),
-      obsUV: Float64Array.from(obsUV),
+      obsPose: this.obsPoseBuf.subarray(0, nO),
+      obsPoint: this.obsPointBuf.subarray(0, nO),
+      obsUV: this.obsUVBuf.subarray(0, 2 * nO),
     };
     const result = bundleAdjust(problem, {
       loss,
       lossScalePx,
       maxIterations,
       timeLimitMs,
+      functionTolerance,
       parameterTolerance: 0,
+      initialLambda,
+      linearSolver,
+      cancel: control?.cancel,
+      onIteration: control?.onIteration,
     });
     for (let k = 0; k < nX; k++) {
       if (pointFixed[k]) continue;
-      const p = rec.points.get(pointIds[k])!;
+      const p = rec.points.get(ids[k])!;
       p.xyz[0] = points[3 * k];
       p.xyz[1] = points[3 * k + 1];
       p.xyz[2] = points[3 * k + 2];
     }
-    return { result, numObs: obsPose.length };
+    return { result, numObs: nO };
+  }
+
+  // scratch for solveBundle (grow-only)
+  private pointSlot = new Int32Array(0);
+  private pointClass = new Uint8Array(0);
+  private pointIdBuf = new Int32Array(1024);
+  private obsCountBuf = new Int32Array(1024);
+  private obsPoseBuf = new Uint32Array(16384);
+  private obsPointBuf = new Uint32Array(16384);
+  private obsUVBuf = new Float64Array(32768);
+
+  private ensurePointTables(rec: Reconstruction): void {
+    let maxId = 0;
+    for (const id of rec.points.keys()) if (id > maxId) maxId = id;
+    if (this.pointSlot.length > maxId) return;
+    const n = Math.max(1024, 2 * (maxId + 1));
+    this.pointSlot = new Int32Array(n);
+    this.pointClass = new Uint8Array(n);
+  }
+
+  private growPointIds(): void {
+    const n = 2 * this.pointIdBuf.length;
+    const a = new Int32Array(n),
+      b = new Int32Array(n);
+    a.set(this.pointIdBuf);
+    b.set(this.obsCountBuf);
+    this.pointIdBuf = a;
+    this.obsCountBuf = b;
+  }
+
+  private growObs(): void {
+    const n = 2 * this.obsPoseBuf.length;
+    const a = new Uint32Array(n),
+      b = new Uint32Array(n),
+      c = new Float64Array(2 * n);
+    a.set(this.obsPoseBuf);
+    b.set(this.obsPointBuf);
+    c.set(this.obsUVBuf);
+    this.obsPoseBuf = a;
+    this.obsPointBuf = b;
+    this.obsUVBuf = c;
   }
 
   /**
@@ -1110,11 +1319,13 @@ export class IncrementalMapper {
           variablePoints,
           refine: (cid) =>
             refineIntrinsics ? this.refineFlags(false, cid, camCount.get(cid) ?? 0) : { focal: false, principalPoint: false, distortion: false },
+          maxConstObsPerImage: o.localBAMaxConstantObsPerImage,
         },
         o.localBALoss,
         o.localBALossScalePx,
         o.localBAMaxIterations,
         timeLimitMs ?? o.localBATimeLimitMs,
+        o.localBAFunctionTolerance,
       );
       report.ba = result;
       report.numAdjustedObservations = numObs;
@@ -1125,7 +1336,10 @@ export class IncrementalMapper {
       report.numCompletedObservations += this.triangulator.completeImage(tri, id);
     }
     const ft = now();
-    report.numFilteredObservations = this.rec.filterPoints3DInImages(o.filterMaxReprojErrorPx, o.filterMinTriAngleDeg * DEG, [id, ...bundle]);
+    // COLMAP filters every observation of every point seen by the bundle images; with long
+    // tracks that is most of the model. Only the bundle poses and the variable points moved:
+    // check the observations in the bundle images, and the modified points completely.
+    report.numFilteredObservations = this.rec.filterObservationsInImages(o.filterMaxReprojErrorPx, [id, ...bundle]);
     report.numFilteredObservations += this.rec.filterPoints3D(o.filterMaxReprojErrorPx, o.filterMinTriAngleDeg * DEG, pointIds);
     this.timings.filter += now() - ft;
     this.timings.localBA += now() - t0;
@@ -1149,13 +1363,24 @@ export class IncrementalMapper {
     this.triangulator.clearModifiedPoints();
   }
 
-  /** Global BA over all registered images (gauge: first image fixed, one translation component of the second). */
-  adjustGlobalBundle(timeLimitMs?: number): BAResult | null {
+  /**
+   * Global BA over all registered images (gauge: first image fixed, one translation
+   * component of the second). Observations behind their camera are removed first
+   * unless `filterNegativeDepth` is false (continuation slices of one BA).
+   */
+  adjustGlobalBundle(
+    timeLimitMs?: number,
+    maxIterations?: number,
+    initialLambda?: number,
+    trackCap = Infinity,
+    control?: BAControl,
+    filterNegativeDepth = true,
+  ): BAResult | null {
     const t0 = now();
     const o = this.opts;
     const reg = this.rec.registeredImageIds();
     if (reg.length < 2) return null;
-    this.rec.filterObservationsWithNegativeDepth();
+    if (filterNegativeDepth) this.rec.filterObservationsWithNegativeDepth();
     const constantPoses = new Set<number>([reg[0]]);
     const ax = largestRelTranslationAxis(this.rec.images.get(reg[0])!.pose, this.rec.images.get(reg[1])!.pose);
     const translationMask = new Map<number, number>([[reg[1], 1 << ax]]);
@@ -1166,11 +1391,17 @@ export class IncrementalMapper {
         translationMask,
         variablePoints: [],
         refine: (cid) => this.refineFlags(true, cid, 0),
+        maxConstObsPerImage: Infinity,
+        trackCap,
       },
       o.globalBALoss,
       o.globalBALossScalePx,
-      o.globalBAMaxIterations,
+      maxIterations ?? o.globalBAMaxIterations,
       timeLimitMs ?? o.globalBATimeLimitMs,
+      1e-6,
+      initialLambda,
+      o.globalBALinearSolver === 'auto' && reg.length > 150 && this.rec.meanTrackLength() > 8 ? 'pcg_schur' : o.globalBALinearSolver,
+      control,
     );
     this.timings.globalBA += now() - t0;
     this.timings.numGlobalBA++;
@@ -1225,36 +1456,102 @@ export class IncrementalMapper {
    * → complete/merge → filter, repeated while > globalBAMaxRefinementChange of the
    * observations change; finally filter images.
    */
-  async iterativeGlobalRefinement(timeLimitMs?: number, cancel?: CancelToken): Promise<void> {
+  async iterativeGlobalRefinement(timeLimitMs?: number, cancel?: CancelToken, full = true): Promise<void> {
     const o = this.opts;
     const tEnd = timeLimitMs !== undefined ? now() + timeLimitMs : Infinity;
     this.completeAndMergeTracks();
     this.retriangulate();
-    for (let i = 0; i < o.globalBAMaxRefinements; i++) {
+    await yieldToEventLoop();
+    const maxRef = full ? o.globalBAMaxRefinements : Math.min(o.globalBAMaxRefinements, o.intermediateGlobalBAMaxRefinements);
+    for (let i = 0; i < maxRef; i++) {
       if (cancel?.cancelled) throw new SfMCancelledError();
-      const remaining = tEnd - now();
-      if (remaining <= 0) break;
+      if (tEnd - now() <= 0) break;
       const numObs = Math.max(1, this.rec.numObservations);
-      this.adjustGlobalBundle(Math.min(o.globalBATimeLimitMs, remaining));
+      await this.adjustGlobalBundleSliced(tEnd, cancel, full);
       let changed = this.completeAndMergeTracks();
       changed += this.filterPoints();
+      await yieldToEventLoop();
       if (changed / numObs < o.globalBAMaxRefinementChange) break;
-      if (timeLimitMs === undefined) await yieldToEventLoop();
     }
     this.filterImages();
   }
 
-  /** Synchronous variant (for time-bounded live use). */
-  iterativeGlobalRefinementSync(timeLimitMs?: number): void {
+  /**
+   * Global BA in slices of ≈ `globalBASliceMs` with event-loop yields in between, up to
+   * globalBAMaxIterations in total and within `globalBATimeLimitMs` (and `tEnd`).
+   *
+   * Slices end only right after an ACCEPTED LM step: the solver's state is then fully
+   * described by its parameters and damping λ (the damping growth factor is reset by
+   * an accepted step), so the next slice — started from the written-back parameters
+   * with the carried λ — continues exactly as one uninterrupted solve would. Where the
+   * slices fall (which depends on CPU speed / load) therefore does not change the
+   * result (deterministic runs). A slice is cut regardless after 3 × globalBASliceMs.
+   */
+  async adjustGlobalBundleSliced(tEnd = Infinity, cancel?: CancelToken, full = true): Promise<void> {
+    const o = this.opts;
+    const deadline = Math.min(tEnd, now() + o.globalBATimeLimitMs);
+    let used = 0;
+    let lambda: number | undefined;
+    let lastCost = NaN;
+    let first = true;
+    while (used < o.globalBAMaxIterations) {
+      const t0 = now();
+      const remaining = deadline - t0;
+      if (remaining <= 0) break;
+      const sliceEnd = t0 + o.globalBASliceMs,
+        hardEnd = t0 + 3 * o.globalBASliceMs;
+      const stop = { cancelled: false };
+      let prev = lastCost,
+        sliced = false;
+      const res = this.adjustGlobalBundle(
+        remaining,
+        o.globalBAMaxIterations - used,
+        lambda,
+        full ? Infinity : o.globalBAMaxTrackLength,
+        {
+          cancel: stop,
+          onIteration: (_it, cost) => {
+            // an accepted step strictly lowers the cost; a rejected one leaves it unchanged
+            const accepted = cost < prev;
+            prev = cost;
+            if (cancel?.cancelled) {
+              stop.cancelled = true;
+              return;
+            }
+            const t = now();
+            if ((accepted && t >= sliceEnd) || t >= hardEnd) {
+              stop.cancelled = true;
+              sliced = true;
+            }
+          },
+        },
+        first,
+      );
+      first = false;
+      if (!res) break;
+      used += Math.max(1, res.iterations);
+      lastCost = res.finalCost;
+      // continue the next slice with the adapted damping (LM state carried over)
+      lambda = res.finalLambda > 0 && Number.isFinite(res.finalLambda) ? res.finalLambda : undefined;
+      if (cancel?.cancelled) throw new SfMCancelledError();
+      if (res.termination !== 'cancelled' || !sliced) break;
+      await yieldToEventLoop();
+      if (cancel?.cancelled) throw new SfMCancelledError();
+    }
+  }
+
+  /** Synchronous variant (for time-bounded live use); `full = false` caps long tracks. */
+  iterativeGlobalRefinementSync(timeLimitMs?: number, full = true): void {
     const o = this.opts;
     const tEnd = timeLimitMs !== undefined ? now() + timeLimitMs : Infinity;
     this.completeAndMergeTracks();
     this.retriangulate();
-    for (let i = 0; i < o.globalBAMaxRefinements; i++) {
+    const maxRef = full ? o.globalBAMaxRefinements : Math.min(o.globalBAMaxRefinements, o.intermediateGlobalBAMaxRefinements);
+    for (let i = 0; i < maxRef; i++) {
       const remaining = tEnd - now();
       if (remaining <= 0) break;
       const numObs = Math.max(1, this.rec.numObservations);
-      this.adjustGlobalBundle(Math.min(o.globalBATimeLimitMs, remaining));
+      this.adjustGlobalBundle(Math.min(o.globalBATimeLimitMs, remaining), undefined, undefined, full ? Infinity : o.globalBAMaxTrackLength);
       let changed = this.completeAndMergeTracks();
       changed += this.filterPoints();
       if (changed / numObs < o.globalBAMaxRefinementChange) break;
@@ -1306,7 +1603,9 @@ export class IncrementalMapper {
         const id = next[trial];
         if (this.registerNextImage(id)) {
           this.triangulateImage(id);
+          await maybeYield();
           this.iterativeLocalRefinement(id);
+          await maybeYield();
           const nImg = this.rec.numRegisteredImages,
             nPts = this.rec.numPoints;
           if (
@@ -1315,7 +1614,7 @@ export class IncrementalMapper {
             nPts >= o.globalBAPointsRatio * prevPoints ||
             nPts >= o.globalBAPointsFreq + prevPoints
           ) {
-            await this.iterativeGlobalRefinement(undefined, cancel);
+            await this.iterativeGlobalRefinement(undefined, cancel, false);
             prevImages = this.rec.numRegisteredImages;
             prevPoints = this.rec.numPoints;
           }
@@ -1333,13 +1632,13 @@ export class IncrementalMapper {
       if (!regSuccess && prevRegSuccess) {
         regSuccess = true;
         prevRegSuccess = false;
-        await this.iterativeGlobalRefinement(undefined, cancel);
+        await this.iterativeGlobalRefinement(undefined, cancel, false);
         prevImages = this.rec.numRegisteredImages;
         prevPoints = this.rec.numPoints;
       } else prevRegSuccess = regSuccess;
     }
-    if (this.rec.numRegisteredImages >= 2 && (this.rec.numRegisteredImages !== prevImages || this.rec.numPoints !== prevPoints))
-      await this.iterativeGlobalRefinement(undefined, cancel);
+    // final global refinement with all observations (intermediate ones cap long tracks)
+    if (this.rec.numRegisteredImages >= 2) await this.iterativeGlobalRefinement(undefined, cancel, true);
     return true;
   }
 }
@@ -1369,29 +1668,36 @@ export async function runIncrementalSfM(
   const frameIds = db.frameIds();
   const shared = createMapperSharedState();
   const models: Reconstruction[] = [];
-  const levels: [number, number][] = [];
+  // [min inliers, min median triangulation angle (deg), max forward motion, last resort]
+  const levels: [number, number, number, boolean][] = [];
   {
     let inl = o.initMinNumInliers,
       ang = o.initMinTriAngleDeg;
     const floorI = Math.min(o.initMinNumInliersFloor, inl),
       floorA = Math.min(o.initMinTriAngleFloorDeg, ang);
-    levels.push([inl, ang]);
+    const fwd = o.initMaxForwardMotion;
+    levels.push([inl, ang, fwd, false]);
     while (inl > floorI || ang > floorA) {
       if (inl > floorI) {
         inl = Math.max(floorI, Math.floor(inl / 2));
-        levels.push([inl, ang]);
+        levels.push([inl, ang, fwd, false]);
       }
       if (ang > floorA) {
         ang = Math.max(floorA, ang / 2);
-        levels.push([inl, ang]);
+        levels.push([inl, ang, fwd, false]);
       }
     }
+    const fa = Math.min(floorA, o.initFallbackMinTriAngleDeg),
+      ff = Math.max(fwd, o.initFallbackMaxForwardMotion);
+    if (o.initFallback && (fa < floorA || ff > fwd)) levels.push([floorI, fa, ff, true]);
   }
   const minModelSize = Math.max(2, Math.min(Math.floor(0.8 * frameIds.length), o.minModelSize));
   progress?.({ stage: 'sfm', progress: 0, message: `${frameIds.length} images, ${graph.numPairs} pairs` });
   let done = false;
-  for (const [minInl, minAng] of levels) {
+  for (const [minInl, minAng, maxFwd, lastResort] of levels) {
     if (done) break;
+    // the last-resort level only runs when the regular levels found no model at all
+    if (lastResort && models.length > 0) break;
     for (;;) {
       if (cancel?.cancelled) throw new SfMCancelledError();
       const numRegAnywhere = frameIds.filter((id) => (shared.registrations.get(id) ?? 0) > 0).length;
@@ -1403,7 +1709,14 @@ export async function runIncrementalSfM(
       const mapper = new IncrementalMapper(db, graph, rec, o, shared);
       for (const id of frameIds) mapper.ensureImage(id);
       rec.attachGraph(graph);
-      const init = mapper.findInitialPair(minInl, minAng);
+      // chunked search with yields (each re-estimation costs ~10–30 ms)
+      let init: ReturnType<IncrementalMapper['findInitialPair']> = null;
+      for (let spent = 0; spent < o.initMaxPairEvaluations; spent += INIT_CHUNK) {
+        init = mapper.findInitialPair(minInl, minAng, undefined, Math.min(INIT_CHUNK, o.initMaxPairEvaluations - spent), maxFwd);
+        if (init || !mapper.initSearchExhausted) break;
+        await yieldToEventLoop();
+        if (cancel?.cancelled) throw new SfMCancelledError();
+      }
       if (!init) break;
       const ok = await mapper.reconstructFrom(
         init.a,

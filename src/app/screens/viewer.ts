@@ -8,7 +8,8 @@
  * timings).
  */
 import { saveFile } from '../../io/download';
-import { Viewer } from '../../viewer';
+import type { Viewer } from '../../viewer';
+import { loadViewerModule } from '../viewer-loader';
 import { formatDistance } from '../../viewer/helpers';
 import type { ExportFormat, QualityPreset } from '../../workers/protocol';
 import type { App, Screen } from '../app';
@@ -16,7 +17,7 @@ import { button, chip, group, iconButton, kvRow, section, segmented, spinner, sw
 import { openSheet, type SheetHandle } from '../components/sheet';
 import { toast } from '../components/toast';
 import { Disposer, h, replaceChildren } from '../dom';
-import { exportFilename, formatBytes, formatCount, formatDuration, formatRelativeDate, modeLabel, qualityLabel } from '../format';
+import { exportFilename, formatBytes, formatCount, formatDuration, modeLabel, qualityLabel } from '../format';
 import { icon, type IconName } from '../icons';
 import type { ProcessingStep, Route } from '../router';
 
@@ -51,7 +52,8 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
 
   const canvasHost = h('div', { class: 'viewer-canvas', 'data-testid': 'viewer-canvas' });
   const loading = h('div', { class: 'viewer-loading' }, spinner('lg'), h('span', { text: 'Loading model…' }));
-  const titleEl = h('span', { class: 'viewer-title', text: app.results.name });
+  // Opened from Home, app.results may still hold the previously loaded scan until load() ran.
+  const titleEl = h('span', { class: 'viewer-title', text: route.sessionId && app.loadedSessionId !== route.sessionId ? '' : app.results.name });
   const subEl = h('span', { class: 'viewer-sub' });
   const top = h(
     'header',
@@ -242,17 +244,34 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     }
   }
 
+  /** Re-renders the OPEN export sheet (null when closed): a build that finishes after the sheet
+   *  was closed and opened again must update the new sheet, not the detached old list. */
+  let renderExports: (() => void) | null = null;
+  /** Until this time (or the share settles) further Save taps are ignored: a double tap would
+   *  reject (InvalidStateError) and, in a Safari tab, fall back to a download on top of the share
+   *  sheet. Time-limited because a share promise that never settles must not disable the button. */
+  let sharingUntil = 0;
+
   function openExport(): void {
     const list = h('div', { class: 'export-list' });
-    const sheet: SheetHandle = openSheet({ title: 'Export', subtitle: 'Files are created on this device.', content: list, testId: 'sheet-export' });
     const render = (): void => {
-      replaceChildren(list, ...EXPORTS.map((e) => exportRow(e, render)));
+      replaceChildren(list, ...EXPORTS.map((e) => exportRow(e)));
     };
+    const sheet: SheetHandle = openSheet({
+      title: 'Export',
+      subtitle: 'Files are created on this device.',
+      content: list,
+      testId: 'sheet-export',
+      onClose: () => {
+        if (renderExports === render) renderExports = null;
+      },
+    });
+    renderExports = render;
     render();
     void sheet;
   }
 
-  function exportRow(e: (typeof EXPORTS)[number], rerender: () => void): HTMLElement {
+  function exportRow(e: (typeof EXPORTS)[number]): HTMLElement {
     const av = exportAvailability(e.format);
     const st = exports.get(e.format) ?? { status: 'idle' };
     const filename = exportFilename(app.results.name, e.ext, e.suffix);
@@ -271,17 +290,23 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
         testId: `export-save-${e.format}`,
         // Fresh user activation: saveFile is called synchronously in this tap.
         onClick: () => {
-          saveFile(blob, filename).then(
-            (res) => {
-              if (res === 'shared') toast('Shared', { tone: 'good' });
-              else if (res === 'downloaded') toast(`Saved ${filename}`, { tone: 'good', icon: 'download' });
-            },
-            (err) => {
-              const n = (err as { name?: string })?.name;
-              if (n === 'NotAllowedError') toast('Tap “Share / Save” again to save the file.', { tone: 'warn' });
-              else toast(`Could not save: ${(err as Error)?.message ?? err}`, { tone: 'bad' });
-            },
-          );
+          if (performance.now() < sharingUntil) return;
+          sharingUntil = performance.now() + 2000;
+          saveFile(blob, filename)
+            .then(
+              (res) => {
+                if (res === 'shared') toast('Shared', { tone: 'good' });
+                else if (res === 'downloaded') toast(`Saved ${filename}`, { tone: 'good', icon: 'download' });
+              },
+              (err) => {
+                const n = (err as { name?: string })?.name;
+                if (n === 'NotAllowedError') toast(`Tap “${app.env.share ? 'Share / Save' : 'Save'}” again to save the file.`, { tone: 'warn' });
+                else if (n !== 'InvalidStateError') toast(`Could not save: ${(err as Error)?.message ?? err}`, { tone: 'bad' });
+              },
+            )
+            .finally(() => {
+              sharingUntil = 0;
+            });
         },
       });
     } else
@@ -290,7 +315,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
         variant: 'secondary',
         size: 'sm',
         testId: `export-prepare-${e.format}`,
-        onClick: () => void prepare(e.format, rerender),
+        onClick: () => void prepare(e.format),
       });
     if (st.status === 'error' && st.error) sub = st.error;
     return h(
@@ -302,16 +327,16 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     );
   }
 
-  async function prepare(format: ExportFormat, rerender: () => void): Promise<void> {
+  async function prepare(format: ExportFormat): Promise<void> {
     exports.set(format, { status: 'building' });
-    rerender();
+    renderExports?.();
     try {
       const blob = await app.engine.exportModel(format);
       exports.set(format, { status: 'ready', blob });
     } catch (e) {
       exports.set(format, { status: 'error', error: (e as Error)?.message ?? String(e) });
     }
-    if (!closed) rerender();
+    if (!closed) renderExports?.();
   }
 
   function openInfo(): void {
@@ -352,7 +377,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     const content: HTMLElement[] = [section('Scale & orientation', group(...rows)), section('Reconstruction', group(...counts))];
     if (timings.length) content.push(section('Timings', group(...timings)));
     content.push(section('Capture', group(...about)));
-    openSheet({ title: 'Model info', subtitle: r.sessionId ? `Created ${formatRelativeDate(Date.now())}` : undefined, content, testId: 'sheet-info' });
+    openSheet({ title: 'Model info', subtitle: `${modeLabel(r.mode)} scan · ${qualityLabel(r.quality)} quality`, content, testId: 'sheet-info' });
   }
 
   // ---- lifecycle ---------------------------------------------------------------------------------
@@ -374,7 +399,9 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       return;
     }
     try {
-      viewer = new Viewer(canvasHost, { background: '#0b0c10' });
+      const { Viewer: ViewerCtor } = await loadViewerModule();
+      if (closed) return;
+      viewer = new ViewerCtor(canvasHost, { background: '#0b0c10' });
     } catch (e) {
       replaceChildren(canvasHost, h('div', { class: 'viewer-nogl' }, icon('warning', { size: 28 }), h('p', { text: `The 3D view could not start: ${(e as Error)?.message ?? e}` })));
     }

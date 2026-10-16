@@ -13,7 +13,7 @@ import type { GeoFix, Mat3, Vec3 } from '../core/types';
 import { alignSim3Ransac } from '../geometry/align';
 import { Rng } from '../math/random';
 import { umeyama } from '../math/sim3';
-import { median, percentile } from '../math/stats';
+import { median } from '../math/stats';
 
 /** WGS84 semi-major axis (m). */
 export const WGS84_A = 6378137.0;
@@ -173,7 +173,7 @@ export interface GpsAlignOptions {
   gravityAligned: boolean;
   /** Minimum number of associated fixes (default 5). */
   minFixes: number;
-  /** Required horizontal track extent in multiples of the median accuracy (default 4). */
+  /** Required horizontal track extent (`trackExtent`, noise-corrected) in multiples of the median accuracy (default 4). */
   minExtentFactor: number;
   /** Lower bound on the per-fix accuracy used for weighting (m, default 1). */
   minAccuracy: number;
@@ -206,7 +206,7 @@ export interface GpsAlignment {
   scaleRelUncertainty: number;
   /** 1-σ yaw uncertainty (rad). */
   yawStdRad: number;
-  /** Horizontal track extent (m) and median fix accuracy (m). */
+  /** Horizontal track extent (m, `trackExtent`) and median fix accuracy (m). */
   extent: number;
   medianAccuracy: number;
   /** Lag-1 autocorrelation of the time-ordered residuals (≥ 0 ⇒ inflated uncertainty). */
@@ -217,6 +217,11 @@ export interface GpsAlignment {
   weights: Float64Array;
   /** Whether each associated fix has an altitude. */
   hasAlt: Uint8Array;
+}
+
+/** Horizontal 1-σ used for a fix: its accuracy floored at `minAccuracy` (fixes without a finite accuracy are not used). */
+function fixSigma(f: GeoFix, minAccuracy: number): number {
+  return Math.max(f.accuracy, minAccuracy);
 }
 
 const DEFAULT_GPS_OPTIONS: Omit<GpsAlignOptions, 'rng'> = {
@@ -230,26 +235,46 @@ const DEFAULT_GPS_OPTIONS: Omit<GpsAlignOptions, 'rng'> = {
   origin: null,
 };
 
-/** Horizontal extent of a set of ENU points (2 × the 90th-percentile distance from their median). */
-export function trackExtent(enu: Float64Array, n: number): number {
+/**
+ * Horizontal track extent (m) of n ENU points: the length of a uniform segment with the same
+ * spread along the principal axis, √(12 · max(0, λ_max − noiseVar)), where λ_max is the largest
+ * eigenvalue of the 2-D covariance and `noiseVar` the mean per-axis variance of the GPS noise
+ * (subtracting it keeps a stationary but noisy track from looking long).
+ */
+export function trackExtent(enu: Float64Array, n: number, noiseVar = 0): number {
   if (n < 2) return 0;
-  const xs = new Float64Array(n),
-    ys = new Float64Array(n);
+  let mx = 0,
+    my = 0;
   for (let i = 0; i < n; i++) {
-    xs[i] = enu[3 * i];
-    ys[i] = enu[3 * i + 1];
+    mx += enu[3 * i];
+    my += enu[3 * i + 1];
   }
-  const mx = median(xs),
-    my = median(ys);
-  const d = new Float64Array(n);
-  for (let i = 0; i < n; i++) d[i] = Math.hypot(xs[i] - mx, ys[i] - my);
-  return 2 * percentile(d, 90);
+  mx /= n;
+  my /= n;
+  let sxx = 0,
+    syy = 0,
+    sxy = 0;
+  for (let i = 0; i < n; i++) {
+    const dx = enu[3 * i] - mx,
+      dy = enu[3 * i + 1] - my;
+    sxx += dx * dx;
+    syy += dy * dy;
+    sxy += dx * dy;
+  }
+  sxx /= n - 1;
+  syy /= n - 1;
+  sxy /= n - 1;
+  const tr = 0.5 * (sxx + syy);
+  const lmax = tr + Math.sqrt(Math.max(0, 0.25 * (sxx - syy) * (sxx - syy) + sxy * sxy));
+  return Math.sqrt(12 * Math.max(0, lmax - noiseVar));
 }
 
 /**
  * Robust weighted alignment of camera centres to GPS fixes. For every fix, the camera
  * centre at the fix time is interpolated linearly between the bracketing keyframes; fixes
- * are weighted by 1/max(accuracy, minAccuracy)². Returns null unless ≥ `minFixes` fixes
+ * are weighted by 1/max(accuracy, minAccuracy)² (fixes with a non-finite position, time or
+ * accuracy are ignored; a non-finite `altitudeAccuracy` falls back to 2 × the horizontal
+ * one). Returns null unless ≥ `minFixes` fixes
  * associate and the horizontal track extent exceeds `minExtentFactor` × the median accuracy.
  *
  * 4-DOF mode (`gravityAligned`): horizontal similarity as a complex linear regression
@@ -287,7 +312,10 @@ export function alignToGps(
   }
 
   // Associate fixes (time-sorted).
-  const fsorted = fixes.filter((f) => Number.isFinite(f.lat) && Number.isFinite(f.lon) && Number.isFinite(f.t)).sort((a, b) => a.t - b.t);
+  // Fixes without a finite position, time or accuracy cannot be weighted: dropped.
+  const fsorted = fixes
+    .filter((f) => Number.isFinite(f.lat) && Number.isFinite(f.lon) && Number.isFinite(f.t) && Number.isFinite(f.accuracy))
+    .sort((a, b) => a.t - b.t);
   const used: GeoFix[] = [];
   const srcList: number[] = [];
   for (const f of fsorted) {
@@ -335,7 +363,7 @@ export function alignToGps(
       swa = 0;
     const lon0 = used[0].lon;
     for (const f of used) {
-      const w = 1 / Math.max(f.accuracy, o.minAccuracy) ** 2;
+      const w = 1 / fixSigma(f, o.minAccuracy) ** 2;
       sw += w;
       slat += w * f.lat;
       // unwrap longitude around the first fix (antimeridian-safe)
@@ -371,12 +399,14 @@ export function alignToGps(
     dst[3 * i] = tmp[0];
     dst[3 * i + 1] = tmp[1];
     dst[3 * i + 2] = tmp[2];
-    sigma[i] = Math.max(Number.isFinite(f.accuracy) ? f.accuracy : 1e3, o.minAccuracy);
+    sigma[i] = fixSigma(f, o.minAccuracy);
     weights[i] = 1 / (sigma[i] * sigma[i]);
     acc[i] = sigma[i];
   }
   const medAcc = median(acc);
-  const extent = trackExtent(dst, n);
+  let noiseVar = 0;
+  for (let i = 0; i < n; i++) noiseVar += acc[i] * acc[i];
+  const extent = trackExtent(dst, n, noiseVar / n);
   if (!(extent > o.minExtentFactor * medAcc)) return null;
 
   const res = o.gravityAligned
@@ -607,7 +637,8 @@ function align4Dof(
   for (let i = 0; i < n; i++) {
     if (!mask[i] || !hasAlt[i]) continue;
     const f = fixes[i];
-    const sa = Math.max(f.altitudeAccuracy ?? 2 * sigma[i], 1);
+    const aa = f.altitudeAccuracy;
+    const sa = Math.max(aa !== null && Number.isFinite(aa) && aa > 0 ? aa : 2 * sigma[i], 1);
     const wz = 1 / (sa * sa);
     swz += wz;
     sz += wz * (dst[3 * i + 2] - s * src[3 * i + 2]);
@@ -747,7 +778,7 @@ function residual3(
 export interface CompassObservation {
   /** Heading of the reference axis, degrees clockwise from (true) north. */
   headingDeg: number;
-  /** 1-σ heading accuracy (degrees); null/undefined ⇒ 20°. */
+  /** 1-σ heading accuracy (degrees); null/undefined/non-finite ⇒ 20°. */
   accuracyDeg?: number | null;
   /** The reference axis (device top or optical axis) in the gravity-aligned (+Z up) frame. */
   direction: ArrayLike<number>;
@@ -793,7 +824,8 @@ export function yawFromCompass(
     const dn = Math.hypot(d[0], d[1], d[2]);
     const h = dn > 0 ? Math.hypot(d[0], d[1]) / dn : 0;
     if (!(h >= minH) || !Number.isFinite(o.headingDeg)) continue;
-    const acc = Math.max(o.accuracyDeg ?? 20, 2) * DEG;
+    const ad = o.accuracyDeg;
+    const acc = Math.max(ad !== null && ad !== undefined && Number.isFinite(ad) ? ad : 20, 2) * DEG;
     phi[i] = wrapPi(Math.atan2(d[0], d[1]) - o.headingDeg * DEG);
     w[i] = (h * h) / (acc * acc);
     used++;

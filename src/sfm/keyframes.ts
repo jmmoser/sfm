@@ -15,7 +15,8 @@
  *   - tracking lost: inliers < `minInliers`;
  *   - `maxIntervalMs` elapsed while the camera is moving;
  * never earlier than `minIntervalMs` after the previous keyframe. Soft triggers wait up to
- * `maxDeferMs` for a sharper frame. Guidance for the UI is attached to every decision.
+ * `maxDeferMs` for a sharper frame. The first keyframe is taken once `sharpnessWarmup` frames
+ * have been seen (so it is not blurry). Guidance for the UI is attached to every decision.
  * Pure rotation (rotation without rotation-compensated parallax) ⇒ 'translate_more'.
  */
 import type { CameraIntrinsics, Mat3, MatchPairs } from '../core/types';
@@ -47,7 +48,7 @@ export interface KeyframeCandidate {
   numFeatures: number;
   /** Putative matches to the last keyframe (0 if there is none). */
   numMatchesToLastKF: number;
-  /** Verified (geometric) inliers to the last keyframe. */
+  /** Verified (geometric) inliers to the last keyframe; NaN = not measured for this frame. */
   numInliersToLastKF: number;
   /** Median rotation-compensated parallax to the last keyframe (px, full resolution). NaN = unknown. */
   medianParallaxPx: number;
@@ -133,6 +134,8 @@ export const DEFAULT_KEYFRAME_OPTIONS: KeyframeSelectorOptions = {
 };
 
 const DEG = Math.PI / 180;
+/** Number of earlier keyframes remembered for `revertLastKeyframe`. */
+const HISTORY = 16;
 
 /**
  * Stateful keyframe policy. `evaluate` both decides and, for 'keyframe' decisions, commits
@@ -146,9 +149,11 @@ export class KeyframeSelector {
   private sharpHead = 0;
   private scratch: Float64Array;
   private lastKfT: number | null = null;
-  private prevKfT: number | null = null;
   private bestInliers = 0;
-  private prevBestInliers = 0;
+  /** Previously committed keyframes (times / best-inlier counts), most recent last, for revert. */
+  private histT = new Float64Array(HISTORY);
+  private histBest = new Float64Array(HISTORY);
+  private histLen = 0;
   private deferStart: number | null = null;
   private kfCount = 0;
 
@@ -196,38 +201,52 @@ export class KeyframeSelector {
   reset(): void {
     this.sharpCount = 0;
     this.sharpHead = 0;
-    this.lastKfT = null;
-    this.prevKfT = null;
-    this.bestInliers = 0;
-    this.prevBestInliers = 0;
-    this.deferStart = null;
+    this.resetTracking();
     this.kfCount = 0;
   }
 
   /** Start a new tracking segment (keeps the sharpness statistics). */
   resetTracking(): void {
     this.lastKfT = null;
-    this.prevKfT = null;
     this.bestInliers = 0;
+    this.histLen = 0;
     this.deferStart = null;
   }
 
   /** Make the frame at time t the reference keyframe. */
   commitKeyframe(t: number): void {
-    this.prevKfT = this.lastKfT;
-    this.prevBestInliers = this.bestInliers;
+    if (this.lastKfT !== null) {
+      if (this.histLen === HISTORY) {
+        this.histT.copyWithin(0, 1);
+        this.histBest.copyWithin(0, 1);
+        this.histLen--;
+      }
+      this.histT[this.histLen] = this.lastKfT;
+      this.histBest[this.histLen] = this.bestInliers;
+      this.histLen++;
+    }
     this.lastKfT = t;
     this.bestInliers = 0;
     this.deferStart = null;
     this.kfCount++;
   }
 
-  /** Undo the last committed keyframe (e.g. the engine failed to register it). */
+  /**
+   * Undo the last committed keyframe (e.g. the engine failed to register it): the previous
+   * keyframe becomes the reference again. Repeated calls walk back through the last 16
+   * keyframes of the current tracking segment; beyond that (or after reverting the segment's
+   * first keyframe) there is no reference and the next good frame becomes a 'first' keyframe.
+   */
   revertLastKeyframe(): void {
     if (this.lastKfT === null) return;
-    this.lastKfT = this.prevKfT;
-    this.bestInliers = this.prevBestInliers;
-    this.prevKfT = null;
+    if (this.histLen > 0) {
+      this.histLen--;
+      this.lastKfT = this.histT[this.histLen];
+      this.bestInliers = this.histBest[this.histLen];
+    } else {
+      this.lastKfT = null;
+      this.bestInliers = 0;
+    }
     this.deferStart = null;
     this.kfCount = Math.max(0, this.kfCount - 1);
   }
@@ -240,12 +259,15 @@ export class KeyframeSelector {
     if (this.sharpCount < w) this.sharpCount++;
   }
 
-  /** Decide for one frame (frames must be presented in time order). */
+  /** Decide for one frame (frames must be presented in time order; a non-finite `t` is skipped). */
   evaluate(c: KeyframeCandidate): KeyframeDecision {
     const o = this.options;
+    if (!Number.isFinite(c.t)) return { decision: 'skip', reason: `invalid timestamp ${c.t}` };
     // 1) Blur relative to the running median of PREVIOUS frames (then include this one so the
     //    reference adapts when the whole scene becomes less textured or the light drops).
-    const ref = this.sharpCount >= o.sharpnessWarmup ? this.sharpnessReference : NaN;
+    //    The warm-up cannot exceed the ring size (else the first keyframe would never come).
+    const warmup = Math.min(Math.max(0, o.sharpnessWarmup), this.sharpRing.length);
+    const ref = this.sharpCount >= warmup ? this.sharpnessReference : NaN;
     this.pushSharpness(c.sharpness);
     const fastRot = Number.isFinite(c.angularSpeed) && c.angularSpeed > o.warnAngularRatio * o.maxAngularSpeed;
     if (!(c.sharpness >= o.minSharpness) || (Number.isFinite(ref) && c.sharpness < o.blurRatio * ref)) {
@@ -267,17 +289,21 @@ export class KeyframeSelector {
     if (c.numFeatures < o.minFeatures) {
       return { decision: 'skip', reason: `only ${c.numFeatures} features`, guidance: 'more_texture' };
     }
-    // 4) First keyframe.
+    // 4) First keyframe — only once the blur statistic is warmed up, so that a blurry first
+    //    frame cannot become the initialisation keyframe.
     if (this.lastKfT === null) {
+      if (!Number.isFinite(ref)) return { decision: 'skip', reason: 'warming up the sharpness statistic', guidance: fastRot ? 'move_slower' : 'good' };
       this.commitKeyframe(c.t);
       return { decision: 'keyframe', reason: 'first keyframe', guidance: fastRot ? 'move_slower' : 'good', trigger: 'first' };
     }
 
     const dt = c.t - this.lastKfT;
-    const inl = Math.max(0, c.numInliersToLastKF);
-    const lost = inl < o.minInliers;
-    if (!lost && inl > this.bestInliers) this.bestInliers = inl;
-    const overlap = this.bestInliers > 0 ? inl / this.bestInliers : 0;
+    // Non-finite inlier count = not measured for this frame: neither "lost" nor an overlap drop.
+    const inlKnown = Number.isFinite(c.numInliersToLastKF);
+    const inl = inlKnown ? Math.max(0, c.numInliersToLastKF) : 0;
+    const lost = inlKnown && inl < o.minInliers;
+    if (inlKnown && !lost && inl > this.bestInliers) this.bestInliers = inl;
+    const overlap = !inlKnown ? 1 : this.bestInliers > 0 ? inl / this.bestInliers : 0;
     const parThr = this.parallaxThresholdPx(c.imageWidth);
     const parallax = Number.isFinite(c.medianParallaxPx) ? c.medianParallaxPx : 0;
     const rot = Number.isFinite(c.rotationSinceLastKFRad) ? c.rotationSinceLastKFRad : 0;
@@ -374,7 +400,8 @@ export function rotationCompensatedParallax(
       const Y = r[3] * x + r[4] * y + r[5];
       const Z = r[6] * x + r[7] * y + r[8];
       if (!(Z > 1e-9)) continue;
-      out[cnt++] = fb * Math.hypot(nrmB[0] - X / Z, nrmB[1] - Y / Z);
+      const d = fb * Math.hypot(nrmB[0] - X / Z, nrmB[1] - Y / Z);
+      if (d === d) out[cnt++] = d; // skip NaN (non-finite keypoints / intrinsics)
     }
   } else {
     const Ka = toK(K),
@@ -399,7 +426,8 @@ export function rotationCompensatedParallax(
       const w = H[6] * u + H[7] * v + H[8];
       const pu = (H[0] * u + H[1] * v + H[2]) / w;
       const pv = (H[3] * u + H[4] * v + H[5]) / w;
-      out[cnt++] = Math.hypot(kpB[4 * ib] - pu, kpB[4 * ib + 1] - pv);
+      const d = Math.hypot(kpB[4 * ib] - pu, kpB[4 * ib + 1] - pv);
+      if (d === d) out[cnt++] = d; // skip NaN
     }
   }
   if (cnt === 0) return NaN;

@@ -1588,3 +1588,348 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
     room decides. The engine should pass `maxDepth`, e.g. 2 × the object distance, in object
     mode;
   * grazing ground with cos θ < 0.1 (under about 6°, beyond ≈ 10× the camera height) uses the ray distance and can still fragment where few views overlap.
+
+### `src/sfm` extras (keyframes, pairs, vocab, inertial, geo, world)
+
+* **Files**: `keyframes.ts` (KeyframeSelector, rotationCompensatedParallax), `pairs.ts` (sequential /
+  retrieval / spatial pairs, mergePairs), `vocab.ts` (k-means vocabulary + TF-IDF index), `inertial.ts`
+  (time offset, gravity, metric scale, gravity alignment), `geo.ts` (WGS84/ECEF/ENU, GPS alignment, compass
+  yaw), `world.ts` (computeWorldAlignment). `extras-testutil.ts` is TEST-ONLY (continuous orbit / walk
+  trajectories, 100 Hz IMU, keyframes in a random similarity frame, GPS). No imports from the SfM core.
+* **Time offset sign**: an image stamped `t_cam` was exposed at IMU time `t_cam + offsetMs`.
+* **KeyframeSelector**: blur = sharpness < 0.6 × running median of the last 30 frames (rejected frames
+  included so the reference adapts); the FIRST keyframe waits for 5 frames of statistics. Overlap =
+  inliers / best inlier count observed since the last keyframe (independent of the absolute match rate).
+  Parallax trigger 3 / 4 / 5 % of the width (object / auto / scene), rotation 12°, tracking lost < 30
+  inliers, min 150 ms, max 2 s only while moving; soft triggers wait ≤ 250 ms for a frame ≥ 0.85 × median
+  sharpness. `evaluate` commits 'keyframe' decisions itself; `revertLastKeyframe()` if the engine drops it.
+  `rotationCompensatedParallax` undistorts with `CameraIntrinsics` (RADIAL), or applies K R K⁻¹ to raw pixels
+  with a Mat3 K.
+* **VocabularyIndex**: exact nearest word (argmax x·c − ½‖c‖²). Uses `features/simd` `createSimdKernels().dot4`
+  (int16 SIMD dot products, centroids rounded to 1/64 grey level) and re-scores in float64 every centroid
+  within the rounding bound of the best ⇒ identical to the JS search (tested), 4000 features × 512 words
+  ≈ 30 ms (JS fallback ≈ 300 ms). Training: k-means++ on 8·k descriptors, ≤ 6 Lloyd passes on 16·k
+  (SIMD assignment; JS fallback with Hamerly bounds + exact handling of the 32 largest centre moves):
+  k = 512 ≈ 1 s (JS 3.3 s). IDF is recomputed lazily after add/remove; query = forward scan over the
+  sparse BoWs (500 images ≈ 0.5 ms). `exportCodebook()` / `new VocabularyIndex(codebook)` for persistence.
+* **Inertial**: R_wd(t) = vision keyframe attitudes + gyro (4th-order Magnus) with the per-interval
+  mismatch distributed linearly (`AttitudeInterpolator`). Time offset: robust (Cauchy) misfit of
+  log(V_kᵀ G_k(δ)) with the gyro bias re-estimated per δ (Forster et al. bias Jacobian), 2 ms grid over
+  ±250 ms + golden section; σ from the LS curvature. Gravity: weighted mean of R_wd·accelG over ALL samples
+  in the keyframe span (fallback: keyframe `gravityCam`). Scale: the SAME linear operator (smoothing-spline
+  second derivative through the keyframe samples → 20 Hz grid → zero-phase 0.3–3 Hz Butterworth) is applied
+  to the camera centres and to double-integrated world-frame IMU acceleration sampled at the keyframe times,
+  so keyframe-rate aliasing affects both sides identically; IRLS regression vision ≈ s₀·IMU + world bias +
+  device-frame bias (Gaussian prior 0.05 m/s² — essential for orbits, where a device bias along the optical
+  axis mimics the centripetal acceleration). σ = Newey–West HAC × 1.3 (calibrated on 30 seeds each).
+* **Measured** (30 seeds each; gyro noise 0.005 rad/s, bias ~0.01; accel noise 0.05, bias ~0.05 m/s²;
+  keyframes 2–4 Hz in a random Sim3 frame, offsets ±150 ms): orbit 0.4 m @ 0.2 Hz (hand-held: ±15 % speed,
+  ±3 cm radius, 3–6 mm jitter) scale rms 0.5 % / max 1.0 %; 40 m walk @ 1.2 m/s with 2 Hz bob rms 1.0 % /
+  max 2.4 %; z-score rms 0.83–0.94; time offset max error 0.9 ms; gravity rms 0.22° (orbit) / 0.44° (walk,
+  max 0.98° — an uncompensated horizontal accel bias tilts gravity by b/g when the device hardly rotates).
+  Total `estimateInertialAlignment` ≈ 20–30 ms (Node). Smooth constant-rate pans are flagged unreliable.
+* **GPS**: fixes associated by time (centre interpolated between bracketing keyframes), weights 1/σ².
+  With gravity (+Z up) a 4-DOF fit (complex regression EN ≈ a·XY + b, 2-point RANSAC + Huber IRLS; vertical
+  from altitudes or mean camera height 0) — works for straight tracks; else Sim3 (`alignSim3Ransac` +
+  weighted Umeyama). Requires ≥ 5 fixes and a noise-corrected track extent √(12·(λ_max − σ̄²)) > 4 × median
+  accuracy. σ_s inflated by (1+ρ)/(1−ρ) for lag-1 residual autocorrelation. 40 m walk, 3 m noise: scale
+  error ≤ 4.8 % (12 seeds), max |z| 1.5.
+* **computeWorldAlignment**: gravity (IMU, else `gravityCam`) → R_g; GPS 4-DOF yaw, else compass yaw
+  (`compassReference` 'auto' = device top while within 45° of horizontal, else optical axis — the
+  `CompassSensor` convention; heading must be TRUE north); scales fused by inverse variance in log-space,
+  or the more certain one when they disagree by > 3σ (warning); GPS ⇒ ENU translation +
+  `originLatLonAlt` (alt = mean MSL altitude, 0 without altitudes), else first camera at the origin.
+  Apply with `Reconstruction.transform(s, R, t)`; `transformPose` gives R' = R_p Rᵀ, t' = s t_p − R' t.
+* **Limits**: `estimateTimeOffset` cost ∝ keyframes × 250 grid points (2000 keyframes ≈ 1 s); a single
+  constant gyro bias and constant accelerometer biases are assumed per capture; the scale needs
+  band-limited (0.3–3 Hz) acceleration ≥ 0.08 m/s² RMS (`excitationRms`) — tripod-smooth motion gets
+  `reliable: false`; segments are split at keyframe gaps > 3 s / IMU gaps > 250 ms.
+
+### `src/sfm` core (database, correspondence graph, reconstruction, triangulator, mapper, live, synthetic)
+
+* **API superset of §4.5** (documented signatures kept). Extras: `pairIds`, `swapMatches`, `invertTwoView`,
+  `MAX_IMAGE_ID` (2^20), `FeatureDatabase.colors` (3 B/feature, optional 3rd arg of `addFrame`), `removeFrame`,
+  `deletePair`, `numPairs`. `getTwoView(a, b)` with a > b returns the cached inverse (inliers swapped,
+  x_a = Rᵀx_b − Rᵀt, Eᵀ, Fᵀ, H⁻¹).
+* **CorrespondenceGraph**: one singly linked list per (image, feature) in a shared typed-array pool (12 B per
+  directed correspondence, no objects). Hot loops: `heads(img)` + `nextOf/imageOf/featureOf` (re-read after
+  `addTwoView`, the pool grows); `getCorrespondences(img, f, outImg, outFeat)`; `correspondences()` allocates
+  (convenience only). `addTwoView` of an existing pair REPLACES it; `removeTwoView`, `matchesBetween(a, b)`
+  (oriented), `neighbours(img)` (adjacency map), `numObservations`, `isTwoViewObservation`, `version`.
+* **Reconstruction**: `addImage(id, cameraId, numFeatures, keypoints?)` (keypoints stride 4 are needed for
+  errors / filtering / visibility), `addCamera(cam, id?)` (copied). `RecImage` extras: `keypoints`,
+  `numVisiblePoints3D`, `visibilityScore` (COLMAP 6-level visibility pyramid, maintained incrementally once a
+  graph is attached with `attachGraph`; `syncVisibility(id)` recomputes one image after the graph grew).
+  COLMAP semantics: deleting an observation of a 2-track deletes the point; `mergePoints` = track-length
+  weighted position/colour, concatenated track, both ids deleted. `transform(s, R, t)`: X' = sRX + t,
+  R'ᵢ = RᵢRᵀ, t'ᵢ = s tᵢ − R'ᵢ t. `meanReprojectionError()` = mean over ALL observations, recomputed (not
+  the cached `error`); `updatePointErrors()`. Filtering: `filterPoints3D / filterPoints3DInImages /
+  filterAllPoints3D(maxPx, minTriAngleRad)`, `filterObservationsWithNegativeDepth`, `filterImages`;
+  `hasBogusParams`, `reprojectionErrorSq`, `imageLUT()`, `numObservations`, `numSharedPoints`. `clone()`
+  shares keypoint arrays and the attached graph.
+* **Triangulator** (COLMAP defaults: create/continue 2° angular error, merge/complete 4 px, completion 5 hops,
+  min angle 1.5°, re-triangulation of pairs < 20 % triangulated with 5°, ignore two-view tracks).
+  `RayTriangulator`: 2-view minimal samples (exhaustive for ≤ 15 observations), angular residuals, cheirality
+  via the camera z-axis, LO = weighted LS ray intersection (re-weighted by 1/distance² ≈ angular error; no
+  DLT/SVD, no allocation). Deviations: a track never gets two observations of the same image
+  (continue/complete skip images already in the track); `completeImage` only scans the image's own
+  correspondences (COLMAP re-scans every element of its tracks — 5× slower; `completeAllTracks` after global
+  BA covers the rest); `completeAllTracks` iterates untriangulated features (fewer) instead of all tracks;
+  `mergeAllTracks` scans each graph edge once.
+* **Mapper** (`MapperOptions`, `DEFAULT_MAPPER_OPTIONS`, `resolveMapperOptions`): cameras are shared per image
+  size (or `cameraKey(frameId)`), initial guess from `intrinsics` (object or per-frame function, rescaled to the
+  frame size) else `hfovPriorDeg` = 69° across the long side. Initial pair: first image by #correspondences,
+  second image by (stored two-view triAngle ≥ threshold) then #correspondences — i.e. video pairs further apart
+  are tried first; pairs whose stored angle is < ½ threshold or 'panoramic' are skipped without
+  re-estimation; re-estimation with current intrinsics (≤ 100 per search, cached); 'uncalibrated' pairs get
+  their pose from E = K₂ᵀFK₁; relaxation (inliers, angle): (100,16°) → (50,16°) → (50,8°) → (30,8°) →
+  (30,4°), also for later models. Initial points need ≥ max(1.5°, ¼·init angle). Registration: PnP 12 px,
+  ≥ 30 inliers AND inlier ratio ≥ 0.25 (acceptance, not only the RANSAC cap). Local BA: image + 6 neighbours
+  (COLMAP's 6 includes the image), soft-L1 1 px, ≤ 25 iterations, ftol 1e-4, **observations of constant
+  (outside-anchored) points subsampled to ≤ 600 per image** (2.5× faster, accuracy unchanged in tests); after
+  it, only the observations IN the bundle images plus the modified points are filtered (COLMAP re-checks every
+  observation of every point of the bundle images — with 60-view tracks that is the whole model). Global
+  BA: trivial loss (as COLMAP), f + k1 + k2 refined once ≥ 3 images are registered, gauge = first registered
+  image fixed + the largest relative-translation component of the second. **Intermediate** global
+  refinements (10 % growth) use ≤ 12 observations per track (every ⌈L/12⌉-th; the Schur cost is Σ m²) and ≤ 2
+  BA/filter rounds; the **final** one uses all observations and ≤ 5 rounds. Above 150 images with mean track
+  > 8 the global BA uses PCG (dense reduced camera matrix: 1.5–2× faster per LM iteration than the skyline
+  Cholesky at 160–250 images, same iteration count). Images are filtered (bogus camera or < 6 points) once
+  ≥ 20 are registered. `runIncrementalSfM` yields every ~25 ms between steps, runs global BA in 500 ms slices
+  (LM damping carried over: identical results) and the initial-pair search in chunks of 6 re-estimations;
+  longest synchronous step ≈ 0.6–0.8 s (desktop Node, idle machine, 100 images). Cancel ⇒
+  `SfMCancelledError` (name 'CancelledError'). Models smaller than min(10, 0.8·N) images are dropped unless
+  it is the only one. Extras: `buildCorrespondenceGraph`, `extractColors`, `intrinsicsFromFov`,
+  `createMapperSharedState`, `IncrementalMapper.timings`.
+* **LiveMapper** (`LiveMapperOptions` = mapper options + live ones): the engine must add the keyframe to the DB
+  and its verified pairs to the graph BEFORE `addKeyframe`. Initialises from the best pair among the last 30
+  keyframes (≥ 60 inliers, ≥ 5° median angle, ≤ 6 re-estimations per call), then registers the pending
+  keyframes; each new keyframe: PnP → triangulate → local BA (120 ms BA budget); failures stay pending and are
+  retried (nearest first, ≤ 4 per success) when their visible-point count grew (relocalisation). Global BA
+  with an 800 ms budget at 3, 4, 6, 8, 11, … ≤ 30 images, then every 15 registrations. `refine(ms?)` for a
+  final global refinement; `incrementalMapper`, `pendingIds()`, `timings`. No re-initialisation of a second
+  model while lost (offline `runIncrementalSfM` handles that).
+* **synthetic.ts** (test data for any module; not re-exported): `generateScene({ kind: 'orbit' | 'walk', … })`
+  (orbit: object 0.3 m at 0.5 m; walk: 60 m yard, houses/trees 5–50 m, sideways walk with panning), RADIAL
+  projections + noise, clutter features, RootSIFT-like descriptors (true-match distance ≈ 0.4, random ≈ 0.75),
+  putative matches with exact outlier ratio, `buildSyntheticDatabase` (two-view verification with a given
+  camera guess, or GT inliers with `verify: false`), `combineScenes` (disconnected captures),
+  `evaluateReconstruction` (Sim3 ATE, rotation, focal, k1/k2, wrong-observation rate). `e2e-testutil.ts`:
+  acceptance-setting data + keyframe streaming like the engine; `rotationOnlyDb()`.
+* **Measured** (Node 22 x86, single process, 0.7 px noise, 25 % outlier matches, f +8 %, k1 = 0.03):
+  orbit 60 images — 60/60, ATE 2.7e-5 of the extent, focal error 2e-6, k1 0.0301, mean reprojection 0.84 px,
+  ≈ 10–12 s; walk 100 images — 100/100, ATE 4–5e-5 of the 81 m extent (4 mm), focal 1e-4, 0.85 px,
+  ≈ 12–14 s. LiveMapper: 60/60 and 100/100, same accuracy, per keyframe median 90–130 ms, p90 250 ms,
+  max ≈ 0.7–1.1 s (global BA keyframes). Disconnected orbit + walk → 2 models. Stress (40 % outliers + f
+  +15 %, or f −10 % with k1 = ±0.05/0.06): all registered, ATE ≤ 5e-5, focal ≤ 2e-4. Scaling: walk with
+  250 keyframes and 58-view mean tracks (358k observations) ≈ 150 s, ATE 7e-5, focal 4e-6 — global BA
+  dominates (≈ 1–3 s per LM iteration at the end); the keyframe selector should keep tracks moderate.
+* **Limits / TODO**: no intrinsics prior in BA (early self-calibration with few images relies on the ≥ 3-image
+  rule); `planarAlternative` of planar initial pairs is not disambiguated; principal point never refined by
+  default; no loop-closure-specific handling beyond the correspondence graph (retrieval pairs must be in it);
+  live mode keeps a single model.
+
+### `src/sfm` extras — review notes (adversarial review; amends the `src/sfm` extras notes above)
+
+* **Time offset from linear acceleration** (new `estimateTimeOffsetFromAcceleration`): when the device hardly
+  rotates (steady camera while walking / sliding) the gyro-based offset is unobservable and the default (0) was
+  used; a true 40–150 ms offset then biased the IMU scale by 4–9 % while it was still reported `reliable`
+  (σ ≈ 3 %). The fallback minimises 1 − R² of the scale regression over the offset (25 ms grid ±250 ms +
+  golden section, offsets with a non-positive scale rejected; σ from the curvature scaled by the HAC effective
+  row count; ≈ 35 scale fits ≈ 0.2 s Node). `estimateInertialAlignment` and `computeWorldAlignment` use it only
+  when the gyro offset is unreliable; results report `offsetSource: 'gyro' | 'accel' | 'default'` and
+  `accelTimeOffset`. Steady-camera walks/orbits: offset error < 1 ms, scale error < 0.7 % (was 4–9 %).
+* **Robustness**: `GyroIntegrator` drops samples with a non-finite gyro (one NaN made every later attitude NaN);
+  `estimateMetricScale` ignores non-finite accelerations. `alignToGps` ignores fixes with a non-finite accuracy
+  (one such fix made the origin NaN ⇒ null alignment) and falls back to 2 × σ_h for a non-finite
+  `altitudeAccuracy` (was NaN translation); `yawFromCompass` treats a non-finite accuracy as 20°.
+  `VocabularyIndex.addBow` / `query(BowVector)` drop word ids ≥ k and non-positive / non-finite tf (were NaN
+  scores for the whole document). `spatialPairs` never pairs cameras with a non-finite pose; 180° accepts all.
+* **KeyframeSelector**: `sharpnessWarmup > sharpnessWindow` deadlocked (no first keyframe ever) — warm-up is now
+  clamped to the ring size; `revertLastKeyframe` keeps a 16-deep history (two reverts used to drop the reference
+  entirely ⇒ the next frame was a spurious 'first' keyframe while `numKeyframes` > 0); a non-finite `t` is
+  skipped (could commit a NaN keyframe time); NaN `numInliersToLastKF` = "not measured" (no lost / overlap
+  trigger). `rotationCompensatedParallax` skips NaN distances (non-finite / out-of-range keypoints).
+* **mergePairs** (also behind `sequentialPairs` / `retrievalPairs` / `spatialPairs`): typed-array sort of numeric
+  keys for integer ids in [0, 2²⁶) — 400 k pairs ≈ 0.1 s (was ≈ 1.5 s); other ids (≥ 2²⁶, negative) use a
+  collision-free generic path (pairId would collide); non-finite ids dropped.
+* Verified correct (no change): R_wd = R_wc·R_cam_device, gyro right-multiplication and the Magnus sign
+  (h²/12 ωa×ωb), Forster bias Jacobian sign, offset sign (τ = t_cam + offset), specific-force gravity sign,
+  Reinsch spline bands / banded Cholesky, RBJ Butterworth + DF2T steady-state init, filtfilt odd padding, scale
+  model signs (bias_w = −c_w/s₀, bias_d = −c_d/s₀), WGS84/ENU formulas, 4-DOF complex regression and σ,
+  compass yaw sign, `transformPose` vs `Reconstruction.transform`, SIMD rounding bound in `Quantizer`
+  (E = (‖x‖₁ + max‖c‖₁)/2 + ¼ in 1/64 units). SIMD and JS k-means give identical codebooks (tested).
+  Measured z-scores (30 seeds, 60 Hz IMU, ±2 ms jitter): time offset rms 0.96–1.12; gravity err/σ rms 0.4–1.1.
+* Tests: `src/sfm/extras-review.test.ts` (22 tests; 12 reproduce the defects above on the pre-review code, the
+  rest are adversarial guards: π rotations, antimeridian / poles, 1e±3 units, 60 Hz jittery IMU, search-range edges).
+* **Remaining**: yaw comes from GPS (4-DOF) whenever the GPS alignment succeeds, even when its `yawStdRad` is
+  larger than the compass σ (short backyard tracks) — no fusion; `estimateGravity`'s `gravityCam` fallback σ
+  ignores temporal correlation (optimistic); errors-in-variables attenuation of the IMU scale (≈ σ²_noise /
+  var(F[P]), ≈ 2 % only at the 0.08 m/s² excitation floor with the pessimistic simulated 0.05 m/s² noise) is not
+  corrected; TF-IDF with very few indexed images is degenerate (N = 2 ⇒ shared words have idf 0).
+
+### `src/app` + `src/workers/protocol.ts` (mobile UI, engine client, protocol)
+
+* **Protocol** (`src/workers/protocol.ts`, ENGINE.md §2–3 types verbatim + extensions, nothing
+  removed): `EngineMethodMap` types every request (`init`, `frame`, `finishCapture`, `refine`,
+  `densify`, `mesh`, `export`, `loadSession`, `cancel`, `dispose`) plus **`visibility`**
+  `{hidden}` (workers get no `visibilitychange`; the engine must not submit GPU work while hidden).
+  Requests `{id, method, params}`; responses `{id, ok, result | error}`; events `{type: 'progress'
+  (requestId?, stage, progress, message?) | 'live' (update) | 'log' | 'error' (fatal, reason)}`.
+  Errors cross as `SerializedError {name, message, stack?, code?}`; well-known names in
+  `ENGINE_ERRORS` (`CancelledError`, `NotImplementedError`, `EngineCrashedError`,
+  `EngineTimeoutError`, `EngineBusyError`, …). Extensions: `EngineOptions.resume` (re-open the
+  persisted `sessionId` after a worker respawn), optional FramePump metadata on `FrameInput`
+  (`index`, `segment`, `gravityDevice`, `attitude`, `imuCalibrationVersion`, `timeSource`),
+  `loadSession(id, options?)` may be called without `init` and returns `SessionSummary` WITH the
+  stored models (`sparse`, `dense`, `mesh`). `LiveUpdate.overlay` is interleaved (u, v) in [0,1]
+  relative to the frame AS SUBMITTED (un-rotate if the engine works in a canonical orientation).
+  `live` events are only for updates NOT returned as a frame response. A worker that cannot
+  continue (GPU process gone: `requestAdapter()` null) posts `{type:'error', fatal:true,
+  reason:'gpu-lost'}`. `collectTransferables(obj, {minByteLength = 1024})` walks arrays /
+  plain objects / Maps / Sets: ArrayBuffers of typed arrays (each once; never SAB or detached),
+  ImageBitmap, OffscreenCanvas, VideoFrame, MessagePort. Small arrays (poses) are cloned so the
+  sender's copies stay valid — only pass objects whose large buffers the sender gives up.
+* **EngineClient** (`engine-client.ts`, implements `EngineLike`): one frame in flight
+  (`EngineBusyError` otherwise, bitmap closed), `processFrame` resolves with the LiveUpdate and
+  also emits it to `onLive`; timeouts: init 120 s, frame 30 s, long operations = 10 min of
+  INACTIVITY (reset by progress). Respawn (terminate + new worker + replay last `init` with
+  `resume: true` or last `loadSession`; pending requests reject with `EngineCrashedError`) on:
+  module load failure, fatal error event, init timeout, 2 consecutive frame timeouts. Cap 3 per
+  60 s → state `dead`; after 2 GPU-related failures the replay uses `preferGPU: false`.
+  `src/workers/engine.worker.ts` is a PLACEHOLDER (every request → `NotImplementedError` "engine
+  not implemented yet"); the app shows that clearly and suggests `?mock=1`.
+* **MockEngine** (`mock-engine.ts`, `mock-scene.ts`; `?mock=1`, `mockSpeed=<x>`,
+  `mockFail=<method>[:msg]`): procedural object-on-table / backyard scenes; keyframes every 10° of
+  an orbit driven by frame timestamps; overlays are projections of the scene into the moving
+  camera; refine / densify / mesh are timed stages; outputs are real `PointCloud` /
+  `TriangleMesh`, exports go through `src/io` (PLY, GLB, COLMAP ZIP with placeholder JPEGs).
+* **App** (`app.ts`): pure navigation state machine in `router.ts` (no History API — single
+  document, see iOS notes), `Store` (`store.ts`), screens in `screens/*`, components in
+  `components/*` (sheets, dialogs, toasts with `inert` + focus management). Large results live in
+  `app.results`, not in the store. Session metadata (status, stats, thumbnail) is written by the
+  app (`SessionStore`) independently of what the engine persists. The three.js viewer is a lazy
+  chunk (`viewer-loader.ts`, prefetched when idle): entry chunk ≈ 190 KB.
+* **Permissions** (Setup "Start capture" tap): `requestCapturePermissions({geolocation:false})`
+  is called synchronously first (motion inside the gesture, then camera), plus wake lock and
+  `storage.persist()` in the same tap; geolocation is requested right after the camera opened
+  (`GeoSensor.start()`), so an unanswered location prompt / slow first fix never delays the
+  camera. Capture: FramePump (10 Hz, back-pressure) → `engine.processFrame`; hidden page ⇒ pause,
+  resume only from a tap (camera re-acquired inside it when needed); camera errors / denied
+  permissions show recovery cards; the keyframe flash animates only `opacity`; no
+  `backdrop-filter` over the live video (re-blurring every video frame competes with engine GPU
+  work); mini 3D view ≤ 2 Hz, ≤ 20k points (50k expanded), unanimated fits.
+* **Export**: first tap builds the Blob (`engine.exportModel`) and shows its size; the second tap
+  calls `saveFile` synchronously in the handler (5 s transient activation for `navigator.share`);
+  a `NotAllowedError` in Home Screen mode asks for another tap.
+* **Tests**: unit — `format`, `router`, `store`, `overlay-map` (object-fit cover/contain, quarter
+  turns), `stages` (name mapping, ETA), `protocol` (transferables, envelopes, errors), `env`,
+  `mock-engine` (+ scene geometry, exports decode). Browser — `engine-client.gpu.test.ts` with
+  `engine-client.worker-fixture.ts` (transfers, progress routing, cancel, timeouts, respawn +
+  resume, CPU fallback, respawn cap, startup failure, visibility, dispose). E2E —
+  `node e2e/ui/smoke.mjs` (full mock flow at 393×852 @3x with the fake camera, downloads checked,
+  screenshots in `e2e/out/ui/`) and `node e2e/ui/states.mjs` (engine missing, install hint, CPU
+  mode, Lockdown, camera denied, landscape, interruption, processing error).
+* **Headless caveat**: under SwiftShader, `createImageBitmap(video)` at 10 Hz (and even a bare
+  fake-camera `<video>`) saturates the GPU process so that screenshots slow down progressively;
+  the e2e scripts call `app.debug.holdFrames(true)` (stops the pump, pauses the `<video>`) around
+  capture screenshots. Not an issue on devices.
+* **Unverified on device**: wake lock from a tap that navigates to Processing; `navigator.share`
+  of 100+ MB exports; Safari's handling of the overlay canvas at DPR 3 during capture; iPad
+  landscape layout of the capture controls.
+
+### `src/sfm` core — review notes (adversarial review; amends the `src/sfm` core notes above)
+
+* **Deterministic time-sliced global BA** (`adjustGlobalBundleSliced`): slices used to end on wall-clock after
+  any LM iteration and restart with the carried λ but a reset damping-growth factor ν, so batch results depended
+  on CPU load (30-image orbit, 3 ms vs 500 ms slices: f 1397.364 vs 1396.695, k1 0.0284 vs 0.0308). Slices now
+  end only right after an ACCEPTED step (BA `onIteration` + a private cancel token; accepted ⇔ cost decreased),
+  where λ fully describes the LM state, and negative-depth filtering runs only before the first slice ⇒
+  bit-identical to one uninterrupted solve (tested with 0.01 ms slices). A slice is still cut after 3 ×
+  `globalBASliceMs` during a run of rejected steps (only then can slicing change the result).
+  `globalBATimeLimitMs` now bounds the whole sliced BA (was applied per slice, i.e. ignored); the run's cancel
+  token is forwarded into BA. Live mode stays time-bounded (load-dependent) by design.
+* **Degenerate PnP rejected**: with coinciding / tightly clustered inlier observations PnP + refinement moves the
+  camera ~1e8 units away and calls every correspondence an inlier. `registerNextImage` now rejects poses with
+  non-finite values or an inlier 2-D RMS spread < `absPoseMaxErrorPx`.
+* **Forward motion** (walking straight ahead: every pair |t_z| > 0.95, median angles < 2°) gave NO model in batch
+  and live. New last resort `initFallback` (default on), `initFallbackMinTriAngleDeg` 1.5, `initFallbackMaxForwardMotion`
+  0.9999: batch adds one level used only when the regular levels found no model (other captures unchanged, tested);
+  live relaxes after `liveInitFallbackAfter` (10) keyframes to max(1.5°, ½·`liveInitMinTriAngleDeg`) + forward ≤ 0.9999,
+  after 20 to 1.5°; evaluated pairs are cached (`initCache`) and re-checked for free. Forward walk (50–60 frames):
+  batch all registered, ATE 6.5e-5 of the extent, f 0.4 %; live initialises at keyframe ≈ 19, all registered.
+* **Validation**: `isValidImageId` (integer in [0, 2²⁰)) enforced by `setTwoView`, `CorrespondenceGraph.addImage`
+  (also integer feature count ≥ 0) and `Reconstruction.addImage` — `pairKey(0, 2²⁰+5) === pairKey(1, 5)` aliased pairs.
+  `addPoint` rejects a track listing an element twice (double-counted `numPoints3D`) or an out-of-range feature, with no
+  side effects. `transform` throws for s ≤ 0 / non-finite. `angularError` is π for depth ≤ 0 (was 0 — a "perfect"
+  continuation — for a point at the camera centre).
+* **Smaller fixes**: `LiveMapper.refine()` reports images dropped by its image filter in `pendingIds()`;
+  `findInitialPair` reads stored pairs in canonical order (no inverted copies cached for half the pairs).
+* **Clarification**: `merge` (as COLMAP) can join two tracks that both observe an image; continue / complete never add a
+  second observation of an image. Visibility counts of images whose graph edges change AFTER they were added (pair
+  replacement / late pairs) can go stale; only next-best-view ranking reads them and registration resyncs first.
+* Verified correct (no change): `transform` pose update, `invertTwoView`, visibility pyramid vs COLMAP, ray triangulator
+  (cheirality, angle tests, LO), local/global gauges (largest relative-translation axis), intrinsics flags, COLMAP
+  filter / merge / complete / retriangulate semantics, multi-model registration bookkeeping, cancel at any point.
+* **Tests**: `core-review.test.ts` (adversarial: ids, π rotations, 1e±3 scales with 1e5 offsets, parallel / behind rays,
+  60 % outlier rays, 600-step bookkeeping fuzz with an exhaustive invariant checker incl. brute-force visibility,
+  next-best view, registration thresholds, bit-identical gauges / constant intrinsics, cancel at the k-th token read,
+  forward walk, live invariants per keyframe, π-rotation × 1e3 × 1e5 similarity mid-capture), `core-stress.test.ts`,
+  `core-testutil.ts` (`reconstructionInvariantErrors`). `synthetic.ts` kinds `'loop'` (closed ≈ 110 m walk around the yard,
+  22 × 12 m ellipse, extra south fence / house / tree) and `'forward'`; existing kinds keep their random streams.
+* **Measured** (Node, load 8–10): loop 200 keyframes batch 200/200, ATE 3.2e-5 of 93 m (3 mm), max centre error 1.6 cm
+  (no loop drift), f 9e-5, k1 0.0299, 0.85 px, ≈ 25 s (+ 13 s verification), max event-loop stall ≈ 0.7–1.3 s; live 200/200,
+  per keyframe median 35 ms / p90 100 ms / max 1.3 s, after `refine()` ATE 2.8e-5. Orbit 120 views (31-view tracks, 161 k
+  observations): batch 21 s, ATE 3.3e-5, f 1e-5; live 120/120, median 96 ms.
+
+### `src/app` — review notes (adversarial review; amends the `src/app` notes above)
+
+* **EngineClient timeouts pause while the page is hidden.** iOS suspends a hidden page and its
+  workers (and drops GPU work), so a request in flight across a trip to the background used to
+  "time out" the moment the user came back: 2 frames ⇒ stuck-worker respawn, `init` ⇒ respawn,
+  a long refine ⇒ "Processing failed". `setHidden(true)` now stops every request timer and
+  `setHidden(false)` restarts the full timeout (progress events received while hidden do not
+  re-arm it either).
+* **`collectTransferables` no longer transfers partial views** (`pool.subarray(0, n)`, several
+  arrays in one allocation) unless `transferPartialViews: true`: transferring detaches the WHOLE
+  buffer, so an engine returning a view of its growing point buffer would have silently lost it.
+  Partial views are cloned (which copies the full underlying buffer — `slice()` them first).
+* **Capture**: frame errors go through `frameErrorAction` (`capture-policy.ts`): a `dead` engine
+  (respawn cap) stops the pump with an error card instead of failing every frame at 10 Hz;
+  quota errors (`StorageQuotaError` / `QuotaExceededError` / `code: 'quota'`) pause the scan
+  with "Finish scan / Resume / Back to home". A quota error when the session record is created
+  blocks the scan before any frame ("Storage is full"); < 300 MB of origin quota left ⇒ warning.
+  `App.createSession` returns `{status: 'ok' | 'quota' | 'error' | 'unavailable'}`.
+* **Overlay**: keypoints of a frame captured at another UI rotation are dropped, not rotated —
+  both the frame bitmap and the `<video>` are upright for THEIR rotation (the UI rotation
+  compensates the device roll), so a quarter turn put them in the wrong place
+  (`overlayMatchesView`). The overlay canvas is capped at 2× DPR (12 MB → 5 MB at DPR 3).
+* **Camera reconnect** waits for a restart CameraCapture is already doing after the page became
+  visible (`restart()` refused it and showed a bogus "could not restart" card).
+* **Processing opened from Home** used the PREVIOUS scan's `app.results` (name, quality, stages
+  shown as built) until the engine had loaded the new one; it now shows "Opening scan…" and fills
+  in name / quality / stages after `ensureSessionLoaded`. A `dead` engine is not retryable.
+* **Export sheet**: a file finished after the sheet was closed and reopened updated the detached
+  old list (stuck "Preparing…"); the open sheet's renderer is tracked. Double taps on "Share /
+  Save" are ignored for 2 s or until the share settles (a second `share()` rejects with
+  `InvalidStateError`, which in a Safari tab fell back to a download on top of the sheet).
+* **Navigation**: the exiting screen is `inert` + `aria-hidden` during its fade; focus moves to
+  the new screen's `h1` (or the screen) when it was on the old screen / `<body>`; the enter
+  transition has a timer fallback when rAF does not run (starved compositor). `beforeunload`
+  asks before leaving a running capture / processing (desktop, Android; iOS shows no prompt).
+* **Small fixes**: SW registration also when `load` already fired (the `?mock=1` boot awaits a
+  chunk); Home thumbnails' object URLs are reused across the per-minute refresh (no flicker) and
+  never created after `leave()`; export file names keep non-Latin letters (only Latin accents are
+  dropped); `--text-3` raised to ≥ 4.5:1 on every surface; sheet close and toast action buttons
+  are 44 px targets; recovery cards scroll (they were clipped in landscape); the expanded live
+  3D view in landscape no longer covers Cancel; the live 3D view is never a button inside a
+  button; the status pill says "Paused" while paused.
+* **Tests**: `capture-policy.test.ts`, `format.test.ts` (non-Latin names), `protocol.test.ts`
+  (partial views), `engine-client.gpu.test.ts` (timeouts paused while hidden, no respawn of a
+  stuck init while hidden). E2E: `node e2e/ui/states.mjs` gained `storage-full-start`,
+  `storage-full-capture`, `engine-dead`, `export-reopen`, `open-other-session`, `focus`;
+  `node e2e/ui/layouts.mjs [se|landscape|ipad]` audits every screen and sheet at 375×667,
+  852×393 and 1180×820 (no horizontal overflow, controls inside the viewport, ≥ 44 px touch
+  targets, no clipped text) with screenshots `e2e/out/ui/layout-*.png`.
+* **Still unverified on a device**: Safari's `inert`/focus behaviour with VoiceOver; whether a
+  `devicemotion`/camera prompt makes the page `hidden` (it should not); share of 100+ MB files.

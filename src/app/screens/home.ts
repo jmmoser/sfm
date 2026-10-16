@@ -19,7 +19,9 @@ const INSTALL_HINT_KEY = 'sfm.hideInstallHint';
 
 export function createHomeScreen(app: App): Screen {
   const d = new Disposer();
-  const urls: string[] = [];
+  /** Thumbnail object URLs by session id + blob (reused across re-renders, revoked on leave). */
+  const thumbUrls = new Map<string, { blob: Blob; url: string }>();
+  let closed = false;
   const banners = h('div', { class: 'banners' });
   const listHost = h('div', { class: 'session-list-host' });
   const storageHost = h('div', { class: 'storage-host' });
@@ -78,19 +80,24 @@ export function createHomeScreen(app: App): Screen {
 
   function thumb(s: SessionMeta): HTMLElement {
     if (s.thumbnail instanceof Blob && s.thumbnail.size > 0) {
-      const url = URL.createObjectURL(s.thumbnail);
-      urls.push(url);
-      return h('img', { class: 'session-thumb', src: url, alt: '', loading: 'lazy', decoding: 'async' });
+      let t = thumbUrls.get(s.id);
+      if (!t || t.blob !== s.thumbnail) {
+        if (t) URL.revokeObjectURL(t.url);
+        t = { blob: s.thumbnail, url: URL.createObjectURL(s.thumbnail) };
+        thumbUrls.set(s.id, t);
+      }
+      return h('img', { class: 'session-thumb', src: t.url, alt: '', loading: 'lazy', decoding: 'async' });
     }
     return h('span', { class: 'session-thumb session-thumb-empty' }, icon(s.mode === 'scene' ? 'area' : 'cube', { size: 26 }));
   }
 
   function openSession(s: SessionMeta): void {
-    if (!routeForSession(s.id, s.status, s.numFrames)) {
-      toast(`This capture was interrupted with ${plural(s.numFrames, 'photo')} — at least ${MIN_KEYFRAMES} are needed.`, { tone: 'warn' });
+    const n = photoCount(s);
+    if (!routeForSession(s.id, s.status, n)) {
+      toast(`This capture was interrupted with ${plural(n, 'photo')} — at least ${MIN_KEYFRAMES} are needed.`, { tone: 'warn' });
       return;
     }
-    app.navigate({ type: 'OPEN_SESSION', sessionId: s.id, status: s.status, numFrames: s.numFrames });
+    app.navigate({ type: 'OPEN_SESSION', sessionId: s.id, status: s.status, numFrames: n });
   }
 
   async function rename(s: SessionMeta): Promise<void> {
@@ -117,7 +124,7 @@ export function createHomeScreen(app: App): Screen {
   }
 
   function more(s: SessionMeta): void {
-    const canOpen = !!routeForSession(s.id, s.status, s.numFrames);
+    const canOpen = !!routeForSession(s.id, s.status, photoCount(s));
     actionSheet(
       s.name,
       [
@@ -130,7 +137,15 @@ export function createHomeScreen(app: App): Screen {
   }
 
   function renderList(): void {
-    for (const u of urls.splice(0)) URL.revokeObjectURL(u);
+    if (closed) return;
+    // Drop the URLs of sessions that are gone (deleted).
+    const ids = new Set(sessions.map((s) => s.id));
+    for (const [id, t] of thumbUrls) {
+      if (!ids.has(id)) {
+        URL.revokeObjectURL(t.url);
+        thumbUrls.delete(id);
+      }
+    }
     if (!sessions.length) {
       replaceChildren(
         listHost,
@@ -158,7 +173,7 @@ export function createHomeScreen(app: App): Screen {
           'span',
           { class: 'session-text' },
           h('span', { class: 'session-name', text: s.name }),
-          h('span', { class: 'session-meta', text: `${formatRelativeDate(s.createdAt)} · ${plural(s.numFrames, 'photo')}` }),
+          h('span', { class: 'session-meta', text: `${formatRelativeDate(s.createdAt)} · ${plural(photoCount(s), 'photo')}` }),
           h('span', { class: 'session-chips' }, chip(st.label, st.tone), chip(modeLabel(s.mode), 'neutral')),
         ),
       );
@@ -181,7 +196,9 @@ export function createHomeScreen(app: App): Screen {
       console.warn('[home] listSessions failed', e);
       sessions = [];
     }
-    if (!el.isConnected) return;
+    // `closed`, not isConnected: the element stays in the DOM during the exit transition, and
+    // object URLs created after leave() would never be revoked.
+    if (closed) return;
     renderList();
   }
 
@@ -229,7 +246,7 @@ export function createHomeScreen(app: App): Screen {
       card.appendChild(close);
       parts.push(card);
     }
-    if (!el.isConnected) return;
+    if (closed) return;
     replaceChildren(storageHost, ...parts);
   }
 
@@ -247,10 +264,18 @@ export function createHomeScreen(app: App): Screen {
       }, 60_000);
     },
     leave() {
+      closed = true;
       d.dispose();
-      for (const u of urls.splice(0)) URL.revokeObjectURL(u);
+      for (const t of thumbUrls.values()) URL.revokeObjectURL(t.url);
+      thumbUrls.clear();
     },
   };
+}
+
+/** Stored frames, or the keyframe count recorded at capture time (engines that store none). */
+export function photoCount(s: Pick<SessionMeta, 'numFrames' | 'stats'>): number {
+  const kf = s.stats?.keyframes;
+  return Math.max(s.numFrames, typeof kf === 'number' && Number.isFinite(kf) ? kf : 0);
 }
 
 function hiddenInstallHint(): boolean {

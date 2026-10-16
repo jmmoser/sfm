@@ -13,6 +13,7 @@
  */
 import type { CameraIntrinsics, Mat3, MetricInfo, Pose, Vec3 } from '../core/types';
 import type { CorrespondenceGraph } from './correspondence-graph';
+import { isValidImageId } from './database';
 
 export interface Track {
   image: number;
@@ -158,6 +159,8 @@ export class Reconstruction {
   private graph: CorrespondenceGraph | null = null;
   private vis = new Map<number, VisData>();
   private numObs = 0;
+  /** Dense image lookup by id (hot loops). */
+  private lut: (RecImage | undefined)[] = [];
 
   // ------------------------------------------------------------------ cameras / images
 
@@ -175,6 +178,7 @@ export class Reconstruction {
    * full-resolution px) are needed for reprojection errors and visibility scores.
    */
   addImage(id: number, cameraId: number, numFeatures: number, keypoints: Float32Array | null = null): RecImage {
+    if (!isValidImageId(id)) throw new RangeError(`Reconstruction.addImage: bad image id ${id} (integer in [0, 2^20))`);
     if (this.images.has(id)) throw new RangeError(`Reconstruction.addImage: image ${id} exists`);
     if (!this.cameras.has(cameraId)) throw new RangeError(`Reconstruction.addImage: unknown camera ${cameraId}`);
     const img: RecImage = {
@@ -189,6 +193,7 @@ export class Reconstruction {
       visibilityScore: 0,
     };
     this.images.set(id, img);
+    this.lut[id] = img;
     if (this.graph) this.initVis(img);
     return img;
   }
@@ -217,6 +222,11 @@ export class Reconstruction {
     }
   }
 
+  /** Dense lookup table image id → image (undefined if absent); do not mutate. */
+  imageLUT(): ReadonlyArray<RecImage | undefined> {
+    return this.lut;
+  }
+
   /** Registered image ids in registration order. */
   registeredImageIds(): number[] {
     return this.regOrder.slice();
@@ -239,18 +249,26 @@ export class Reconstruction {
 
   /** Adds a point with the given track (features must not have a point yet). Returns its id. */
   addPoint(xyz: ArrayLike<number>, track: Track[], color?: ArrayLike<number>): number {
-    const id = this.nextPointId++;
-    for (const el of track) {
+    // validate (features free, no element twice — marked −2 while checking) before mutating
+    for (let k = 0; k < track.length; k++) {
+      const el = track[k];
       const img = this.images.get(el.image);
-      if (!img) throw new RangeError(`Reconstruction.addPoint: unknown image ${el.image}`);
-      if (img.point3D[el.feature] !== -1)
+      const cur = img ? img.point3D[el.feature] : undefined;
+      if (cur !== -1) {
+        for (let q = 0; q < k; q++) this.lut[track[q].image]!.point3D[track[q].feature] = -1;
+        if (!img) throw new RangeError(`Reconstruction.addPoint: unknown image ${el.image}`);
+        if (cur === undefined) throw new RangeError(`Reconstruction.addPoint: feature ${el.feature} out of range in image ${el.image}`);
+        if (cur === -2) throw new Error(`Reconstruction.addPoint: element (${el.image}, ${el.feature}) appears twice in the track`);
         throw new Error(`Reconstruction.addPoint: feature ${el.feature} of image ${el.image} already has a point`);
+      }
+      img!.point3D[el.feature] = -2;
     }
+    const id = this.nextPointId++;
     const tr: Track[] = new Array(track.length);
     for (let k = 0; k < track.length; k++) {
       const el = track[k];
       tr[k] = { image: el.image, feature: el.feature };
-      const img = this.images.get(el.image)!;
+      const img = this.lut[el.image]!;
       img.point3D[el.feature] = id;
       img.numPoints3D++;
     }
@@ -313,7 +331,7 @@ export class Reconstruction {
     if (!p) return;
     if (this.graph) for (const el of p.track) this.resetTriObservation(el.image, el.feature);
     for (const el of p.track) {
-      const img = this.images.get(el.image)!;
+      const img = this.lut[el.image]!;
       img.point3D[el.feature] = -1;
       img.numPoints3D--;
     }
@@ -395,7 +413,7 @@ export class Reconstruction {
     const lim = Math.min(n, heads.length);
     for (let f = 0; f < lim; f++) {
       for (let e = heads[f]; e >= 0; e = nx[e]) {
-        const other = this.images.get(im[e]);
+        const other = this.lut[im[e]];
         if (other && other.point3D[ft[e]] >= 0) this.incrementCorr(img, vd, f);
       }
     }
@@ -449,7 +467,7 @@ export class Reconstruction {
       im = g.imageOf,
       ft = g.featureOf;
     for (let e = heads[feature]; e >= 0; e = nx[e]) {
-      const other = this.images.get(im[e]);
+      const other = this.lut[im[e]];
       if (!other) continue;
       const vd = this.vis.get(other.id);
       if (vd && ft[e] < vd.counts.length) this.incrementCorr(other, vd, ft[e]);
@@ -464,7 +482,7 @@ export class Reconstruction {
       im = g.imageOf,
       ft = g.featureOf;
     for (let e = heads[feature]; e >= 0; e = nx[e]) {
-      const other = this.images.get(im[e]);
+      const other = this.lut[im[e]];
       if (!other) continue;
       const vd = this.vis.get(other.id);
       if (vd && ft[e] < vd.counts.length) this.decrementCorr(other, vd, ft[e]);
@@ -478,8 +496,13 @@ export class Reconstruction {
 
   // ------------------------------------------------------------------ geometry ops
 
-  /** Applies X' = s R X + t to points and poses (R' = R_i Rᵀ, t' = s t_i − R' t). */
+  /**
+   * Applies X' = s R X + t to points and poses (R' = R_i Rᵀ, t' = s t_i − R' t), so
+   * every projection is unchanged. s must be finite and > 0 (s ≤ 0 would put the
+   * points behind their cameras); R must be a rotation.
+   */
   transform(s: number, R: Mat3, t: Vec3): void {
+    if (!(s > 0 && s < Infinity)) throw new RangeError(`Reconstruction.transform: scale must be finite and > 0 (got ${s})`);
     for (const p of this.points.values()) {
       const x = p.xyz[0],
         y = p.xyz[1],
@@ -531,7 +554,7 @@ export class Reconstruction {
         X1 = p.xyz[1],
         X2 = p.xyz[2];
       for (const el of p.track) {
-        const img = this.images.get(el.image)!;
+        const img = this.lut[el.image]!;
         const kp = img.keypoints;
         if (!kp) continue;
         const e2 = reprojectionErrorSq(
@@ -613,10 +636,36 @@ export class Reconstruction {
     return this.filterPoints3D(maxReprojErrorPx, minTriAngle, [...this.points.keys()]);
   }
 
+  /**
+   * Flat per-image projection table (R 9, t 3, f, cx, cy, k1, k2 = 17 doubles) for
+   * images with keypoints; `slot[id]` = row or −1.
+   */
+  private projectionTable(): { table: Float64Array; slot: Int32Array } {
+    const slot = new Int32Array(this.lut.length).fill(-1);
+    const table = new Float64Array(17 * this.images.size);
+    let r = 0;
+    for (const img of this.images.values()) {
+      if (!img.keypoints) continue;
+      const cam = this.cameras.get(img.cameraId)!;
+      const o = 17 * r;
+      table.set(img.pose.R, o);
+      table.set(img.pose.t, o + 9);
+      table[o + 12] = cam.f;
+      table[o + 13] = cam.cx;
+      table[o + 14] = cam.cy;
+      table[o + 15] = cam.k1;
+      table[o + 16] = cam.k2;
+      slot[img.id] = r++;
+    }
+    return { table, slot };
+  }
+
   private filterLargeReprojError(maxErr: number, ids: number[]): number {
     const max2 = maxErr * maxErr;
     let removed = 0;
-    let bad: number[] = [];
+    const bad: number[] = [];
+    const { table: T, slot } = this.projectionTable();
+    const lut = this.lut;
     for (const id of ids) {
       const p = this.points.get(id);
       if (!p) continue;
@@ -626,23 +675,28 @@ export class Reconstruction {
       const X0 = p.xyz[0],
         X1 = p.xyz[1],
         X2 = p.xyz[2];
-      for (let k = 0; k < p.track.length; k++) {
-        const el = p.track[k];
-        const img = this.images.get(el.image)!;
-        const kp = img.keypoints;
-        if (!kp) {
+      const tr = p.track;
+      for (let k = 0; k < tr.length; k++) {
+        const el = tr[k];
+        const r = slot[el.image];
+        if (r < 0) {
           good++;
           continue;
         }
-        const e2 = reprojectionErrorSq(
-          this.cameras.get(img.cameraId)!,
-          img.pose,
-          X0,
-          X1,
-          X2,
-          kp[4 * el.feature],
-          kp[4 * el.feature + 1],
-        );
+        const o = 17 * r;
+        const z = T[o + 6] * X0 + T[o + 7] * X1 + T[o + 8] * X2 + T[o + 11];
+        let e2 = Infinity;
+        if (z > 1e-12) {
+          const iz = 1 / z;
+          const x = (T[o] * X0 + T[o + 1] * X1 + T[o + 2] * X2 + T[o + 9]) * iz;
+          const y = (T[o + 3] * X0 + T[o + 4] * X1 + T[o + 5] * X2 + T[o + 10]) * iz;
+          const r2 = x * x + y * y;
+          const fd = T[o + 12] * (1 + r2 * (T[o + 15] + T[o + 16] * r2));
+          const kp = lut[el.image]!.keypoints!;
+          const du = fd * x + T[o + 13] - kp[4 * el.feature],
+            dv = fd * y + T[o + 14] - kp[4 * el.feature + 1];
+          e2 = du * du + dv * dv;
+        }
         if (e2 > max2 || !(e2 < Infinity)) bad.push(k);
         else {
           sum += Math.sqrt(e2);
@@ -653,17 +707,16 @@ export class Reconstruction {
         p.error = good > 0 ? sum / good : -1;
         continue;
       }
-      if (p.track.length - bad.length <= 1) {
-        removed += p.track.length;
+      if (tr.length - bad.length <= 1) {
+        removed += tr.length;
         this.deletePoint(id);
         continue;
       }
-      const els = bad.map((k) => p.track[k]);
+      const els = bad.map((k) => tr[k]);
       for (const el of els) this.deleteObservation(el.image, el.feature);
       removed += els.length;
       p.error = good > 0 ? sum / good : -1;
     }
-    bad = [];
     return removed;
   }
 
@@ -676,7 +729,7 @@ export class Reconstruction {
       const n = p.track.length;
       if (TRI_SCRATCH.length < 3 * n) TRI_SCRATCH = new Float64Array(3 * n * 2);
       const C = TRI_SCRATCH;
-      for (let k = 0; k < n; k++) centerOf(this.images.get(p.track[k].image)!.pose, C, 3 * k);
+      for (let k = 0; k < n; k++) centerOf(this.lut[p.track[k].image]!.pose, C, 3 * k);
       let ok = false;
       for (let a = 0; a < n && !ok; a++)
         for (let b = a + 1; b < n; b++)
@@ -692,20 +745,56 @@ export class Reconstruction {
     return removed;
   }
 
+  /**
+   * Removes observations IN the given images whose reprojection error exceeds
+   * maxReprojErrorPx (or that are behind the camera); a point left with < 2
+   * observations is deleted. Cheaper than `filterPoints3DInImages` (which checks every
+   * observation of the images' points) after a local BA that only moved these poses.
+   * Returns the number of removed observations.
+   */
+  filterObservationsInImages(maxReprojErrorPx: number, imageIds: Iterable<number>): number {
+    const max2 = maxReprojErrorPx * maxReprojErrorPx;
+    let removed = 0;
+    const bad: number[] = [];
+    for (const iid of imageIds) {
+      const img = this.images.get(iid);
+      if (!img || !img.keypoints) continue;
+      const cam = this.cameras.get(img.cameraId)!;
+      const kp = img.keypoints;
+      const p3 = img.point3D;
+      bad.length = 0;
+      for (let f = 0; f < p3.length; f++) {
+        const pid = p3[f];
+        if (pid < 0) continue;
+        const X = this.points.get(pid)!.xyz;
+        const e2 = reprojectionErrorSq(cam, img.pose, X[0], X[1], X[2], kp[4 * f], kp[4 * f + 1]);
+        if (!(e2 <= max2)) bad.push(f);
+      }
+      for (const f of bad) {
+        const pid = p3[f];
+        if (pid < 0) continue;
+        const p = this.points.get(pid)!;
+        removed += p.track.length <= 2 ? p.track.length : 1;
+        this.deleteObservation(iid, f);
+      }
+    }
+    return removed;
+  }
+
   /** Removes observations of points behind their camera (COLMAP, before global BA). */
   filterObservationsWithNegativeDepth(): number {
     let removed = 0;
     const els: Track[] = [];
     for (const p of this.points.values()) {
       for (const el of p.track) {
-        const img = this.images.get(el.image)!;
+        const img = this.lut[el.image]!;
         const R = img.pose.R;
         const z = R[6] * p.xyz[0] + R[7] * p.xyz[1] + R[8] * p.xyz[2] + img.pose.t[2];
         if (!(z > 1e-12)) els.push(el);
       }
     }
     for (const el of els) {
-      const img = this.images.get(el.image)!;
+      const img = this.lut[el.image]!;
       if (img.point3D[el.feature] >= 0) {
         this.deleteObservation(el.image, el.feature);
         removed++;
@@ -754,12 +843,15 @@ export class Reconstruction {
   clone(): Reconstruction {
     const r = new Reconstruction();
     for (const [id, c] of this.cameras) r.cameras.set(id, { ...c });
-    for (const [id, img] of this.images)
-      r.images.set(id, {
+    for (const [id, img] of this.images) {
+      const c: RecImage = {
         ...img,
         pose: { R: Float64Array.from(img.pose.R), t: Float64Array.from(img.pose.t) },
         point3D: Int32Array.from(img.point3D),
-      });
+      };
+      r.images.set(id, c);
+      r.lut[id] = c;
+    }
     for (const [id, p] of this.points)
       r.points.set(id, {
         id,

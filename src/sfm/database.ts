@@ -13,6 +13,11 @@ import { mat3Inv, mat3Transpose } from '../math/mat3';
 export const MAX_IMAGE_ID = 1 << 20;
 const PAIR_SHIFT = MAX_IMAGE_ID;
 
+/** True for a valid image id (integer in [0, MAX_IMAGE_ID)); larger ids would make `pairKey` collide. */
+export function isValidImageId(id: number): boolean {
+  return Number.isInteger(id) && id >= 0 && id < MAX_IMAGE_ID;
+}
+
 /**
  * Order-independent integer key of an image pair: min·2^20 + max (exact in a double,
  * ids < 2^20). pairKey(a, b) === pairKey(b, a).
@@ -73,7 +78,7 @@ export class FeatureDatabase {
   /** Adds (or replaces) a frame with its features and optional per-feature colours. */
   addFrame(info: FrameInfo, features: FeatureSet, colors?: Uint8Array): void {
     const id = info.id;
-    if (!(Number.isInteger(id) && id >= 0 && id < MAX_IMAGE_ID)) throw new RangeError(`FeatureDatabase: bad frame id ${id}`);
+    if (!isValidImageId(id)) throw new RangeError(`FeatureDatabase: bad frame id ${id}`);
     if (colors && colors.length < 3 * features.count)
       throw new RangeError('FeatureDatabase: colors must have 3 bytes per feature');
     this.frames.set(id, info);
@@ -99,6 +104,7 @@ export class FeatureDatabase {
   /** Stores the verified geometry of (a, b) — given oriented a → b — canonically (min id first). */
   setTwoView(a: number, b: number, geom: TwoViewGeometry): void {
     if (a === b) throw new RangeError('FeatureDatabase.setTwoView: a === b');
+    if (!isValidImageId(a) || !isValidImageId(b)) throw new RangeError(`FeatureDatabase.setTwoView: bad image id ${isValidImageId(a) ? b : a}`);
     const key = pairKey(a, b);
     this.twoViews.set(key, a < b ? geom : invertTwoView(geom));
     this.invCache.delete(key);

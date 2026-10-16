@@ -39,7 +39,7 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
   let closed = false;
   const motionTest: MotionTest = { state: 'idle' };
   const body = h('div', { class: 'diag-body' }, h('div', { class: 'list-loading' }, spinner('md', 'Collecting diagnostics')));
-  const copyBtn = button({ label: 'Copy', icon: 'copy', variant: 'secondary', size: 'sm', testId: 'diag-copy', onClick: () => void copy() });
+  const copyBtn = button({ label: 'Copy', icon: 'copy', variant: 'ghost', size: 'sm', testId: 'diag-copy', onClick: () => void copy() });
   copyBtn.disabled = true;
 
   const el = h(
@@ -169,7 +169,7 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
       if (gpu.isSoftware !== undefined) gpuRows.push(kvRow('Software renderer', yesNo(gpu.isSoftware)));
       for (const k of KEY_LIMITS) {
         const v = gpu.limits?.[k];
-        if (typeof v === 'number') gpuRows.push(kvRow(k, h('span', { class: 'mono', text: BYTE_LIMITS.has(k) ? `${formatBytes(v)} (${v})` : String(v) })));
+        if (typeof v === 'number') gpuRows.push(kvRow(camelBreaks(k), h('span', { class: 'mono', text: BYTE_LIMITS.has(k) ? `${formatBytes(v)} (${v})` : String(v) })));
       }
       if (gpu.preferredCanvasFormat) gpuRows.push(kvRow('Canvas format', h('span', { class: 'mono', text: gpu.preferredCanvasFormat })));
     }
@@ -249,7 +249,10 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
 
     sections.push(section('Memory', group(...memoryHints(g))));
     if (g.errors.length) sections.push(section('Probe errors', h('pre', { class: 'code-block', text: g.errors.join('\n') })));
+    // Re-rendering replaces the focused control (e.g. the motion test button): keep focus on it.
+    const focused = body.contains(document.activeElement) ? (document.activeElement as HTMLElement).dataset.testid : undefined;
     replaceChildren(body, ...sections);
+    if (focused) body.querySelector<HTMLElement>(`[data-testid="${focused}"]`)?.focus({ preventScroll: true });
   }
 
   return {
@@ -271,6 +274,11 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
       d.dispose();
     },
   };
+}
+
+/** Insert zero-width break opportunities at camelCase boundaries (long WebGPU limit names). */
+function camelBreaks(s: string): string {
+  return s.replace(/([a-z0-9])([A-Z])/g, '$1\u200b$2');
 }
 
 /** RAM is not exposed on iOS; WebGPU maxBufferSize is a coarse proxy (ios-platform.md §1.1). */

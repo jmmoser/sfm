@@ -2,6 +2,8 @@
  * Visual-inertial alignment of a finished reconstruction (ARCHITECTURE §5 "Refine"):
  *  (a) `estimateTimeOffset` — camera ↔ IMU clock offset by matching relative rotations of
  *      consecutive keyframes (SfM) with gyro-integrated rotations, jointly with a gyro bias;
+ *  (a') `estimateTimeOffsetFromAcceleration` — the same offset from linear acceleration, for
+ *      captures with too little angular acceleration (an offset error biases the scale);
  *  (b) `estimateGravity` — gravity direction in the reconstruction frame from the specific
  *      force rotated into the world by the vision-anchored attitude;
  *  (c) `estimateMetricScale` — metres per reconstruction unit by regressing band-limited
@@ -127,6 +129,11 @@ function mtm(a: Float64Array, ao: number, b: Float64Array, bo: number, out: Floa
   }
 }
 
+/** Whether a 3-vector is present and all its components are finite. */
+function finite3(v: ArrayLike<number> | null | undefined): boolean {
+  return !!v && Number.isFinite(v[0]) && Number.isFinite(v[1]) && Number.isFinite(v[2]);
+}
+
 function sortKeyframes(kfs: readonly InertialKeyframe[]): InertialKeyframe[] {
   return kfs.filter((k) => Number.isFinite(k.t)).sort((a, b) => a.t - b.t);
 }
@@ -158,8 +165,13 @@ export class GyroIntegrator {
   private tm = new Float64Array(9);
   private ti = new Float64Array(9);
 
-  constructor(samples: readonly ImuSample[]) {
-    const s = samples.filter((x) => Number.isFinite(x.t)).sort((a, b) => a.t - b.t);
+  /**
+   * @param samples IMU samples (any order; duplicates in time and samples with a non-finite
+   *   time or gyro value are dropped — one NaN would otherwise poison every later attitude)
+   * @param gyroBias optional constant gyro bias (rad/s, device frame) subtracted from ω
+   */
+  constructor(samples: readonly ImuSample[], gyroBias?: ArrayLike<number> | null) {
+    const s = samples.filter((x) => Number.isFinite(x.t) && finite3(x.gyro)).sort((a, b) => a.t - b.t);
     const keep: ImuSample[] = [];
     for (const x of s) if (keep.length === 0 || x.t > keep[keep.length - 1].t) keep.push(x);
     const n = keep.length;
@@ -168,11 +180,14 @@ export class GyroIntegrator {
     this.w = new Float64Array(3 * n);
     this.q = new Float64Array(4 * n);
     this.W = new Float64Array(9 * n);
+    const bx = gyroBias ? gyroBias[0] : 0,
+      by = gyroBias ? gyroBias[1] : 0,
+      bz = gyroBias ? gyroBias[2] : 0;
     for (let i = 0; i < n; i++) {
       this.t[i] = keep[i].t;
-      this.w[3 * i] = keep[i].gyro[0];
-      this.w[3 * i + 1] = keep[i].gyro[1];
-      this.w[3 * i + 2] = keep[i].gyro[2];
+      this.w[3 * i] = keep[i].gyro[0] - bx;
+      this.w[3 * i + 1] = keep[i].gyro[1] - by;
+      this.w[3 * i + 2] = keep[i].gyro[2] - bz;
     }
     if (n === 0) return;
     this.q[0] = 1;
@@ -727,6 +742,8 @@ export interface GravityOptions {
   minSamples: number;
   /** Correlation time of hand motion used for the uncertainty (s, default 0.5). */
   correlationS: number;
+  /** Gyro bias (rad/s) to remove before integration, e.g. `TimeOffsetResult.gyroBias`. */
+  gyroBias: ArrayLike<number> | null;
 }
 
 /** Gravity estimate in the reconstruction frame. */
@@ -742,7 +759,7 @@ export interface GravityResult {
   source: 'accelG' | 'gravityCam';
 }
 
-const DEFAULT_GRAVITY: GravityOptions = { offsetMs: 0, g0: G0, magnitudeSigma: 0.5, minSamples: 20, correlationS: 0.5 };
+const DEFAULT_GRAVITY: GravityOptions = { offsetMs: 0, g0: G0, magnitudeSigma: 0.5, minSamples: 20, correlationS: 0.5, gyroBias: null };
 
 /**
  * Gravity direction: weighted mean of the world-frame specific force f = R_wd(t)·accelG over
@@ -758,7 +775,7 @@ export function estimateGravity(
   const o = { ...DEFAULT_GRAVITY, ...options };
   const kf = sortKeyframes(keyframes);
   if (kf.length === 0) return null;
-  const gyro = new GyroIntegrator(imu);
+  const gyro = new GyroIntegrator(imu, o.gyroBias);
   const t0 = kf[0].t + o.offsetMs - 100,
     t1 = kf[kf.length - 1].t + o.offsetMs + 100;
   let cnt = 0;
@@ -1079,10 +1096,18 @@ export interface MetricScaleOptions {
   gridHz: number;
   /** Seconds trimmed at both ends of each segment (default 0.5). */
   edgeTrimS: number;
-  /** Also estimate a constant device-frame accelerometer bias (with a prior; default false). */
+  /**
+   * Also estimate a constant device-frame accelerometer bias with a Gaussian prior (default
+   * true). Important for orbits: a device-frame bias along the optical axis rotates with the
+   * centripetal acceleration and would otherwise masquerade as a scale change.
+   */
   estimateDeviceBias: boolean;
   /** Prior σ (m/s²) of the device-frame bias (default 0.05). */
   deviceBiasSigma: number;
+  /** Max lag (s) of the Newey–West uncertainty estimate (default 3). */
+  hacLagS: number;
+  /** Gyro bias (rad/s) to remove before integration, e.g. `TimeOffsetResult.gyroBias`. */
+  gyroBias: ArrayLike<number> | null;
   /** Keyframe gaps (ms) above which the trajectory is split into segments (default 3000). */
   maxGapMs: number;
   /** IMU gaps (ms) above which segments are split (default 250). */
@@ -1130,8 +1155,10 @@ const DEFAULT_SCALE: MetricScaleOptions = {
   bandHighHz: 3,
   gridHz: 20,
   edgeTrimS: 0.5,
-  estimateDeviceBias: false,
+  estimateDeviceBias: true,
   deviceBiasSigma: 0.05,
+  hacLagS: 3,
+  gyroBias: null,
   maxGapMs: 3000,
   maxImuGapMs: 250,
   minSegmentS: 3,
@@ -1140,6 +1167,13 @@ const DEFAULT_SCALE: MetricScaleOptions = {
   maxRelUncertainty: 0.1,
   minR2: 0.3,
 };
+
+/**
+ * Empirical factor on the HAC σ: on synthetic hand-held orbits and walks (30 seeds each) the
+ * plain Newey–West σ was 1.2–1.35× too small (rms z-score), as usual for HAC with strongly
+ * coloured residuals and a short bandwidth.
+ */
+const HAC_CALIBRATION = 1.3;
 
 /** Number of filtered channels per row block: C(3), P(3), Q(1), Dm(9). */
 const NCH = 16;
@@ -1185,8 +1219,8 @@ function doubleIntegrateAt(s: Float64Array, a: Float64Array, dim: number, q: Flo
  * sides identically, and drift from unknown initial velocity vanishes under F. Vision is the
  * regressand (its noise is larger after differentiation; IMU noise in the band is small, so
  * the errors-in-variables bias is negligible). IRLS (Huber) least squares; scale = 1/s₀.
- * The uncertainty uses the residual variance and the integrated autocorrelation time of the
- * residuals (Geyer's initial positive sequence) to account for oversampling/band-limiting.
+ * The uncertainty is a Newey–West (HAC) sandwich estimate, since the band-limited, oversampled
+ * residuals are strongly autocorrelated.
  * Unknowns c_w absorb a constant world-frame acceleration bias (e.g. gravity leakage when
  * accelG − g is used); c_d (optional) a device-frame accelerometer bias with a Gaussian prior.
  */
@@ -1197,13 +1231,13 @@ export function estimateMetricScale(
 ): MetricScaleResult | null {
   const o = { ...DEFAULT_SCALE, ...options };
   const kf = sortKeyframes(keyframes);
-  const gyro = new GyroIntegrator(imu);
+  const gyro = new GyroIntegrator(imu, o.gyroBias);
   if (gyro.n < 2 || kf.length < o.minSegmentKeyframes) return null;
   let nAcc = 0,
     nAccG = 0;
   for (const s of imu) {
-    if (s.accel) nAcc++;
-    if (s.accelG) nAccG++;
+    if (finite3(s.accel)) nAcc++;
+    if (finite3(s.accelG)) nAccG++;
   }
   let source: 'accel' | 'accelG';
   if (o.source === 'accel' || (o.source === 'auto' && nAcc >= 0.5 * imu.length && nAcc > 0)) source = 'accel';
@@ -1219,7 +1253,7 @@ export function estimateMetricScale(
 
   // IMU samples with the chosen acceleration (sorted, unique times).
   const samp = imu
-    .filter((s) => Number.isFinite(s.t) && (source === 'accel' ? s.accel : s.accelG))
+    .filter((s) => Number.isFinite(s.t) && finite3(source === 'accel' ? s.accel : s.accelG))
     .sort((a, b) => a.t - b.t)
     .filter((s, i, arr) => i === 0 || s.t > arr[i - 1].t);
   const ns = samp.length;
@@ -1389,12 +1423,13 @@ export function estimateMetricScale(
       }
     }
     for (let a = 0; a < p; a++) for (let b = 0; b < a; b++) A[a * p + b] = A[b * p + a];
-    for (let a = 1; a < p; a++) A[a * p + a] += 1e-9 * N + (a >= 4 ? prior : 0);
+    // prior < 0 ⇒ first pass: device-bias columns effectively excluded (prior unknown yet)
+    for (let a = 1; a < p; a++) A[a * p + a] += 1e-9 * N + (a >= 4 ? (prior < 0 ? 1e6 * A[a * p + a] + 1e-6 * N : prior) : 0);
     const sol = solveSPD(A, p, bv);
     return sol ? { beta: sol, A } : null;
   };
   let A: Float64Array = new Float64Array(p * p);
-  let prior = 0;
+  let prior = -1;
   for (let it = 0; it < 6; it++) {
     const res = solve(prior);
     if (!res) return null;
@@ -1427,10 +1462,30 @@ export function estimateMetricScale(
   const e0 = new Float64Array(p);
   e0[0] = 1;
   const Ainv0 = solveSPD(A, p, e0);
-  const tauInt = integratedAutocorrelation(r, rowSeg, Math.ceil(2 * o.gridHz));
-  const nEff = Math.min(N / tauInt, 3 * Math.max(1, usedKf - 2 * usedSeg));
-  const infl = N / nEff;
-  const varS0 = Ainv0 ? sigma2 * Ainv0[0] * infl : Infinity;
+  // Newey–West (Bartlett) HAC variance of ŝ₀: influence gᵢ = wᵢ rᵢ (A⁻¹)₀· xᵢ, autocovariances
+  // summed within each contiguous block (segment × axis) up to `hacLagS` (Newey & West 1987).
+  let varS0 = Infinity,
+    nEff = 0;
+  if (Ainv0) {
+    const g = new Float64Array(N);
+    for (let i = 0; i < N; i++) {
+      let ax = 0;
+      for (let a = 0; a < p; a++) ax += Ainv0[a] * X[a][i];
+      g[i] = w[i] * r[i] * ax;
+    }
+    const L = Math.max(1, Math.ceil(o.hacLagS * o.gridHz));
+    let v = 0;
+    for (let i = 0; i < N; i++) v += g[i] * g[i];
+    for (let l = 1; l <= L; l++) {
+      const kw = 1 - l / (L + 1);
+      let c = 0;
+      for (let i = 0; i + l < N; i++) if (rowSeg[i] === rowSeg[i + l]) c += g[i] * g[i + l];
+      v += 2 * kw * c;
+    }
+    const iid = sigma2 * Ainv0[0];
+    varS0 = Math.max(v * (N / Math.max(1, N - p)), iid) * HAC_CALIBRATION * HAC_CALIBRATION;
+    nEff = (N * iid) / varS0;
+  }
   const s0 = beta[0];
   const relUnc = Math.sqrt(Math.max(varS0, 0)) / Math.abs(s0);
   let rr = 0;
@@ -1460,35 +1515,109 @@ export function estimateMetricScale(
   };
 }
 
+// ---------------------------------------------------------------------------------------
+// (a') Time offset from linear acceleration (fallback when rotation cannot observe it)
+// ---------------------------------------------------------------------------------------
+
+/** Options of `estimateTimeOffsetFromAcceleration`. */
+export interface AccelTimeOffsetOptions {
+  /** Search half-range around `initialOffsetMs` (default 250). */
+  searchRangeMs: number;
+  /** Coarse grid step (default 25 ms; the misfit is smooth on the scale of the motion period). */
+  coarseStepMs: number;
+  /** Centre of the search (default 0). */
+  initialOffsetMs: number;
+  /** `reliable` requires stdMs below this (default 5). */
+  maxStdMs: number;
+  /** Options forwarded to `estimateMetricScale` (`gravity` is required for the accelG source). */
+  scale: Partial<MetricScaleOptions>;
+}
+
+/** Result of `estimateTimeOffsetFromAcceleration`. */
+export interface AccelTimeOffsetResult {
+  /** IMU time = camera time + offsetMs. */
+  offsetMs: number;
+  /** Approximate 1-σ (ms) from the misfit curvature, corrected for residual autocorrelation. */
+  stdMs: number;
+  /** 1 − min misfit / median misfit over the grid, in [0, 1]. */
+  quality: number;
+  reliable: boolean;
+  /** Metric-scale fit at the optimum. */
+  scale: MetricScaleResult;
+  /** Misfit 1 − R² of the scale regression on the coarse grid (Infinity where it failed). */
+  curve: { offsetMs: Float64Array; cost: Float64Array };
+}
+
+const DEFAULT_ACCEL_OFFSET: Omit<AccelTimeOffsetOptions, 'scale'> = { searchRangeMs: 250, coarseStepMs: 25, initialOffsetMs: 0, maxStdMs: 5 };
+
 /**
- * Integrated autocorrelation time of a residual series made of contiguous blocks (block id
- * per row), using Geyer's initial positive sequence (Geyer 1992, "Practical Markov chain
- * Monte Carlo", Stat. Sci.) on the pooled autocorrelation, up to `maxLag`. ≥ 1.
+ * Camera–IMU time offset from LINEAR acceleration: minimises the misfit 1 − R² of the
+ * metric-scale regression (`estimateMetricScale`, vision ≈ s₀ · IMU after the same
+ * band-limited second-derivative operator) over the offset (coarse grid, then golden section;
+ * offsets giving a non-positive scale are rejected). Use it when `estimateTimeOffset` is
+ * unreliable because the device hardly rotates (e.g. walking with a steady camera): a wrong
+ * offset Δ attenuates the in-band regression by ≈ cos(2π f Δ) and biases the metric scale
+ * (40 ms at ~1 Hz motion ⇒ ≈ 5 %). Cost ≈ 35 scale fits. Returns null without any valid fit.
  */
-function integratedAutocorrelation(r: Float64Array, block: number[], maxLag: number): number {
-  const N = r.length;
-  let c0 = 0;
-  for (let i = 0; i < N; i++) c0 += r[i] * r[i];
-  if (!(c0 > 0)) return 1;
-  const rho = new Float64Array(maxLag + 2);
-  rho[0] = 1;
-  for (let l = 1; l <= maxLag + 1; l++) {
-    let s = 0,
-      cnt = 0;
-    for (let i = 0; i + l < N; i++) {
-      if (block[i] !== block[i + l]) continue;
-      s += r[i] * r[i + l];
-      cnt++;
-    }
-    rho[l] = cnt > 0 ? (s / cnt) * (N / c0) : 0;
+export function estimateTimeOffsetFromAcceleration(
+  keyframes: readonly InertialKeyframe[],
+  imu: readonly ImuSample[],
+  options: Partial<AccelTimeOffsetOptions> = {},
+): AccelTimeOffsetResult | null {
+  const o = { ...DEFAULT_ACCEL_OFFSET, ...options };
+  const sopts = options.scale ?? {};
+  const kf = sortKeyframes(keyframes);
+  if (kf.length < 2 || imu.length < 4) return null;
+  const f = (d: number): number => {
+    const r = estimateMetricScale(kf, imu, { ...sopts, offsetMs: d });
+    if (!r || !(r.scale > 0) || !Number.isFinite(r.r2)) return Infinity;
+    return 1 - r.r2;
+  };
+  const step = Math.max(o.coarseStepMs, 0.5);
+  const range = Math.max(o.searchRangeMs, step);
+  const nGrid = Math.floor((2 * range) / step) + 1;
+  const offs = new Float64Array(nGrid),
+    costs = new Float64Array(nGrid);
+  let bi = -1;
+  for (let i = 0; i < nGrid; i++) {
+    offs[i] = o.initialOffsetMs - range + i * step;
+    costs[i] = f(offs[i]);
+    if (Number.isFinite(costs[i]) && (bi < 0 || costs[i] < costs[bi])) bi = i;
   }
-  let tauI = -1;
-  for (let m = 0; 2 * m + 1 <= maxLag + 1; m++) {
-    const G = rho[2 * m] + rho[2 * m + 1];
-    if (!(G > 0)) break;
-    tauI += 2 * G;
+  if (bi < 0) return null;
+  const lo = offs[Math.max(0, bi - 1)],
+    hi = offs[Math.min(nGrid - 1, bi + 1)];
+  let best = offs[bi],
+    bestCost = costs[bi];
+  const ref = goldenSection(f, lo, hi, 0.25);
+  const refCost = f(ref);
+  if (refCost < bestCost) {
+    best = ref;
+    bestCost = refCost;
   }
-  return Math.max(1, tauI);
+  // Curvature of the misfit; residuals are strongly autocorrelated (band-limited, oversampled),
+  // so the information is scaled by the effective row count of the fit at the optimum.
+  const h = 2;
+  const cp = f(best + h),
+    cm = f(best - h);
+  const res = estimateMetricScale(kf, imu, { ...sopts, offsetMs: best });
+  if (!res) return null;
+  const curv = (cp - 2 * bestCost + cm) / (h * h);
+  const nEff = Math.max(1, Number.isFinite(res.numEffective) ? res.numEffective : 1);
+  const stdMs = curv > 0 && Number.isFinite(curv) ? Math.sqrt((2 * Math.max(bestCost, 1e-12)) / (curv * nEff)) : Infinity;
+  const finite: number[] = [];
+  for (let i = 0; i < nGrid; i++) if (Number.isFinite(costs[i])) finite.push(Math.min(costs[i], 1));
+  const med = median(finite);
+  const quality = med > 0 ? Math.min(1, Math.max(0, 1 - bestCost / med)) : 0;
+  const atEdge = Math.abs(best - o.initialOffsetMs) > range - step;
+  return {
+    offsetMs: best,
+    stdMs,
+    quality,
+    reliable: res.reliable && !atEdge && stdMs <= o.maxStdMs && quality > 0.3,
+    scale: res,
+    curve: { offsetMs: offs, cost: costs },
+  };
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1498,27 +1627,70 @@ function integratedAutocorrelation(r: Float64Array, block: number[], maxLag: num
 /** All inertial estimates in sequence: time offset → gravity → metric scale. */
 export interface InertialAlignment {
   timeOffset: TimeOffsetResult | null;
+  /** Acceleration-based offset (only computed when the gyro-based one is unreliable). */
+  accelTimeOffset: AccelTimeOffsetResult | null;
   /** Offset actually used (estimated when reliable, else the given/initial one). */
   offsetMs: number;
+  /** Where `offsetMs` comes from. */
+  offsetSource: 'gyro' | 'accel' | 'default';
   gravity: GravityResult | null;
   scale: MetricScaleResult | null;
   /** composeGravityAlignment(gravity.down) or null. */
   R_gravity: Mat3 | null;
 }
 
-/** Runs (a)–(d) with sensible fallbacks. */
+/**
+ * Runs (a)–(d) with sensible fallbacks. When the rotation-based time offset is unreliable
+ * (too little angular acceleration), the offset is estimated from the linear acceleration
+ * instead (`estimateTimeOffsetFromAcceleration`), since an offset error biases the scale.
+ */
 export function estimateInertialAlignment(
   keyframes: readonly InertialKeyframe[],
   imu: readonly ImuSample[],
-  opts: { timeOffset?: Partial<TimeOffsetOptions>; gravity?: Partial<GravityOptions>; scale?: Partial<MetricScaleOptions>; offsetMs?: number } = {},
+  opts: {
+    timeOffset?: Partial<TimeOffsetOptions>;
+    accelTimeOffset?: Partial<Omit<AccelTimeOffsetOptions, 'scale'>>;
+    gravity?: Partial<GravityOptions>;
+    scale?: Partial<MetricScaleOptions>;
+    offsetMs?: number;
+  } = {},
 ): InertialAlignment {
   const timeOffset = imu.length >= 2 ? estimateTimeOffset(keyframes, imu, { initialOffsetMs: opts.offsetMs ?? 0, ...opts.timeOffset }) : null;
-  const offsetMs = timeOffset && timeOffset.reliable ? timeOffset.offsetMs : (opts.offsetMs ?? 0);
-  const gravity = estimateGravity(keyframes, imu, { ...opts.gravity, offsetMs });
-  const scale = estimateMetricScale(keyframes, imu, {
-    ...opts.scale,
+  let offsetMs = opts.offsetMs ?? 0;
+  let offsetSource: InertialAlignment['offsetSource'] = 'default';
+  const gyroBias = timeOffset && timeOffset.reliable ? timeOffset.gyroBias : null;
+  let gravity: GravityResult | null;
+  let accelTimeOffset: AccelTimeOffsetResult | null = null;
+  const gravityFor = (g: GravityResult | null): MetricScaleOptions['gravity'] =>
+    g ? { down: g.down, magnitude: g.source === 'accelG' ? g.magnitude : undefined } : (opts.scale?.gravity ?? null);
+  if (timeOffset && timeOffset.reliable) {
+    offsetMs = timeOffset.offsetMs;
+    offsetSource = 'gyro';
+    gravity = estimateGravity(keyframes, imu, { gyroBias, ...opts.gravity, offsetMs });
+  } else {
+    // Gravity is insensitive to the offset when the device rotates slowly (the case here).
+    gravity = estimateGravity(keyframes, imu, { gyroBias, ...opts.gravity, offsetMs });
+    if (imu.length >= 4) {
+      accelTimeOffset = estimateTimeOffsetFromAcceleration(keyframes, imu, {
+        initialOffsetMs: offsetMs,
+        ...opts.accelTimeOffset,
+        scale: { gyroBias, ...opts.scale, gravity: gravityFor(gravity) },
+      });
+      if (accelTimeOffset && accelTimeOffset.reliable) {
+        offsetMs = accelTimeOffset.offsetMs;
+        offsetSource = 'accel';
+        gravity = estimateGravity(keyframes, imu, { gyroBias, ...opts.gravity, offsetMs });
+      }
+    }
+  }
+  const scale = estimateMetricScale(keyframes, imu, { gyroBias, ...opts.scale, offsetMs, gravity: gravityFor(gravity) });
+  return {
+    timeOffset,
+    accelTimeOffset,
     offsetMs,
-    gravity: gravity ? { down: gravity.down, magnitude: gravity.magnitude } : (opts.scale?.gravity ?? null),
-  });
-  return { timeOffset, offsetMs, gravity, scale, R_gravity: gravity ? composeGravityAlignment(gravity.down) : null };
+    offsetSource,
+    gravity,
+    scale,
+    R_gravity: gravity ? composeGravityAlignment(gravity.down) : null,
+  };
 }

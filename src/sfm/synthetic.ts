@@ -23,8 +23,17 @@ import { rotationAngleBetween } from '../math/rotation';
 import { FeatureDatabase } from './database';
 import type { Reconstruction } from './reconstruction';
 
+/**
+ * 'orbit': object on a table, cameras on a circle (close range). 'walk': sideways S-walk
+ * through a yard with panning (large scale). 'loop': closed walk (ellipse 22 × 12 m)
+ * around the yard looking towards its centre with panning — the last images overlap the
+ * first (loop closure). 'forward': straight walk towards the houses looking forward
+ * (forward motion: the epipole is inside the image).
+ */
+export type SyntheticSceneKind = 'orbit' | 'walk' | 'loop' | 'forward';
+
 export interface SyntheticSceneOptions {
-  kind: 'orbit' | 'walk';
+  kind: SyntheticSceneKind;
   numImages: number;
   seed: number;
   width: number;
@@ -310,7 +319,7 @@ function buildOrbit(o: SyntheticSceneOptions, rng: Rng): { prims: Prim[]; poses:
   return { prims, poses, numPoints: o.numPoints || 5000 };
 }
 
-function buildWalk(o: SyntheticSceneOptions, rng: Rng): { prims: Prim[]; poses: Pose[]; numPoints: number } {
+function yardPrims(): Prim[] {
   const prims: Prim[] = [{ kind: 'plane', z: 0, x0: -35, x1: 35, y0: -20, y1: 50, color: [70, 140, 60] }];
   // houses along the far side and the flanks
   const houses: [number, number, number, number, number][] = [
@@ -338,6 +347,11 @@ function buildWalk(o: SyntheticSceneOptions, rng: Rng): { prims: Prim[]; poses: 
   prims.push({ kind: 'sphere', c: [12, 18, 4.5], r: 3, color: [50, 110, 45] });
   prims.push({ kind: 'sphere', c: [-3, 22, 3.5], r: 2, color: [45, 95, 50] });
   prims.push({ kind: 'box', min: [8, 8, 0], max: [11, 10.5, 2.5], color: [150, 90, 60] });
+  return prims;
+}
+
+function buildWalk(o: SyntheticSceneOptions, rng: Rng): { prims: Prim[]; poses: Pose[]; numPoints: number } {
+  const prims = yardPrims();
   const poses: Pose[] = [];
   const n = o.numImages;
   for (let i = 0; i < n; i++) {
@@ -351,6 +365,50 @@ function buildWalk(o: SyntheticSceneOptions, rng: Rng): { prims: Prim[]; poses: 
       fy = Math.sin(yaw) * Math.cos(pitch),
       fz = Math.sin(pitch);
     poses.push(poseFrom(lookRotation(fx, fy, fz, 0.03 * rng.gaussian()), C));
+  }
+  return { prims, poses, numPoints: o.numPoints || 9000 };
+}
+
+/**
+ * Closed walk (~110 m) around the yard: ellipse centred at (0, 14) with radii 22 × 12 m
+ * (≥ 2 m from every house / tree / the shed), looking towards the centre with a ±20° pan.
+ */
+function buildLoop(o: SyntheticSceneOptions, rng: Rng): { prims: Prim[]; poses: Pose[]; numPoints: number } {
+  const prims = yardPrims();
+  // structure on the south side too (seen when walking along the north edge)
+  prims.push({ kind: 'box', min: [-28, -10.4, 0], max: [28, -10, 2], color: [120, 90, 70] }); // fence
+  prims.push({ kind: 'box', min: [-12, -22, 0], max: [6, -13, 7], color: [210, 200, 180] }); // house
+  prims.push({ kind: 'sphere', c: [17, -5, 3], r: 2.2, color: [40, 105, 45] }); // tree
+  const poses: Pose[] = [];
+  const n = o.numImages;
+  for (let i = 0; i < n; i++) {
+    const s = i / n; // closed: image n would coincide with image 0
+    const th = 2 * Math.PI * s - Math.PI / 2;
+    const C = [22 * Math.cos(th) + 0.03 * rng.gaussian(), 14 + 12 * Math.sin(th) + 0.03 * rng.gaussian(), 1.6 + 0.01 * rng.gaussian()];
+    const yaw = Math.atan2(14 - C[1], -C[0]) + 0.35 * Math.sin(2 * Math.PI * 4 * s) + 0.01 * rng.gaussian();
+    const pitch = -0.1 + 0.005 * rng.gaussian();
+    const fx = Math.cos(yaw) * Math.cos(pitch),
+      fy = Math.sin(yaw) * Math.cos(pitch),
+      fz = Math.sin(pitch);
+    poses.push(poseFrom(lookRotation(fx, fy, fz, 0.03 * rng.gaussian()), C));
+  }
+  return { prims, poses, numPoints: o.numPoints || 9000 };
+}
+
+/** Straight 24 m walk north towards the houses, looking forward (small pan / sway). */
+function buildForward(o: SyntheticSceneOptions, rng: Rng): { prims: Prim[]; poses: Pose[]; numPoints: number } {
+  const prims = yardPrims();
+  const poses: Pose[] = [];
+  const n = o.numImages;
+  for (let i = 0; i < n; i++) {
+    const s = i / Math.max(1, n - 1);
+    const C = [-1 + 0.15 * Math.sin(6 * Math.PI * s) + 0.02 * rng.gaussian(), -6 + 24 * s + 0.02 * rng.gaussian(), 1.6 + 0.02 * Math.sin(12 * Math.PI * s)];
+    const yaw = Math.PI / 2 + 0.05 * Math.sin(2 * Math.PI * s) + 0.005 * rng.gaussian();
+    const pitch = -0.05 + 0.005 * rng.gaussian();
+    const fx = Math.cos(yaw) * Math.cos(pitch),
+      fy = Math.sin(yaw) * Math.cos(pitch),
+      fz = Math.sin(pitch);
+    poses.push(poseFrom(lookRotation(fx, fy, fz, 0.02 * rng.gaussian()), C));
   }
   return { prims, poses, numPoints: o.numPoints || 9000 };
 }
@@ -396,10 +454,13 @@ function quantizeDescriptor(v: Float64Array, noise: number, rng: Rng, out: Uint8
  * Generates a synthetic scene. Image ids are idOffset + index; frames are in capture
  * order (FrameInfo.t = 100 ms · index).
  */
-export function generateScene(opts: Partial<SyntheticSceneOptions> & { kind: 'orbit' | 'walk' }): SyntheticScene {
+export function generateScene(opts: Partial<SyntheticSceneOptions> & { kind: SyntheticSceneKind }): SyntheticScene {
   const o: SyntheticSceneOptions = { ...DEFAULTS, ...opts };
-  const rng = new Rng(o.seed * 7919 + (o.kind === 'orbit' ? 1 : 2));
-  const built = o.kind === 'orbit' ? buildOrbit(o, rng) : buildWalk(o, rng);
+  const kindIndex = { orbit: 1, walk: 2, loop: 3, forward: 4 }[o.kind];
+  if (kindIndex === undefined) throw new RangeError(`generateScene: unknown kind ${String(o.kind)}`);
+  const rng = new Rng(o.seed * 7919 + kindIndex);
+  const built =
+    o.kind === 'orbit' ? buildOrbit(o, rng) : o.kind === 'walk' ? buildWalk(o, rng) : o.kind === 'loop' ? buildLoop(o, rng) : buildForward(o, rng);
   const { prims } = built;
   // offset the world
   const off = o.offset;

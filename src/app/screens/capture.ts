@@ -20,15 +20,17 @@ import { GeoSensor } from '../../sensors/geolocation';
 import { MotionSensor } from '../../sensors/motion';
 import { screenAngle } from '../../sensors/frame-orientation';
 import type { CapturePermissionStatus } from '../../sensors/permissions';
-import { Viewer } from '../../viewer';
+import type { Viewer } from '../../viewer';
+import { loadViewerModule } from '../viewer-loader';
 import { ENGINE_ERRORS, isCancelledError, type FrameInput, type LiveCamera, type LiveUpdate } from '../../workers/protocol';
 import type { App, Screen } from '../app';
-import { button, iconButton, setButtonLabel, spinner } from '../components/controls';
+import { button, iconButton, spinner } from '../components/controls';
 import { confirmDialog } from '../components/dialog';
 import { toast } from '../components/toast';
 import { Disposer, h, replaceChildren } from '../dom';
-import { defaultSessionName, formatAccuracy, formatClock, formatCount, guidanceInfo, trackingLabel } from '../format';
+import { defaultSessionName, formatAccuracy, formatBytes, formatClock, formatCount, guidanceInfo, trackingLabel } from '../format';
 import { icon, type IconName } from '../icons';
+import { frameErrorAction, overlayMatchesView } from '../capture-policy';
 import { mapOverlay } from '../overlay-map';
 import { MIN_KEYFRAMES, type Route } from '../router';
 
@@ -37,6 +39,8 @@ type Phase = 'starting' | 'running' | 'paused' | 'interrupted' | 'error' | 'fini
 const MINI_POINTS = 20_000;
 const EXPANDED_POINTS = 50_000;
 const MAX_CAMERAS = 80;
+/** Below this much free origin quota a capture starts with a warning. */
+const LOW_STORAGE_BYTES = 300e6;
 
 export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'capture' }>): Screen {
   const d = new Disposer();
@@ -141,9 +145,21 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     el.dataset.phase = p;
     const paused = p === 'paused';
     pausedLabel.hidden = !paused;
+    if (p !== 'running') {
+      guidance.hidden = true;
+      lastGuidance = '';
+    }
     pauseBtn.setAttribute('aria-label', paused ? 'Resume capture' : 'Pause capture');
     pauseBtn.querySelector('.ctl-main-core')!.replaceChildren(icon(paused ? 'play' : 'pause', { size: 28 }));
     pauseBtn.disabled = !(p === 'running' || p === 'paused');
+    // The pill shows the live tracking state only while frames flow.
+    if (paused || p === 'interrupted') {
+      statusPill.dataset.state = 'paused';
+      trackLabel.textContent = 'Paused';
+    } else if (p === 'running' && last) {
+      statusPill.dataset.state = last.tracking;
+      trackLabel.textContent = trackingLabel(last.tracking);
+    }
     if (p === 'running') {
       if (runningSince === null) runningSince = performance.now();
     } else if (runningSince !== null) {
@@ -185,14 +201,16 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     const actions: HTMLElement[] = [];
     if (retry) actions.push(button({ label: retryLabel, variant: 'primary', size: 'lg', block: true, onClick: retry, testId: 'capture-retry' }));
     actions.push(button({ label: 'Back to home', variant: 'secondary', size: 'lg', block: true, onClick: () => void abandon(), testId: 'capture-back' }));
-    showCard(infoCard({ icon: 'warning', title, text, actions, tone: 'bad', testId: 'capture-error' }));
+    showCard(infoCard({ icon: 'warning', title, text: capitalize(text), actions, tone: 'bad', testId: 'capture-error' }));
   }
 
   // ---- overlay -----------------------------------------------------------------------------------
   let overlayClearTimer: ReturnType<typeof setTimeout> | null = null;
   function sizeOverlay(): { w: number; h: number; dpr: number } {
     const r = el.getBoundingClientRect();
-    const dpr = Math.min(3, window.devicePixelRatio || 1);
+    // ≤ 2×: a 3× full-screen canvas is ~12 MB cleared and redrawn 10 times a second next to the
+    // engine's GPU work; 2.2 px dots look the same at 2×.
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
     const w = Math.max(1, Math.round(r.width * dpr));
     const hh = Math.max(1, Math.round(r.height * dpr));
     if (overlay.width !== w || overlay.height !== hh) {
@@ -208,10 +226,9 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     const { w, h: hh, dpr } = sizeOverlay();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, overlay.width, overlay.height);
-    if (!pts || pts.length < 2) return;
-    const now = screenAngle();
-    const k = ((((meta.screenAngle - now) / 90) % 4) + 4) % 4;
-    const xy = mapOverlay(pts, meta.width, meta.height, w, hh, { fit: 'cover', quarterTurns: k });
+    // A frame from before a UI rotation does not match the rotated preview: drop its overlay.
+    if (!pts || pts.length < 2 || !overlayMatchesView(meta.screenAngle, screenAngle())) return;
+    const xy = mapOverlay(pts, meta.width, meta.height, w, hh, { fit: 'cover' });
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = 'rgba(54, 224, 166, 0.95)';
     ctx.strokeStyle = 'rgba(4, 18, 12, 0.55)';
@@ -242,11 +259,24 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   let lastViewerUpdate = 0;
   let viewerTimer: ReturnType<typeof setTimeout> | null = null;
   let viewerDirty = false;
+  /** The user orbited the expanded view: stop re-framing it until it is collapsed. */
+  let userMovedView = false;
+  miniHost.addEventListener('pointerdown', () => {
+    if (expanded) userMovedView = true;
+  });
 
   function setExpanded(v: boolean): void {
     expanded = v;
+    userMovedView = false;
+    if (v) clearOverlay();
     mini.classList.toggle('expanded', v);
+    // Collapsed it is a button; expanded it is a region holding the (separate) collapse button —
+    // never a button inside a button for VoiceOver.
+    mini.setAttribute('role', v ? 'region' : 'button');
+    mini.tabIndex = v ? -1 : 0;
     mini.setAttribute('aria-label', v ? 'Live 3D view' : 'Expand live 3D view');
+    if (v) miniCollapse.focus({ preventScroll: true });
+    else if (mini.contains(document.activeElement)) mini.focus({ preventScroll: true });
     el.classList.toggle('mini-expanded', v);
     viewerDirty = true;
     scheduleViewer(true);
@@ -261,10 +291,31 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     }
   });
 
+  let ViewerCtor: typeof Viewer | null = null;
+  let viewerLoading = false;
   function ensureViewer(): Viewer | null {
     if (viewer || viewerFailed || !app.env.webgl) return viewer;
+    if (!ViewerCtor) {
+      // three.js is a separate chunk (usually prefetched already): load, then retry the update.
+      if (!viewerLoading) {
+        viewerLoading = true;
+        loadViewerModule().then(
+          (m) => {
+            ViewerCtor = m.Viewer;
+            if (!closed) scheduleViewer(true);
+          },
+          (e) => {
+            viewerFailed = true;
+            console.warn('[capture] live 3D view unavailable', e);
+          },
+        );
+      }
+      return null;
+    }
     try {
-      viewer = new Viewer(miniHost, { background: 'transparent', autoFit: 'follow', maxPixelRatio: 2, fovDeg: 55 });
+      // autoFit 'off' + an unanimated fit per update: 'follow' animates every refit, which keeps
+      // WebGL rendering continuously next to the camera preview and the engine's GPU work.
+      viewer = new ViewerCtor(miniHost, { background: 'transparent', autoFit: 'off', maxPixelRatio: 2, fovDeg: 55 });
       viewer.setWorldUp('auto');
       viewer.setDisplay({ grid: false, edl: false, cameras: true, sparsePointSizePx: 2.5 });
     } catch (e) {
@@ -297,6 +348,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     const { positions, colors } = decimate(latestSparse.positions, latestSparse.colors, max);
     v.setSparsePoints(positions, colors);
     if (latestCameras?.length) v.setCameras(decimateCameras(latestCameras, MAX_CAMERAS), true);
+    if (!userMovedView) v.fitToContent(false);
     miniEmpty.hidden = true;
   }
 
@@ -311,11 +363,13 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     kfCount.textContent = String(u.numKeyframes);
     regCount.textContent = String(u.numRegistered);
     ptCount.textContent = formatCount(u.numPoints);
-    statusPill.dataset.state = u.tracking;
-    trackLabel.textContent = trackingLabel(u.tracking);
+    if (phase === 'running') {
+      statusPill.dataset.state = u.tracking;
+      trackLabel.textContent = trackingLabel(u.tracking);
+    }
     const g = guidanceInfo(u.guidance, cfg.mode);
     const gkey = `${u.guidance}`;
-    if (gkey !== lastGuidance) {
+    if (gkey !== lastGuidance && phase === 'running') {
       lastGuidance = gkey;
       guidance.hidden = !g.title;
       guidance.dataset.tone = g.tone;
@@ -323,8 +377,9 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       guidanceDetail.textContent = g.detail;
       guidance.querySelector('.guidance-icon')!.replaceChildren(icon(g.tone === 'good' ? 'check' : g.tone === 'bad' ? 'warning' : g.tone === 'info' ? 'info' : 'warning', { size: 18 }));
     }
-    if (meta && u.overlay) drawOverlay(u.overlay, meta);
-    if (u.decision === 'keyframe' && u.numKeyframes > prevKf) {
+    const live = phase === 'running';
+    if (meta && u.overlay && live && !expanded) drawOverlay(u.overlay, meta);
+    if (live && u.decision === 'keyframe' && u.numKeyframes > prevKf) {
       flash.classList.remove('pulse');
       void flash.offsetWidth; // restart the animation
       flash.classList.add('pulse');
@@ -386,20 +441,55 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
 
   function onFrameError(e: unknown): void {
     if (closed) return;
-    const name = (e as { name?: string })?.name;
-    if (name === ENGINE_ERRORS.busy) return;
-    if (name === ENGINE_ERRORS.notImplemented || name === ENGINE_ERRORS.notInitialized) {
-      pump?.stop();
-      errorCard('Processing engine unavailable', `${(e as Error).message}. Open the app with ?mock=1 to try the demo engine.`, null);
-      return;
+    const engineState = app.engine.status.state;
+    switch (frameErrorAction(e, engineState)) {
+      case 'ignore':
+        return;
+      case 'unavailable': {
+        if (phase === 'error') return;
+        pump?.stop();
+        clearOverlay();
+        const dead = engineState === 'dead' || engineState === 'disposed';
+        errorCard(
+          dead ? 'Processing engine stopped' : 'Processing engine unavailable',
+          dead
+            ? `It failed repeatedly (${app.engine.status.reason ?? (e as Error)?.message ?? 'unknown error'}). ${numKeyframes >= MIN_KEYFRAMES ? 'The photos captured so far are kept — reload the app to process them.' : 'Reload the app and try again.'}`
+            : `${(e as Error).message}. Open the app with ?mock=1 to try the demo engine.`,
+          null,
+        );
+        return;
+      }
+      case 'storage': {
+        if (phase !== 'running') return;
+        pause('user');
+        const enough = numKeyframes >= MIN_KEYFRAMES;
+        showCard(
+          infoCard({
+            icon: 'storage',
+            tone: 'bad',
+            title: 'Storage is full',
+            text: enough
+              ? `New photos cannot be saved. Finish now to reconstruct the ${numKeyframes} keyframes captured so far, or free up space and resume.`
+              : 'New photos cannot be saved. Free up space on this device (or delete old scans), then resume.',
+            testId: 'capture-storage-full',
+            actions: [
+              ...(enough ? [button({ label: 'Finish scan', icon: 'check', variant: 'primary', size: 'lg', block: true, onClick: () => void finish() })] : []),
+              button({ label: 'Resume', variant: enough ? 'secondary' : 'primary', size: 'lg', block: true, onClick: () => resume() }),
+              button({ label: 'Back to home', variant: 'secondary', size: 'lg', block: true, onClick: () => void abandon() }),
+            ],
+          }),
+        );
+        return;
+      }
+      case 'restarted':
+        toast('The engine restarted — continuing the scan.', { tone: 'warn' });
+        return;
+      case 'transient':
+        frameErrors++;
+        console.warn('[capture] frame failed', e);
+        if (frameErrors === 3) toast(`Frames are failing: ${(e as Error)?.message ?? e}`, { tone: 'warn' });
+        return;
     }
-    if (name === ENGINE_ERRORS.crashed) {
-      toast('The engine restarted — continuing the scan.', { tone: 'warn' });
-      return;
-    }
-    frameErrors++;
-    console.warn('[capture] frame failed', e);
-    if (frameErrors === 3) toast(`Frames are failing: ${(e as Error)?.message ?? e}`, { tone: 'warn' });
   }
 
   // ---- lifecycle ---------------------------------------------------------------------------------
@@ -503,9 +593,19 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       gpsChip.hidden = false;
     }
     if (sessionId) {
-      sessionCreated = app.createSession(sessionId, { name: sessionName, mode: cfg.mode, quality: cfg.quality });
-      await sessionCreated;
+      const created = app.createSession(sessionId, { name: sessionName, mode: cfg.mode, quality: cfg.quality });
+      sessionCreated = created;
+      const [res, available] = await Promise.all([created, app.storageAvailable()]);
       if (closed) return;
+      if (res.status === 'quota') {
+        // Every keyframe would fail to save: do not start a scan that cannot be kept.
+        errorCard('Storage is full', 'Free up space on this device (Settings › General › iPhone Storage) or delete old scans, then try again.', null);
+        return;
+      }
+      if (res.status === 'error') toast('This scan cannot be saved on this device (storage error).', { tone: 'warn' });
+      else if (available !== null && available < LOW_STORAGE_BYTES) {
+        toast(`Only ${formatBytes(available)} of storage left — a long scan may not fit.`, { tone: 'warn', durationMs: 6000 });
+      }
     }
     await initEngine();
   }
@@ -567,7 +667,10 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   /** From a tap: re-acquire the camera (inside the gesture) if needed, then resume. */
   async function reconnect(): Promise<void> {
     showCard(infoCard({ spinner: true, title: 'Reconnecting camera…' }));
-    const ok = camera.state === 'running' ? true : await camera.restart('manual');
+    // CameraCapture may already be re-opening the camera by itself (after the page became
+    // visible): restart() would refuse (false) and show a bogus error — wait for that instead.
+    const busy = camera.state === 'restarting' || camera.state === 'starting';
+    const ok = camera.state === 'running' ? true : busy ? await settledCamera(camera, 8000) : await camera.restart('manual');
     if (closed) return;
     if (!ok) {
       errorCard('Camera could not restart', 'Close other apps that use the camera, then try again.', () => void reconnect(), 'Reconnect camera');
@@ -704,6 +807,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     if (sessionId) {
       await sessionCreated;
       if (deleteSession) await app.deleteSession(sessionId);
+      else await app.updateSession(sessionId, { stats: { keyframes: numKeyframes, points: last?.numPoints ?? 0, quality: cfg.quality } });
     }
     app.loadedSessionId = null;
     app.navigate({ type: 'CANCEL' });
@@ -712,6 +816,18 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   return {
     el,
     enter() {
+      app.debug.holdFrames = (hold) => {
+        if (hold) {
+          pump?.stop();
+          video.pause();
+        } else {
+          void video.play().catch(() => undefined);
+          if (phase === 'running') pump?.start();
+        }
+      };
+      d.add(() => {
+        app.debug.holdFrames = undefined;
+      });
       d.listen(document, 'visibilitychange', onVisibility);
       d.add(app.engine.onLive(onLive));
       d.interval(() => {
@@ -739,6 +855,30 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** Resolves true when the camera reaches 'running', false on any other final state / timeout. */
+function settledCamera(camera: CameraCapture, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v: boolean): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      unsub();
+      resolve(v);
+    };
+    const unsub = camera.onStateChange((s) => {
+      if (s === 'running') finish(true);
+      else if (s !== 'restarting' && s !== 'starting') finish(false);
+    });
+    const timer = setTimeout(() => finish(camera.state === 'running'), timeoutMs);
+    if (camera.state === 'running') finish(true);
+  });
+}
+
+function capitalize(s: string): string {
+  return s ? s[0].toUpperCase() + s.slice(1) : s;
+}
 
 /** Evenly spread subset of at most `max` points. */
 export function decimate(positions: Float32Array, colors: Uint8Array, max: number): { positions: Float32Array; colors: Uint8Array } {

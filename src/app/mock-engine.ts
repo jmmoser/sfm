@@ -10,7 +10,7 @@
  */
 import type { MetricInfo, PointCloud, ProgressCallback, ProgressEvent, TriangleMesh } from '../core/types';
 import { createColmapZipBlob, encodeGLB, encodeMeshPLY, encodePLY, type ColmapModelInput } from '../io';
-import type { SessionMeta, SessionStore } from '../io/storage';
+import { SessionStore, type SessionMeta } from '../io/storage';
 import { Rng } from '../math/random';
 import {
   ENGINE_ERRORS,
@@ -100,7 +100,6 @@ export class MockEngine implements EngineLike {
       opts.sessions ??
       (async () => {
         try {
-          const { SessionStore } = await import('../io/storage');
           return SessionStore.isSupported() ? await SessionStore.open() : null;
         } catch {
           return null;
@@ -211,10 +210,10 @@ export class MockEngine implements EngineLike {
       this.check('frame');
       if (!this.scene || !this.samples) throw namedError(ENGINE_ERRORS.notInitialized, 'init() first');
       const rng = new Rng(this.seed * 1009 + this.frameIndex);
-      // Advance the scan clock (ignore gaps > 300 ms: paused / backgrounded).
+      // Advance the scan clock; long gaps (paused / backgrounded) count as one slow frame.
       if (this.lastT !== null) {
         const dt = f.t - this.lastT;
-        if (dt > 0 && dt < 300) this.scanMs += dt * this.speed;
+        if (dt > 0) this.scanMs += Math.min(dt, 400) * this.speed;
       }
       this.lastT = f.t;
       await sleep((25 + rng.next() * 45) / Math.sqrt(this.speed));

@@ -5,7 +5,8 @@
  * Continues to the Viewer when done. Holds the wake lock (iOS suspends a hidden page).
  */
 import type { PointCloud, ProgressEvent } from '../../core/types';
-import { Viewer } from '../../viewer';
+import type { Viewer } from '../../viewer';
+import { loadViewerModule } from '../viewer-loader';
 import { ENGINE_ERRORS, isCancelledError } from '../../workers/protocol';
 import type { App, Screen } from '../app';
 import { button, chip, progressBar, spinner } from '../components/controls';
@@ -31,16 +32,28 @@ const DEFAULT_STAGE: Record<ProcessingStep, StageId> = { refine: 'matching', den
 export function createProcessingScreen(app: App, route: Extract<Route, { screen: 'processing' }>): Screen {
   const d = new Disposer();
   const steps: ProcessingStep[] = [...route.steps];
-  const quality = app.results.quality;
-  const weights = stageWeights(quality);
+  // Opened from Home, `app.results` still describes the PREVIOUS scan until the engine loaded
+  // this one (run → ensureSessionLoaded): name, quality and "already built" stages are then
+  // filled in after the load instead of showing the other scan's.
+  let resultsStale = !!route.sessionId && app.loadedSessionId !== route.sessionId;
+  let quality = app.results.quality;
+  let weights = stageWeights(quality);
   let closed = false;
   let running = false;
   let cancelling = false;
   const startedAt = performance.now();
 
-  const states = new Map<StageId, StageState>(
-    STAGES.map((s) => [s.id, { id: s.id, status: steps.includes(s.step) ? 'pending' : 'skipped', progress: 0, startedAt: null, endedAt: null }]),
-  );
+  const states = new Map<StageId, StageState>();
+  /** Stages of steps that are not part of this run: already built earlier ('done', no time) or not requested ('skipped'). */
+  function initStates(): void {
+    const r = app.results;
+    const built: Record<ProcessingStep, boolean> = resultsStale ? { refine: false, densify: false, mesh: false } : { refine: !!r.sparse, densify: !!r.dense, mesh: !!r.mesh };
+    for (const s of STAGES) {
+      const run = steps.includes(s.step);
+      states.set(s.id, { id: s.id, status: run ? 'pending' : built[s.step] ? 'done' : 'skipped', progress: run ? 0 : 1, startedAt: null, endedAt: null });
+    }
+  }
+  initStates();
 
   // ---- DOM ---------------------------------------------------------------------------------------
   const previewHost = h('div', { class: 'proc-preview-canvas' });
@@ -66,7 +79,9 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
     rows.set(s.id, { el, bar, pct, statusIcon, detail });
     list.appendChild(el);
   }
-  const cancelBtn = button({ label: 'Cancel', variant: 'secondary', size: 'md', testId: 'processing-cancel', onClick: () => void cancel() });
+  const titleEl = h('span', { class: 'topbar-title', text: resultsStale ? 'Opening scan…' : app.results.name });
+  const subEl = h('span', { class: 'topbar-sub', text: resultsStale ? '' : `${qualityLabel(quality)} quality` });
+  const cancelBtn = button({ label: 'Cancel', variant: 'ghost', size: 'sm', testId: 'processing-cancel', onClick: () => void cancel() });
   const errorHost = h('div', { class: 'proc-error-host' });
 
   const el = h(
@@ -76,7 +91,7 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
       'header',
       { class: 'topbar' },
       h('span', { class: 'topbar-spacer' }),
-      h('div', { class: 'topbar-center' }, h('span', { class: 'topbar-title', text: app.results.name }), h('span', { class: 'topbar-sub', text: `${qualityLabel(quality)} quality` })),
+      h('div', { class: 'topbar-center' }, titleEl, subEl),
       cancelBtn,
     ),
     h(
@@ -97,7 +112,7 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
     switch (st.status) {
       case 'skipped':
         r.statusIcon.replaceChildren(icon('dot', { size: 10 }));
-        r.pct.replaceChildren(chip('Optional', 'neutral'));
+        r.pct.replaceChildren(chip('Not requested', 'neutral'));
         r.bar.set(0);
         break;
       case 'pending':
@@ -112,7 +127,7 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
         break;
       case 'done':
         r.statusIcon.replaceChildren(icon('check', { size: 16 }));
-        r.pct.textContent = st.startedAt !== null && st.endedAt !== null ? formatDuration(st.endedAt - st.startedAt) : '';
+        r.pct.textContent = st.startedAt !== null && st.endedAt !== null ? formatDuration(st.endedAt - st.startedAt) : 'Done';
         r.bar.set(1);
         break;
       case 'error':
@@ -191,10 +206,11 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
 
   // ---- preview -----------------------------------------------------------------------------------
   let viewer: Viewer | null = null;
+  let ViewerCtor: typeof Viewer | null = null;
   function ensureViewer(): Viewer | null {
-    if (viewer || !app.env.webgl) return viewer;
+    if (viewer || !app.env.webgl || !ViewerCtor) return viewer;
     try {
-      viewer = new Viewer(previewHost, { background: 'transparent', autoFit: 'follow' });
+      viewer = new ViewerCtor(previewHost, { background: 'transparent', autoFit: 'follow' });
       viewer.setDisplay({ grid: false, edl: true, cameras: true });
     } catch (e) {
       console.warn('[processing] preview unavailable', e);
@@ -242,6 +258,15 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
       return;
     }
     if (closed) return;
+    if (resultsStale) {
+      resultsStale = false;
+      quality = app.results.quality;
+      weights = stageWeights(quality);
+      titleEl.textContent = app.results.name;
+      subEl.textContent = `${qualityLabel(quality)} quality`;
+      initStates();
+      for (const st of STAGES) renderStage(st.id);
+    }
     showPreview();
     let step: ProcessingStep | null = null;
     try {
@@ -287,6 +312,11 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
       }
       const name = (e as { name?: string })?.name;
       const msg = (e as Error)?.message ?? String(e);
+      if (app.engine.status.state === 'dead') {
+        // Retrying cannot work: EngineClient gave up after repeated worker crashes.
+        showError('Processing engine stopped', `${msg}. Your capture is saved — reload the app to process it.`, false);
+        return;
+      }
       showError(
         name === ENGINE_ERRORS.crashed ? 'The engine restarted' : 'Processing failed',
         name === ENGINE_ERRORS.crashed ? `${msg}. Your capture is saved — try again.` : msg,
@@ -302,6 +332,7 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
 
   function showError(title: string, text: string, canRetry: boolean): void {
     cancelBtn.disabled = true;
+    headline.textContent = 'Processing stopped';
     const actions: HTMLElement[] = [];
     if (canRetry) actions.push(button({ label: 'Try again', icon: 'refresh', variant: 'primary', size: 'md', onClick: () => void retry(), testId: 'processing-retry' }));
     actions.push(
@@ -325,6 +356,7 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
   }
 
   async function retry(): Promise<void> {
+    headline.textContent = steps.includes('refine') ? 'Reconstructing' : steps.includes('mesh') ? 'Building mesh' : 'Building dense cloud';
     for (const s of STAGES) {
       const st = states.get(s.id)!;
       if (st.status === 'error' || st.status === 'active') {
@@ -383,7 +415,17 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
   return {
     el,
     enter() {
+      // Keep the screen on (iOS suspends a hidden page). Requested here too: opening a stored
+      // capture from Home navigates inside that tap.
+      void app.wakeLock.acquire();
       for (const s of STAGES) renderStage(s.id);
+      void loadViewerModule().then(
+        (m) => {
+          ViewerCtor = m.Viewer;
+          if (!closed) showPreview();
+        },
+        (e) => console.warn('[processing] preview unavailable', e),
+      );
       d.interval(tick, 1000);
       let wasHidden = false;
       d.listen(document, 'visibilitychange', () => {

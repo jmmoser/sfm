@@ -191,7 +191,7 @@ export function createSetupScreen(app: App): Screen {
       'div',
       { class: 'cta-bar' },
       start,
-      h('p', { class: 'cta-note' }, icon('lock', { size: 14 }), h('span', { text: 'Asks for camera and motion access. Photos stay on this device.' })),
+      h('p', { class: 'cta-note' }, icon('lock', { size: 14 }), h('span', { text: 'Camera & motion access · photos stay on this device' })),
     ),
   );
 

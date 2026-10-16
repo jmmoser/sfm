@@ -3,26 +3,27 @@
  *
  * Vocabulary: flat k-means codebook (k ≈ 256–1024) trained on a random subsample of the
  * RootSIFT descriptors (uint8, compared as floats): k-means++ seeding (Arthur & Vassilvitskii
- * 2007) on a smaller subsample, then Lloyd iterations accelerated with Hamerly's bounds
- * (Hamerly 2010, "Making k-means even faster", SDM) — after the first pass most points skip
- * the full search. Features are quantised by EXACT nearest-centroid search
- * (argmaxₖ x·cₖ − ½‖cₖ‖², 4-centroid register blocking).
+ * 2007) on a smaller subsample, then Lloyd iterations — with the exact SIMD assignment of
+ * `Quantizer` when WebAssembly SIMD is available, else in JS accelerated with Hamerly's bounds
+ * (Hamerly 2010, "Making k-means even faster", SDM; the k largest centre moves handled
+ * exactly as in Drake & Hamerly 2012). Features are quantised by EXACT nearest-centroid
+ * search (argmaxₖ x·cₖ − ½‖cₖ‖²).
  *
  * Index: TF-IDF weighting with L2-normalised BoW vectors and cosine scoring (Sivic &
  * Zisserman 2003, "Video Google"); burstiness handled by power-law term frequencies
  * (tf → √tf, Jégou, Douze & Schmid 2009, "On the burstiness of visual elements") or binary
- * tf. IDF = ln(N / nᵥᵥ) is recomputed lazily when images are added, so `add` is O(features·k·128)
- * for the quantisation plus O(1) bookkeeping.
+ * tf. IDF = ln(N / n_w) is recomputed lazily after images are added or removed.
  *
- * Complexity (D = 128, measured in Node/V8 x86, ≈ 1 GMAC/s; phones similar to ½×):
- *  - quantisation: n·k·D MACs per image — 4000 features × k = 512 ≈ 0.26 s, so
- *    500 images × 4000 features ≈ 130 s total. `maxFeaturesPerImage` (strongest by detector
- *    score) bounds it: 1500 ⇒ ≈ 0.1 s / image ≈ 50 s for 500 images, spread over capture.
- *  - training: seeding s·k·D (s = seedPerWord·k), first Lloyd pass M·k·D (M = trainingPerWord·k),
- *    later passes typically 5–20 % of that: k = 512 ⇒ ≈ 1–1.5 s.
- *  - query: O(total non-zeros) = O(images · min(k, features)) — 500 images × 512 words ≈ 0.3 ms.
+ * Complexity (D = 128; Node/V8 x86 timings — phones are typically 1–2× slower):
+ *  - quantisation: n·k·D MACs per image. SIMD path: 4000 features × k = 512 ≈ 35 ms
+ *    (500 images × 4000 features ≈ 20 s, done incrementally per keyframe); JS fallback
+ *    ≈ 260 ms per image. `maxFeaturesPerImage` (strongest by detector score) bounds it further.
+ *  - training: seeding s·k·D (s = seedPerWord·k) + iterations · M·k·D (M = trainingPerWord·k):
+ *    k = 512 ⇒ ≈ 1 s with SIMD, ≈ 3.5 s in JS.
+ *  - query: O(total non-zeros) = O(images · min(k, features)) — 500 images × 512 words ≈ 0.5 ms.
  */
 import { DESCRIPTOR_SIZE, type FeatureSet } from '../core/types';
+import { createSimdKernels, type SimdKernels } from '../features/simd';
 import { Rng } from '../math/random';
 import type { RetrievalSource } from './pairs';
 
@@ -32,9 +33,9 @@ const D = DESCRIPTOR_SIZE;
 export interface VocabularyOptions {
   /** Number of visual words k (default 512). */
   numWords: number;
-  /** Lloyd iterations after seeding (default 8; stops early when no assignment changes). */
+  /** Lloyd iterations after seeding (default 6; stops early when no assignment changes). */
   iterations: number;
-  /** Training sample size per word (default 24 ⇒ M = 24·k descriptors). */
+  /** Training sample size per word (default 16 ⇒ M = 16·k descriptors). */
   trainingPerWord: number;
   /** k-means++ seeding sample per word (default 8). */
   seedPerWord: number;
@@ -44,17 +45,20 @@ export interface VocabularyOptions {
   burstiness: 'sqrt' | 'binary' | 'none';
   /** Index / query only the strongest N features per image by detector score (0 = all; default 0). */
   maxFeaturesPerImage: number;
+  /** Use the WebAssembly SIMD kernel when available (default true; results are identical). */
+  simd: boolean;
 }
 
 /** Default `VocabularyOptions`. */
 export const DEFAULT_VOCABULARY_OPTIONS: VocabularyOptions = {
   numWords: 512,
-  iterations: 8,
-  trainingPerWord: 24,
+  iterations: 6,
+  trainingPerWord: 16,
   seedPerWord: 8,
   seed: 0x5eed,
   burstiness: 'sqrt',
   maxFeaturesPerImage: 0,
+  simd: true,
 };
 
 /** Sparse bag of words: sorted unique word ids and their (burstiness-adjusted) term frequencies. */
@@ -258,6 +262,171 @@ export function quantizeDescriptors(
   return res;
 }
 
+/**
+ * Exact nearest-word quantiser. With WebAssembly SIMD (`features/simd` `dot4`: exact int16
+ * dot products, 4 descriptors × all centroids per call) the centroids are rounded to 1/64 of
+ * a grey level; the rounding perturbs each score x·c − ½‖c‖² by at most
+ * E = (‖x‖₁ + max‖c‖₁)/128 + 1/256, so every centroid whose rounded score is within 2E of the
+ * best is re-scored in float64 — the result is identical to the plain search (typically only
+ * the winner qualifies). ≈ 6–9× faster than the JS kernel (Node: 4000 × 512 words ≈ 35 ms vs
+ * 260 ms). Falls back to the JS kernel when SIMD is unavailable or a centroid is outside
+ * [0, 255]. Each instance owns its WASM memory (≈ k·0.27 KB); not re-entrant.
+ */
+export class Quantizer {
+  readonly numWords: number;
+  readonly codebook: Float64Array;
+  /** ½‖c‖² per centroid. */
+  readonly halfNorms: Float64Array;
+  private simd: SimdKernels | null = null;
+  private c16: Int16Array | null = null;
+  private x16: Int16Array | null = null;
+  private dots: Int32Array | null = null;
+  private hn16: Float64Array | null = null;
+  private maxC1 = 0;
+  private xb = new Float64Array(D);
+  private xOff = 0;
+  private cOff = 0;
+  private oOff = 0;
+  private cand: Int32Array;
+
+  constructor(codebook: Float64Array, numWords: number, useSimd = true) {
+    this.codebook = codebook;
+    this.numWords = numWords;
+    this.halfNorms = new Float64Array(numWords);
+    halfNorms(codebook, numWords, this.halfNorms);
+    this.cand = new Int32Array(numWords);
+    if (useSimd) this.initSimd();
+  }
+
+  /** Whether the SIMD path is active. */
+  get usesSimd(): boolean {
+    return this.simd !== null;
+  }
+
+  private initSimd(): void {
+    const k = this.numWords,
+      cb = this.codebook;
+    for (let i = 0; i < k * D; i++) if (!(cb[i] >= 0 && cb[i] <= 255.5)) return;
+    const kern = createSimdKernels();
+    if (!kern) return;
+    this.cOff = 0;
+    this.xOff = k * D * 2;
+    this.oOff = this.xOff + 4 * D * 2;
+    try {
+      kern.ensure(this.oOff + k * 16 + 64);
+    } catch {
+      return;
+    }
+    const mem = kern.memory.buffer;
+    this.c16 = new Int16Array(mem, this.cOff, k * D);
+    this.x16 = new Int16Array(mem, this.xOff, 4 * D);
+    this.dots = new Int32Array(mem, this.oOff, 4 * k);
+    this.hn16 = new Float64Array(k);
+    this.simd = kern;
+    this.uploadCentroids();
+  }
+
+  /** Re-read the (modified) codebook into the SIMD buffers (k-means updates). */
+  uploadCentroids(): void {
+    halfNorms(this.codebook, this.numWords, this.halfNorms);
+    if (!this.simd || !this.c16 || !this.hn16) return;
+    const cb = this.codebook,
+      c16 = this.c16,
+      k = this.numWords;
+    let maxC1 = 0;
+    for (let c = 0; c < k; c++) {
+      let n2 = 0,
+        l1 = 0;
+      const o = c * D;
+      for (let d = 0; d < D; d++) {
+        const v = Math.round(64 * cb[o + d]);
+        c16[o + d] = v;
+        n2 += v * v;
+        l1 += cb[o + d];
+      }
+      this.hn16[c] = n2 / 128; // ½‖ĉ‖² in units of 1/64
+      if (l1 > maxC1) maxC1 = l1;
+    }
+    this.maxC1 = maxC1;
+  }
+
+  /**
+   * Nearest word for descriptors `desc` (uint8, 128 per feature): features indices[j]
+   * (or j < count) → out[j].
+   */
+  quantize(desc: Uint8Array, count: number, out?: Uint32Array, indices?: ArrayLike<number>): Uint32Array {
+    const m = indices ? indices.length : count;
+    const res = out && out.length >= m ? out : new Uint32Array(m);
+    const k = this.numWords;
+    if (!this.simd || !this.x16 || !this.dots || !this.hn16) {
+      for (let j = 0; j < m; j++) {
+        loadDescriptor(desc, indices ? indices[j] : j, this.xb);
+        res[j] = nearest(this.xb, this.codebook, this.halfNorms, k);
+      }
+      return res;
+    }
+    const x16 = this.x16,
+      dots = this.dots,
+      hn16 = this.hn16,
+      cand = this.cand,
+      cb = this.codebook,
+      hn = this.halfNorms;
+    const l1 = new Float64Array(4);
+    for (let j0 = 0; j0 < m; j0 += 4) {
+      const q = Math.min(4, m - j0);
+      for (let qq = 0; qq < 4; qq++) {
+        const xo = qq * D;
+        if (qq >= q) {
+          x16.fill(0, xo, xo + D);
+          continue;
+        }
+        const i = indices ? indices[j0 + qq] : j0 + qq;
+        const io = i * D;
+        let s1 = 0;
+        for (let d = 0; d < D; d++) {
+          const v = desc[io + d];
+          x16[xo + d] = v;
+          s1 += v;
+        }
+        l1[qq] = s1;
+      }
+      this.simd.dot4(this.xOff, this.cOff, k, this.oOff);
+      for (let qq = 0; qq < q; qq++) {
+        let best = -Infinity,
+          bi = 0;
+        for (let c = 0, o = qq; c < k; c++, o += 4) {
+          const v = dots[o] - hn16[c];
+          if (v > best) {
+            best = v;
+            bi = c;
+          }
+        }
+        // rounding bound (in units of 1/64)
+        const thr = best - 2 * 64 * ((l1[qq] + this.maxC1) / 128 + 1 / 256) - 1e-6;
+        let nc = 0;
+        for (let c = 0, o = qq; c < k; c++, o += 4) if (dots[o] - hn16[c] >= thr) cand[nc++] = c;
+        if (nc > 1) {
+          const io = (indices ? indices[j0 + qq] : j0 + qq) * D;
+          let bs = -Infinity;
+          for (let t = 0; t < nc; t++) {
+            const c = cand[t],
+              co = c * D;
+            let dot = 0;
+            for (let d = 0; d < D; d++) dot += desc[io + d] * cb[co + d];
+            const v = dot - hn[c];
+            if (v > bs) {
+              bs = v;
+              bi = c;
+            }
+          }
+        }
+        res[j0 + qq] = bi;
+      }
+    }
+    return res;
+  }
+}
+
 // ------------------------------------------------------------------------------------
 // Training
 // ------------------------------------------------------------------------------------
@@ -360,6 +529,9 @@ function kmeansPlusPlus(data: Uint8Array, n: number, k: number, rng: Rng): Float
   return cb;
 }
 
+/** Number of largest-moving centres handled exactly in the Hamerly bound update. */
+const BIG_MOVERS = 32;
+
 /**
  * Hamerly-accelerated Lloyd iterations on `data` (uint8, n × D), refining `cb` (k × D)
  * in place. Empty clusters are re-seeded with the point farthest from its centre.
@@ -385,6 +557,8 @@ function lloydHamerly(data: Uint8Array, n: number, cb: Float64Array, k: number, 
   const moved = new Float64Array(k);
   const sHalf = new Float64Array(k);
   const old = new Float64Array(D);
+  const order = Array.from({ length: k }, (_, c) => c);
+  const isBig = new Uint8Array(k);
   for (let it = 0; it < iterations; it++) {
     // ---- update step
     sums.fill(0);
@@ -396,9 +570,7 @@ function lloydHamerly(data: Uint8Array, n: number, cb: Float64Array, k: number, 
         so = a * D;
       for (let d = 0; d < D; d++) sums[so + d] += data[o + d];
     }
-    let maxMove = 0,
-      maxMove2 = 0,
-      argMax = -1;
+    let maxMove = 0;
     for (let c = 0; c < k; c++) {
       const co = c * D;
       for (let d = 0; d < D; d++) old[d] = cb[co + d];
@@ -432,17 +604,45 @@ function lloydHamerly(data: Uint8Array, n: number, cb: Float64Array, k: number, 
       }
       mv = Math.sqrt(mv);
       moved[c] = mv;
-      if (mv > maxMove) {
-        maxMove2 = maxMove;
-        maxMove = mv;
-        argMax = c;
-      } else if (mv > maxMove2) maxMove2 = mv;
+      if (mv > maxMove) maxMove = mv;
     }
     if (maxMove === 0) break;
     halfNorms(cb, k, hn);
+    // Big movers: exact distances to the NB centres that moved most, the lower bound of the
+    // others decreases only by their (smaller) maximum move (cf. Drake & Hamerly 2012).
+    const nb = Math.min(BIG_MOVERS, k - 1);
+    order.sort((a, b) => moved[b] - moved[a]);
+    isBig.fill(0);
+    for (let j = 0; j < nb; j++) isBig[order[j]] = 1;
+    let ms1 = 0,
+      ms2 = 0,
+      msArg = -1;
+    for (let c = 0; c < k; c++) {
+      if (isBig[c]) continue;
+      const mv = moved[c];
+      if (mv > ms1) {
+        ms2 = ms1;
+        ms1 = mv;
+        msArg = c;
+      } else if (mv > ms2) ms2 = mv;
+    }
     for (let i = 0; i < n; i++) {
-      upper[i] += moved[assign[i]];
-      lower[i] -= assign[i] === argMax ? maxMove2 : maxMove;
+      const a = assign[i];
+      upper[i] += moved[a];
+      let lb = lower[i] - (a === msArg ? ms2 : ms1);
+      if (nb > 0) {
+        const o = i * D;
+        for (let j = 0; j < nb; j++) {
+          const c = order[j];
+          if (c === a) continue;
+          const co = c * D;
+          let dot = 0;
+          for (let d = 0; d < D; d++) dot += data[o + d] * cb[co + d];
+          const dist = Math.sqrt(Math.max(0, xn[i] - 2 * dot + 2 * hn[c]));
+          if (dist < lb) lb = dist;
+        }
+      }
+      lower[i] = lb;
     }
     // s(c) = ½ min distance to another centre
     for (let c = 0; c < k; c++) sHalf[c] = Infinity;
@@ -497,6 +697,66 @@ function lloydHamerly(data: Uint8Array, n: number, cb: Float64Array, k: number, 
 }
 
 /**
+ * Plain Lloyd iterations with exact SIMD assignment (`Quantizer`); empty clusters are re-seeded
+ * with the point farthest from its centre.
+ */
+function lloydSimd(data: Uint8Array, n: number, cb: Float64Array, k: number, iterations: number, q: Quantizer): void {
+  const assign = new Uint32Array(n);
+  const prev = new Uint32Array(n);
+  const sums = new Float64Array(k * D);
+  const counts = new Int32Array(k);
+  q.quantize(data, n, assign);
+  for (let it = 0; it <= iterations; it++) {
+    sums.fill(0);
+    counts.fill(0);
+    for (let i = 0; i < n; i++) {
+      const a = assign[i];
+      counts[a]++;
+      const o = i * D,
+        so = a * D;
+      for (let d = 0; d < D; d++) sums[so + d] += data[o + d];
+    }
+    for (let c = 0; c < k; c++) {
+      if (counts[c] > 0) {
+        const inv = 1 / counts[c];
+        for (let d = 0; d < D; d++) cb[c * D + d] = sums[c * D + d] * inv;
+      }
+    }
+    // re-seed empty clusters with the points farthest from their centres
+    let empty = 0;
+    for (let c = 0; c < k; c++) if (counts[c] === 0) empty++;
+    if (empty > 0) {
+      const dist = new Float64Array(n);
+      for (let i = 0; i < n; i++) {
+        const a = assign[i],
+          o = i * D,
+          ao = a * D;
+        let d2 = 0;
+        for (let d = 0; d < D; d++) {
+          const e = data[o + d] - cb[ao + d];
+          d2 += e * e;
+        }
+        dist[i] = counts[a] > 1 ? d2 : -1;
+      }
+      const order = Array.from({ length: n }, (_, i) => i).sort((a, b) => dist[b] - dist[a]);
+      let r = 0;
+      for (let c = 0; c < k; c++) {
+        if (counts[c] !== 0) continue;
+        const far = order[r++];
+        for (let d = 0; d < D; d++) cb[c * D + d] = data[far * D + d];
+      }
+    }
+    if (it === iterations) break;
+    q.uploadCentroids();
+    prev.set(assign);
+    q.quantize(data, n, assign);
+    let changed = 0;
+    for (let i = 0; i < n; i++) if (assign[i] !== prev[i]) changed++;
+    if (changed === 0 && empty === 0) break;
+  }
+}
+
+/**
  * Train a k-means codebook (k × 128 floats, row-major) from a random subsample of the
  * descriptors. k is reduced to the number of available descriptors if necessary.
  */
@@ -518,7 +778,11 @@ export function trainVocabulary(sources: readonly DescriptorSource[], opts: Part
     for (let j = 0; j < ns; j++) seedData.set(sample.subarray(idx[j] * D, idx[j] * D + D), j * D);
   }
   const cb = kmeansPlusPlus(seedData, ns, k, rng);
-  if (o.iterations > 0) lloydHamerly(sample, n, cb, k, o.iterations);
+  if (o.iterations > 0) {
+    const q = o.simd ? new Quantizer(cb, k, true) : null;
+    if (q && q.usesSimd) lloydSimd(sample, n, cb, k, o.iterations, q);
+    else lloydHamerly(sample, n, cb, k, o.iterations);
+  }
   return cb;
 }
 
@@ -541,7 +805,7 @@ export class VocabularyIndex implements RetrievalSource {
   /** Codebook, numWords × 128 (row-major, float64). */
   readonly codebook: Float64Array;
   readonly options: VocabularyOptions;
-  private hn: Float64Array;
+  private quantizer: Quantizer;
   private docs = new Map<number, Doc>();
   private df: Uint32Array;
   private idf: Float64Array;
@@ -555,8 +819,7 @@ export class VocabularyIndex implements RetrievalSource {
     this.codebook = codebook instanceof Float64Array ? codebook : Float64Array.from(codebook);
     this.numWords = this.codebook.length / D;
     this.options = { ...DEFAULT_VOCABULARY_OPTIONS, ...opts, numWords: this.numWords };
-    this.hn = new Float64Array(this.numWords);
-    halfNorms(this.codebook, this.numWords, this.hn);
+    this.quantizer = new Quantizer(this.codebook, this.numWords, this.options.simd);
     this.df = new Uint32Array(this.numWords);
     this.idf = new Float64Array(this.numWords);
     this.counts = new Float64Array(this.numWords);
@@ -592,7 +855,7 @@ export class VocabularyIndex implements RetrievalSource {
     const sel = this.selectFeatures(features);
     const m = sel ? sel.length : features.count;
     const out = new Uint32Array(m);
-    quantizeDescriptors(this.codebook, this.numWords, features.descriptors, features.count, out, sel ?? undefined, this.hn);
+    this.quantizer.quantize(features.descriptors, features.count, out, sel ?? undefined);
     return out;
   }
 
@@ -642,12 +905,33 @@ export class VocabularyIndex implements RetrievalSource {
     this.addBow(imageId, this.computeBow(features));
   }
 
-  /** Add (or replace) an image from a precomputed BoW. */
+  /**
+   * Add (or replace) an image from a precomputed BoW (sorted unique word ids). Entries with a
+   * word id ≥ numWords or a non-finite / non-positive tf are dropped.
+   */
   addBow(imageId: number, bow: BowVector): void {
     this.remove(imageId);
-    for (let i = 0; i < bow.words.length; i++) this.df[bow.words[i]]++;
-    this.docs.set(imageId, { words: bow.words, tf: bow.tf, invNorm: 0 });
+    const b = this.sanitize(bow);
+    for (let i = 0; i < b.words.length; i++) this.df[b.words[i]]++;
+    this.docs.set(imageId, { words: b.words, tf: b.tf, invNorm: 0 });
     this.dirty = true;
+  }
+
+  /** The BoW itself when valid, else a filtered copy (out-of-range words would yield NaN scores). */
+  private sanitize(bow: BowVector): BowVector {
+    const k = this.numWords;
+    const n = Math.min(bow.words.length, bow.tf.length);
+    let ok = n === bow.words.length;
+    for (let i = 0; i < n && ok; i++) if (!(bow.words[i] < k) || !(bow.tf[i] > 0) || bow.tf[i] === Infinity) ok = false;
+    if (ok) return bow;
+    const ws: number[] = [],
+      tf: number[] = [];
+    for (let i = 0; i < n; i++) {
+      if (!(bow.words[i] < k) || !(bow.tf[i] > 0) || bow.tf[i] === Infinity) continue;
+      ws.push(bow.words[i]);
+      tf.push(bow.tf[i]);
+    }
+    return { words: Uint32Array.from(ws), tf: Float32Array.from(tf) };
   }
 
   /** Remove an image; returns whether it was indexed. */
@@ -724,7 +1008,7 @@ export class VocabularyIndex implements RetrievalSource {
       if (!d) return [];
       bow = d;
       selfId = q;
-    } else if ('words' in q) bow = q;
+    } else if ('words' in q) bow = this.sanitize(q);
     else bow = this.computeBow(q);
     const qv = this.qv;
     let qn = 0;

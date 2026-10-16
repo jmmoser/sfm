@@ -8,6 +8,7 @@ import { SessionStore, type SessionMeta, type SessionPatch } from '../io/storage
 import { requestCapturePermissions, type CapturePermissionStatus } from '../sensors/permissions';
 import { WakeLock } from '../sensors/wakelock';
 import type { CaptureMode, LiveCamera, QualityPreset, SparseResult } from '../workers/protocol';
+import { isQuotaError } from './capture-policy';
 import { closeAllModals, initLayers } from './components/layers';
 import { toast } from './components/toast';
 import { h, reducedMotion } from './dom';
@@ -22,6 +23,7 @@ import { createHomeScreen } from './screens/home';
 import { createProcessingScreen } from './screens/processing';
 import { createSetupScreen } from './screens/setup';
 import { createViewerScreen } from './screens/viewer';
+import { prefetchViewer } from './viewer-loader';
 
 export interface Screen {
   readonly el: HTMLElement;
@@ -107,6 +109,11 @@ export class App {
   results: Results;
   /** Session whose state the engine currently holds (init or loadSession). */
   loadedSessionId: string | null = null;
+  /**
+   * Debug / e2e hooks installed by screens (e.g. hold frame delivery while a headless test
+   * takes a screenshot: software GPU emulation starves the compositor while frames are grabbed).
+   */
+  readonly debug: { holdFrames?: (hold: boolean) => void } = {};
   private permissions: Promise<CapturePermissionStatus> | null = null;
   private sessionsP: Promise<SessionStore | null> | null = null;
   private screen: Screen | null = null;
@@ -133,6 +140,21 @@ export class App {
     });
     this.engine.onError((e) => {
       if (e.fatal) console.warn('[app] engine fatal error', e.error);
+      if (e.reason === 'storage' || isQuotaError(e.error)) {
+        toast('Storage is full — free up space on this device, or delete old scans.', { tone: 'bad', durationMs: 9000 });
+      }
+    });
+
+    // Workers cannot see page visibility; iOS drops GPU work submitted while hidden.
+    document.addEventListener('visibilitychange', () => this.engine.setHidden(document.hidden));
+    // Desktop / Android: the browser Back button or closing the tab would silently drop a running
+    // capture or processing job (there is no History API state to go back to) — ask first.
+    // (iOS Safari shows no beforeunload prompt; the capture itself is persisted as it goes.)
+    window.addEventListener('beforeunload', (e: BeforeUnloadEvent) => {
+      const screen = this.route.screen;
+      if (screen !== 'capture' && screen !== 'processing') return;
+      e.preventDefault();
+      e.returnValue = '';
     });
 
     void probeWebGPU().then((r) => {
@@ -142,6 +164,7 @@ export class App {
 
     this.show({ screen: 'home' });
     if (opts.initialEvent) this.navigate(opts.initialEvent);
+    prefetchViewer();
   }
 
   static emptyResults(cfg: Pick<CaptureConfig, 'mode' | 'quality'>): Results {
@@ -198,16 +221,28 @@ export class App {
     el.classList.add('screen');
     el.dataset.screen = route.screen;
     const animate = !!prev && !reducedMotion();
+    // Focus was in the old screen (the tapped button): move it to the new one afterwards, so
+    // keyboard / VoiceOver users are not left on a removed element (focus falls to <body>).
+    const hadFocus = !!prev && (prev.el.contains(document.activeElement) || document.activeElement === document.body);
     if (prev) {
       const old = prev.el;
+      // The fading old screen must not take taps, keyboard focus or VoiceOver attention.
+      old.inert = true;
+      old.setAttribute('aria-hidden', 'true');
       if (animate) {
         old.classList.add('screen-exit');
         setTimeout(() => old.remove(), 180);
       } else old.remove();
     }
-    if (animate) el.classList.add('screen-enter');
+    if (animate) {
+      el.classList.add('screen-enter');
+      // Two frames so the start state is painted, plus a timer fallback: rAF does not run while
+      // the compositor is starved or the page is hidden, which left the new screen invisible.
+      const reveal = (): void => el.classList.remove('screen-enter');
+      requestAnimationFrame(() => requestAnimationFrame(reveal));
+      setTimeout(reveal, 120);
+    }
     this.host.appendChild(el);
-    if (animate) requestAnimationFrame(() => requestAnimationFrame(() => el.classList.remove('screen-enter')));
     document.title = titleFor(route);
     try {
       screen.enter?.();
@@ -215,6 +250,7 @@ export class App {
       console.error('[app] screen enter failed', e);
       toast(`Could not open this screen: ${(e as Error)?.message ?? e}`, { tone: 'bad' });
     }
+    if (hadFocus) focusScreen(el);
   }
 
   private createScreen(route: Route): Screen {
@@ -295,16 +331,30 @@ export class App {
     return this.sessionsP;
   }
 
-  async createSession(id: string, init: { name: string; mode: CaptureMode; quality: QualityPreset }): Promise<SessionMeta | null> {
+  /**
+   * Create the session record of a new capture. Never throws: 'quota' when the origin is out of
+   * storage (the capture cannot be saved — the caller blocks it), 'error' / 'unavailable' when
+   * IndexedDB failed or is missing (the caller warns and continues).
+   */
+  async createSession(
+    id: string,
+    init: { name: string; mode: CaptureMode; quality: QualityPreset },
+  ): Promise<{ status: 'ok'; meta: SessionMeta } | { status: 'quota' | 'error' | 'unavailable'; error?: unknown }> {
     const s = await this.sessions();
-    if (!s) return null;
+    if (!s) return { status: 'unavailable' };
     try {
-      return await s.createSession({ id, name: init.name, mode: init.mode, status: 'capturing', stats: { quality: init.quality } });
+      return { status: 'ok', meta: await s.createSession({ id, name: init.name, mode: init.mode, status: 'capturing', stats: { quality: init.quality } }) };
     } catch (e) {
       console.warn('[app] createSession failed', e);
-      if ((e as Error)?.name === 'StorageQuotaError') toast('Storage is full — this scan cannot be saved.', { tone: 'bad' });
-      return null;
+      return { status: isQuotaError(e) ? 'quota' : 'error', error: e };
     }
+  }
+
+  /** Bytes still available to this origin (null when unknown). */
+  async storageAvailable(): Promise<number | null> {
+    const s = await this.sessions();
+    const est = s ? await s.estimate() : null;
+    return est && est.quota > 0 ? est.available : null;
   }
 
   /** Patch a session's metadata (stats are merged). Never throws. */
@@ -361,6 +411,17 @@ export class App {
       toast(`Couldn’t open the scan: ${(e as Error)?.message ?? e}`, { tone: 'bad' });
       return false;
     }
+  }
+}
+
+/** Focus the screen's heading (or the screen itself) without scrolling or a visible ring. */
+function focusScreen(el: HTMLElement): void {
+  const target = el.querySelector<HTMLElement>('h1') ?? el;
+  if (!target.hasAttribute('tabindex')) target.setAttribute('tabindex', '-1');
+  try {
+    target.focus({ preventScroll: true });
+  } catch {
+    /* ignore */
   }
 }
 

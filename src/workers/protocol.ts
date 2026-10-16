@@ -379,6 +379,15 @@ export interface CollectTransferablesOptions {
   minByteLength?: number;
   /** Maximum object nesting that is searched (default 8). */
   maxDepth?: number;
+  /**
+   * Views that cover only PART of their ArrayBuffer (`pool.subarray(0, n)`, several arrays in
+   * one allocation) are NOT transferred by default: transferring detaches the whole buffer, so a
+   * sender that keeps using its pool (a mapper's growing point buffer, a reused scratch arena)
+   * would silently see length-0 arrays afterwards. They are structured-cloned instead (which
+   * copies the whole underlying buffer — `slice()` such views before sending to copy only the
+   * view). `true` transfers them anyway when the sender gives the whole buffer up.
+   */
+  transferPartialViews?: boolean;
 }
 
 type Ctor = abstract new (...args: never[]) => unknown;
@@ -391,12 +400,14 @@ function ctor(name: string): Ctor | null {
 /**
  * Walk `value` (arrays, plain objects, Maps, Sets) and return the transfer list for
  * `postMessage`: the ArrayBuffers behind typed arrays / DataViews (each buffer once, ≥
- * `minByteLength`, never SharedArrayBuffers or detached buffers) and ImageBitmaps,
+ * `minByteLength`, only views spanning their whole buffer unless `transferPartialViews`,
+ * never SharedArrayBuffers or detached buffers) and ImageBitmaps,
  * OffscreenCanvases, VideoFrames and MessagePorts. Cycles are handled.
  */
 export function collectTransferables(value: unknown, opts: CollectTransferablesOptions = {}): Transferable[] {
   const minBytes = opts.minByteLength ?? 1024;
   const maxDepth = opts.maxDepth ?? 8;
+  const partial = opts.transferPartialViews ?? false;
   const out: Transferable[] = [];
   const seen = new Set<unknown>();
   const transferableCtors = ['ImageBitmap', 'OffscreenCanvas', 'VideoFrame', 'MessagePort'].map(ctor).filter((c): c is Ctor => !!c);
@@ -415,6 +426,7 @@ export function collectTransferables(value: unknown, opts: CollectTransferablesO
   const visit = (v: unknown, depth: number): void => {
     if (v === null || typeof v !== 'object') return;
     if (ArrayBuffer.isView(v)) {
+      if (!partial && (v.byteOffset !== 0 || v.byteLength !== v.buffer.byteLength)) return;
       addBuffer(v.buffer);
       return;
     }

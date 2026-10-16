@@ -199,15 +199,25 @@ export function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string);
 }
 
-/** File name for an export, e.g. "Object_Oct_16_14-05.ply". */
+/**
+ * File name for an export, e.g. "Object_Oct_16_14_05.ply". Letters and digits of every script are
+ * kept ("花瓶.ply", "Кухня.glb"; Latin accents are dropped: "Küche" → "Kuche"); punctuation, emoji
+ * and path characters become separators.
+ */
 export function exportFilename(sessionName: string, ext: string, suffix = ''): string {
   const base =
-    sessionName
-      .normalize('NFKD')
-      .replace(/[^\w\s-]+/g, ' ')
-      .trim()
-      .replace(/\s+/g, '_')
-      .replace(/_+/g, '_')
-      .slice(0, 60) || 'scan';
+    Array.from(
+      sessionName
+        .normalize('NFKD')
+        .replace(/(\p{Script=Latin})\p{M}+/gu, '$1') // Café → Cafe (portable); が, ё, 한 keep their marks
+        .normalize('NFC')
+        .replace(/[^\p{L}\p{M}\p{N}\s_-]+/gu, ' ')
+        .trim()
+        .replace(/\s+/g, '_')
+        .replace(/_+/g, '_'),
+    )
+      .slice(0, 60)
+      .join('')
+      .replace(/^[_-]+|[_-]+$/g, '') || 'scan';
   return `${base}${suffix ? `_${suffix}` : ''}.${ext.replace(/^\./, '')}`;
 }

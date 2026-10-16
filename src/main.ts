@@ -4,21 +4,25 @@
  * never on localhost), persistent storage in Home Screen mode.
  *
  * URL parameters (development / tests): `mock=1`, `mockSpeed=<x>` (MockEngine time scale),
- * `screen=diagnostics|setup` (initial screen).
+ * `mockFail=<method>[:message]` (make a MockEngine method fail), `screen=diagnostics|setup`.
  */
 import './app/styles.css';
 import { App } from './app/app';
 import { toast } from './app/components/toast';
 import { EngineClient, type EngineLike } from './app/engine-client';
-import { MockEngine } from './app/mock-engine';
 import type { NavEvent } from './app/router';
 import { isCancelledError } from './workers/protocol';
 
-function boot(): void {
+async function boot(): Promise<void> {
   const params = new URLSearchParams(location.search);
   const mock = params.get('mock') === '1' || params.get('mock') === 'true';
   const speed = Number(params.get('mockSpeed') ?? '1');
-  const engine: EngineLike = mock ? new MockEngine({ speed: Number.isFinite(speed) && speed > 0 ? speed : 1 }) : new EngineClient();
+  const fail = params.get('mockFail');
+  const failOn = fail ? { [fail.split(':')[0]]: fail.split(':').slice(1).join(':') || 'Simulated failure' } : undefined;
+  // The MockEngine (dev / tests) is loaded on demand: it is not part of the production entry chunk.
+  const engine: EngineLike = mock
+    ? new (await import('./app/mock-engine')).MockEngine({ speed: Number.isFinite(speed) && speed > 0 ? speed : 1, failOn })
+    : new EngineClient();
   const root = document.getElementById('app') ?? document.body.appendChild(document.createElement('div'));
   root.id = 'app';
   installErrorToasts();
@@ -54,9 +58,12 @@ function registerServiceWorker(): void {
   if (!import.meta.env.PROD || !('serviceWorker' in navigator)) return;
   const host = location.hostname;
   if (host === 'localhost' || host === '[::1]' || host.endsWith('.localhost') || /^127\./.test(host)) return;
-  window.addEventListener('load', () => {
+  const register = (): void => {
     navigator.serviceWorker.register(new URL('sw.js', document.baseURI), { scope: './' }).catch((e) => console.warn('[sw] registration failed', e));
-  });
+  };
+  // boot() may run after 'load' (it awaits the MockEngine chunk with ?mock=1): never miss it.
+  if (document.readyState === 'complete') register();
+  else window.addEventListener('load', register, { once: true });
 }
 
 /**
@@ -70,4 +77,4 @@ function requestPersistenceIfInstalled(): void {
   void nav.storage.persist().catch(() => false);
 }
 
-boot();
+void boot();
