@@ -64,6 +64,8 @@ export interface MatcherSelfTestResult {
   overlap: number;
   ms: number;
   error?: string;
+  /** The test could not run because submitted GPU work was dropped (page hidden): run it again later. */
+  transient?: boolean;
 }
 
 export interface MatcherGPUTimings {
@@ -261,7 +263,7 @@ export class MatcherGPU {
       const overlap = Math.min(o1, o2);
       return { ok: overlap >= 0.99, overlap, ms: performance.now() - t0 };
     } catch (e) {
-      return { ok: false, overlap: 0, ms: performance.now() - t0, error: (e as Error)?.message ?? String(e) };
+      return { ok: false, overlap: 0, ms: performance.now() - t0, error: (e as Error)?.message ?? String(e), transient: e instanceof GPUWorkDroppedError };
     }
   }
 

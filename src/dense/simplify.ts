@@ -31,7 +31,7 @@ export interface SimplifyOptions {
  * arrays (4 contiguous children per level → few cache misses); the payload (u, v and
  * their versions at push time) lives in a recycled slot pool.
  */
-class EdgeHeap {
+export class EdgeHeap {
   private cost = new Float64Array(1024);
   private slot = new Int32Array(1024);
   private pool = new Int32Array(4 * 1024);

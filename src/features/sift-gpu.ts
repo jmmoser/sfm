@@ -120,6 +120,11 @@ export interface SiftSelfTestResult {
   medianCos: number;
   ms: number;
   error?: string;
+  /**
+   * The test could not run because submitted GPU work was dropped (page hidden): it says
+   * nothing about the GPU's correctness, run it again later.
+   */
+  transient?: boolean;
 }
 
 /** Image sources accepted by SiftGPU.extractFromBitmap (copyExternalImageToTexture). */
@@ -380,6 +385,10 @@ export class SiftGPU {
       // Any other typed array would be uploaded as raw bytes (garbage features).
       return Promise.reject(new Error('SiftGPU.extract: image data must be a Uint8Array (0..255) or Float32Array (0..1)'));
     }
+    if (!(Number.isInteger(img.width) && Number.isInteger(img.height) && img.width >= 1 && img.height >= 1)) {
+      // (A fractional size reached createBuffer as a TypeError, reported as a GPU failure.)
+      return Promise.reject(new Error(`SiftGPU.extract: invalid image size ${img.width}x${img.height}`));
+    }
     if (img.data.length < img.width * img.height) return Promise.reject(new Error('SiftGPU.extract: image data shorter than width*height'));
     let FW: number;
     let FH: number;
@@ -489,7 +498,7 @@ export class SiftGPU {
       const ok = Math.abs(g.count - c.count) <= Math.max(2, 0.05 * c.count) && p.posFrac >= 0.9 && p.medianCos >= 0.97 && c.count >= minCount;
       return { ok, gpuCount: g.count, cpuCount: c.count, posFrac: p.posFrac, medianCos: p.medianCos, ms: performance.now() - t0 };
     } catch (e) {
-      return { ok: false, gpuCount: 0, cpuCount: 0, posFrac: 0, medianCos: 0, ms: performance.now() - t0, error: (e as Error)?.message ?? String(e) };
+      return { ok: false, gpuCount: 0, cpuCount: 0, posFrac: 0, medianCos: 0, ms: performance.now() - t0, error: (e as Error)?.message ?? String(e), transient: e instanceof GPUWorkDroppedError };
     }
   }
 

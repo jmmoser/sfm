@@ -588,18 +588,54 @@ export function meshComponents(mesh: TriangleMesh): { triComponent: Int32Array; 
 /**
  * Remove connected components with fewer triangles than `minFraction` × the largest
  * component (and fewer than `minTriangles`, if given, regardless of the fraction).
+ * Components whose bounding-box diagonal exceeds `keepDiagonal` (world units) are always
+ * kept: in a large scene a tree or a house that is not connected to the main surface can be
+ * far below 2 % of it, while noise blobs are small in extent.
  */
-export function removeSmallComponents(mesh: TriangleMesh, minFraction: number, minTriangles = 0): { mesh: TriangleMesh; removedComponents: number } {
+export function removeSmallComponents(
+  mesh: TriangleMesh,
+  minFraction: number,
+  minTriangles = 0,
+  keepDiagonal = Infinity,
+): { mesh: TriangleMesh; removedComponents: number } {
   if (mesh.triangleCount === 0) return { mesh, removedComponents: 0 };
   const { triComponent, sizes } = meshComponents(mesh);
   let largest = 0;
   for (const s of sizes) largest = Math.max(largest, s);
   const thr = Math.max(minFraction * largest, minTriangles);
+  const nc = sizes.length;
+  const drop = new Uint8Array(nc);
+  for (let c = 0; c < nc; c++) drop[c] = sizes[c] < thr ? 1 : 0;
+  if (keepDiagonal < Infinity) {
+    // bounding boxes of the candidate components
+    const bb = new Float64Array(6 * nc);
+    for (let c = 0; c < nc; c++) bb.set([Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity], 6 * c);
+    const P = mesh.positions;
+    const ix = mesh.indices;
+    for (let t = 0; t < mesh.triangleCount; t++) {
+      const c = triComponent[t];
+      if (!drop[c]) continue;
+      const o = 6 * c;
+      for (let k = 0; k < 3; k++) {
+        const v = 3 * ix[3 * t + k];
+        for (let a = 0; a < 3; a++) {
+          const x = P[v + a];
+          if (x < bb[o + a]) bb[o + a] = x;
+          if (x > bb[o + 3 + a]) bb[o + 3 + a] = x;
+        }
+      }
+    }
+    for (let c = 0; c < nc; c++) {
+      if (!drop[c]) continue;
+      const o = 6 * c;
+      if (Math.hypot(bb[o + 3] - bb[o], bb[o + 4] - bb[o + 1], bb[o + 5] - bb[o + 2]) > keepDiagonal) drop[c] = 0;
+    }
+  }
   let removed = 0;
-  for (const s of sizes) if (s < thr) removed++;
+  for (let c = 0; c < nc; c++) removed += drop[c];
   if (removed === 0) return { mesh, removedComponents: 0 };
   const keep = new Uint8Array(mesh.triangleCount);
-  for (let t = 0; t < mesh.triangleCount; t++) keep[t] = sizes[triComponent[t]] >= thr ? 1 : 0;
+  for (let t = 0; t < mesh.triangleCount; t++) keep[t] = drop[triComponent[t]] ? 0 : 1;
   return { mesh: compactMesh(mesh, keep), removedComponents: removed };
 }
 

@@ -11,7 +11,8 @@
  *    degenerates when the spacing varies by 100×); points with m_i > μ + std·σ are removed.
  *    With `scaleAdaptive` (default when the cloud has radii) the statistic is m_i / r_i,
  *    i.e. the distance in units of the point's own pixel footprint, so sparse far-away
- *    surfaces are not mistaken for outliers of a dense close-range object.
+ *    surfaces are not mistaken for outliers of a dense close-range object (points without a
+ *    usable radius use the median radius). NaN positions are removed.
  */
 import type { PointCloud } from '../core/types';
 import { Int3HashMap } from './dense-util';
@@ -156,12 +157,26 @@ export function statisticalOutlierMask(
   const keep = new Uint8Array(n).fill(1);
   const meanDist = new Float64Array(n);
   if (n <= k) return { keep, meanDist, threshold: Infinity };
-  const adaptive = (opts.scaleAdaptive ?? !!pc.radii) && !!pc.radii;
+  let adaptive = (opts.scaleAdaptive ?? !!pc.radii) && !!pc.radii;
+  // Points without a usable radius (0, negative, NaN — e.g. merged from another source) are
+  // normalised by the median radius instead of getting an infinite statistic (which removed
+  // them all).
+  let rSub = 1;
+  if (adaptive) {
+    const radii = pc.radii!;
+    const stride = Math.max(1, Math.floor(n / 20000));
+    const rs: number[] = [];
+    for (let i = 0; i < n; i += stride) if (radii[i] > 0 && radii[i] < Infinity) rs.push(radii[i]);
+    if (rs.length === 0) adaptive = false;
+    else {
+      rs.sort((a, b) => a - b);
+      rSub = rs[rs.length >> 1];
+    }
+  }
   const tree = new KdTree3(pc.positions, n);
   const d2 = new Float64Array(k);
   const ii = new Int32Array(k);
   let sum = 0;
-  let sum2 = 0;
   let m = 0;
   // queries in tree order (spatially coherent → cache friendly)
   const order = tree.perm;
@@ -173,20 +188,27 @@ export function statisticalOutlierMask(
     let v = got > 0 ? s / got : Infinity;
     if (adaptive) {
       const r = pc.radii![i];
-      v = r > 0 ? v / r : Infinity;
+      v /= r > 0 && r < Infinity ? r : rSub;
     }
     meanDist[i] = v;
     if (Number.isFinite(v)) {
       sum += v;
-      sum2 += v * v;
       m++;
     }
   }
   if (m === 0) return { keep, meanDist, threshold: Infinity };
+  // two-pass variance (Σv² / m − μ² cancels catastrophically for near-identical values)
   const mu = sum / m;
-  const sigma = Math.sqrt(Math.max(0, sum2 / m - mu * mu));
+  let ss = 0;
+  for (let i = 0; i < n; i++) {
+    const v = meanDist[i];
+    if (Number.isFinite(v)) ss += (v - mu) * (v - mu);
+  }
+  const sigma = Math.sqrt(ss / m);
   const threshold = mu + opts.std * sigma;
-  for (let i = 0; i < n; i++) if (!(meanDist[i] <= threshold)) keep[i] = 0;
+  // rounding tolerance: identical statistics must never fall above their own mean
+  const keepBelow = threshold + 1e-9 * Math.abs(mu);
+  for (let i = 0; i < n; i++) if (!(meanDist[i] <= keepBelow)) keep[i] = 0;
   return { keep, meanDist, threshold };
 }
 

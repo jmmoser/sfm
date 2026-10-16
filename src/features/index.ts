@@ -10,7 +10,7 @@ export * from './sift-cpu';
 export * from './distribute';
 export * from './match';
 export { simdAvailable } from './simd';
-export { GPUFeatureError, GPUWorkDroppedError } from './gpu-common';
+export { FeatureInputError, GPUFeatureError, GPUWorkDroppedError } from './gpu-common';
 export { SiftGPU } from './sift-gpu';
 export type { SiftGPUConfig, SiftGPUTimings, SiftBitmapSource, SiftSelfTestResult } from './sift-gpu';
 export { MatcherGPU } from './match-gpu';

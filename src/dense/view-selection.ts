@@ -121,6 +121,8 @@ export function selectSourceViews(
   options: Partial<ViewSelectionOptions> = {},
 ): Map<number, SourceViewSelection> {
   const o: ViewSelectionOptions = { ...DEFAULT_VIEW_SELECTION_OPTIONS, ...options };
+  // numSources is a hard cap (the geometric fallback fills up to minSources ≤ numSources)
+  o.minSources = Math.min(o.minSources, o.numSources);
   const nv = views.length;
   const result = new Map<number, SourceViewSelection>();
   if (nv === 0) return result;
@@ -277,9 +279,15 @@ export function selectSourceViews(
     };
     let rangePts: number[] | null = null;
     if (depths.length < o.minPointsForRange) {
+      // too few observed points: ADD every point projecting into the image (observed points
+      // stay: their pinhole projection may fall outside the frame for a distorted camera)
       rangePts = frustumPts();
-      depths.length = 0;
-      for (const p of rangePts) depths.push(R[6] * xyz[3 * p] + R[7] * xyz[3 * p + 1] + R[8] * xyz[3 * p + 2] + t[2]);
+      const observed = new Set<number>();
+      for (let k = viewStart[r]; k < viewStart[r + 1]; k++) observed.add(viewPts[k]);
+      for (const p of rangePts) {
+        if (observed.has(p)) continue;
+        depths.push(R[6] * xyz[3 * p] + R[7] * xyz[3 * p + 1] + R[8] * xyz[3 * p + 2] + t[2]);
+      }
     }
 
     // geometric fallback: views whose frustum contains the reference's points

@@ -6,26 +6,34 @@
  *  1. Scene scale: depths sampled from (up to 16) depth maps → median depth z̃ and median
  *     focal length f̃ (depth-map pixels). Auto voxel size = autoVoxelPixels · z̃ / f̃
  *     (≈ 2 pixel footprints at the median depth), clamped to [1e-4, 0.05] · z̃.
- *  2. Allocation pass over all depth maps: every valid pixel (on a stride grid finer than
- *     a third of a block footprint) inserts the blocks along its truncation band
- *     [d − τ, d + τ] on the viewing ray. This runs simultaneously for a ladder of voxel
+ *  2. Allocation pass over all depth maps: valid pixels insert the blocks along their
+ *     band [d − reach, d + reach] on the viewing ray (reach: see 3.), sampled densely enough that
+ *     samples are ≤ half a block apart on the surface (per-pixel power-of-two lattice
+ *     stride from the footprint and the viewing angle; sub-pixel rays where a pixel is
+ *     wider than half a block, i.e. far beyond the median depth — see `allocateBands`).
+ *     This runs simultaneously for a ladder of voxel
  *     sizes (×√2 per level); levels whose block count exceeds `maxBlocks` stop early and
  *     the finest level that fits is used (automatic coarsening: the same code works for a
  *     0.5 m object and a 50 m yard within a fixed memory budget). All blocks are known
  *     before integration, so free-space observations of every view also carve blocks that
  *     were allocated by other views (outlier removal).
  *  3. Integration pass: for each depth map, blocks are culled against the frustum and a
- *     16 × 16-pixel tile max-depth map (blocks entirely behind the observed surface are
- *     skipped); each voxel is projected to its nearest pixel and updated with
- *       sdf = n·(X − P)  (point-to-plane, P = pixel's surface point, n its normal; falls back
- *       to the ray distance (d − z)·|r| for missing / grazing normals),
+ *     16 × 16-pixel tile map of max(d + reach) (blocks entirely behind the observed surfaces
+ *     are skipped); each voxel is projected to its nearest pixel and updated with
+ *       sdf = n·(X − P)  (point-to-plane, P = pixel's surface point, n its normal, for
+ *       cos θ ≥ 0.1; else the ray distance (d − z)·|r|),
  *       τ_obs = max(τ, adaptiveTruncationPx · d / f)  (truncation never thinner than the
  *       observation's footprint-scaled noise, so far surfaces do not fragment),
+ *       only voxels within the reach behind the surface along the ray: τ_obs, but for the
+ *       plane distance at least 1.5 voxels perpendicular (max(τ_obs, 1.5·voxel / cos θ),
+ *       ≤ 10 τ_obs; updates beyond τ_obs along the ray get 0.1× weight) — grazing ground
+ *       planes need it, a reach of τ_obs never observed a voxel below them,
  *       tsdf ← running weighted mean of clamp(sdf/τ_obs, ·, 1) for sdf ≥ −τ_obs,
  *       w = (z̃ / d)² · cos θ  (depth-dependent weight, normalised to 1 at the median depth),
  *       colour ← running mean (separate colour weight) for |sdf| < τ_obs.
  *  4. Marching cubes (`marching-cubes.ts`), then components smaller than
- *     `minComponentFraction` of the largest are removed.
+ *     `minComponentFraction` of the largest AND not wider than `componentKeepVoxels` voxels
+ *     (bounding-box diagonal) are removed.
  *
  * Memory: 11 B per voxel (Int16 TSDF, Uint16 weight, 3 × Uint16 colour, Uint8 colour
  * weight) = 5.6 KB per block; default maxBlocks 50 000 ≈ 280 MB worst case.
@@ -65,6 +73,12 @@ export interface TsdfOptions {
   maxWeight?: number;
   /** Remove components with fewer triangles than this fraction of the largest. Default 0.02 (0 disables). */
   minComponentFraction?: number;
+  /**
+   * Components whose bounding-box diagonal exceeds this many voxels are never removed by
+   * `minComponentFraction` (a detached tree / house in a yard scene is far below 2 % of the
+   * ground, noise blobs are small). Default 16.
+   */
+  componentKeepVoxels?: number;
   /** Accumulate voxel colours. Default true. */
   color?: boolean;
   /** Depth pixels with a photometric cost above this are ignored. Default 2. */
@@ -105,12 +119,32 @@ const DEFAULTS = {
   minWeight: 0,
   maxWeight: 256,
   minComponentFraction: 0.02,
+  componentKeepVoxels: 16,
   color: true,
   maxCost: 2,
 };
 
-/** Minimum cos(viewing angle) for the point-to-plane distance (else the ray distance is used). */
-const MIN_PLANE_COS = 0.25;
+/**
+ * Minimum cos(viewing angle) for the point-to-plane distance (else the ray distance is used).
+ * Grazing surfaces need the plane distance: the ray distance over-estimates the distance to
+ * the surface by 1/cos θ, which makes the band thinner than a voxel (saturated ±1 neighbours →
+ * ghost-rejected cubes → a ground plane seen from 1.6 m broke into > 1000 pieces).
+ */
+const MIN_PLANE_COS = 0.1;
+/** Max. reach behind the surface along the ray in units of τ_obs (= 1 / MIN_PLANE_COS). */
+const MAX_REACH = 1 / MIN_PLANE_COS;
+/**
+ * Perpendicular depth (voxels) behind a surface that plane-distance updates always reach,
+ * also on grazing rays (along-ray reach max(τ_obs, BEHIND_PLANE_VOX·voxel / cos θ)): enough to
+ * bracket the zero crossing with observed voxels, small enough not to bulge silhouettes.
+ */
+const BEHIND_PLANE_VOX = 1.5;
+/**
+ * Weight factor of updates in that extension zone (more than τ_obs behind along the ray):
+ * extrapolated evidence, so wherever another view observes the voxel directly (e.g. free
+ * space beyond a box edge) it dominates; below a grazing ground plane nothing else does.
+ */
+const EXTENSION_WEIGHT = 0.1;
 /** Normalised depth behind the surface down to which observations keep full weight. */
 const BEHIND_FULL = 0.25;
 /** Voxel-size ladder for automatic coarsening: up to √2^15 ≈ 181 × the auto voxel. */
@@ -275,75 +309,136 @@ function viewGeom(view: DenseView, dm: DepthMap): ViewGeom {
   return { cam: scaleCamera(view.cam, dm.width, dm.height), R: view.pose.R, t: view.pose.t, C: poseCentre(view.pose) };
 }
 
-/** Low percentile of valid depths (allocation stride) — sampled. */
-function lowDepth(dm: DepthMap, maxDepth: number, maxCost: number): number {
-  const n = dm.width * dm.height;
-  const step = Math.max(1, Math.floor(n / 4096));
-  const s: number[] = [];
-  for (let i = 0; i < n; i += step) {
-    const d = dm.depth[i];
-    if (d > 0 && d <= maxDepth && !(dm.cost && dm.cost[i] > maxCost)) s.push(d);
-  }
-  return s.length ? quantile(s, 0.02) : NaN;
+/** One voxel size of the allocation ladder (see `allocateBands`). */
+interface AllocLevel {
+  voxelSize: number;
+  /** Inserts a block; returns false on overflow (the level is then marked done). */
+  insert: (bx: number, by: number, bz: number) => boolean;
+  done: boolean;
 }
 
+/** Cap on the sub-pixel rays per axis for pixels whose footprint exceeds half a block. */
+const MAX_SUBRAYS = 6;
+
 /**
- * Insert the blocks covering the truncation bands of a depth map's pixels into `insert`.
- * Returns false when `insert` reported overflow.
+ * Insert the blocks covering the bands [d − reach, d + reach] along the rays of a depth map's
+ * pixels (reach = the integration's reach behind the surface: τ_obs, or for plane-distance
+ * pixels max(τ_obs, BEHIND_PLANE_VOX·voxel / cos θ) ≤ MAX_REACH·τ_obs), for every level of
+ * the ladder in one pass over the pixels.
+ *
+ * Sampling density adapts PER PIXEL so that consecutive samples are ≤ half a block apart
+ * ON THE SURFACE: the allowed pixel stride is p = ½·bw·cos θ / footprint (cos θ from the
+ * pixel normal, clamped to ≥ 0.25; 0.5 without a normal). p ≥ 2 → the pixel is used only
+ * if it lies on the power-of-two lattice of spacing p (lattices nest, so mixed depths keep
+ * the local density); p < 1 (surfaces much further than the median depth, where a pixel
+ * covers more than half a block) → the pixel is split into m × m sub-pixel rays. A single
+ * stride derived from a low depth percentile (the previous scheme) left holes in far
+ * surfaces and on grazing ones.
  */
 function allocateBands(
   dm: DepthMap,
   g: ViewGeom,
-  voxelSize: number,
-  tau: number,
+  levels: AllocLevel[],
+  truncVox: number,
   adaptivePx: number,
   maxDepth: number,
   maxCost: number,
-  zLow: number,
-  insert: (bx: number, by: number, bz: number) => boolean,
-): boolean {
+  planeMode: boolean,
+): void {
   const { cam, R, C } = g;
   const W = dm.width;
   const H = dm.height;
-  const bw = BLOCK_SIZE * voxelSize;
-  // pixel stride: footprint at the near depth ≤ a third of a block
-  const stride = Math.max(1, Math.min(16, Math.floor((bw * cam.f) / (3 * Math.max(zLow, 1e-12)))));
-  const invV = 1 / voxelSize;
-  let lastX = 0x7fffffff;
-  let lastY = 0;
-  let lastZ = 0;
-  for (let y = 0; y < H; y += stride) {
-    const ry = (y - cam.cy) / cam.f;
-    for (let x = 0; x < W; x += stride) {
+  const f = cam.f;
+  const depth = dm.depth;
+  const normal = dm.normal;
+  const cost = dm.cost;
+  const nL = levels.length;
+  const halfBw = levels.map((l) => 0.5 * BLOCK_SIZE * l.voxelSize);
+  const invV = levels.map((l) => 1 / l.voxelSize);
+  const tauL = levels.map((l) => truncVox * l.voxelSize);
+  // per level: last inserted block (skip consecutive duplicates)
+  const last = new Int32Array(3 * nL).fill(0x7fffffff);
+  let active = 0;
+  for (const l of levels) if (!l.done) active++;
+  for (let y = 0; y < H && active > 0; y++) {
+    const ryc = (y - cam.cy) / f;
+    for (let x = 0; x < W; x++) {
       const i = y * W + x;
-      const d = dm.depth[i];
-      if (!(d > 0) || d > maxDepth) continue;
-      if (dm.cost && dm.cost[i] > maxCost) continue;
-      const rx = (x - cam.cx) / cam.f;
-      const L = Math.sqrt(rx * rx + ry * ry + 1);
-      const tauObs = Math.max(tau, (adaptivePx * d) / cam.f);
-      // world ray direction for unit camera z: Rᵀ (rx, ry, 1)
-      const dx = R[0] * rx + R[3] * ry + R[6];
-      const dy = R[1] * rx + R[4] * ry + R[7];
-      const dz = R[2] * rx + R[5] * ry + R[8];
-      const z0 = d - tauObs / L;
-      const z1 = d + tauObs / L;
-      const n = Math.max(2, Math.ceil(((z1 - z0) * L) / (0.5 * bw)) + 1);
-      for (let s = 0; s < n; s++) {
-        const z = z0 + ((z1 - z0) * s) / (n - 1);
-        if (z <= 0) continue;
-        const bx = Math.floor(((C[0] + z * dx) * invV + 0.5) / BLOCK_SIZE);
-        const by = Math.floor(((C[1] + z * dy) * invV + 0.5) / BLOCK_SIZE);
-        const bz = Math.floor(((C[2] + z * dz) * invV + 0.5) / BLOCK_SIZE);
-        if (bx === lastX && by === lastY && bz === lastZ) continue;
-        lastX = bx;
-        lastY = by;
-        lastZ = bz;
-        if (!insert(bx, by, bz)) return false;
+      const d = depth[i];
+      if (!(d > 0 && d <= maxDepth && d < Infinity)) continue; // NaN / ±Infinity = invalid
+      if (cost && cost[i] > maxCost) continue;
+      const rxc = (x - cam.cx) / f;
+      const Lc = Math.sqrt(rxc * rxc + ryc * ryc + 1);
+      const nx = normal[3 * i];
+      const ny = normal[3 * i + 1];
+      const nz = normal[3 * i + 2];
+      let cosT = 0.5;
+      // 1/cos θ where the integration uses the plane distance (its along-ray reach behind the
+      // surface is max(τ_obs, BEHIND_PLANE_VOX·voxel/cos θ)); 0 = ray distance (reach τ_obs)
+      let invCosPlane = 0;
+      if (nx !== 0 || ny !== 0 || nz !== 0) {
+        const cn = -(nx * rxc + ny * ryc + nz) / Lc;
+        if (planeMode && cn >= MIN_PLANE_COS) invCosPlane = 1 / cn;
+        cosT = cn > 1 ? 1 : cn > 0.25 ? cn : 0.25; // also NaN → 0.25
+      }
+      // allowed stride (pixels) per unit of half-block width
+      const pfUnit = (cosT * f) / d;
+      // the last row / column are always sampled (they are not on the lattice in general)
+      const xy = x === W - 1 || y === H - 1 ? 0 : x | y;
+      const tauAd = (adaptivePx * d) / f;
+      for (let l = 0; l < nL; l++) {
+        const lev = levels[l];
+        if (lev.done) continue;
+        const pf = pfUnit * halfBw[l];
+        let m = 1;
+        if (pf >= 2) {
+          const p = pf >= 16 ? 16 : pf >= 8 ? 8 : pf >= 4 ? 4 : 2;
+          if (xy & (p - 1)) continue;
+        } else if (pf < 1) {
+          m = Math.min(MAX_SUBRAYS, Math.ceil(1 / pf));
+        }
+        const tau0 = Math.max(tauL[l], tauAd);
+        // band half-length along the ray = the integration's reach (symmetric)
+        const tauObs = invCosPlane > 0 ? Math.max(tau0, Math.min(MAX_REACH * tau0, BEHIND_PLANE_VOX * levels[l].voxelSize * invCosPlane)) : tau0;
+        const iv = invV[l];
+        const stepLen = halfBw[l]; // ≤ half a block between band samples
+        let ok = true;
+        for (let sy = 0; sy < m && ok; sy++) {
+          const ry = m === 1 ? ryc : (y + (sy + 0.5) / m - 0.5 - cam.cy) / f;
+          for (let sx = 0; sx < m; sx++) {
+            const rx = m === 1 ? rxc : (x + (sx + 0.5) / m - 0.5 - cam.cx) / f;
+            const L = m === 1 ? Lc : Math.sqrt(rx * rx + ry * ry + 1);
+            // world ray direction for unit camera z: Rᵀ (rx, ry, 1)
+            const dx = R[0] * rx + R[3] * ry + R[6];
+            const dy = R[1] * rx + R[4] * ry + R[7];
+            const dz = R[2] * rx + R[5] * ry + R[8];
+            const z0 = d - tauObs / L;
+            const z1 = d + tauObs / L;
+            const n = Math.max(2, Math.ceil((2 * tauObs) / stepLen) + 1);
+            for (let s = 0; s < n; s++) {
+              const z = z0 + ((z1 - z0) * s) / (n - 1);
+              if (z <= 0) continue;
+              const bx = Math.floor(((C[0] + z * dx) * iv + 0.5) / BLOCK_SIZE);
+              const by = Math.floor(((C[1] + z * dy) * iv + 0.5) / BLOCK_SIZE);
+              const bz = Math.floor(((C[2] + z * dz) * iv + 0.5) / BLOCK_SIZE);
+              const o = 3 * l;
+              if (bx === last[o] && by === last[o + 1] && bz === last[o + 2]) continue;
+              last[o] = bx;
+              last[o + 1] = by;
+              last[o + 2] = bz;
+              if (!lev.insert(bx, by, bz)) {
+                lev.done = true;
+                active--;
+                ok = false;
+                break;
+              }
+            }
+            if (!ok) break;
+          }
+        }
       }
     }
   }
-  return true;
 }
 
 const TILE = 16;
@@ -374,13 +469,14 @@ export function integrateDepthMap(
   const maxDepth = params.maxDepth;
   const maxCost = params.maxCost;
   const maxW = Math.min(65535, Math.round(params.maxWeight * WEIGHT_UNIT));
+  const behindPlane = BEHIND_PLANE_VOX * vs;
   const depth = dm.depth;
   const normal = dm.normal;
   const cost = dm.cost;
 
   // Interleaved per-pixel record (d, nx, ny, nz) with validity folded into d (0 = unusable):
-  // a voxel lookup then touches one cache line instead of three arrays. Plus the tile
-  // max-depth map (0 = no valid depth) for block culling.
+  // a voxel lookup then touches one cache line instead of three arrays. Plus the per-tile
+  // max of (d + reach behind the surface) (0 = no valid depth) for block culling.
   const n4 = 4 * W * H;
   if (pixScratch.length < n4) pixScratch = new Float32Array(n4);
   const pix = pixScratch;
@@ -389,17 +485,26 @@ export function integrateDepthMap(
   const tileMax = new Float32Array(tw * th);
   for (let y = 0; y < H; y++) {
     const trow = ((y / TILE) | 0) * tw;
+    const ry = (y - cy) / f;
     for (let x = 0; x < W; x++) {
       const i = y * W + x;
       let d = depth[i];
-      if (!(d > 0) || d > maxDepth || (cost && cost[i] > maxCost)) d = 0;
+      if (!(d > 0 && d <= maxDepth && d < Infinity) || (cost && cost[i] > maxCost)) d = 0;
+      const nx = normal[3 * i];
+      const ny = normal[3 * i + 1];
+      const nz = normal[3 * i + 2];
       pix[4 * i] = d;
-      pix[4 * i + 1] = normal[3 * i];
-      pix[4 * i + 2] = normal[3 * i + 1];
-      pix[4 * i + 3] = normal[3 * i + 2];
+      pix[4 * i + 1] = nx;
+      pix[4 * i + 2] = ny;
+      pix[4 * i + 3] = nz;
       if (d === 0) continue;
+      const rx = (x - cx) / f;
+      const L = Math.sqrt(rx * rx + ry * ry + 1);
+      const tauObs = kPx > 0 ? Math.max(tau, (kPx * d) / f) : tau;
+      const cosN = -(nx * rx + ny * ry + nz) / L;
+      const reach = planeMode && cosN >= MIN_PLANE_COS ? Math.max(tauObs, Math.min(MAX_REACH * tauObs, behindPlane / cosN)) : tauObs;
       const ti = trow + ((x / TILE) | 0);
-      if (d > tileMax[ti]) tileMax[ti] = d;
+      if (d + reach > tileMax[ti]) tileMax[ti] = d + reach;
     }
   }
 
@@ -434,28 +539,34 @@ export function integrateDepthMap(
     if (zNear > 0) {
       const bcx = R[0] * wx + R[1] * wy + R[2] * wz + t[0];
       const bcy = R[3] * wx + R[4] * wy + R[5] * wz + t[1];
-      const u = (f * bcx) / bcz + cx;
-      const v = (f * bcy) / bcz + cy;
-      const rpx = (f * blockRadius) / zNear;
-      const u0 = u - rpx;
-      const u1 = u + rpx;
-      const v0 = v - rpx;
-      const v1 = v + rpx;
+      const tx = bcx / bcz;
+      const ty = bcy / bcz;
+      const u = f * tx + cx;
+      const v = f * ty + cy;
+      // half-extent of the projected bounding sphere per axis: f·r·√(1 + (X/Z)²) / (Z − r)
+      // (an off-axis sphere projects to an ellipse elongated radially; f·r/(Z − r) alone
+      // under-estimates it by up to 2× at a 120° FOV and culled blocks that were in view)
+      const rpx0 = (f * blockRadius) / zNear;
+      const rpu = rpx0 * Math.sqrt(1 + tx * tx);
+      const rpv = rpx0 * Math.sqrt(1 + ty * ty);
+      const u0 = u - rpu;
+      const u1 = u + rpu;
+      const v0 = v - rpv;
+      const v1 = v + rpv;
       if (u1 < -0.5 || v1 < -0.5 || u0 > W - 0.5 || v0 > H - 0.5) continue;
       const tx0 = Math.max(0, Math.floor((u0 + 0.5) / TILE));
       const tx1 = Math.min(tw - 1, Math.floor((u1 + 0.5) / TILE));
       const ty0 = Math.max(0, Math.floor((v0 + 0.5) / TILE));
       const ty1 = Math.min(th - 1, Math.floor((v1 + 0.5) / TILE));
-      let dMax = 0;
+      let reachMax = 0;
       for (let ty = ty0; ty <= ty1; ty++) {
         for (let tx = tx0; tx <= tx1; tx++) {
           const m = tileMax[ty * tw + tx];
-          if (m > dMax) dMax = m;
+          if (m > reachMax) reachMax = m;
         }
       }
-      if (dMax === 0) continue;
-      const tauMax = Math.max(tau, (kPx * dMax) / f);
-      if (zNear > dMax + tauMax) continue; // entirely behind the observed surface
+      if (reachMax === 0) continue; // no valid depth under the block
+      if (zNear > reachMax) continue; // entirely behind the observed surfaces (+ their reach)
     }
 
     // voxel (0,0,0) of the block in camera coordinates
@@ -485,26 +596,37 @@ export function integrateDepthMap(
           const d = pix[q4];
           if (d === 0) continue;
           const tauObs = kPx > 0 ? Math.max(tau, (kPx * d) / f) : tau;
-          // only voxels at most τ behind the observed surface ALONG THE RAY are updated
-          // (the point-to-plane distance alone would reach τ/cos θ deep on grazing rays,
-          // through thin parts and around edges)
-          if (Z - d > tauObs) continue;
+          if (Z - d > MAX_REACH * tauObs) continue; // cheap early reject (see `reach` below)
           const rqx = (px - cx) / f;
           const rqy = (py - cy) / f;
           const L = Math.sqrt(rqx * rqx + rqy * rqy + 1);
-          if ((Z - d) * L > tauObs) continue;
           let sdf: number;
           let cosT = 1;
           const nx = pix[q4 + 1];
           const ny = pix[q4 + 2];
           const nz = pix[q4 + 3];
           const nr = nx * rqx + ny * rqy + nz;
-          if (planeMode && -nr >= MIN_PLANE_COS * L) {
-            sdf = nx * X + ny * Y + nz * Z - d * nr;
+          // Reach behind the surface ALONG THE RAY: τ_obs (the plane distance alone would reach
+          // τ_obs/cos θ deep on grazing rays and bulge silhouettes / thin parts), but for the
+          // plane distance at least BEHIND_PLANE_VOX voxels perpendicular to the tangent plane:
+          // limited to τ_obs along the ray, no voxel below a grazing ground plane was ever
+          // observed (no sign change → a yard ground broke into > 1000 pieces).
+          let reach = tauObs;
+          const plane = planeMode && -nr >= MIN_PLANE_COS * L;
+          if (plane) {
             cosT = -nr / L;
+            const r2 = behindPlane / cosT;
+            if (r2 > reach) reach = r2 < MAX_REACH * tauObs ? r2 : MAX_REACH * tauObs;
+          }
+          if ((Z - d) * L > reach) continue;
+          if (plane) {
+            sdf = nx * X + ny * Y + nz * Z - d * nr;
           } else {
             sdf = (d - Z) * L;
-            if (nx !== 0 || ny !== 0 || nz !== 0) cosT = Math.max(0.1, Math.abs(nr) / L);
+            if (nx !== 0 || ny !== 0 || nz !== 0) {
+              cosT = Math.abs(nr) / L;
+              if (!(cosT >= 0.1)) cosT = 0.1; // also NaN normals
+            }
           }
           if (sdf < -tauObs) continue;
           const tv = sdf >= tauObs ? 1 : sdf / tauObs;
@@ -517,6 +639,10 @@ export function integrateDepthMap(
           if (tv < -BEHIND_FULL) {
             wq = ((wq * (1 + tv)) / (1 - BEHIND_FULL) + 0.5) | 0;
             if (wq < 1) continue;
+          }
+          if ((Z - d) * L > tauObs) {
+            wq = (wq * EXTENSION_WEIGHT + 0.5) | 0;
+            if (wq < 1) wq = 1;
           }
           const vi = rowBase + lx;
           const w0 = weight[vi];
@@ -580,7 +706,7 @@ export async function buildTsdfVolume(
     let any = false;
     for (let i = 0; i < n; i += step) {
       const d = dm.depth[i];
-      if (d > 0 && d <= o.maxDepth && !(dm.cost && dm.cost[i] > o.maxCost)) {
+      if (d > 0 && d <= o.maxDepth && d < Infinity && !(dm.cost && dm.cost[i] > o.maxCost)) {
         depthSamples.push(d);
         any = true;
       }
@@ -594,7 +720,7 @@ export async function buildTsdfVolume(
       if (!dm) continue;
       for (let i = 0; i < dm.depth.length; i += 7) {
         const d = dm.depth[i];
-        if (d > 0 && d <= o.maxDepth) depthSamples.push(d);
+        if (d > 0 && d <= o.maxDepth && d < Infinity) depthSamples.push(d);
       }
       fs.push(scaleCamera(v.cam, dm.width, dm.height).f);
       if (depthSamples.length > 1000) break;
@@ -618,40 +744,39 @@ export async function buildTsdfVolume(
   //    level of a window overflows, the next window is counted in a new pass.
   const maxLevels = userVoxel ? 1 : MAX_LEVELS;
   const budget = Math.max(1, Math.floor(o.maxBlocks));
-  const cap = userVoxel ? Infinity : budget;
+  // The counting maps are capped by the budget for a user voxel size too: an unbounded map
+  // (a tiny voxel over a large scene) would exhaust memory before the budget is applied.
+  const cap = budget;
   let level = -1;
   let chosenMap: Int3HashMap | null = null;
   for (let base = 0; base < maxLevels && level < 0; base += LEVEL_WINDOW) {
     const nL = Math.min(LEVEL_WINDOW, maxLevels - base);
-    const levelVoxel: number[] = [];
-    for (let l = 0; l < nL; l++) levelVoxel.push(voxel0 * Math.pow(Math.SQRT2, base + l));
-    const levelMaps = levelVoxel.map(() => new Int3HashMap(1024));
-    const levelOverflow = new Uint8Array(nL);
+    const levels: AllocLevel[] = [];
+    const levelMaps: Int3HashMap[] = [];
+    for (let l = 0; l < nL; l++) {
+      const map = new Int3HashMap(1024);
+      levelMaps.push(map);
+      levels.push({
+        voxelSize: voxel0 * Math.pow(Math.SQRT2, base + l),
+        insert: (bx, by, bz) => {
+          map.getOrInsert(bx, by, bz, map.size);
+          return map.size <= cap;
+        },
+        done: false,
+      });
+    }
     for (let k = 0; k < views.length; k++) {
       progress?.({ stage: 'tsdf', progress: 0.3 * (k / views.length), message: `allocating ${k + 1}/${views.length}` });
       await yielder.tick();
       const view = views[k];
       const dm = await cache.get(view.id);
       if (!dm) continue;
-      const g = viewGeom(view, dm);
-      const zLow = lowDepth(dm, o.maxDepth, o.maxCost);
-      if (!(zLow > 0)) continue;
-      for (let l = 0; l < nL; l++) {
-        if (levelOverflow[l]) continue;
-        const map = levelMaps[l];
-        const ok = allocateBands(dm, g, levelVoxel[l], truncVox * levelVoxel[l], o.adaptiveTruncationPx, o.maxDepth, o.maxCost, zLow, (bx, by, bz) => {
-          map.getOrInsert(bx, by, bz, map.size);
-          return map.size <= cap;
-        });
-        if (!ok) {
-          levelOverflow[l] = 1;
-          levelMaps[l] = new Int3HashMap(16); // release
-        }
-      }
-      if (levelOverflow.every((x) => x === 1)) break;
+      allocateBands(dm, viewGeom(view, dm), levels, truncVox, o.adaptiveTruncationPx, o.maxDepth, o.maxCost, o.sdfMode === 'plane');
+      for (let l = 0; l < nL; l++) if (levels[l].done) levelMaps[l] = new Int3HashMap(16); // release
+      if (levels.every((x) => x.done)) break;
     }
     for (let l = 0; l < nL; l++) {
-      if (!levelOverflow[l]) {
+      if (!levels[l].done) {
         level = base + l;
         chosenMap = levelMaps[l];
         break;
@@ -664,14 +789,15 @@ export async function buildTsdfVolume(
   const tau = truncVox * voxel;
   const vol = new TsdfVolume(voxel, tau, budget, o.color, chosenMap ? Math.max(16, chosenMap.size) : budget);
   if (overflowAll || !chosenMap) {
-    // even the coarsest level overflowed: allocate greedily up to the budget during a second pass
+    // even the coarsest level overflowed (or the user voxel does not fit): allocate greedily,
+    // views in sequence, until the budget is exhausted
+    const greedy: AllocLevel = { voxelSize: voxel, insert: (bx, by, bz) => vol.allocateBlock(bx, by, bz) >= 0, done: false };
     for (const view of views) {
       await yielder.tick();
       const dm = await cache.get(view.id);
       if (!dm) continue;
-      const zLow = lowDepth(dm, o.maxDepth, o.maxCost);
-      if (!(zLow > 0)) continue;
-      allocateBands(dm, viewGeom(view, dm), voxel, tau, o.adaptiveTruncationPx, o.maxDepth, o.maxCost, zLow, (bx, by, bz) => vol.allocateBlock(bx, by, bz) >= 0 || true);
+      allocateBands(dm, viewGeom(view, dm), [greedy], truncVox, o.adaptiveTruncationPx, o.maxDepth, o.maxCost, o.sdfMode === 'plane');
+      if (greedy.done) break;
     }
   } else {
     // re-create the blocks of the chosen level (insertion order: views in sequence)
@@ -700,6 +826,7 @@ export async function buildTsdfVolume(
       maxWeight: o.maxWeight,
     });
   }
+  pixScratch = new Float32Array(0); // release the per-pixel scratch (16 B/px of the largest map)
   const tC = performance.now();
   if (stats) {
     stats.voxelSize = voxel;
@@ -756,7 +883,8 @@ export async function tsdfMesh(
   const frac = opts.minComponentFraction ?? DEFAULTS.minComponentFraction;
   let removed = 0;
   if (frac > 0) {
-    const r = removeSmallComponents(mesh, frac);
+    const keepVox = opts.componentKeepVoxels ?? DEFAULTS.componentKeepVoxels;
+    const r = removeSmallComponents(mesh, frac, 0, keepVox > 0 ? keepVox * vol.voxelSize : Infinity);
     mesh = r.mesh;
     removed = r.removedComponents;
   }

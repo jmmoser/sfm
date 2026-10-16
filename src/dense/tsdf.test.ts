@@ -125,7 +125,9 @@ describe('tsdfMesh', () => {
     log(`box: ${fmtStats(s)}; error mean ${(err.mean / s.voxelSize).toFixed(3)} vox, p95 ${(err.p95 / s.voxelSize).toFixed(3)} vox, max ${(err.max / s.voxelSize).toFixed(3)} vox; edges ${JSON.stringify(st)}`);
     expect(st.boundary).toBe(0);
     expect(st.nonManifold).toBe(0);
-    expect(err.p95).toBeLessThan(0.5 * s.voxelSize);
+    // p95 0.48 → 0.54 voxel since grazing views (cos θ ≥ 0.1) use the plane distance (needed for
+    // ground planes seen from eye height, see tsdf-adversarial): slightly rounder box edges
+    expect(err.p95).toBeLessThan(0.6 * s.voxelSize);
     expect(err.max).toBeLessThan(1.5 * s.voxelSize); // corners are rounded by ~1 voxel
   });
 

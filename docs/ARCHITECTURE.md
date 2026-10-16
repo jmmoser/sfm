@@ -1417,3 +1417,174 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   orphans the re-acquired lock. **GeoSensor.approximate** follows the newest fix (not sticky after a
   coarse first cell/Wi-Fi fix).
 * Tests: `src/sensors/review.test.ts` (Node) and `src/sensors/review.gpu.test.ts` (Chromium).
+
+### `src/geometry` — review notes (adversarial review; supersedes conflicting points of the `src/geometry` notes above)
+
+* **recoverPose tie-breaking**: when several of the four (R, ±t) candidates have the same finite-depth
+  in-front count — in particular 0 for all of them when every point is beyond `CHEIRALITY_MAX_DEPTH` (1000)
+  baselines or the rays are exactly parallel (pure rotation) — the candidate was the first one, i.e. the
+  180°-twisted rotation half of the time. Ties are now broken by the in-front count without the depth
+  bound, then by Σ cos∠(R x1, x2) (rejects the twisted R). `numInFront` keeps its finite-depth meaning.
+  `cheiralityCount(..., maxDepth = Infinity)` is supported.
+* **essential5pt**: real eigenvalues whose Gauss–Newton polish does not converge (rel. residual > 1e-6;
+  ill-conditioned root clusters near pure rotation) are dropped — they were returned although they are
+  not essential (σ2/σ1 down to 0.96). True solutions polish to ≤ 1e-9 (4800 noise-free configurations
+  incl. planar / forward motion / baseline/depth 1e-4). The polish now reports the residual of the
+  accepted point, not of a rejected trial step. Still lost at small baselines: ~2–10 % of noise-free
+  samples at baseline/depth 1e-3…1e-2 (up to 30 % for forward motion toward a plane), 25–80 % at
+  1e-4…1e-3 — the true root's eigenvalue is perturbed into a complex pair by the ill-conditioned
+  elimination template (widening the near-real gate does not help); such parallax is below the noise.
+* **estimateTwoViewGeometry**:
+  - planar_or_panoramic: the H decomposition is computed once; if the E-RANSAC pose matches an H branch
+    with clearly less cheirality support than the best branch (> max(2, 1 % of nH) fewer points in front),
+    the best branch is used — E cannot tell the planar branches apart, cheirality often can (walking along
+    a facade / sideways over the ground: wrong branch, 5.7°–19° rotation error, in 3–5 of 6 seeds before).
+    'planar' reports, among branches tied in support, the one closest to the selected pose;
+    `planarAlternative` only if another branch has ≥ 90 % of the best support (genuinely ambiguous).
+  - 'panoramic' with an observed translation (≥ 80 % of the inliers in front for the full model's pose;
+    pure rotation measures ≤ 0.52) reports the full model's R; the rotation-only fit is used only for
+    (near-)pure rotation. It absorbed the translation: 0.11–0.28° error vs 0.006–0.04° now (3-D scene
+    5–15 m, 5 cm step). t stays (0, 0, 0).
+  - Inlier sets that are coincident / collinear within maxErrorPx (minor-axis RMS of the 2-D scatter in
+    either image) or have < minNumInliers distinct correspondences (1-px cells, min over both images) are
+    'degenerate' (were 'calibrated' with an arbitrary pose for identical, collinear or 3-point-repeated
+    input).
+* `refinePoint` with `cams = []` / `n = 0` returns a copy instead of throwing.
+* Regression tests: `src/geometry/adversarial.test.ts` (26 tests; the 8 marked [regression] fail on the
+  pre-review code). Remaining known limits: planar pairs with t ∥ n (walking toward a wall) are
+  ill-conditioned for both H and E (≈ 0.2–0.3° / 2–6° from two views); hopeless (random) pairs still cost
+  ≈ 0.6–1.2 s in Node (pass `maxIterations` for speculative pairs); `projectCam` does not reject points
+  beyond the monotone radius of a strongly barrel-distorted lens (they fold back into the image).
+
+### `src/features` — GPU review notes (adversarial review; amends the `src/features` GPU notes above)
+
+* **Kernels verified line by line against the CPU reference.** Checked: barriers and
+  shared-memory reuse in all 13 WGSL kernels, uniformity, uniform layouts against `ParamBlock`,
+  index bounds and the fixed-point overflow bound. No kernel defect found. New parity tests
+  show identical feature counts, position agreement 1.000 and median descriptor cosine 1.00000
+  for each of these: S = 1 / 2 / 4, `maxOrientations` 4, σ below the base blur (copy path),
+  `firstOctave` 1, `distribute: false`, odd sizes, a 700×40 image. Tiled and direct blurs are
+  bit-identical at odd sizes and with radius 45 (above the tiled-V limit). A submit budget of
+  63 command buffers gives bit-identical output. Multi-pass matching (`rowTile0 > 0`), extreme
+  column chunking, exact ties, all-zero descriptors and `ratio > 1` give pairs identical to
+  matchCPU.
+* **Fixed: GPU errors were misclassified as dropped work.** An invalid command buffer is not
+  executed, so the work stamp also mismatches, and the error scope's validation / OOM error
+  was ignored in favour of that mismatch. Result: 3 retries, then a *transient*
+  `GPUWorkDroppedError`, so the pipeline kept a broken GPU backend for the whole session (3
+  failing GPU attempts per call, then the CPU). A scope error now outranks the stamp. Such a
+  failure is a hard `GPUFeatureError` and drops the cached per-size resources.
+* **Fixed: input errors no longer switch the pipeline to the CPU for good.** These are now
+  plain `Error`s (`FeatureInputError`, exported) instead of GPU failures:
+  * FeatureSets shorter than `count` (before: a RangeError → `GPUFeatureError`, or an
+    out-of-view read);
+  * unreadable `extractFromBitmap` sources;
+  * a detached `ImageData` (Chromium's `copyExternalImageToTexture` crashes the renderer on
+    it);
+  * non-Uint8 / Float32 gray data (before: uploaded as raw bytes).
+* **Fixed: freeing resources mid-call.** `releaseCaches()` / `clearCache()` / `destroy()`
+  during a running call are deferred to its end. Before, they destroyed buffers still used by
+  later command buffers, so the call silently retried and re-allocated what was meant to be
+  freed.
+* **Fixed: a transient start-up self-test failure** (GPU work dropped while the app was
+  backgrounded during `createFeaturePipeline`) is postponed to the next call instead of
+  selecting the CPU for the session. `selfTest()` results have `transient`. The SIFT
+  self-test no longer fails for `maxFeatures < 10`.
+* **Fixed: smaller issues.**
+  * `extractFromBitmap(bmp, fullWidth)` with only one dimension: the CPU fallback used an
+    anisotropic frame.
+  * Error scopes in `compilePipeline` are synchronous, and the two pops in `errorScope` are
+    issued together: concurrent compilations no longer swap errors. Before, a good pipeline
+    could report another pipeline's shader error.
+  * `BudgetEncoder` creates encoders lazily, so no stamp-only encoder is left dangling after
+    the last submit.
+  * Octave sizes are checked before any allocation (fixes a leak on the limit error).
+  * Staging buffers are always unmapped.
+* **Still open:**
+  * `SiftGPU` / `MatcherGPU` hold their error scopes across `await`. A GPU error from another
+    module during that window, if that module uses no scopes of its own, is attributed to
+    features, which then fall back to the CPU. The reverse attribution cannot give wrong
+    results: an invalid command buffer fails the stamp check.
+  * Float32 input must stay within 0..1. The descriptor fixed point has about 25 % headroom;
+    0..255 floats overflow the u32 bins silently.
+  * `onSubmittedWorkDone` has no timeout. If iOS stalls the queue while hidden, the call
+    waits until the page is visible again.
+* Tests: `gpu-review.gpu.test.ts` (23, Chromium) and `gpu-review.test.ts` (8, Node, with a
+  fake device for `BudgetEncoder` / `WorkStamp`). The existing GPU tests now require identical
+  match arrays, and stricter SIFT thresholds: position ≥ 0.97 and cosine ≥ 0.995 (before
+  0.85 / 0.97).
+
+### `src/dense` — fusion & meshing review notes (adversarial review; amends the fusion & meshing subsection above)
+
+* **TSDF allocation** (`allocateBands`): one stride from the 2nd depth percentile left holes.
+  Pixels more than about 3× that depth were spaced over a block apart, and grazing surfaces too.
+  Measured on a near box plus a wall 15× further: 1 223 of 1 319 wall pixels and 285 box pixels
+  had no block. Sampling now adapts per pixel: a power-of-two lattice stride
+  p = ½·block·cos θ / footprint, and m × m sub-pixel rays (m ≤ 6) where a pixel is wider than
+  half a block. The last row and column are always sampled. All ladder levels share one pass
+  over the pixels. Result: 0 missing blocks, and the far wall is meshed with 100 % coverage
+  (was 57 %).
+* **Grazing surfaces** (a ground plane seen from 1.6 m): the yard mesh had 1 128 components,
+  because no voxel below the ground was ever observed. Behind the surface, updates stopped at
+  τ_obs along the ray, and below cos θ = 0.25 the ray distance was used, which saturates the
+  voxel above the ground to +1. Both pushed the cubes into ghost rejection or left them with no
+  sign change. Now:
+  * the plane distance is used down to cos θ ≥ 0.1;
+  * the reach behind the surface along the ray is max(τ_obs, 1.5·voxel / cos θ), at most
+    10·τ_obs;
+  * updates beyond τ_obs along the ray carry 0.1× weight, so voxels seen directly from another
+    view dominate;
+  * the allocation band and the tile culling use the same reach.
+
+  Effect on the yard: largest component 50 k → 157 k triangles, all components 171 k → 293 k
+  triangles. On a pure ground plane, the share of ground within 25 m covered by the largest
+  component rose from 73 % to 96.5 %. Sphere accuracy improved: mean 0.024 → 0.015 voxel, max
+  0.14 → 0.095. Trade-off: on the yawed box, p95 goes from 0.48 to 0.54 voxel because box edges
+  seen at grazing angles get slightly rounder.
+* **Tile culling**: the projected block radius f·r/(Z − r) under-estimates an off-axis sphere,
+  by up to 2× at 120° FOV, so blocks that were in view got culled. Now f·r·√(1 + (X/Z)²)/(Z − r)
+  per axis. The voxel update count matches a brute-force integrator exactly, in ray and plane
+  mode.
+* **Memory cap**: with a user-given `voxelSize`, the counting hash map was unbounded (cap = ∞).
+  It is now capped at `maxBlocks`, followed by greedy allocation that stops at the budget.
+  The module-level per-pixel scratch (16 B/px) is released after `buildTsdfVolume`.
+* **Non-finite input**: one `Infinity` depth made the band sample count infinite. NaN block keys
+  all hash to one slot, so probing went quadratic and the run hung. NaN and ±∞ depths are now
+  invalid everywhere: TSDF, fusion, and the scene-scale sampling. In fusion, an `Infinity`
+  neighbour depth also passed both consistency tests (`Inf > Inf` is false), and NaN normals
+  leaked into the output. Both are fixed.
+* **Small components**: `minComponentFraction` (2 % of the largest) also deleted real structure
+  in large scenes, e.g. a 7 m tree at 40 m (3.1 k triangles, 1.99 %). New
+  `componentKeepVoxels` (default 16): components whose bounding-box diagonal exceeds this many
+  voxels are always kept. `removeSmallComponents(mesh, frac, minTriangles, keepDiagonal)` is
+  backwards compatible.
+* **SOR**:
+  * In scale-adaptive mode, points with radius 0 got an infinite statistic and were all
+    removed. They now use the median radius.
+  * The variance used Σv²/m − μ² and the threshold had no rounding slack, so a regular cloud with
+    identical statistics was deleted completely (4 000 of 4 000 points). Now a two-pass variance
+    with a 1e-9 relative tolerance.
+* **View selection**:
+  * The frustum fallback for fewer than 10 observed points replaced the observed points instead
+    of adding to them. Observed points outside the pinhole frame (distorted cameras) were lost,
+    falling back to a range of 0.5–200 × baseline. It now uses the union.
+  * `minSources` could exceed `numSources`; it is now clamped.
+* **Verified correct (adversarial tests in `fusion-adversarial`, `meshing-adversarial` and
+  `tsdf-adversarial` `.test.ts`)**:
+  * undistortion direction and §2 scaling: image smaller than the calibration, anisotropic
+    rounding with and without antialiasing, error ≤ 0.02 px;
+  * fusion: world-frame normals with rotated cameras, z-depth at 120° FOV, cancel mid-run;
+  * marching cubes on a random field over 3³ blocks: all 256 cases occur; closed, edge-manifold
+    and consistently oriented, with positive enclosed volume; exact zero voxels give χ = 2;
+  * `EdgeHeap` (exported for tests) against a reference under 60 k random pushes and pops;
+  * simplification of a flat grid stays planar, keeps its outline and area, and has no flips;
+    a sphere at 1 % stays closed with χ = 2; degenerate and non-manifold input does not crash;
+  * the k-d tree on duplicate and collinear points;
+  * TSDF face winding, and cancel mid-integration.
+* **Still open**:
+  * marching cubes and per-view integration are synchronous; cancel latency is one view's
+    integration, ≤ ~1 s at 50 k blocks;
+  * one voxel size per volume, from the median depth: for an object in front of a room, the
+    room decides. The engine should pass `maxDepth`, e.g. 2 × the object distance, in object
+    mode;
+  * grazing ground with cos θ < 0.1 (under about 6°, beyond ≈ 10× the camera height) uses the ray distance and can still fragment where few views overlap.

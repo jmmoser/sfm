@@ -224,6 +224,9 @@ describe('SiftGPU review: non-default options and odd geometry stay CPU-equivale
       );
       expect(err).toBeInstanceOf(Error);
       expect(err).not.toBeInstanceOf(GPUFeatureError);
+      // fractional size: input error (it used to reach createBuffer -> TypeError -> GPU failure)
+      await expect(ex.extract({ width: W - 0.5, height: H, data: u8 })).rejects.not.toBeInstanceOf(GPUFeatureError);
+      await expect(ex.extract({ width: W - 0.5, height: H, data: u8 })).rejects.toThrow(/invalid image size/);
       expect(sameFeatures(ref, await ex.extract({ width: W, height: H, data: u8 }))).toBe(true);
     } finally {
       ex.destroy();
@@ -501,6 +504,33 @@ describe('gpu-common / pipeline review', () => {
     expect(r.map((x) => x.status)).toEqual(['fulfilled', 'rejected', 'fulfilled', 'fulfilled']);
     expect((r[1] as PromiseRejectedResult).reason).toBeInstanceOf(GPUFeatureError);
     expect(((r[1] as PromiseRejectedResult).reason as Error).message).toMatch(/bad/);
+  });
+
+  it('a start-up self-test whose GPU work was dropped is postponed, not a permanent CPU fallback', async () => {
+    // Before: GPUWorkDroppedError in the self-test (app backgrounded during start-up) made
+    // createFeaturePipeline select the CPU for the whole session.
+    let attempts = 0;
+    const reasons: string[] = [];
+    const fp = await createFeaturePipeline({
+      sift: { maxFeatures: 300 },
+      siftGPU: { testDropSubmissions: () => (attempts++ < 3 ? [0] : []) },
+      onFallback: (r) => reasons.push(r),
+    });
+    try {
+      expect(attempts).toBe(3); // the self-test extraction: every attempt dropped
+      expect(fp.gpu).toBe(true);
+      expect(fp.fallbackReason).toBeNull();
+      const img = makeTexturedImage(160, 120, 8);
+      const r = await fp.extract(img, 160, 120);
+      expect(attempts).toBe(5); // deferred self-test (1 attempt) + this extraction, both on the GPU
+      expect(fp.gpu).toBe(true);
+      expect(featureParity(extractSiftCPU(img, { maxFeatures: 300 }), r).posFrac).toBeGreaterThan(0.97);
+      await fp.extract(img, 160, 120);
+      expect(attempts).toBe(6); // verified once only
+      expect(reasons).toEqual([]);
+    } finally {
+      fp.destroy();
+    }
   });
 
   it('extractFromBitmap with only fullWidth: the CPU fallback uses the same (aspect-derived) frame as the GPU', async () => {

@@ -400,8 +400,11 @@ export function errorScope(device: GPUDevice, label: string): () => Promise<void
   device.pushErrorScope('out-of-memory');
   device.pushErrorScope('validation');
   return async () => {
-    const v = await device.popErrorScope();
-    const o = await device.popErrorScope();
+    // Pop both scopes synchronously: with an await between them, another module could push
+    // its scopes in between and the second pop would remove (and swallow) one of those.
+    const pv = device.popErrorScope();
+    const po = device.popErrorScope();
+    const [v, o] = await Promise.all([pv, po]);
     if (v) throw new GPUFeatureError(`[${label}] validation error: ${v.message}`);
     if (o) throw new GPUFeatureError(`[${label}] out of memory: ${o.message}`);
   };

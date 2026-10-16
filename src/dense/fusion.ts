@@ -216,17 +216,24 @@ function fuseRows(c: RefContext, out: PointSink, sc: KernelScratch, p: KernelPar
     for (let x = 0; x < W; x += step) {
       const i = y * W + x;
       const d = depthR[i];
-      if (!(d > 0)) continue;
+      // NaN / ±Infinity / ≤ 0 = invalid (non-finite values would pass the relative tests below)
+      if (!(d > 0 && d < Infinity)) continue;
       if ((maskR[i >>> 5] >>> (i & 31)) & 1) continue;
       if (costR !== null && costR[i] > maxCost) continue;
       candidates++;
       const X = d * ((x - cxR) / fR);
       const Y = d * yr;
       const Z = d;
-      const rnx = normalR[3 * i];
-      const rny = normalR[3 * i + 1];
-      const rnz = normalR[3 * i + 2];
-      const refNormalOk = rnx !== 0 || rny !== 0 || rnz !== 0;
+      let rnx = normalR[3 * i];
+      let rny = normalR[3 * i + 1];
+      let rnz = normalR[3 * i + 2];
+      // false for (0,0,0) and for NaN / Infinity components
+      const refNormalOk = rnx * rnx + rny * rny + rnz * rnz < Infinity && (rnx !== 0 || rny !== 0 || rnz !== 0);
+      if (!refNormalOk) {
+        rnx = 0;
+        rny = 0;
+        rnz = 0;
+      }
       let sX = X;
       let sY = Y;
       let sZ = Z;
@@ -254,14 +261,14 @@ function fuseRows(c: RefContext, out: PointSink, sc: KernelScratch, p: KernelPar
         const mask = c.nbMask[k];
         if ((mask[q >>> 5] >>> (q & 31)) & 1) continue;
         const dj = c.nbDepth[k][q];
-        if (!(dj > 0)) continue;
+        if (!(dj > 0 && dj < Infinity)) continue;
         const cj = c.nbCost[k];
         if (cj !== null && cj[q] > maxCost) continue;
         const nrmj = c.nbNormal[k];
         const njx = nrmj[3 * q];
         const njy = nrmj[3 * q + 1];
         const njz = nrmj[3 * q + 2];
-        const nbNormalOk = njx !== 0 || njy !== 0 || njz !== 0;
+        const nbNormalOk = njx * njx + njy * njy + njz * njz < Infinity && (njx !== 0 || njy !== 0 || njz !== 0);
         let dp = dj;
         if (usePlane && nbNormalOk) {
           const nrq = njx * ((qx - cxj) / fj) + njy * ((qy - cyj) / fj) + njz;

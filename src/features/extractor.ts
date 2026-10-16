@@ -21,7 +21,8 @@ import type { MatcherGPUConfig } from './match-gpu';
 import type { SiftOptions } from './sift-common';
 import { extractSiftCPU } from './sift-cpu';
 import { SiftGPU } from './sift-gpu';
-import type { SiftBitmapSource, SiftGPUConfig } from './sift-gpu';
+import type { SiftBitmapSource, SiftGPUConfig, SiftSelfTestResult } from './sift-gpu';
+import type { MatcherSelfTestResult } from './match-gpu';
 
 export interface FeaturePipelineOptions {
   /** Use WebGPU when available (default true). false = CPU only. */
@@ -79,12 +80,33 @@ export function bitmapToGrayCPU(bitmap: SiftBitmapSource): GrayImage {
   return rgbaToGray(c2d.getImageData(0, 0, w, h));
 }
 
+/** Outcome of the GPU-vs-CPU start-up self-tests. */
+type SelfTestVerdict = { ok: true } | { ok: false; transient: boolean; reason: string };
+
+async function runSelfTests(sift: SiftGPU, matcher: MatcherGPU): Promise<SelfTestVerdict> {
+  const [ts, tm]: [SiftSelfTestResult, MatcherSelfTestResult] = await Promise.all([sift.selfTest(), matcher.selfTest()]);
+  if (ts.ok && tm.ok) return { ok: true };
+  const reason =
+    `GPU self-test failed (SIFT ok=${ts.ok} gpu/cpu ${ts.gpuCount}/${ts.cpuCount} pos ${ts.posFrac.toFixed(3)} cos ${ts.medianCos.toFixed(4)}` +
+    `${ts.error ? ` ${ts.error}` : ''}; matcher ok=${tm.ok} overlap ${tm.overlap.toFixed(3)}${tm.error ? ` ${tm.error}` : ''})`;
+  // Transient = every failing test failed only because its GPU work was dropped (page hidden).
+  const transient = (ts.ok || !!ts.transient) && (tm.ok || !!tm.transient);
+  return { ok: false, transient, reason };
+}
+
 class FeaturePipelineImpl implements FeaturePipeline {
   private sift: SiftGPU | null;
   private matcher: MatcherGPU | null;
   private reason: string | null;
   private destroyed = false;
   private warnedTransient = false;
+  /**
+   * The start-up self-test could not run (GPU work dropped, e.g. the app was backgrounded
+   * while the pipeline was created): it is re-run before the next GPU use instead of
+   * selecting the CPU for the whole session.
+   */
+  private verifyPending: boolean;
+  private verifying: Promise<void> | null = null;
 
   constructor(
     sift: SiftGPU | null,
@@ -93,10 +115,12 @@ class FeaturePipelineImpl implements FeaturePipeline {
     private readonly siftOpts: Partial<SiftOptions>,
     private readonly onFallback: ((reason: string) => void) | undefined,
     device: GPUDevice | null,
+    verifyPending = false,
   ) {
     this.sift = sift;
     this.matcher = matcher;
     this.reason = reason;
+    this.verifyPending = verifyPending && !!(sift && matcher);
     if (device && sift && matcher) {
       device.lost.then((info) => {
         if (!this.destroyed && this.sift) this.fallback(`GPU device lost (${info.reason}): ${info.message}`);
@@ -127,11 +151,35 @@ class FeaturePipelineImpl implements FeaturePipeline {
     this.onFallback?.(reason);
   }
 
-  private async withGPU<T>(gpuOp: (() => Promise<T>) | null, cpuOp: () => T): Promise<T> {
+  /** Runs the deferred start-up self-test (once; concurrent calls share it). */
+  private async verify(): Promise<void> {
+    if (!this.verifyPending) return;
+    const s = this.sift;
+    const m = this.matcher;
+    if (!s || !m) return;
+    this.verifying ??= runSelfTests(s, m)
+      .then((v) => {
+        if (v.ok) this.verifyPending = false;
+        else if (!v.transient) {
+          this.verifyPending = false;
+          this.fallback(v.reason);
+        }
+        // still transient: stays pending, this call runs on the CPU
+      })
+      .finally(() => {
+        this.verifying = null;
+      });
+    await this.verifying;
+  }
+
+  private async withGPU<T>(gpuOp: ((s: SiftGPU, m: MatcherGPU) => Promise<T>) | null, cpuOp: () => T): Promise<T> {
     if (this.destroyed) throw new Error('FeaturePipeline: used after destroy()');
-    if (gpuOp) {
+    if (gpuOp && this.sift && this.matcher) await this.verify();
+    const s = this.sift;
+    const m = this.matcher;
+    if (gpuOp && s && m && !this.verifyPending && !this.destroyed) {
       try {
-        return await gpuOp();
+        return await gpuOp(s, m);
       } catch (e) {
         if (!(e instanceof GPUFeatureError)) throw e;
         if (e instanceof GPUWorkDroppedError) {
@@ -146,28 +194,24 @@ class FeaturePipelineImpl implements FeaturePipeline {
   }
 
   extract(img: GrayImage, fullWidth: number, fullHeight: number): Promise<FeatureSet> {
-    const s = this.sift;
-    return this.withGPU(s ? () => s.extract(img, fullWidth, fullHeight) : null, () => extractSiftCPU(img, this.siftOpts, fullWidth, fullHeight));
+    return this.withGPU((s) => s.extract(img, fullWidth, fullHeight), () => extractSiftCPU(img, this.siftOpts, fullWidth, fullHeight));
   }
 
   extractFromBitmap(bitmap: SiftBitmapSource, fullWidth?: number, fullHeight?: number): Promise<FeatureSet> {
-    const s = this.sift;
     // fullWidth / fullHeight are passed through unchanged: with only one of them given,
     // extractSiftCPU (like SiftGPU) derives the other from the image aspect. (Defaulting the
     // missing one to the bitmap size gave an anisotropic frame on the CPU path only.)
-    return this.withGPU(s ? () => s.extractFromBitmap(bitmap, fullWidth, fullHeight) : null, () =>
+    return this.withGPU((s) => s.extractFromBitmap(bitmap, fullWidth, fullHeight), () =>
       extractSiftCPU(bitmapToGrayCPU(bitmap), this.siftOpts, fullWidth, fullHeight),
     );
   }
 
   match(a: FeatureSet, b: FeatureSet, opts?: MatchOptions): Promise<MatchPairs> {
-    const m = this.matcher;
-    return this.withGPU(m ? () => m.match(a, b, opts) : null, () => matchCPU(a, b, opts));
+    return this.withGPU((_s, m) => m.match(a, b, opts), () => matchCPU(a, b, opts));
   }
 
   matchGuided(a: FeatureSet, b: FeatureSet, guide: MatchGuide, opts?: MatchOptions): Promise<MatchPairs> {
-    const m = this.matcher;
-    return this.withGPU(m ? () => m.matchGuided(a, b, guide, opts) : null, () => matchGuidedCPU(a, b, guide, opts));
+    return this.withGPU((_s, m) => m.matchGuided(a, b, guide, opts), () => matchGuidedCPU(a, b, guide, opts));
   }
 
   destroy(): void {
@@ -191,6 +235,7 @@ export async function createFeaturePipeline(opts: FeaturePipelineOptions = {}): 
   let matcher: MatcherGPU | null = null;
   let reason: string | null = null;
   let device: GPUDevice | null = null;
+  let verifyPending = false;
   if (opts.preferGPU === false) {
     reason = 'CPU requested (preferGPU: false)';
   } else {
@@ -209,11 +254,13 @@ export async function createFeaturePipeline(opts: FeaturePipelineOptions = {}): 
         matcher = rm.value;
         device = ctx.device;
         if (opts.selfTest ?? true) {
-          const [ts, tm] = await Promise.all([sift.selfTest(), matcher.selfTest()]);
-          if (!ts.ok || !tm.ok) {
-            reason =
-              `GPU self-test failed (SIFT ok=${ts.ok} gpu/cpu ${ts.gpuCount}/${ts.cpuCount} pos ${ts.posFrac.toFixed(3)} cos ${ts.medianCos.toFixed(4)}` +
-              `${ts.error ? ` ${ts.error}` : ''}; matcher ok=${tm.ok} overlap ${tm.overlap.toFixed(3)}${tm.error ? ` ${tm.error}` : ''})`;
+          const v = await runSelfTests(sift, matcher);
+          if (!v.ok && v.transient) {
+            // The tests' GPU work was dropped (page hidden?): no verdict; re-run before first use.
+            verifyPending = true;
+            console.info('[features] GPU self-test postponed (GPU work dropped):', v.reason);
+          } else if (!v.ok) {
+            reason = v.reason;
             sift.destroy();
             matcher.destroy();
             sift = null;
@@ -230,5 +277,5 @@ export async function createFeaturePipeline(opts: FeaturePipelineOptions = {}): 
     }
     if (reason) console.info('[features] using the CPU feature pipeline:', reason);
   }
-  return new FeaturePipelineImpl(sift, matcher, reason, siftOpts, opts.onFallback, device);
+  return new FeaturePipelineImpl(sift, matcher, reason, siftOpts, opts.onFallback, device, verifyPending);
 }
