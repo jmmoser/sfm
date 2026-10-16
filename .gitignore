@@ -1,0 +1,12 @@
+node_modules/
+dist/
+coverage/
+.vite/
+*.log
+.DS_Store
+e2e/out/
+e2e/data/
+test-results/
+playwright-report/
+__screenshots__/
+.vitest-attachments/

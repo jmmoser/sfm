@@ -1,0 +1,34 @@
+{
+  "name": "sfm",
+  "version": "0.1.0",
+  "private": true,
+  "description": "On-device mobile web photogrammetry: continuous capture, visual-inertial structure-from-motion, and WebGPU multi-view stereo.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host",
+    "build": "tsc --noEmit -p tsconfig.json && vite build",
+    "preview": "vite preview --host",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:gpu": "node e2e/run-gpu-tests.mjs",
+    "e2e": "node e2e/run-e2e.mjs"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "three": "^0.186.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "@types/pngjs": "^6.0.5",
+    "@types/three": "^0.186.0",
+    "@vitest/browser": "^5.0.5",
+    "@vitest/browser-playwright": "^5.0.5",
+    "@webgpu/types": "^0.1.74",
+    "playwright": "^1.56.1",
+    "pngjs": "^7.0.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.4",
+    "vitest": "^5.0.5"
+  }
+}
