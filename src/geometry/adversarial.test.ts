@@ -10,7 +10,7 @@ import { median } from '../math/stats';
 import { createIntrinsics, distortNormalized, undistortNormalized } from './camera';
 import { CHEIRALITY_MAX_DEPTH, cheiralityCount, essential5pt, essentialFromPose, recoverPose } from './essential';
 import { decomposeHomography } from './homography';
-import { p3p } from './pnp';
+import { p3p, solvePnPRansac } from './pnp';
 import { ransac, ransacIterations, type RansacEstimator } from './ransac';
 import { refinePoint } from './triangulation';
 import { estimateTwoViewGeometry } from './twoview';
@@ -609,6 +609,56 @@ describe('adversarial: misc', () => {
         if (sols.some((s) => rotErrDeg(s.R, R) < 1e-3)) ok++;
       }
       expect(ok / N).toBeGreaterThanOrEqual(0.999);
+    }
+  });
+
+  it('solvePnPRansac: 80 % outliers at 1e5 m ENU offsets, near and far scenes', () => {
+    const rng = new Rng(7100);
+    const cam = createIntrinsics(1920, 1440, (70 * Math.PI) / 180, -0.1, 0.02);
+    for (const [zmin, zmax] of [
+      [0.3, 1.0],
+      [20, 120],
+    ]) {
+      for (let k = 0; k < 4; k++) {
+        const R = randomRotation(rng, Math.PI);
+        const C = [1e5 + rng.uniform(-10, 10), -2e5 + rng.uniform(-10, 10), 30 + rng.uniform(-1, 1)];
+        const t = Float64Array.of(
+          -(R[0] * C[0] + R[1] * C[1] + R[2] * C[2]),
+          -(R[3] * C[0] + R[4] * C[1] + R[5] * C[2]),
+          -(R[6] * C[0] + R[7] * C[1] + R[8] * C[2]),
+        );
+        const n = 500;
+        const X = new Float64Array(3 * n),
+          uv = new Float64Array(2 * n);
+        const pc = new Float64Array(3),
+          px = new Float64Array(2);
+        for (let i = 0; i < n; i++) {
+          const z = rng.uniform(zmin, zmax);
+          pc[0] = rng.uniform(-0.6, 0.6) * z;
+          pc[1] = rng.uniform(-0.45, 0.45) * z;
+          pc[2] = z;
+          // X = Rᵀ (pc − t)
+          for (let c = 0; c < 3; c++) X[3 * i + c] = R[c] * (pc[0] - t[0]) + R[3 + c] * (pc[1] - t[1]) + R[6 + c] * (pc[2] - t[2]);
+          if (i % 5 === 0) {
+            const xd = new Float64Array(2);
+            distortNormalized(cam, pc[0] / z, pc[1] / z, xd);
+            px[0] = cam.f * xd[0] + cam.cx + 0.7 * rng.gaussian();
+            px[1] = cam.f * xd[1] + cam.cy + 0.7 * rng.gaussian();
+          } else {
+            px[0] = rng.uniform(0, 1920);
+            px[1] = rng.uniform(0, 1440);
+          }
+          uv[2 * i] = px[0];
+          uv[2 * i + 1] = px[1];
+        }
+        const res = solvePnPRansac(X, uv, n, cam, { maxErrorPx: 4, rng: new Rng(k) });
+        expect(res).not.toBeNull();
+        expect(rotErrDeg(res!.pose.R, R)).toBeLessThan(0.15);
+        const Ce = [0, 1, 2].map((c) => -(res!.pose.R[c] * res!.pose.t[0] + res!.pose.R[3 + c] * res!.pose.t[1] + res!.pose.R[6 + c] * res!.pose.t[2]));
+        expect(Math.hypot(Ce[0] - C[0], Ce[1] - C[1], Ce[2] - C[2]) / zmax).toBeLessThan(0.01);
+        expect(res!.numInliers).toBeGreaterThan(0.95 * 100);
+        expect(res!.numInliers).toBeLessThan(110);
+      }
     }
   });
 

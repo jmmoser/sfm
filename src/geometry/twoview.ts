@@ -66,7 +66,9 @@ export interface TwoViewGeometryResult extends TwoViewGeometry {
   /**
    * 'planar' only: the other relative pose that explains a planar scene equally well
    * (two-view planar ambiguity, Longuet-Higgins 1986; Faugeras & Lustman 1988). It
-   * can only be resolved with a third view or a prior on the plane normal.
+   * can only be resolved with a third view or a prior on the plane normal. Absent when
+   * cheirality already resolves the ambiguity (the other branch of the homography
+   * decomposition has < 90 % of the best branch's points in front of both cameras).
    */
   planarAlternative?: { R: Mat3; t: Vec3 };
 }
@@ -387,13 +389,18 @@ function extractInliers(matches: MatchPairs, mask: Uint8Array): MatchPairs {
  * 4. calibrated: the refined, cheirality-consistent (R, t) (|t| = 1); triAngle =
  *    median angle between the two rays of the inliers in front of both cameras.
  *    planar_or_panoramic: pose from E when E is reliable (E_inl ≥ minNumInliers and
- *    E_inl/F_inl ≥ 0.95), else from the decomposition of H; resolved to 'panoramic'
- *    if the median triangulation angle is < minTriAngleDeg, translation is
- *    unobservable (fewer than half of the inliers triangulate in front, or H is a
- *    pure rotation), or the rotation prior's rotation-only model explains the
- *    inliers; otherwise 'planar', whose R, t come from the H decomposition on the same
- *    branch of the planar two-fold ambiguity (the other branch is returned as
- *    `planarAlternative`). For 'panoramic', R is the rotation-only (Kabsch) fit
+ *    E_inl/F_inl ≥ 0.95), else from the decomposition of H — but when E's pose is an H
+ *    branch with clearly fewer points in front of both cameras than the best H branch
+ *    (E cannot tell the planar branches apart; cheirality can), the best H branch;
+ *    resolved to 'panoramic' if the median triangulation angle is < minTriAngleDeg,
+ *    translation is unobservable (fewer than half of the inliers triangulate in front,
+ *    or H is a pure rotation), or the rotation prior's rotation-only model explains the
+ *    inliers; otherwise 'planar', whose R, t come from the H decomposition: among the
+ *    branches with maximal cheirality support (±max(2, 1 % of the H inliers)) the one
+ *    closest to the selected pose; another branch with ≥ 90 % of that support is
+ *    returned as `planarAlternative`. Inlier sets that are coincident / collinear
+ *    within maxErrorPx in either image, or have fewer than minNumInliers distinct
+ *    correspondences, are 'degenerate'. For 'panoramic', R is the rotation-only (Kabsch) fit
  *    refined on its inliers when the translation is unobserved (< 80 % of the inliers
  *    in front of both cameras for the full model's pose), else the full model's
  *    rotation (a rotation-only fit would absorb the small translation); t = (0, 0, 0),

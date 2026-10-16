@@ -1,0 +1,789 @@
+/**
+ * Capture: full-bleed camera preview, keypoint overlay (object-fit: cover mapping), tracking
+ * status / counters / elapsed time / GPS accuracy, guidance banner, collapsible live 3D view
+ * (≤ 2 Hz, decimated), pause / finish / torch / cancel.
+ *
+ * Pipeline: CameraCapture → FramePump (≤ 10 Hz, back-pressure: the next frame is grabbed only
+ * after engine.processFrame resolved) → engine. WakeLock while capturing (acquired in the Start
+ * tap). Lifecycle (docs/research/ios-camera.md §6, ios-platform.md §6.2):
+ *  - page hidden ⇒ pause; on return a TAP resumes (re-acquiring the camera inside the gesture
+ *    when the track did not come back — iOS reuses a camera grant without a gesture only ~1 min);
+ *  - camera errors show a recovery card whose button restarts the camera from the tap;
+ *  - UI rotation: the layout reflows, frames carry their screenAngle, the overlay is rotated
+ *    into the current orientation.
+ */
+import type { PumpFrame } from '../../sensors/frame-pump';
+import { CameraCapture, type CameraStartResult, type CameraState } from '../../sensors/camera';
+import { CompassSensor } from '../../sensors/orientation';
+import { FramePump } from '../../sensors/frame-pump';
+import { GeoSensor } from '../../sensors/geolocation';
+import { MotionSensor } from '../../sensors/motion';
+import { screenAngle } from '../../sensors/frame-orientation';
+import type { CapturePermissionStatus } from '../../sensors/permissions';
+import { Viewer } from '../../viewer';
+import { ENGINE_ERRORS, isCancelledError, type FrameInput, type LiveCamera, type LiveUpdate } from '../../workers/protocol';
+import type { App, Screen } from '../app';
+import { button, iconButton, setButtonLabel, spinner } from '../components/controls';
+import { confirmDialog } from '../components/dialog';
+import { toast } from '../components/toast';
+import { Disposer, h, replaceChildren } from '../dom';
+import { defaultSessionName, formatAccuracy, formatClock, formatCount, guidanceInfo, trackingLabel } from '../format';
+import { icon, type IconName } from '../icons';
+import { mapOverlay } from '../overlay-map';
+import { MIN_KEYFRAMES, type Route } from '../router';
+
+type Phase = 'starting' | 'running' | 'paused' | 'interrupted' | 'error' | 'finishing' | 'closed';
+
+const MINI_POINTS = 20_000;
+const EXPANDED_POINTS = 50_000;
+const MAX_CAMERAS = 80;
+
+export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'capture' }>): Screen {
+  const d = new Disposer();
+  const cfg = { ...app.config };
+  const sessionId = route.sessionId;
+  const sessionName = defaultSessionName(cfg.mode);
+  app.results.name = sessionName;
+  app.results.mode = cfg.mode;
+  app.results.quality = cfg.quality;
+
+  const camera = new CameraCapture();
+  const motion = MotionSensor.isSupported() ? new MotionSensor() : null;
+  const compass = new CompassSensor();
+  const geo = cfg.useGps && GeoSensor.isSupported() ? new GeoSensor() : null;
+  let pump: FramePump | null = null;
+  let camRes: CameraStartResult | null = null;
+  let phase: Phase = 'starting';
+  let closed = false;
+  let torchOn = false;
+  let sessionCreated: Promise<unknown> = Promise.resolve();
+
+  // Live state.
+  let last: LiveUpdate | null = null;
+  let numKeyframes = 0;
+  let elapsedMs = 0;
+  let runningSince: number | null = null;
+  let thumbDone = false;
+  let latestSparse: { positions: Float32Array; colors: Uint8Array } | null = null;
+  let latestCameras: LiveCamera[] | null = null;
+  let inFlight: { width: number; height: number; screenAngle: number } | null = null;
+  let frameErrors = 0;
+
+  // ---- DOM ---------------------------------------------------------------------------------------
+  const video = h('video', { class: 'capture-video', playsinline: true, muted: true, autoplay: true, 'aria-label': 'Camera preview' });
+  const overlay = h('canvas', { class: 'capture-overlay', 'aria-hidden': 'true' });
+  const flash = h('div', { class: 'capture-flash', 'aria-hidden': 'true' });
+  const dot = h('span', { class: 'status-dot' });
+  const trackLabel = h('span', { class: 'status-label', text: 'Starting' });
+  const timeLabel = h('span', { class: 'status-time', text: '0:00' });
+  const statusPill = h('div', { class: 'status-pill', role: 'status', 'data-state': 'initializing', 'data-testid': 'tracking' }, dot, trackLabel, h('span', { class: 'status-sep' }), timeLabel);
+  const gpsChip = h('div', { class: 'gps-chip', hidden: true, 'data-testid': 'gps' }, icon('location', { size: 14 }), h('span', { text: 'GPS…' }));
+  const kfCount = h('strong', { text: '0', 'data-testid': 'kf-count' });
+  const regCount = h('strong', { text: '0' });
+  const ptCount = h('strong', { text: '0' });
+  const stats = h(
+    'div',
+    { class: 'capture-stats', 'aria-live': 'off' },
+    h('span', { class: 'stat' }, kfCount, h('span', { text: 'keyframes' })),
+    h('span', { class: 'stat' }, regCount, h('span', { text: 'registered' })),
+    h('span', { class: 'stat' }, ptCount, h('span', { text: 'points' })),
+  );
+  const closeBtn = iconButton('close', 'Cancel scan', () => void cancel(), { variant: 'glass', testId: 'capture-cancel' });
+  const top = h(
+    'div',
+    { class: 'capture-top' },
+    h('div', { class: 'capture-top-row' }, closeBtn, statusPill, h('div', { class: 'capture-top-right' }, gpsChip)),
+    stats,
+  );
+  const guidanceTitle = h('span', { class: 'guidance-title' });
+  const guidanceDetail = h('span', { class: 'guidance-detail' });
+  const guidance = h('div', { class: 'guidance', role: 'status', 'aria-live': 'polite', hidden: true, 'data-testid': 'guidance' }, h('span', { class: 'guidance-icon' }), h('span', { class: 'guidance-text' }, guidanceTitle, guidanceDetail));
+
+  const miniHost = h('div', { class: 'mini-view-canvas' });
+  const miniEmpty = h('div', { class: 'mini-view-empty' }, icon('cube', { size: 22 }), h('span', { text: 'Live 3D' }));
+  const miniCollapse = iconButton('collapse', 'Collapse 3D view', (e) => {
+    e.stopPropagation();
+    setExpanded(false);
+  }, { variant: 'glass', className: 'mini-collapse' });
+  const mini = h('div', { class: 'mini-view', role: 'button', tabindex: '0', 'aria-label': 'Expand live 3D view', 'data-testid': 'mini-view' }, miniHost, miniEmpty, miniCollapse);
+
+  const torchBtn = iconButton('torchOff', 'Torch', () => void toggleTorch(), { variant: 'glass', className: 'ctl-side', testId: 'torch' });
+  torchBtn.setAttribute('aria-pressed', 'false');
+  const pauseBtn = h('button', { type: 'button', class: 'ctl-main', 'aria-label': 'Pause capture', 'data-testid': 'pause' }, h('span', { class: 'ctl-main-ring' }), h('span', { class: 'ctl-main-core' }, icon('pause', { size: 28 })));
+  pauseBtn.addEventListener('click', () => (phase === 'paused' ? resume() : pause('user')));
+  const finishBtn = button({ label: 'Finish', icon: 'check', variant: 'primary', size: 'md', className: 'ctl-finish', testId: 'finish', onClick: () => void finish() });
+  finishBtn.disabled = true;
+  const finishHint = h('div', { class: 'finish-hint', 'aria-live': 'polite', text: `Capture ${MIN_KEYFRAMES} keyframes to finish` });
+  const controls = h('div', { class: 'capture-controls' }, finishHint, h('div', { class: 'capture-controls-row' }, torchBtn, pauseBtn, finishBtn));
+
+  const card = h('div', { class: 'capture-card-host' });
+  const pausedLabel = h('div', { class: 'paused-label', hidden: true, text: 'Paused' });
+
+  const el = h(
+    'div',
+    { class: 'capture', 'data-phase': 'starting' },
+    video,
+    overlay,
+    flash,
+    h('div', { class: 'capture-shade-top', 'aria-hidden': 'true' }),
+    h('div', { class: 'capture-shade-bottom', 'aria-hidden': 'true' }),
+    top,
+    guidance,
+    pausedLabel,
+    mini,
+    controls,
+    card,
+  );
+
+  // ---- UI helpers --------------------------------------------------------------------------------
+  function setPhase(p: Phase): void {
+    phase = p;
+    el.dataset.phase = p;
+    const paused = p === 'paused';
+    pausedLabel.hidden = !paused;
+    pauseBtn.setAttribute('aria-label', paused ? 'Resume capture' : 'Pause capture');
+    pauseBtn.querySelector('.ctl-main-core')!.replaceChildren(icon(paused ? 'play' : 'pause', { size: 28 }));
+    pauseBtn.disabled = !(p === 'running' || p === 'paused');
+    if (p === 'running') {
+      if (runningSince === null) runningSince = performance.now();
+    } else if (runningSince !== null) {
+      elapsedMs += performance.now() - runningSince;
+      runningSince = null;
+    }
+    updateFinish();
+  }
+
+  function elapsed(): number {
+    return elapsedMs + (runningSince !== null ? performance.now() - runningSince : 0);
+  }
+
+  function updateFinish(): void {
+    const enough = numKeyframes >= MIN_KEYFRAMES;
+    finishBtn.disabled = !enough || !(phase === 'running' || phase === 'paused');
+    finishHint.hidden = enough || phase === 'starting' || phase === 'error';
+    if (!enough) finishHint.textContent = `${numKeyframes} / ${MIN_KEYFRAMES} keyframes — keep moving`;
+  }
+
+  function showCard(content: HTMLElement | null): void {
+    replaceChildren(card, content);
+    el.classList.toggle('has-card', !!content);
+  }
+
+  function infoCard(o: { icon?: IconName; spinner?: boolean; title: string; text?: string; actions?: HTMLElement[]; tone?: 'neutral' | 'bad'; testId?: string }): HTMLElement {
+    return h(
+      'div',
+      { class: `capture-card${o.tone === 'bad' ? ' capture-card-bad' : ''}`, role: o.tone === 'bad' ? 'alert' : 'status', 'data-testid': o.testId },
+      o.spinner ? spinner('lg') : o.icon ? h('span', { class: 'capture-card-icon' }, icon(o.icon, { size: 30 })) : null,
+      h('h2', { class: 'capture-card-title', text: o.title }),
+      o.text ? h('p', { class: 'capture-card-text', text: o.text }) : null,
+      o.actions?.length ? h('div', { class: 'capture-card-actions' }, ...o.actions) : null,
+    );
+  }
+
+  function errorCard(title: string, text: string, retry: (() => void) | null, retryLabel = 'Try again'): void {
+    setPhase('error');
+    const actions: HTMLElement[] = [];
+    if (retry) actions.push(button({ label: retryLabel, variant: 'primary', size: 'lg', block: true, onClick: retry, testId: 'capture-retry' }));
+    actions.push(button({ label: 'Back to home', variant: 'secondary', size: 'lg', block: true, onClick: () => void abandon(), testId: 'capture-back' }));
+    showCard(infoCard({ icon: 'warning', title, text, actions, tone: 'bad', testId: 'capture-error' }));
+  }
+
+  // ---- overlay -----------------------------------------------------------------------------------
+  let overlayClearTimer: ReturnType<typeof setTimeout> | null = null;
+  function sizeOverlay(): { w: number; h: number; dpr: number } {
+    const r = el.getBoundingClientRect();
+    const dpr = Math.min(3, window.devicePixelRatio || 1);
+    const w = Math.max(1, Math.round(r.width * dpr));
+    const hh = Math.max(1, Math.round(r.height * dpr));
+    if (overlay.width !== w || overlay.height !== hh) {
+      overlay.width = w;
+      overlay.height = hh;
+    }
+    return { w: r.width, h: r.height, dpr };
+  }
+
+  function drawOverlay(pts: Float32Array | undefined, meta: { width: number; height: number; screenAngle: number }): void {
+    const ctx = overlay.getContext('2d');
+    if (!ctx) return;
+    const { w, h: hh, dpr } = sizeOverlay();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, overlay.width, overlay.height);
+    if (!pts || pts.length < 2) return;
+    const now = screenAngle();
+    const k = ((((meta.screenAngle - now) / 90) % 4) + 4) % 4;
+    const xy = mapOverlay(pts, meta.width, meta.height, w, hh, { fit: 'cover', quarterTurns: k });
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = 'rgba(54, 224, 166, 0.95)';
+    ctx.strokeStyle = 'rgba(4, 18, 12, 0.55)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let i = 0; i < xy.length; i += 2) {
+      ctx.moveTo(xy[i] + 2.2, xy[i + 1]);
+      ctx.arc(xy[i], xy[i + 1], 2.2, 0, Math.PI * 2);
+    }
+    ctx.fill();
+    ctx.stroke();
+    if (overlayClearTimer) clearTimeout(overlayClearTimer);
+    overlayClearTimer = setTimeout(() => {
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, overlay.width, overlay.height);
+    }, 900);
+  }
+
+  function clearOverlay(): void {
+    const ctx = overlay.getContext('2d');
+    ctx?.clearRect(0, 0, overlay.width, overlay.height);
+  }
+
+  // ---- mini 3D view ------------------------------------------------------------------------------
+  let viewer: Viewer | null = null;
+  let viewerFailed = false;
+  let expanded = false;
+  let lastViewerUpdate = 0;
+  let viewerTimer: ReturnType<typeof setTimeout> | null = null;
+  let viewerDirty = false;
+
+  function setExpanded(v: boolean): void {
+    expanded = v;
+    mini.classList.toggle('expanded', v);
+    mini.setAttribute('aria-label', v ? 'Live 3D view' : 'Expand live 3D view');
+    el.classList.toggle('mini-expanded', v);
+    viewerDirty = true;
+    scheduleViewer(true);
+  }
+  mini.addEventListener('click', () => {
+    if (!expanded) setExpanded(true);
+  });
+  mini.addEventListener('keydown', (e: KeyboardEvent) => {
+    if ((e.key === 'Enter' || e.key === ' ') && !expanded) {
+      e.preventDefault();
+      setExpanded(true);
+    }
+  });
+
+  function ensureViewer(): Viewer | null {
+    if (viewer || viewerFailed || !app.env.webgl) return viewer;
+    try {
+      viewer = new Viewer(miniHost, { background: 'transparent', autoFit: 'follow', maxPixelRatio: 2, fovDeg: 55 });
+      viewer.setWorldUp('auto');
+      viewer.setDisplay({ grid: false, edl: false, cameras: true, sparsePointSizePx: 2.5 });
+    } catch (e) {
+      viewerFailed = true;
+      console.warn('[capture] live 3D view unavailable', e);
+    }
+    return viewer;
+  }
+
+  function scheduleViewer(now = false): void {
+    if (closed) return;
+    const due = lastViewerUpdate + 500 - performance.now(); // ≤ 2 Hz
+    if (viewerTimer) return;
+    viewerTimer = setTimeout(
+      () => {
+        viewerTimer = null;
+        updateViewer();
+      },
+      now ? 0 : Math.max(0, due),
+    );
+  }
+
+  function updateViewer(): void {
+    if (closed || !viewerDirty || !latestSparse) return;
+    const v = ensureViewer();
+    if (!v) return;
+    viewerDirty = false;
+    lastViewerUpdate = performance.now();
+    const max = expanded ? EXPANDED_POINTS : MINI_POINTS;
+    const { positions, colors } = decimate(latestSparse.positions, latestSparse.colors, max);
+    v.setSparsePoints(positions, colors);
+    if (latestCameras?.length) v.setCameras(decimateCameras(latestCameras, MAX_CAMERAS), true);
+    miniEmpty.hidden = true;
+  }
+
+  // ---- live updates ------------------------------------------------------------------------------
+  let lastGuidance = '';
+  function onLive(u: LiveUpdate): void {
+    if (closed) return;
+    const meta = inFlight;
+    last = u;
+    const prevKf = numKeyframes;
+    numKeyframes = u.numKeyframes;
+    kfCount.textContent = String(u.numKeyframes);
+    regCount.textContent = String(u.numRegistered);
+    ptCount.textContent = formatCount(u.numPoints);
+    statusPill.dataset.state = u.tracking;
+    trackLabel.textContent = trackingLabel(u.tracking);
+    const g = guidanceInfo(u.guidance, cfg.mode);
+    const gkey = `${u.guidance}`;
+    if (gkey !== lastGuidance) {
+      lastGuidance = gkey;
+      guidance.hidden = !g.title;
+      guidance.dataset.tone = g.tone;
+      guidanceTitle.textContent = g.title;
+      guidanceDetail.textContent = g.detail;
+      guidance.querySelector('.guidance-icon')!.replaceChildren(icon(g.tone === 'good' ? 'check' : g.tone === 'bad' ? 'warning' : g.tone === 'info' ? 'info' : 'warning', { size: 18 }));
+    }
+    if (meta && u.overlay) drawOverlay(u.overlay, meta);
+    if (u.decision === 'keyframe' && u.numKeyframes > prevKf) {
+      flash.classList.remove('pulse');
+      void flash.offsetWidth; // restart the animation
+      flash.classList.add('pulse');
+      if (!thumbDone && u.numKeyframes >= 1) {
+        thumbDone = true;
+        void saveThumbnail();
+      }
+    }
+    if (u.sparse) {
+      latestSparse = u.sparse;
+      viewerDirty = true;
+    }
+    if (u.cameras) {
+      latestCameras = u.cameras;
+      viewerDirty = true;
+    }
+    if (viewerDirty) scheduleViewer();
+    updateFinish();
+  }
+
+  async function saveThumbnail(): Promise<void> {
+    if (!sessionId) return;
+    const blob = await videoThumbnail(video);
+    if (!blob || closed) return;
+    await sessionCreated;
+    await app.updateSession(sessionId, { thumbnail: blob });
+  }
+
+  // ---- frames ------------------------------------------------------------------------------------
+  async function consume(f: PumpFrame): Promise<void> {
+    if (phase !== 'running' || closed) {
+      f.bitmap.close();
+      return;
+    }
+    const input: FrameInput = {
+      bitmap: f.bitmap,
+      t: f.t,
+      screenAngle: f.screenAngle,
+      imu: f.imu,
+      geo: f.geo,
+      heading: f.heading ? { heading: f.heading.heading, accuracy: f.heading.accuracy } : null,
+      index: f.index,
+      segment: f.segment,
+      gravityDevice: f.gravityDevice,
+      attitude: f.attitude ? { t: f.attitude.t, R_world_device: f.attitude.R_world_device, absolute: f.attitude.absolute, yawAccuracyDeg: f.attitude.yawAccuracyDeg } : null,
+      imuCalibrationVersion: f.imuCalibrationVersion,
+      timeSource: f.timeSource,
+    };
+    inFlight = { width: f.width, height: f.height, screenAngle: f.screenAngle };
+    try {
+      await app.engine.processFrame(input);
+      frameErrors = 0;
+    } catch (e) {
+      onFrameError(e);
+    } finally {
+      inFlight = null;
+    }
+  }
+
+  function onFrameError(e: unknown): void {
+    if (closed) return;
+    const name = (e as { name?: string })?.name;
+    if (name === ENGINE_ERRORS.busy) return;
+    if (name === ENGINE_ERRORS.notImplemented || name === ENGINE_ERRORS.notInitialized) {
+      pump?.stop();
+      errorCard('Processing engine unavailable', `${(e as Error).message}. Open the app with ?mock=1 to try the demo engine.`, null);
+      return;
+    }
+    if (name === ENGINE_ERRORS.crashed) {
+      toast('The engine restarted — continuing the scan.', { tone: 'warn' });
+      return;
+    }
+    frameErrors++;
+    console.warn('[capture] frame failed', e);
+    if (frameErrors === 3) toast(`Frames are failing: ${(e as Error)?.message ?? e}`, { tone: 'warn' });
+  }
+
+  // ---- lifecycle ---------------------------------------------------------------------------------
+  async function start(): Promise<void> {
+    setPhase('starting');
+    showCard(infoCard({ spinner: true, title: 'Starting camera…', text: 'Allow camera and motion access when asked.' }));
+    const perms = app.takePermissions();
+    if (!perms) {
+      // No Start tap (e.g. reload / retry): ask from a tap now.
+      showPermissionTap();
+      return;
+    }
+    const st = await perms;
+    if (closed) return;
+    await afterPermissions(st);
+  }
+
+  function showPermissionTap(): void {
+    setPhase('error');
+    showCard(
+      infoCard({
+        icon: 'camera',
+        title: 'Camera and motion access',
+        text: 'Scanning uses the camera, plus the motion sensors for scale and gravity.',
+        actions: [
+          button({
+            label: 'Allow and start',
+            variant: 'primary',
+            size: 'lg',
+            block: true,
+            testId: 'allow-start',
+            onClick: () => {
+              const p = app.requestCapturePermissions(); // synchronous inside the tap
+              app.takePermissions();
+              setPhase('starting');
+              showCard(infoCard({ spinner: true, title: 'Starting camera…' }));
+              void p.then((st) => (closed ? undefined : afterPermissions(st)));
+            },
+          }),
+          button({ label: 'Back to home', variant: 'secondary', size: 'lg', block: true, onClick: () => void abandon() }),
+        ],
+      }),
+    );
+  }
+
+  async function afterPermissions(st: CapturePermissionStatus): Promise<void> {
+    if (st.camera !== 'granted') {
+      const denied = st.camera === 'denied';
+      errorCard(
+        denied ? 'Camera access is off' : 'Camera not available',
+        denied
+          ? 'Allow camera access for this website: Settings › Apps › Safari › Camera (or tap “aA” › Website Settings in Safari), then try again.'
+          : `The camera could not be opened (${st.errors.join(', ') || st.camera}). Close other apps that use the camera and try again.`,
+        () => showPermissionTap(),
+      );
+      return;
+    }
+    if (st.motion === 'denied' || st.motion === 'needs-gesture') {
+      toast('Motion access is off — scale and gravity will be less accurate. To allow it, close and reopen the app, then tap Start.', { tone: 'warn', durationMs: 7000 });
+    }
+    const motionOk = st.motion === 'granted';
+    if (motion && motionOk) motion.start();
+    if (motionOk) compass.start();
+    await openCamera();
+  }
+
+  async function openCamera(): Promise<void> {
+    if (closed) return;
+    setPhase('starting');
+    showCard(infoCard({ spinner: true, title: 'Starting camera…' }));
+    try {
+      camRes = await camera.start(video, { quality: cfg.quality });
+    } catch (e) {
+      if (closed) return;
+      const n = (e as { name?: string })?.name;
+      errorCard(
+        n === 'NotAllowedError' ? 'Camera access is off' : 'Camera could not start',
+        n === 'NotAllowedError'
+          ? 'Allow camera access for this website in Settings, then try again.'
+          : n === 'NotReadableError'
+            ? 'The camera is busy. Close other apps that use the camera, then try again.'
+            : `${(e as Error)?.message ?? e}`,
+        () => void openCamera(), // a tap: getUserMedia inside the gesture
+      );
+      return;
+    }
+    if (closed) {
+      camera.stop();
+      return;
+    }
+    d.add(camera.onStateChange(onCameraState));
+    torchBtn.disabled = !camRes.torchAvailable;
+    if (cfg.torch && camRes.torchAvailable) void toggleTorch(true);
+    // Lock white balance after auto-WB settled (iOS supports manual WB only).
+    d.timeout(() => void camera.lockWhiteBalance().catch(() => false), 1200);
+    if (camRes.lensMaySwitch) toast('This camera may switch lenses automatically — accuracy can suffer.', { tone: 'warn' });
+    if (geo) {
+      geo.start(); // location prompt (after camera, never blocking it)
+      d.add(geo.onFix(() => updateGps()));
+      d.interval(updateGps, 2000);
+      gpsChip.hidden = false;
+    }
+    if (sessionId) {
+      sessionCreated = app.createSession(sessionId, { name: sessionName, mode: cfg.mode, quality: cfg.quality });
+      await sessionCreated;
+      if (closed) return;
+    }
+    await initEngine();
+  }
+
+  async function initEngine(): Promise<void> {
+    showCard(infoCard({ spinner: true, title: 'Preparing 3D engine…', text: 'Compiling GPU programs. This takes a moment the first time.' }));
+    try {
+      await app.engine.init({
+        mode: cfg.mode,
+        quality: cfg.quality,
+        sessionId: sessionId ?? undefined,
+        persist: !!sessionId,
+        preferGPU: true,
+        hfovPriorDeg: camRes?.hfovPriorDeg,
+      });
+      app.loadedSessionId = sessionId;
+    } catch (e) {
+      if (closed) return;
+      const msg = (e as Error)?.message ?? String(e);
+      errorCard(
+        'Processing engine unavailable',
+        (e as { name?: string })?.name === ENGINE_ERRORS.notImplemented ? `${msg}. Open the app with ?mock=1 to try the demo engine.` : msg,
+        () => void initEngine(),
+      );
+      return;
+    }
+    if (closed) return;
+    showCard(null);
+    pump = new FramePump({
+      camera,
+      consumer: consume,
+      motion: motion?.running ? motion : null,
+      geo,
+      compass: compass.running ? compass : null,
+      targetHz: 10,
+      onError: (e) => console.warn('[capture] pump error', e),
+    });
+    pump.start();
+    setPhase('running');
+    guidance.hidden = false;
+    guidanceTitle.textContent = guidanceInfo('initializing', cfg.mode).title;
+    guidanceDetail.textContent = guidanceInfo('initializing', cfg.mode).detail;
+    guidance.dataset.tone = 'info';
+    guidance.querySelector('.guidance-icon')!.replaceChildren(icon('info', { size: 18 }));
+  }
+
+  function onCameraState(s: CameraState, detail?: string): void {
+    if (closed || phase === 'finishing') return;
+    if (s === 'error') {
+      pump?.stop();
+      errorCard('The camera stopped', `Tap to reconnect the camera${detail ? ` (${detail})` : ''}.`, () => void reconnect(), 'Reconnect camera');
+    } else if (s === 'running' && phase === 'error' && pump) {
+      showCard(null);
+      pump.start();
+      setPhase('running');
+    }
+  }
+
+  /** From a tap: re-acquire the camera (inside the gesture) if needed, then resume. */
+  async function reconnect(): Promise<void> {
+    showCard(infoCard({ spinner: true, title: 'Reconnecting camera…' }));
+    const ok = camera.state === 'running' ? true : await camera.restart('manual');
+    if (closed) return;
+    if (!ok) {
+      errorCard('Camera could not restart', 'Close other apps that use the camera, then try again.', () => void reconnect(), 'Reconnect camera');
+      return;
+    }
+    showCard(null);
+    pump?.resetReference();
+    pump?.start();
+    setPhase('running');
+  }
+
+  function pause(reason: 'user' | 'background'): void {
+    if (phase !== 'running') return;
+    pump?.stop();
+    clearOverlay();
+    if (reason === 'user') setPhase('paused');
+    else setPhase('interrupted');
+  }
+
+  function resume(): void {
+    if (phase !== 'paused' && phase !== 'interrupted') return;
+    if (camera.state !== 'running') {
+      void reconnect();
+      return;
+    }
+    showCard(null);
+    pump?.start();
+    setPhase('running');
+  }
+
+  function onVisibility(): void {
+    if (closed) return;
+    if (document.hidden) {
+      if (phase === 'running') pause('background');
+      return;
+    }
+    if (phase === 'interrupted') {
+      showCard(
+        infoCard({
+          icon: 'camera',
+          title: 'Capture paused',
+          text: 'The camera stops while the app is in the background. Point at the area you captured last, then resume.',
+          actions: [button({ label: 'Resume capture', icon: 'play', variant: 'primary', size: 'lg', block: true, onClick: resume, testId: 'resume' })],
+        }),
+      );
+    }
+  }
+
+  async function toggleTorch(force?: boolean): Promise<void> {
+    const want = force ?? !torchOn;
+    const ok = await camera.setTorch(want);
+    if (!ok) {
+      if (force === undefined) toast('The torch is not available on this camera.', { tone: 'warn' });
+      return;
+    }
+    torchOn = want;
+    torchBtn.setAttribute('aria-pressed', String(want));
+    torchBtn.classList.toggle('active', want);
+    torchBtn.replaceChildren(icon(want ? 'torch' : 'torchOff', { size: 22 }));
+  }
+
+  function updateGps(): void {
+    if (!geo) return;
+    const label = gpsChip.querySelector('span:last-child')!;
+    const latest = geo.latest();
+    gpsChip.classList.toggle('warn', geo.status === 'denied' || geo.approximate);
+    if (geo.status === 'denied') label.textContent = 'GPS off';
+    else if (!latest) label.textContent = 'GPS…';
+    else label.textContent = geo.approximate ? 'Approx.' : formatAccuracy(latest.accuracy);
+  }
+
+  function stopSensors(): void {
+    pump?.stop();
+    camera.stop();
+    motion?.stop();
+    compass.stop();
+    geo?.stop();
+  }
+
+  async function finish(): Promise<void> {
+    if (numKeyframes < MIN_KEYFRAMES || !(phase === 'running' || phase === 'paused')) return;
+    setPhase('finishing');
+    pump?.stop();
+    showCard(infoCard({ spinner: true, title: 'Finishing capture…' }));
+    // Let the frame in flight complete (back-pressure: at most one).
+    for (let i = 0; i < 50 && app.engine.frameInFlight; i++) await sleep(100);
+    const durationMs = elapsed();
+    stopSensors();
+    try {
+      await app.engine.finishCapture();
+    } catch (e) {
+      if (!isCancelledError(e)) console.warn('[capture] finishCapture failed', e);
+    }
+    if (closed) return;
+    app.results.liveSparse = latestSparse;
+    app.results.liveCameras = latestCameras;
+    await sessionCreated;
+    void app.updateSession(sessionId, {
+      status: 'captured',
+      stats: {
+        keyframes: numKeyframes,
+        points: last?.numPoints ?? 0,
+        durationMs: Math.round(durationMs),
+        quality: cfg.quality,
+        ...(camRes ? { camera: camRes.label, resolution: `${camRes.width}×${camRes.height}` } : {}),
+      },
+    });
+    closed = true;
+    app.navigate({ type: 'FINISH_CAPTURE', steps: cfg.autoDense ? ['densify'] : [] });
+  }
+
+  async function cancel(): Promise<void> {
+    const wasRunning = phase === 'running';
+    if (wasRunning) pause('user');
+    const ok = await confirmDialog({
+      title: 'Discard this scan?',
+      message: numKeyframes > 0 ? 'The photos captured so far will be deleted.' : undefined,
+      confirmLabel: 'Discard',
+      cancelLabel: 'Keep scanning',
+      destructive: true,
+    });
+    if (!ok) {
+      if (wasRunning) resume();
+      return;
+    }
+    await abandon(true);
+  }
+
+  async function abandon(deleteSession = numKeyframes < MIN_KEYFRAMES): Promise<void> {
+    closed = true;
+    stopSensors();
+    void app.wakeLock.release();
+    app.engine.cancel();
+    if (sessionId) {
+      await sessionCreated;
+      if (deleteSession) await app.deleteSession(sessionId);
+    }
+    app.loadedSessionId = null;
+    app.navigate({ type: 'CANCEL' });
+  }
+
+  return {
+    el,
+    enter() {
+      d.listen(document, 'visibilitychange', onVisibility);
+      d.add(app.engine.onLive(onLive));
+      d.interval(() => {
+        timeLabel.textContent = formatClock(elapsed());
+      }, 500);
+      const onResize = (): void => {
+        clearOverlay();
+        sizeOverlay();
+      };
+      d.listen(window, 'resize', onResize);
+      d.listen(window, 'orientationchange', onResize);
+      void start();
+    },
+    leave() {
+      closed = true;
+      setPhase('closed');
+      stopSensors();
+      if (viewerTimer) clearTimeout(viewerTimer);
+      if (overlayClearTimer) clearTimeout(overlayClearTimer);
+      viewer?.dispose();
+      viewer = null;
+      d.dispose();
+    },
+  };
+}
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** Evenly spread subset of at most `max` points. */
+export function decimate(positions: Float32Array, colors: Uint8Array, max: number): { positions: Float32Array; colors: Uint8Array } {
+  const n = Math.floor(positions.length / 3);
+  if (n <= max) return { positions, colors };
+  const step = n / max;
+  const p = new Float32Array(max * 3);
+  const c = new Uint8Array(max * 3);
+  for (let i = 0; i < max; i++) {
+    const j = Math.floor(i * step);
+    p[3 * i] = positions[3 * j];
+    p[3 * i + 1] = positions[3 * j + 1];
+    p[3 * i + 2] = positions[3 * j + 2];
+    c[3 * i] = colors[3 * j];
+    c[3 * i + 1] = colors[3 * j + 1];
+    c[3 * i + 2] = colors[3 * j + 2];
+  }
+  return { positions: p, colors: c };
+}
+
+/** At most `max` cameras, always keeping the newest. */
+export function decimateCameras<T>(cams: T[], max: number): T[] {
+  if (cams.length <= max) return cams;
+  const out: T[] = [];
+  const step = (cams.length - 1) / (max - 1);
+  for (let i = 0; i < max - 1; i++) out.push(cams[Math.floor(i * step)]);
+  out.push(cams[cams.length - 1]);
+  return out;
+}
+
+/** Square JPEG thumbnail of the current video frame (cover crop). */
+async function videoThumbnail(video: HTMLVideoElement, size = 240): Promise<Blob | null> {
+  try {
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    if (!vw || !vh) return null;
+    const c = document.createElement('canvas');
+    c.width = size;
+    c.height = size;
+    const ctx = c.getContext('2d');
+    if (!ctx) return null;
+    const s = Math.min(vw, vh);
+    ctx.drawImage(video, (vw - s) / 2, (vh - s) / 2, s, s, 0, 0, size, size);
+    return await new Promise<Blob | null>((r) => c.toBlob((b) => r(b), 'image/jpeg', 0.78));
+  } catch {
+    return null;
+  }
+}

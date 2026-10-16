@@ -1,0 +1,94 @@
+/**
+ * Mapping of normalised frame coordinates (LiveUpdate.overlay, [0,1]², relative to the frame
+ * as submitted) to CSS pixels of a `<video>` element drawn with `object-fit: cover` (or
+ * `contain`) and `object-position: 50% 50%`.
+ */
+
+export interface CoverTransform {
+  /** CSS px per frame pixel. */
+  scale: number;
+  /** Displayed frame size (CSS px). */
+  width: number;
+  height: number;
+  /** Top-left of the displayed frame relative to the element (≤ 0 when cropped). */
+  offsetX: number;
+  offsetY: number;
+}
+
+/**
+ * Transform of a `srcW × srcH` frame drawn into an `elW × elH` box. `cover` scales by the larger
+ * ratio and crops the overflow symmetrically; `contain` by the smaller one (letterbox).
+ */
+export function fitTransform(srcW: number, srcH: number, elW: number, elH: number, fit: 'cover' | 'contain' = 'cover'): CoverTransform {
+  if (!(srcW > 0 && srcH > 0 && elW > 0 && elH > 0)) return { scale: 0, width: 0, height: 0, offsetX: 0, offsetY: 0 };
+  const sx = elW / srcW;
+  const sy = elH / srcH;
+  const scale = fit === 'cover' ? Math.max(sx, sy) : Math.min(sx, sy);
+  const width = srcW * scale;
+  const height = srcH * scale;
+  return { scale, width, height, offsetX: (elW - width) / 2, offsetY: (elH - height) / 2 };
+}
+
+/** Normalised frame point → element CSS px. */
+export function mapNormalizedPoint(u: number, v: number, t: CoverTransform): { x: number; y: number } {
+  return { x: t.offsetX + u * t.width, y: t.offsetY + v * t.height };
+}
+
+/** Element CSS px → normalised frame point (inverse of mapNormalizedPoint). */
+export function unmapPoint(x: number, y: number, t: CoverTransform): { u: number; v: number } {
+  return { u: t.width > 0 ? (x - t.offsetX) / t.width : NaN, v: t.height > 0 ? (y - t.offsetY) / t.height : NaN };
+}
+
+/**
+ * Rotate a normalised point by `k` CLOCKWISE quarter turns (as displayed) — the same convention
+ * as `rotateRGBA90` / `canonicalRotation`: k = 1 maps (u, v) → (1 − v, u).
+ */
+export function rotateNormalizedPoint(u: number, v: number, k: number): { u: number; v: number } {
+  const q = ((Math.round(k) % 4) + 4) % 4;
+  switch (q) {
+    case 1:
+      return { u: 1 - v, v: u };
+    case 2:
+      return { u: 1 - u, v: 1 - v };
+    case 3:
+      return { u: v, v: 1 - u };
+    default:
+      return { u, v };
+  }
+}
+
+/**
+ * Map an interleaved overlay (u0, v0, u1, v1, …) to element coordinates. Points outside the
+ * visible (cropped) area are dropped. `quarterTurns` rotates the points first (frame captured
+ * at a different UI rotation than the current one). Returns interleaved CSS px (x, y, …).
+ */
+export function mapOverlay(
+  overlay: ArrayLike<number>,
+  frameW: number,
+  frameH: number,
+  elW: number,
+  elH: number,
+  opts: { fit?: 'cover' | 'contain'; quarterTurns?: number; margin?: number } = {},
+): Float32Array {
+  const k = ((Math.round(opts.quarterTurns ?? 0) % 4) + 4) % 4;
+  // A rotated frame swaps its aspect.
+  const w = k % 2 ? frameH : frameW;
+  const h = k % 2 ? frameW : frameH;
+  const t = fitTransform(w, h, elW, elH, opts.fit ?? 'cover');
+  const m = opts.margin ?? 0;
+  const n = Math.floor(overlay.length / 2);
+  const out = new Float32Array(n * 2);
+  let j = 0;
+  for (let i = 0; i < n; i++) {
+    let u = overlay[2 * i];
+    let v = overlay[2 * i + 1];
+    if (!Number.isFinite(u) || !Number.isFinite(v)) continue;
+    if (k) ({ u, v } = rotateNormalizedPoint(u, v, k));
+    const x = t.offsetX + u * t.width;
+    const y = t.offsetY + v * t.height;
+    if (x < -m || y < -m || x > elW + m || y > elH + m) continue;
+    out[j++] = x;
+    out[j++] = y;
+  }
+  return out.subarray(0, j);
+}

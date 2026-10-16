@@ -1,0 +1,455 @@
+/**
+ * Typed RPC protocol between the UI thread and the engine worker (docs/ENGINE.md §2–3).
+ *
+ *   main → worker   EngineRequest   { id, method, params }
+ *   worker → main   EngineResponse  { id, ok: true, result } | { id, ok: false, error }
+ *   worker → main   EngineEvent     { type: 'progress' | 'live' | 'log' | 'error', … }
+ *
+ * Responses are told apart from events by the `type` field (events) vs `id` + `ok` (responses):
+ * use {@link isEngineEvent} / {@link isEngineResponse}.
+ *
+ * Large typed arrays and ImageBitmaps are TRANSFERRED, never copied: build the transfer list
+ * with {@link collectTransferables}. Small arrays (poses, intrinsics) are structured-cloned —
+ * `Float64Array`s and plain objects survive the clone unchanged. Only transfer buffers the
+ * sender no longer needs (a transferred buffer is detached on the sending side).
+ *
+ * Extensions over ENGINE.md (superset, nothing removed): the `visibility` request (workers get
+ * no `visibilitychange`; the engine must not submit GPU work while the page is hidden),
+ * `EngineOptions.resume` (re-open a persisted session after a worker respawn), optional
+ * FramePump metadata on `FrameInput`, `SessionSummary` carries the stored models.
+ */
+import type {
+  CameraIntrinsics,
+  GeoFix,
+  ImuSample,
+  Mat3,
+  MetricInfo,
+  PointCloud,
+  Pose,
+  ProgressEvent,
+  RGBAImage,
+  TriangleMesh,
+  Vec3,
+} from '../core/types';
+import type { SessionStatus } from '../io/storage';
+
+export const ENGINE_PROTOCOL_VERSION = 1;
+
+export type CaptureMode = 'object' | 'scene' | 'auto';
+export type QualityPreset = 'fast' | 'balanced' | 'max';
+export type ScreenAngle = 0 | 90 | 180 | 270;
+
+// ---------------------------------------------------------------------------------------------
+// Engine API types (ENGINE.md §2)
+// ---------------------------------------------------------------------------------------------
+
+export interface EngineOptions {
+  mode: CaptureMode;
+  quality: QualityPreset;
+  /** Persist frames/models in IndexedDB under this session. */
+  sessionId?: string;
+  /** Default true in the app, false in tests. */
+  persist?: boolean;
+  /** Default true. */
+  preferGPU?: boolean;
+  /** From CameraCapture (lens + aspect): FOV across the LONG image side, degrees. */
+  hfovPriorDeg?: number;
+  /**
+   * Extension: re-open the persisted state of `sessionId` instead of starting empty (sent by
+   * EngineClient when it re-initialises a respawned worker).
+   */
+  resume?: boolean;
+}
+
+export interface InitResult {
+  gpu: boolean;
+  adapter?: string;
+  /** Why the engine runs on the CPU although a GPU was preferred. */
+  fallbackReason?: string;
+}
+
+export interface HeadingSample {
+  /** Degrees clockwise from north. */
+  heading: number;
+  /** Degrees. */
+  accuracy: number;
+}
+
+export interface AttitudeSample {
+  t: number;
+  /** Device → world rotation (row-major 3×3). ENU when `absolute`. */
+  R_world_device: Mat3;
+  absolute: boolean;
+  yawAccuracyDeg: number | null;
+}
+
+export interface FrameInput {
+  /** Full resolution, any UI orientation. Transferred to the worker (owned by the engine). */
+  bitmap: ImageBitmap | RGBAImage;
+  /** Capture time, ms (performance.now() domain). */
+  t: number;
+  /** θ of ARCHITECTURE §2 when the frame was captured. */
+  screenAngle: ScreenAngle;
+  /** IMU samples since the previous frame. */
+  imu: ImuSample[];
+  geo?: GeoFix | null;
+  heading?: HeadingSample | null;
+  // ---- optional FramePump metadata (extension) ----
+  /** 0-based index of delivered frames. */
+  index?: number;
+  /** Camera capture segment: changes after an interruption (relocalise / new segment). */
+  segment?: number;
+  /** Unit gravity direction (DOWN) in the device frame at t. */
+  gravityDevice?: Vec3 | null;
+  attitude?: AttitudeSample | null;
+  /** MotionSensor calibration version the IMU samples were normalised with (-1: no motion). */
+  imuCalibrationVersion?: number;
+  timeSource?: 'captureTime' | 'presentationTime' | 'callback';
+}
+
+export type KeyframeDecision = 'keyframe' | 'skip' | 'reject_blur' | 'reject_motion';
+export type Guidance = 'good' | 'move_slower' | 'more_texture' | 'translate_more' | 'tracking_lost' | 'initializing';
+export type TrackingState = 'initializing' | 'tracking' | 'lost';
+
+export interface LiveCamera {
+  pose: Pose;
+  intrinsics: CameraIntrinsics;
+}
+
+export interface LiveUpdate {
+  frameIndex: number;
+  decision: KeyframeDecision;
+  guidance: Guidance;
+  tracking: TrackingState;
+  numKeyframes: number;
+  numRegistered: number;
+  numPoints: number;
+  /**
+   * Keypoints of the processed frame in [0,1] normalised image coordinates, interleaved
+   * (u0, v0, u1, v1, …), decimated. Relative to the frame AS SUBMITTED (its bitmap / UI
+   * orientation `screenAngle`), even when the engine rotates frames to a canonical
+   * orientation internally.
+   */
+  overlay?: Float32Array;
+  /** Present when the sparse model changed (decimated to ≤ 50k points). */
+  sparse?: { positions: Float32Array; colors: Uint8Array };
+  cameras?: LiveCamera[];
+  timings: Record<string, number>;
+}
+
+export interface SparseCamera {
+  id: number;
+  pose: Pose;
+  intrinsics: CameraIntrinsics;
+}
+
+export interface SparseResult {
+  points: PointCloud;
+  cameras: SparseCamera[];
+  metric: MetricInfo;
+  /**
+   * Free-form statistics for the info sheet. Well-known keys (all optional): `images`,
+   * `registeredImages`, `points`, `meanReprojErrorPx`, `meanTrackLength`, `focalPx`, `k1`, `k2`,
+   * and timings `<stage>Ms` (e.g. `matchingMs`, `reconstructionMs`, `alignmentMs`).
+   */
+  stats: Record<string, number | string>;
+}
+
+export interface DenseOptions {
+  /** Default: the session preset. */
+  quality?: QualityPreset;
+  /** Long side of the undistorted images used for stereo (overrides the preset). */
+  maxImageSize?: number;
+  /** Limit the number of reference views. */
+  maxViews?: number;
+}
+
+export interface MeshOptions {
+  quality?: QualityPreset;
+  /** TSDF voxel size in world units (default: automatic). */
+  voxelSize?: number;
+  /** Simplify to about this many triangles (default: no simplification). */
+  targetTriangles?: number;
+}
+
+export type ExportFormat = 'ply-points' | 'ply-mesh' | 'glb' | 'colmap-zip';
+export const EXPORT_FORMATS: readonly ExportFormat[] = ['ply-points', 'ply-mesh', 'glb', 'colmap-zip'];
+
+export interface SessionSummary {
+  id: string;
+  name: string;
+  mode: CaptureMode;
+  quality: QualityPreset | null;
+  status: SessionStatus;
+  numFrames: number;
+  /** Epoch ms. */
+  createdAt: number;
+  updatedAt: number;
+  /** Stored models (null when not built yet). */
+  sparse: SparseResult | null;
+  dense: PointCloud | null;
+  mesh: TriangleMesh | null;
+  stats: Record<string, number | string>;
+}
+
+// ---------------------------------------------------------------------------------------------
+// RPC envelopes (ENGINE.md §3)
+// ---------------------------------------------------------------------------------------------
+
+export interface EngineMethodMap {
+  init: { params: EngineOptions; result: InitResult };
+  frame: { params: FrameInput; result: LiveUpdate };
+  finishCapture: { params: undefined; result: void };
+  refine: { params: undefined; result: SparseResult };
+  densify: { params: DenseOptions | undefined; result: PointCloud };
+  mesh: { params: MeshOptions | undefined; result: TriangleMesh };
+  export: { params: { format: ExportFormat }; result: Blob };
+  /** May be called without `init`: the engine is created from the stored session. */
+  loadSession: { params: { id: string; options?: Partial<EngineOptions> }; result: SessionSummary };
+  /** Cancel the request `target` (default: the running long operation). Resolves at once. */
+  cancel: { params: { target?: number } | undefined; result: void };
+  /** Extension: page visibility (pause GPU submissions while hidden). */
+  visibility: { params: { hidden: boolean }; result: void };
+  dispose: { params: undefined; result: void };
+}
+
+export type EngineMethod = keyof EngineMethodMap;
+export type EngineParams<M extends EngineMethod> = EngineMethodMap[M]['params'];
+export type EngineResult<M extends EngineMethod> = EngineMethodMap[M]['result'];
+
+export const ENGINE_METHODS: readonly EngineMethod[] = [
+  'init',
+  'frame',
+  'finishCapture',
+  'refine',
+  'densify',
+  'mesh',
+  'export',
+  'loadSession',
+  'cancel',
+  'visibility',
+  'dispose',
+];
+
+/** Long-running methods that report `progress` events and can be cancelled. */
+export const LONG_RUNNING_METHODS: readonly EngineMethod[] = ['refine', 'densify', 'mesh', 'export', 'loadSession', 'finishCapture'];
+
+export interface EngineRequest<M extends EngineMethod = EngineMethod> {
+  id: number;
+  method: M;
+  params: EngineParams<M>;
+}
+
+/** Well-known error names (Error.name survives the round trip). */
+export const ENGINE_ERRORS = {
+  cancelled: 'CancelledError',
+  notImplemented: 'NotImplementedError',
+  crashed: 'EngineCrashedError',
+  timeout: 'EngineTimeoutError',
+  busy: 'EngineBusyError',
+  notInitialized: 'EngineNotInitializedError',
+  gpuLost: 'GPUDeviceLostError',
+} as const;
+
+export interface SerializedError {
+  name: string;
+  message: string;
+  stack?: string;
+  /** Optional machine-readable code (e.g. 'quota', 'gpu-lost'). */
+  code?: string;
+}
+
+export interface EngineSuccess<M extends EngineMethod = EngineMethod> {
+  id: number;
+  ok: true;
+  result: EngineResult<M>;
+}
+
+export interface EngineFailure {
+  id: number;
+  ok: false;
+  error: SerializedError;
+}
+
+export type EngineResponse<M extends EngineMethod = EngineMethod> = EngineSuccess<M> | EngineFailure;
+
+/** Progress of a long operation (`requestId` = the request it belongs to, if any). */
+export interface ProgressMessage extends ProgressEvent {
+  type: 'progress';
+  requestId?: number;
+}
+
+/** Unsolicited live update (e.g. background mapping finished); frame responses are NOT repeated as events. */
+export interface LiveMessage {
+  type: 'live';
+  update: LiveUpdate;
+}
+
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+export interface LogMessage {
+  type: 'log';
+  level: LogLevel;
+  message: string;
+  data?: unknown;
+}
+
+export type EngineErrorReason = 'gpu-lost' | 'out-of-memory' | 'internal' | 'storage';
+
+/**
+ * Error not tied to a request. `fatal: true` means the worker cannot continue (e.g. the GPU
+ * device was lost and `requestAdapter()` returns null in this realm — ios-webgpu.md §5): the
+ * client terminates and respawns it.
+ */
+export interface ErrorMessage {
+  type: 'error';
+  error: SerializedError;
+  fatal: boolean;
+  reason?: EngineErrorReason;
+}
+
+export type EngineEvent = ProgressMessage | LiveMessage | LogMessage | ErrorMessage;
+export type EngineEventType = EngineEvent['type'];
+export type WorkerToMainMessage = EngineResponse | EngineEvent;
+export type MainToWorkerMessage = EngineRequest;
+
+const EVENT_TYPES = new Set<string>(['progress', 'live', 'log', 'error']);
+
+export function isEngineEvent(m: unknown): m is EngineEvent {
+  return !!m && typeof m === 'object' && typeof (m as { type?: unknown }).type === 'string' && EVENT_TYPES.has((m as { type: string }).type);
+}
+
+export function isEngineResponse(m: unknown): m is EngineResponse {
+  if (!m || typeof m !== 'object') return false;
+  const r = m as { id?: unknown; ok?: unknown; type?: unknown };
+  return typeof r.id === 'number' && typeof r.ok === 'boolean' && r.type === undefined;
+}
+
+export function isEngineRequest(m: unknown): m is EngineRequest {
+  if (!m || typeof m !== 'object') return false;
+  const r = m as { id?: unknown; method?: unknown };
+  return typeof r.id === 'number' && typeof r.method === 'string' && (ENGINE_METHODS as readonly string[]).includes(r.method);
+}
+
+/** Error → plain object (Error instances lose their name/stack in some structured clones). */
+export function serializeError(e: unknown): SerializedError {
+  if (e && typeof e === 'object') {
+    const o = e as { name?: unknown; message?: unknown; stack?: unknown; code?: unknown };
+    const out: SerializedError = {
+      name: typeof o.name === 'string' && o.name ? o.name : 'Error',
+      message: typeof o.message === 'string' ? o.message : String(e),
+    };
+    if (typeof o.stack === 'string') out.stack = o.stack;
+    if (typeof o.code === 'string') out.code = o.code;
+    return out;
+  }
+  return { name: 'Error', message: String(e) };
+}
+
+/** Plain object → Error with the original name (and `code`, when present). */
+export function deserializeError(s: SerializedError | undefined | null): Error & { code?: string } {
+  const err = new Error(s?.message ?? 'Unknown engine error') as Error & { code?: string };
+  err.name = s?.name || 'Error';
+  if (s?.stack) err.stack = s.stack;
+  if (s?.code) err.code = s.code;
+  return err;
+}
+
+/** An Error with a given name (e.g. ENGINE_ERRORS.cancelled). */
+export function namedError(name: string, message: string, code?: string): Error & { code?: string } {
+  const err = new Error(message) as Error & { code?: string };
+  err.name = name;
+  if (code) err.code = code;
+  return err;
+}
+
+export function isCancelledError(e: unknown): boolean {
+  return !!e && typeof e === 'object' && ((e as { name?: string }).name === ENGINE_ERRORS.cancelled || (e as { name?: string }).name === 'AbortError');
+}
+
+// ---------------------------------------------------------------------------------------------
+// Transfer lists
+// ---------------------------------------------------------------------------------------------
+
+export interface CollectTransferablesOptions {
+  /**
+   * ArrayBuffers smaller than this are cloned instead of transferred (default 1024 bytes):
+   * poses, intrinsics and other tiny arrays stay usable on the sending side.
+   */
+  minByteLength?: number;
+  /** Maximum object nesting that is searched (default 8). */
+  maxDepth?: number;
+}
+
+type Ctor = abstract new (...args: never[]) => unknown;
+
+function ctor(name: string): Ctor | null {
+  const c = (globalThis as unknown as Record<string, unknown>)[name];
+  return typeof c === 'function' ? (c as Ctor) : null;
+}
+
+/**
+ * Walk `value` (arrays, plain objects, Maps, Sets) and return the transfer list for
+ * `postMessage`: the ArrayBuffers behind typed arrays / DataViews (each buffer once, ≥
+ * `minByteLength`, never SharedArrayBuffers or detached buffers) and ImageBitmaps,
+ * OffscreenCanvases, VideoFrames and MessagePorts. Cycles are handled.
+ */
+export function collectTransferables(value: unknown, opts: CollectTransferablesOptions = {}): Transferable[] {
+  const minBytes = opts.minByteLength ?? 1024;
+  const maxDepth = opts.maxDepth ?? 8;
+  const out: Transferable[] = [];
+  const seen = new Set<unknown>();
+  const transferableCtors = ['ImageBitmap', 'OffscreenCanvas', 'VideoFrame', 'MessagePort'].map(ctor).filter((c): c is Ctor => !!c);
+  const SAB = ctor('SharedArrayBuffer');
+  const BlobCtor = ctor('Blob');
+
+  const addBuffer = (buf: ArrayBufferLike): void => {
+    if (SAB && buf instanceof SAB) return;
+    if (!(buf instanceof ArrayBuffer)) return;
+    if (buf.byteLength === 0 || buf.byteLength < minBytes) return; // detached buffers have byteLength 0
+    if (seen.has(buf)) return;
+    seen.add(buf);
+    out.push(buf);
+  };
+
+  const visit = (v: unknown, depth: number): void => {
+    if (v === null || typeof v !== 'object') return;
+    if (ArrayBuffer.isView(v)) {
+      addBuffer(v.buffer);
+      return;
+    }
+    if (v instanceof ArrayBuffer) {
+      addBuffer(v);
+      return;
+    }
+    for (const C of transferableCtors) {
+      if (v instanceof C) {
+        if (!seen.has(v)) {
+          seen.add(v);
+          out.push(v as Transferable);
+        }
+        return;
+      }
+    }
+    if (BlobCtor && v instanceof BlobCtor) return; // cloned by reference
+    if (depth >= maxDepth || seen.has(v)) return;
+    seen.add(v);
+    if (Array.isArray(v)) {
+      for (const x of v) visit(x, depth + 1);
+      return;
+    }
+    if (v instanceof Map) {
+      for (const x of v.values()) visit(x, depth + 1);
+      return;
+    }
+    if (v instanceof Set) {
+      for (const x of v) visit(x, depth + 1);
+      return;
+    }
+    if (Object.prototype.toString.call(v) !== '[object Object]') return; // Date, RegExp, Error, …
+    for (const k of Object.keys(v)) visit((v as Record<string, unknown>)[k], depth + 1);
+  };
+
+  visit(value, 0);
+  return out;
+}
