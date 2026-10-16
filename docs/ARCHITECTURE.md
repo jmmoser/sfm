@@ -662,3 +662,758 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   and repeatability 0.55–0.99 under rotation 30/90°, scale 0.6/1.5, tilt 40°, photometric
   change and noise. `testdata.ts` (browser-safe) provides procedural textures, homography
   warps with anti-aliasing, photometric changes and evaluation helpers for the GPU tests.
+
+### `src/viewer` (three.js WebGL2 viewer)
+
+* **API superset of §4.9** (documented signatures kept). Extras: `ViewerOptions`
+  (`maxPixelRatio` 2, `antialias`, `interactivePointBudget` 1.5 M, `pickMode`
+  `'auto'|'cpu'`, `autoFit` `'first'|'follow'|'off'`, `fovDeg`, `background: 'transparent'`);
+  `setPointCloud(pc, { pointSizePx, splats, softShading, minConfidence })`;
+  `setDisplay({ …, unlit, edlStrength, edlRadiusPx, sparsePointSizePx })`;
+  `fitToContent(animate?)`; `pickPoint`, `pickPoints`, `measureBetweenScreenPoints(p1, p2)`,
+  `measureTap(p)` (screen points = CSS px relative to the container, `{x,y}` or `[x,y]`);
+  `worldToScreen`, `setOrbitTarget`/`getOrbitTarget` (world frame), `getWorldUp`,
+  `getContentBounds`, `requestRender`, `renderNow`, `readPixels`, `getStats`, `framePending`.
+* **Frames**: content lives under world roots rotated so world up → three +Y ('z':
+  −90° about X, `(x,y,z) → (x,z,−y)`). `setWorldUp('auto')`: up from camera poses —
+  smallest eigenvector of Σ xxᵀ of the camera x axes (phones are held level; IRLS
+  Cauchy weights drop rolled frames), sign from the mean of the camera up vectors
+  (−Rᵀe_y); falls back to that mean when the x axes are parallel / not level. Unlike
+  the plain mean it is not biased by camera pitch on partial orbits. When up changes,
+  the camera is carried along (view kept, horizon levelled). Grid only in 'z' mode.
+* **Colour**: point / vertex colours are sRGB Uint8 and are converted to linear in the
+  shaders (three treats vertex colours as linear); output via three's colour-space
+  conversion, so direct and EDL paths match (exact sRGB value for unlit content).
+* **EDL** (points only): content → offscreen SRGB8_ALPHA8 + depth texture
+  (DEPTH_COMPONENT32F, fallback 24; no float colour target needed; if neither
+  framebuffer is complete EDL is disabled and picking uses the CPU path). Composite:
+  log2 of linearised depth, 8 neighbours at 1.4 CSS px, `exp(−300·s·mean(max(0, l₀−lᵢ)))`,
+  writes `gl_FragDepth` so overlays depth-test against content. Mesh fragments write
+  alpha 0 into the target (shared `uEdlWeight` uniform) and are not shaded; a mesh
+  without points is drawn directly (canvas MSAA). Depth precision: near/far are
+  recomputed every frame from a clip sphere (outlier-clamped full bounds ∪ cameras ∪
+  grid), far/near ≤ ~2000 unless zoomed very close to the orbit target.
+* **Points**: round splats; size = 2·radius·projScale/depth when `radii` exist and
+  `splats` (default), else `pointSizePx`·dpr; clamped to [1, 64·dpr] device px (and
+  the GL max). Dense arrays are wrapped, not copied (kept for context restore and CPU
+  picking). Clouds > 1.2·budget get an extra index buffer (golden-ratio stride
+  permutation, `budget` entries) drawn while the view moves (size × min(2, √(n/budget))).
+* **Picking** (GPU, default; O(1) in the number of points, occlusion-correct):
+  (A) content depth (normal splats) read in a ±14 CSS px window → front surface
+  depth at the tapped pixel (or nearest covered pixel = tap in a gap); (B) a ×4
+  magnified 64² render around the tap with 1 px splats → sub-pixel depths of point
+  centres / mesh; samples behind pass-A depth ×1.05 are rejected; the hit is on the
+  tap ray at the depth of a planar fit 1/z = a + b·u + c·v (exact for planes). Error on
+  a 240×180 px test canvas viewed at 30° ≈ 5 mm at 7 m (≈ 0.1 px). A one-time
+  known-pattern readback self-test guards against Safari readback noise (Private
+  Browsing fingerprinting protection); on failure (or `pickMode: 'cpu'`, or no EDL
+  target) the CPU picker projects all points (≈ 10–30 ms per 2 M points on one core),
+  emulates splat coverage and uses the same planar fit; mesh vertices act as 1 px points.
+* **Render loop**: rAF only on change (content / display / resize / controls 'change'
+  incl. damping / target animation); `resize()` (ResizeObserver) redraws synchronously.
+  Context loss: frames stop, three restores resources from the retained arrays.
+  `dispose()` cancels the pending frame, removes listeners/DOM and forces context loss.
+
+### `src/dense` — PatchMatch MVS (types, synthetic data, CPU reference, WebGPU)
+
+* **Files**: `types.ts` (DenseView, DepthMap, DepthMapStore, MemoryDepthMapStore, `GeometricInput`,
+  `PatchMatchOptions` + `DEFAULT_PATCHMATCH_OPTIONS`, `MAX_PATCHMATCH_SOURCES` = 16),
+  `patchmatch-common.ts` (shared CPU/GPU set-up), `patchmatch-cpu.ts`, `patchmatch-wgsl.ts`,
+  `patchmatch-gpu.ts`, `synthetic.ts`, `index.ts` (synthetic and low-level helpers are re-exported
+  as the namespaces `synthetic` / `patchMatchInternals` to avoid name clashes in barrels).
+* **Hypothesis / homography convention**: per pixel (z, n) in the reference camera frame, n facing the
+  camera. Plane nᵀX + δ = 0 with δ = −z·n·K_r⁻¹p̃ > 0 (distance to the plane). With
+  R_sr = R_s R_rᵀ, t_sr = t_s − R_sr t_r: **H = K_s (R_sr − t_sr nᵀ/δ) K_r⁻¹** (the §4.6 formula with
+  d = δ; written as nᵀX = d the sign flips). Propagated planes are re-intersected with the pixel ray.
+* **Cost**: 1 − bilateral-weighted NCC on Rec.709 grey (rounded to 8 bit, identical to the r8unorm
+  upload); window offsets −r…r step s (ACMM; defaults 6×6 = 36 samples, centre excluded); weights
+  exp(−|Δxy|/(2σs²) − ΔC/(2σc²)), σs = 5 px, σc = 3, where **ΔC = mean |ΔR|,|ΔG|,|ΔB|** (colour instead
+  of ACMM's grey, to separate surfaces of equal luminance). Weighted variance < (0.75/255)² ⇒
+  textureless ⇒ cost 2 and the pixel is not updated. Source samples are hardware-bilinear
+  (clamp-to-edge); window centre outside the source / behind it ⇒ 2.
+* **Propagation & view selection**: red/black passes, ACMH adaptive checkerboard (4 V-shaped regions of
+  7 px, 4 strips of 11 px reaching 23 px). ACMH multi-hypothesis view selection over **9** hypotheses
+  (8 region winners + the current one): good if c < 0.8·exp(−t²/90), bad if c > 1.2; view selected if
+  #good > 2 and #bad < 3, weight = mean exp(−c²/0.18) of its good costs × soft prior
+  (0.3 + 0.7·fraction of the 4-neighbours that selected it). Fallback when nothing is selected: the
+  `topK` (3) views with the lowest best cost, weight 1. Refinement: 6 proposals (perturbed / random
+  depth × normal; relative depth perturbation 5 %·0.5ᵗ, floor 0.2 %; normal 0.15 rad·0.5ᵗ); random
+  depths are uniform in **inverse depth** (init and proposals).
+* **Geometric mode (ACMM)**: `compute(ref, sources, range, opts, { prior, sourceDepths })`; prior and
+  source maps may have any resolution (nearest, §2 rule), a 0×0 source map = unavailable. Cost +=
+  λ·Σ wᵢ·min(eᵢ, τ)/Σ wᵢ (λ 0.2, τ 3 px, forward–backward reprojection with nearest source depth).
+  Runs `geometricIterations` (3) instead of `iterations`, starting from 1 % perturbation. Passing
+  `{geometric:false}` with the data runs photometric; `{geometric:true}` without data throws.
+  **Multi-scale ACMM** is possible with this API: photometric at ½ resolution for all views, then
+  geometric at full resolution with the ½-res maps as prior + sources.
+* **Output**: `cost` is always the photometric cost; depth = 0 when cost > `maxCost` (0.5) or z ∉
+  [min, max]; normals unit, camera frame, facing the camera, (0,0,0) when invalid.
+* **CPU ≡ GPU**: same PCG random streams (per pass and pixel), same sampling order; results do not
+  depend on the band tiling (bit-identical on GPU). GPU and CPU agree statistically (≈ 70 % of pixels
+  within 1e-4, all metrics within 0.2 %). The CPU reference also has an in-bounds fast path and reuses
+  costs of duplicate candidates.
+* **GPU scheduling (iOS)**: one command buffer in flight (submit → `onSubmittedWorkDone` → next), row
+  bands adapted on line to `targetSubmitMs` (20 ms, capped by `maxPixelViewsPerSubmit` = 1.5 M pixel·views;
+  disabled on software adapters); every dispatch increments a sentinel counter, and a mismatch with
+  the number of submissions (work dropped while hidden) triggers up to 2 full retries, then an Error.
+  Patch window + checkerboard loops are unrolled in the generated WGSL (Safari loop counters / bounds
+  checks); no structs by value, no vec3 in buffers, 5 storage buffers, 8×8 workgroups, no workgroup
+  memory. **All 8 pipelines (source buckets 4/8/12/16 × init/propagate) are compiled in `create()`**
+  (raced against device loss + 30 s timeout → sync fallback) — create the matcher after capture, not
+  while the camera preview runs. `selfTest()` compares GPU vs CPU on an 80×60 synthetic scene (~0.5 s)
+  — call it once and fall back to `patchMatchCPU` if `ok` is false. Readback is chunked through a
+  ≤ 4 MB staging buffer (one `getMappedRange` per map). Resources are reused (per-size buffers,
+  grow-only texture arrays). Device loss ⇒ `Error('PatchMatchGPU: GPU device lost …')`.
+* **Memory** (GPU): 32 B per reference pixel (+ ≤ 4 MB staging), 1 B per source pixel, + 4 B per source
+  pixel in geometric mode. 1600×1200 with 8 sources: ≈ 61 + 15 (+ 61 geometric) MB; JS output
+  20 B/px (+ 20 B/px transient during readback).
+* **Measured** (synthetic, 1 ref + 6 sources; "surface" = GT pixels > 5 px from depth edges, viewing
+  angle < 75°): CPU 160×120 near: surface 99.8 % valid, 89 % within 1 %, median normal 5°; all pixels
+  71 % within 1 % (window-radius fattening/rim effects dominate at this resolution); 5.6 s (Node).
+  GPU 256×192 near: surface 94 % within 1 %, all pixels 85 %, normals 4.3°; far (6.5–56 m GT, search 4–76 m): surface
+  90 % within 1 %, 97 % within 2 %. Geometric pass (192×144): all-pixel accuracy 78 → 82 %, surface
+  92 → 95.5 %. 640×480 / 8 sources: 97 % within 1 % after 2 iterations. SwiftShader runs ≈ 1 s per
+  iteration at 256×192 — a CPU emulation, not representative of Apple GPUs.
+* **Limitations / TODO**: window-based fattening at occlusion boundaries (left to fusion consistency
+  checks); no multi-scale driver inside the module; hardware bilinear weights have ~8-bit sub-texel
+  precision on some GPUs (≈ 1/256 px); r32float source depth arrays could be r16float to halve
+  geometric-mode memory; on-device (A-series) profiling of the unrolled kernel still to be done.
+
+### `src/features` — CPU part: review notes (adversarial review)
+
+* **`H` guide is sign-invariant**: a homography is only defined up to a (possibly
+  negative) scale (DLT/SVD estimates have an arbitrary sign). `matchGuidedCPU` orients H
+  by majority vote so that most keypoints of a map with w > 0; only points mapping to /
+  beyond infinity under that orientation are excluded. (Before: −H matched nothing.)
+  `match-gpu` must do the same.
+* **Matchers recompute descriptor norms per call** (O(128 n), < 1 ms for 4k features), so
+  a descriptor buffer refilled in place can never produce stale similarities. The
+  `descriptorInvNorms` / `unitDescriptors` helpers stay cached per array (treat
+  descriptors as immutable once passed to them).
+* **Uint8 input is resampled directly** (`resizeFloat32` accepts Uint8/Uint8Clamped and
+  scales by 1/255 on the fly, streaming one row of scratch): no full-size Float32 copy
+  (48 MB for a 12 MP frame) and no full-height temporary in `resizeGray`, `sharpness` or
+  `extractSiftCPU`.
+* `extractSiftCPU(img, opts, fullWidth)` with only one full-resolution dimension derives
+  the other from the input aspect (before: the other defaulted to the input size, i.e. a
+  wrong anisotropic mapping); invalid sizes throw. `rotateRGBA90` throws on non-finite
+  turns. `sortByScoreDesc` ranks NaN scores as −∞ (consistent comparator).
+* Conventions now pinned by tests (would not be caught by matching precision): orientation
+  sign (warp by +α clockwise as displayed ⇒ θ increases by α), exact-90° equivariance
+  (θ + π/2, identical descriptors), absolute descriptor layout incl. y′ sign and
+  orientation-bin direction (mutation-tested: transposed bins, flipped x′/y′ and flipped
+  (θ − φ) all fail), S = 2/4 localisation + DoG scale 2^(−1/(2S)), F-guided band walk
+  with a finite epipole (steep + flat lines) against a brute-force reference.
+
+### `src/math` — review pass (supersedes the conflicting points of the `src/math` notes above)
+
+* **poly**: `polyRealRoots` no longer makes the polynomial monic (a tiny leading
+  coefficient overflowed it); coefficients are normalised by exact powers of two, root
+  bounds are computed from exponents, and when deg·log2(max/min root bound) > 800 bits
+  the modulus range is split into power-of-two bands (each searched on its own scaling),
+  so small roots survive next to huge ones (verified: cubic with lead 1e-300, degree 10
+  with 1e-100, degree 20 with 1e-40). rtsafe cap 300 → 2500 (roots ~1e-90 of the bracket
+  were returned unconverged). Cluster-merge noise factor 8× (64× in the final merge) →
+  1.5× the rigorous Horner bound: (x−1)(x−1−5e-7)(x−5) now yields 3 roots; no 2–4-fold
+  root was lost or split in 14k rounded-coefficient trials. `solveQuadratic` scales by a
+  power of two (b²−4ac overflowed/underflowed), returns [] for non-finite coefficients
+  and drops overflowing roots. `polyRealRootsSturm` keeps a single scaling (cross-check only).
+* **NaN policy**: non-finite input now yields NaN instead of a plausible default in
+  `symEig`, `mat3ToRotvec`, `mat3ToQuat`, `quatNormalize`, `axisAngleToMat3`,
+  `rotationBetweenVectors`, `vec3Normalize` (zero input keeps the documented
+  identity/zero), and `median`/`percentile`/`mad` (NaN data or NaN p → NaN).
+  `quickselect` returns NaN for k ∉ [0, n). Normalisers are over/underflow safe (hypot).
+* **Subnormal scale**: SVD/svd3/nullSpace/nullVector/qr/solveLeastSquares scaled by
+  1/max|a|, which overflowed for max|a| < 2^-1024 (NaN / zero outputs); fixed.
+* **Rng**: `sample` uses Floyd's permutation variant — output ORDER is now uniform too.
+  Negative seeds no longer collide with small positive ones (−1−k ≡ k); streams for
+  seeds in [0, 2³²) are unchanged.
+* Regression tests: `src/math/adversarial.test.ts` (each test names the defect; 16 of
+  its 30 tests fail on the pre-review code).
+
+### `src/harness/synth` + `e2e/` — synthetic datasets & evaluation
+
+* **Purpose**: rendered sequences with exact GT for headless end-to-end tests
+  (`node e2e/generate-synth.mjs [object|yard|all] [--frames N] …`) and a scorer
+  (`node e2e/metrics.mjs <dataset> <result.json>`). Full format, CLI and metric
+  definitions: `e2e/README.md`. Datasets go to `e2e/data/<name>/` (gitignored, served by
+  Vite at `/e2e/data/<name>/`); `src/harness/synth/dataset.ts` → `loadSynthDataset(url)`.
+* **Ground truth is self-contained**: the generator uses its own tiny PRNG (`rng.ts`,
+  sfc32) and 3×3 helpers (`mat.ts`) instead of `src/math`, so a bug in the code under test
+  cannot leak into the GT. (Deliberate exception to the "always use `Rng`" rule.)
+* **Trajectories** (`trajectory.ts`) are written with second-order forward-mode jets
+  (`jet.ts`): positions, R_wd, dR_wd, d²R_wd, ω_dev, ω̇_dev are exact (tested against
+  finite differences). The IMU (`imu.ts`) is sampled from them per §2:
+  gyro = ω_dev, accel = R_wdᵀa, accelG = R_wdᵀ(a − g); camera and IMU co-located.
+* **Rendering** (`render.ts`, WebGL2 via three): unlit MeshBasicMaterial scenes (Lambert
+  baked into vertex colours), rendered undistorted to a half-float target at 2× over a
+  window covering the undistorted sensor, then resampled per output pixel (2×2
+  sub-samples) through the inverse RADIAL distortion (Newton). The OpenCV pose and
+  intrinsics map to a three camera with an off-axis frustum (`three-camera.ts`), so the
+  principal point is exact. A GPU test checks that marker centroids land within 0.05 px
+  of their RADIAL projections. Noise, vignetting and exposure are applied in linear light
+  before sRGB encoding.
+* **Time base**: frames report `t = tTrue + timeOffsetMs` (default +25 ms); IMU, GPS and
+  compass are on the true clock. Frames, depth maps and keypoints are in the upright UI
+  orientation (θ = 0 portrait for object, θ = 90 landscape for yard).
+* **GT surface**: area-uniform samples with int8 normals and per-sample visibility
+  counts (depth-tested against every frame). The object scene has an extra dense
+  "focus" set on the object of interest, so mm-level accuracy can be measured.
+* **Known limits**: global shutter (no rolling shutter); no lighting changes beyond
+  ±5 % exposure; no specularity; the camera and IMU have no lever arm; textures repeat
+  only where the material is periodic (bricks, shingles, grass/soil detail tiles of
+  2.3 / 3.7 m). SwiftShader renders about 0.75–0.9 s per frame, so a full 240-frame
+  yard dataset takes about 4 min.
+
+### `src/dense` — PatchMatch review notes (corrections to the PatchMatch subsection above)
+
+* **Multi-scale recipe (correction)**: do NOT pass ½-resolution maps as `sourceDepths` of a
+  full-resolution geometric pass. Their reprojection error (λ·min(e, τ) in full-resolution pixels)
+  dominates the photometric term. On the near scene this gives 62 % within 1 %, against 88 % for
+  plain full-resolution photometric. Use instead:
+  1. photometric at ½ resolution (all views);
+  2. `compute(ref, srcs, range, { geometric: false, iterations: 2 }, { prior: halfMap, sourceDepths: [] })`.
+     This is a **prior-initialised photometric pass**, new semantics for `{geometric:false}` + data,
+     which used to ignore the data. It matches 6 random-init iterations (88.2 % vs 87.5 %) at about
+     40 % of their cost;
+  3. geometric pass with the **full-resolution** maps as prior and sources.
+
+  Any pass initialised from a prior starts at `geometricPerturbation`. `priorToPlanes`
+  re-intersects resampled planes with the target pixel ray, which is exact for planes; before, the
+  depth was copied, with errors up to 2 % on slanted planes.
+* **`selfTest()`** now runs the CPU reference with the instance's `create()` options. Before, a GPU
+  instance created with non-default options was compared against a different algorithm and
+  reported `ok: false` (agreement 0.59), forcing the CPU fallback.
+* **Error scopes**: they are opened and closed synchronously around each encode + submit, and never
+  held across `await`. The scope stack is shared by every user of the device in the realm.
+  `onSubmittedWorkDone` is raced against `device.lost`, so a lost device cannot hang `compute()`.
+  If set-up fails (e.g. out of memory), the cached resources are released. Texture arrays only
+  grow, per dimension.
+* **Known limits**:
+  * No mip selection for sources that see the surface at a different scale. At 2× resolution,
+    within 1 % drops from 81 % to 70 %; at 0.5×, to 33 %.
+  * A zero-baseline source, photo-consistent at every depth, is harmless when there are at least
+    2 informative sources, but it lowers the reported cost. `selectSourceViews` must enforce a
+    minimum triangulation angle.
+
+### `src/sensors` (camera, IMU, compass/attitude, GPS, orientation, permissions, FramePump)
+
+* **API superset of §4.7** (documented signatures kept). Files: `frame-orientation.ts`,
+  `normalize.ts` (pure, DOM-free), `motion.ts`, `orientation.ts`, `geolocation.ts`, `camera.ts`,
+  `wakelock.ts`, `permissions.ts`, `diagnostics.ts`, `frame-pump.ts`, `index.ts`.
+* **θ / R_cam_device**: `screenAngle()` prefers `window.orientation` ((wo+360)%360; 90 = device
+  turned counter-clockwise, top edge LEFT) and falls back to `screen.orientation.angle` — on iPad
+  WebKit reports `screen.orientation.angle = (90 − θ) mod 360` (natural = landscape), so the
+  angle API alone is wrong there. `cameraFromDevice(θ)` = diag(1,−1,−1)·Rz(θ), exact integers.
+  `canonicalRotation(θ_s, θ_f)` = ((θ_f − θ_s)/90) mod 4 CLOCKWISE quarter turns (same
+  convention as `rotateRGBA90`); afterwards `R_cam_device = cameraFromDevice(θ_s) =
+  quarterTurnMat3(k)·cameraFromDevice(θ_f)`, pixels map with `rotateImagePoint` (= rotateRGBA90),
+  a world→camera pose R becomes `quarterTurnMat3(k)·R`. `ScreenAngleTracker` records θ changes;
+  frames < 500 ms after a change are dropped (Safari 26 transient mis-rotation).
+* **IMU normalisation** (normalize.ts): rotationRate alpha/beta/gamma = ω about device x/y/z
+  (deg/s → rad/s; NOT alpha = z), `interval` s→ms, spec-sign accelerations. The iOS sign
+  inversion is detected at run time (prior −1 only when `DeviceMotionEvent.requestPermission`
+  exists): check B compares the raw specific force with the DeviceOrientation up-vector
+  (β, γ) at near-stillness (decides after 30 consistent votes); fallback B′ uses the UI-up axis
+  (≥ 2 s of votes); B″ measures the sign of `acceleration` relative to the gravity-including field;
+  D estimates the gyro signed permutation + units from orientation-derived body rates. The ring
+  buffer stores RAW values, so a calibration change re-signs everything still buffered
+  (`calibration.version` increments; drained samples are not revisited). First (replayed) event
+  after attaching and bit-identical duplicates (only for unquantised data) are dropped.
+* **Timing**: `ImuSample.t` = `event.timeStamp` except for bursts after a main-thread stall
+  (arrival gaps < 0.35 × nominal): the run is re-spaced at the nominal interval ending at the
+  newest arrival (never moved later; drained samples frozen). The ~10–20 ms platform latency is
+  NOT removed (estimate a camera–IMU offset). Camera `t` = rVFC `captureTime` (post-ISP arrival,
+  ~10–40 ms after exposure) else `presentationTime` else callback time (`meta.timeSource`).
+* **integrateGyro** returns R_{d(t1)←d(t0)} = R_wd(t1)ᵀR_wd(t0): cubic Hermite ω(t) (3-point
+  parabola tangents; linear at data ends / gaps > 100 ms; held outside the data) + 4th-order
+  Gauss–Magnus steps split at sample times. Error on smooth hand-like motion at 60 Hz with ±2 ms
+  jitter < 3e-5 rad over 2.5 s (linear + trapezoid: ~1.4e-3). `MotionSensor.rotationBetween(t0,t1)`
+  does the same on the buffer; `samplesBetween(t0, t1, { pad: true })` adds the bracketing samples.
+* **MotionSensor extras**: `needsPermission()`, `lastPermissionError` ('NotAllowedError' = no
+  gesture), `calibration`/`onCalibrationChange`, `gravityAt(t)` (unit DOWN, device frame: from
+  DeviceOrientation, else mean specific force), `stats`, `handleMotion/handleOrientation` (replay),
+  `{ target }` option (tests). `angularSpeed(t)` is NaN without a sample within 100 ms.
+* **CompassSensor**: `headingAt(t)` = platform heading (iOS `webkitCompassHeading`, MAGNETIC,
+  interpolated on the circle; accuracy = `webkitCompassAccuracy`; < 0 or > 25° ignored) or, with
+  `deviceorientationabsolute`, the azimuth of the same reference (device top; camera axis when the
+  top is > 45° from horizontal), nominal accuracy 20°. `attitudeAt(t)` = R_world_device (ENU when
+  `absolute`): Chrome absolute events directly; iOS arbitrary-yaw α rotated by the estimated yaw
+  offset ψ (`heading = azimuth_arb + ψ`, circular mean weighted by accuracy, τ = 30 s, motion
+  > 57°/s rejected). `setDeclination(deg)` turns magnetic into true north. A "ui-top" heading model
+  (iOS 26 landscape compensation, unverified for Safari) is auto-selected only when it is clearly
+  more consistent across UI rotations. `cameraHeadingAt(t)` = azimuth/elevation of the optical axis.
+* **CameraCapture**: label classification (English AVFoundation names + localised keywords
+  + capabilities: `facingMode`, `zoom.min < 1` ⇒ virtual); `chooseCamera`: physical wide >
+  unidentified rear (Android) > virtual (zoom 1, `lensMaySwitch`) > unknown > ultra-wide > tele.
+  Formats: exact LANDSCAPE sizes (+ `resizeMode: 'none'` where supported ⇒ native formats only,
+  no silent crop), then ideal, then device-only. 'max': 4032×3024, 3264×2448, 2592×1944,
+  1920×1440, 3840×2160, 1920×1080 (filtered by `getCapabilities()` max); 'balanced': 1920×1440,
+  (1600×1200), 1920×1080; 'fast': 1280×960, 1280×720 — on Apple 1920×1440 (no native 1280×960;
+  smaller 4:3 presets are cropped) with `frameMaxSide` 1280 (FramePump downscales on grab).
+  **`hfovPriorDeg` is the FOV across the LONG image side** (Apple main 67.3°, Pro 69.5°,
+  16:9 ×1.016, cropped presets narrower, ultra-wide 104°, tele 25°, front 70°, unknown 63°);
+  use `focalPriorPx = (max(W,H)/2)/tan(hfov/2)` (in the result) — valid for any UI rotation.
+  Image settings (zoom 1, continuous focus/exposure/WB, torch off) are applied as separate
+  advanced sets merged with the stream constraints (applyConstraints replaces everything) and
+  verified via getSettings(). `lockFocus/lockExposure` work on Chrome/Android only (false on iOS);
+  `lockWhiteBalance()` works on iOS — call it ~1 s after start. Interruptions: mute ⇒
+  'interrupted'; unmute or re-open ⇒ `segment++` (FramePump passes it on: start a new SfM
+  segment / relocalise). Hidden: optional release; on visible re-open if still muted after 1.2 s
+  or ended (≤ 3 restarts / 10 s). Keep the `<video>` attached and visible (rVFC / iOS decode).
+* **FramePump** delivers `PumpFrame` = ENGINE `FrameInput` + `index`, `width/height`,
+  `timeSource`, `R_cam_device`, `imuCalibrationVersion`, `attitude`, `gravityDevice`, `segment`.
+  Rate limit uses half a frame of tolerance (30 fps → exactly 10 Hz); never more than one frame
+  in the consumer; skips while hidden, after θ changes and when the bitmap aspect contradicts θ
+  (transient, re-baselined after 1.5 s). The consumer owns the bitmap (closed by the pump only if
+  the consumer throws). `geo` = interpolated fix (or nearest within 30 s).
+* **GeoSensor**: `watchPosition({enableHighAccuracy: true, maximumAge: 0})`; `t = timestamp −
+  (Date.now() − performance.now())` at delivery; `interpolate(t)` (≤ 5 s gaps, antimeridian-safe),
+  `latest`, `status`, `approximate` (accuracy > 1 km ⇒ iOS "Precise Location" off), `onFix`.
+  **`GeoFix.alt` is orthometric (MSL/EGM2008) on iOS**, not WGS84-ellipsoidal.
+* **requestCapturePermissions()** must be called synchronously in a click/touchend handler: it
+  calls `DeviceMotionEvent.requestPermission()` before returning, then (awaited) orientation,
+  camera probe (yields device labels), geolocation; never rejects; `motion: 'needs-gesture'` when
+  called outside a gesture. `queryPermissionStates()` (camera/geolocation; motion is not queryable).
+* **collectDiagnostics({camera, motion, compass, geo, gpu: 'device' | 'adapter' | false})**: UA,
+  standalone, COI, cores, deviceMemory, screen/θ, feature flags (rVFC, MSTP, VideoFrame, WebGPU,
+  wake lock, SIMD…), GPU info/limits/features (`'device'` uses `getGPU()` = creates this realm's
+  device), cameras, live sensor state, storage estimate, Lockdown-mode suspicion.
+* **Tests**: unit (Node) — θ/R_cam_device/canonical rotation, Euler round trips, simulated iOS and
+  spec events (flat, upright portrait, landscape, tilted) incl. sign/axis/unit self-checks,
+  integrateGyro vs analytic rotation, burst re-timing, compass ψ estimation, geo interpolation,
+  label classification (en/de/fr/es/it/pt/ja/zh/ko/ru, Android), FramePump back-pressure;
+  browser (`sensors.gpu.test.ts`, Chromium fake camera) — start/onFrame/grabFrame/controls/stop,
+  'max' format choice, restart segments, start/stop race, FramePump with synthetic DeviceMotion
+  events, diagnostics, wake lock.
+* **Unverified on device / limits**: localised labels beyond English/German are best-effort
+  keyword lists (unknown locales fall back to capabilities + rank); the compass reference when
+  the phone is upright and the iOS 26 landscape heading behaviour; createImageBitmap resize
+  options on Safari (falls back to native size — always use bitmap.width/height); whether
+  `<video>`-derived bitmaps are rotated exactly as the UI on every iOS version (aspect check +
+  hand-eye check in the engine recommended); rVFC `captureTime` latency; MSTP worker path
+  (research ladder A) is not implemented here — the FramePump uses `createImageBitmap(video)`.
+
+### `src/ba` (bundle adjustment)
+
+* **Files**: `problem.ts` (types, defaults, `validateBAProblem`), `loss.ts`, `camera-model.ts`
+  (RADIAL residual + analytic Jacobians, kept local to ba — must stay identical to §2),
+  `priors.ts`, `linear.ts` (block-sparse symmetric matrix, skyline Cholesky, block-Jacobi PCG),
+  `solver.ts`, `index.ts`; `synthetic.ts` = deterministic problem generator for tests /
+  benchmarks (orbit = close range, strafe = 5–100 m scenes; NOT re-exported from the index).
+* **API superset of §4.3** (documented signatures kept). `BAResult` extras: `successfulIterations`,
+  `linearSolver` ('dense_schur' | 'pcg_schur' | 'none'), `numReducedParams`, `numFreePoints`,
+  `pcgIterations`, `finalLambda`; `termination` is the `BATermination` union. Extra functions:
+  `evaluateBACost(problem, opts) → { cost, rmsPx }`, `computeBAGradient(problem, opts)` (gradient
+  per pose [δω, δt], point, camera [f, cx, cy, k1, k2]; 0 for fixed/pinned), plus the low-level
+  pieces (`radialResidualJacobian`, `so3LeftJacobianInverse`, `SkylineCholesky`, `pcgSolve`, …).
+* **Cost** = ½Σρ(‖w·r‖²) + ½Σ‖prior residual‖² (Ceres convention), r = predicted − observed px,
+  w = `obsWeight` (1/σ). ρ is applied to the WEIGHTED residual, so `lossScalePx` is in pixels for
+  unit weights and in σ units for 1/σ weights. Priors are not robustified. RMS values are
+  unweighted, over all valid observations.
+* **LM** (Ceres / Nielsen): D = clamp(diag(JᵀJ), 1e-6, 1e32) on U and V; accept if gain ratio
+  > 1e-3, then λ ·= max(1/3, 1 − (2ρ−1)³), else λ ·= ν, ν ·= 2; λ ∈ [1e-16, 1e32], above ⇒
+  'min_trust_region_radius' (usable). The gain ratio uses the exact UNDAMPED quadratic model
+  (valid for inexact PCG steps and frozen points). Robust losses by IRLS (√ρ' scaling — what Ceres
+  does for ρ'' ≤ 0): linear convergence (≈ 5–15 iterations), trivial loss converges quadratically.
+  Defaults: `functionTolerance` 1e-6 (relative cost decrease), `gradientTolerance` 1e-10 (max |g|),
+  `parameterTolerance` 1e-8 · (‖x‖ + tol) with ‖x‖ over ALL free parameters incl. points (pass 0
+  to disable on large scenes). `success` is false only for 'invalid_initial_cost' and
+  'linear_solver_failure'; the problem always ends at the last accepted state (also on cancel,
+  time limit, or an exception from `onIteration`).
+* **Gauge / degeneracies**: `translationFixedMask` components are zero Jacobian columns with unit
+  diagonal in S ("pinned"), dropped from the direct solve. Fixed points only feed U. A free point
+  whose damped 3x3 V fails a relative-pivot test (1e-12) is frozen for that step (δX = 0, no Schur
+  term); points without valid observations are untouched. Observations with a non-finite residual
+  at the input (or NaN / negative / infinite weight) are ignored for the whole run; a trial step
+  that makes a residual non-finite is rejected. |Z| is clamped to ≥ 1e-12 (points behind a
+  camera give finite mirrored residuals that robust losses down-weight).
+* **Priors**: centre prior Jacobian w.r.t. δω is −Rᵀ[t]×/σ, w.r.t. δt −Rᵀ/σ. Relative-rotation
+  prior uses the EXACT Jacobian (inverse left Jacobian J_l⁻¹(φ)), not the first-order one.
+* **Linear solver**: reduced system over [free poses (6 each, pinned components kept as decoupled
+  unit rows) + free intrinsics per camera]; block order = free poses in INPUT order, then cameras
+  (so intrinsics rows, which couple to all their poses, do not widen the envelope). S is assembled
+  explicitly block-sparse (pattern fixed per call; per-point pair offsets precomputed, no
+  allocation inside iterations). **'dense_schur' = Cholesky in packed skyline (envelope) storage**
+  over the fixed row profile of S: same result as a dense Cholesky, memory/work only inside the
+  profile. **Deviation (extension) of 'auto'**: direct when n ≤ 2400 (as documented) OR when the
+  envelope is small (≤ 4M entries and ≤ 3e8 multiply-adds — e.g. sequential captures), else PCG
+  (block-Jacobi on S, x₀ = 0, ‖r‖ ≤ `pcgTolerance`·‖b‖). Callers (sfm) should pass poses roughly
+  in capture order — the envelope (and thus the direct-solver cost) depends on it; a random order
+  just falls back to PCG. A forced 'dense_schur' falls back to PCG above 18M envelope entries.
+* **Memory**: no per-observation Jacobians are stored. Per call: W = 18 doubles per (point,
+  distinct camera-side block) ≈ 144 B × (#obs + #points), Schur pair offsets 4 B × Σ m(m+1)/2
+  (m = blocks per point), U and S (block-sparse), V/V⁻¹ 12 doubles per point, 2 parameter copies.
+  ≈ 85 MB for 400k observations / 60k points; ≈ 20 MB for 100k / 20k.
+* **Performance** (Node 22, x86, on a loaded 4-core machine; `solver.perf.test.ts` logs them):
+  100 poses / 20k pts / 98k obs, direct (n = 596): ≈ 140–210 ms per LM iteration (first call incl.
+  setup + JIT ≈ 600 ms); 500 / 60k / 406k: PCG ≈ 850 ms/iteration (≈ 440 PCG iterations/solve —
+  block-Jacobi is weak on long chains), 'auto' (skyline) ≈ 570 ms/iteration with exact steps;
+  local BA (12 free + 18 fixed poses, 49k obs) ≈ 50 ms/iteration after warm-up. Hot loops: Schur
+  6x6 pose blocks unrolled with W in registers, linearisation unrolled for the pose block.
+* **Accuracy** (tests): self-calibration from f +10 %, k1 +0.05, perturbed poses/points → f error
+  1.3e-5, RMS = LS noise floor (0.658 vs 0.653 px expected, σ = 0.5 px); 10 % gross outliers with
+  Cauchy → f error 3e-5, inlier RMS 0.647 px (trivial loss: f error 12.8 %); depth range 2 m–2 km
+  in one scene converges; points at 1–1000 km stay finite. Dense and PCG solutions agree to 1e-7.
+* **Limitations / TODO**: IRLS only (no Triggs correction, like Ceres for concave ρ); points far
+  beyond the baseline converge slowly along the ray (no inverse-depth parameterisation; harmless
+  for reprojection); PCG uses block-Jacobi only (no visibility-based preconditioner); synchronous
+  and single-threaded (run it in the engine worker; use `timeLimitMs` / `cancel` for live BA).
+
+### `src/io` — review notes (adversarial review; supersedes conflicting points of the `src/io` notes above)
+
+* **SessionStore reconnects** (research §2.5 rule): a transaction that cannot start
+  (InvalidStateError), or that aborts with InvalidStateError / UnknownError while the
+  connection can no longer start transactions (probe), is retried ONCE on a freshly opened
+  connection. This covers WebKit "Connection to Indexed Database server lost" and our own
+  close on `versionchange` (another tab upgrading or deleting the DB; a deleted DB is
+  recreated empty). An aborted transaction committed nothing, so the retry is safe. `close()`
+  is final. `store.db` is now a getter (current connection).
+* **Blob → ArrayBuffer fallback** becomes permanent only if the buffered retry SUCCEEDS.
+  Before, a DataCloneError from a non-cloneable frame `info` switched the store to buffer
+  mode for good.
+* **saveFile**: in an iOS Home Screen app (`navigator.standalone === true`), a failed share
+  (typically NotAllowedError after an expired activation) is **rethrown** instead of falling
+  back to `<a download>`, which is broken there (WebKit 275288 / 290847). The UI should ask
+  for another tap. `sanitizeFilename` keeps the extension when shortening to 200 units and
+  never splits surrogate pairs.
+* **COLMAP export validates**: ids are non-negative integers, width/height positive
+  integers, every image references an exported camera, and every track element references an
+  exported image and an existing POINTS2D index (RangeError otherwise). POINTS2D entries
+  referencing a point id that is not exported (e.g. filtered points) are written as −1, and NaN
+  colours as 0. COLMAP crashes or mis-parses on all of these.
+* **ZIP**: `readZip` accepts plain archives with exactly 65 535 entries (ZIP64 only when the
+  locator is present) and is not fooled by an EOCD signature inside the comment. Writers refuse
+  such comments. `'.'` path segments are dropped, so duplicates are detected. Non-Uint8 views
+  are stored as raw bytes.
+* **PLY**: element counts are checked against the remaining body before any allocation (a
+  hostile header otherwise triggers multi-GB allocations, i.e. jetsam). A trailing empty polygon
+  in the binary face fast path no longer throws a DataView RangeError.
+* **GLB**: an empty scene omits `scene.nodes` (schema: minItems 1).
+  **serialize**: `float32ToFloat16Bits` is correctly rounded for any double (round-to-odd into
+  float32), mesh indices use u16 only when every index ≤ 65535, and JSON-safe encoding keeps −0
+  and throws on Set / Date / ArrayBuffer / DataView / Blob instead of emitting `{}`.
+* Tests: `src/io/adversarial.test.ts` (Node) and `src/io/adversarial.gpu.test.ts` (Chromium).
+  `zip.test.ts` / `serialize.test.ts` no longer need `@types/node`; the main tsconfig is
+  browser-typed and `src/io` typechecks clean.
+
+### `src/viewer` — review notes (adversarial review; amends the `src/viewer` notes above)
+
+* **Fixed**: CPU picker now honours the confidence filter (`PickSplatModel.confidence/minConfidence`,
+  same `conf < min` test as the shader) and intersects meshes exactly (`raycastTriangles`,
+  Möller–Trumbore, ≈ 20 ms / 1 M triangles) instead of treating vertices as 1 px points (taps inside
+  large triangles missed; points behind a mesh were picked). `setPointCloud` with the same
+  positions/colours but NEW `radii`/`confidence` arrays uses them (same byte size → re-upload into the
+  existing buffer, else the layer is rebuilt; in-place edits of arrays are still not detected — pass
+  new arrays). `fitToContent()` while the container is 0×0 is deferred to the first real resize (the
+  aspect was unknown → wrong framing after the app shows the viewer). Context restore re-schedules a
+  frame (animations/damping no longer stall). WebGL creation failure removes the canvas and restores
+  the container before rethrowing; `dispose()` restores the container's inline `position`.
+  `screenshot()` rejects while the context is lost (was a blank PNG). Degenerate content (all points
+  coincide, no grid/cameras) no longer gets a zero-thickness near/far range. A pinch between two taps
+  no longer counts as a double tap. GPU-pick sample selection is O(m) (was O(want·m)).
+* **iOS**: canvas also sets `user-select: none`, `-webkit-touch-callout: none`,
+  `-webkit-tap-highlight-color: transparent` and cancels Safari `gesturestart/gesturechange`.
+* **Verified by tests** (`viewer.review.gpu.test.ts`, `review.test.ts`): (x,y,z)→(x,z,−y) mapping of
+  targets/content/projection; splat diameter = 2·r·f_px/z (± 1.5 px) and fixed CSS sizes at DPR 1/2;
+  overlays behind EDL-composited points are depth-occluded; frustum orientation (rows of R, C = −Rᵀt,
+  up marker → world +Z); picks/measures return WORLD coords under `setWorldUp('auto')`, at DPR 1.5/2,
+  at canvas edges, at 100 m scale with km outliers (< 0.5 % distance error), during LOD; mouse drag +
+  damping terminates; no growth of GL buffers/textures/FBOs/VAOs or scene children over repeated
+  content updates; transparent background alpha.
+
+### `src/features` — GPU part (SiftGPU, MatcherGPU, createFeaturePipeline)
+
+* **Files**: `sift-gpu.ts` (+ `shaders/sift-wgsl.ts`), `sift-gpu-host.ts` (WebGPU-free host logic, Node-tested:
+  resize tables, candidate decode / order / de-dup, describe order, assembly, self-test image, `featureParity`),
+  `match-gpu.ts` (+ `shaders/match-wgsl.ts`), `match-gpu-host.ts` (norms + content hash, guide records, Morton
+  order, tile boxes, exact top-2 reduction, `emitMatches`), `gpu-common.ts` (`GPUFeatureError`,
+  `GPUWorkDroppedError`, `ParamBlock`, `Staging`, `BudgetEncoder`, `WorkStamp`), `extractor.ts`.
+* **API superset of §4.4**: `SiftGPU.create(ctx, opts?, cfg?: SiftGPUConfig)`, `extract`, **`extractFromBitmap(bitmap |
+  ImageData | canvas, fullW?, fullH?)`** (copyExternalImageToTexture → Rec.709 luma of the sRGB values (= rgbaToGray)
+  + area resampling in one kernel, no CPU pixel work), `selfTest()`, `memoryBytes()`, `releaseCaches()`,
+  `lastTimings`, `lastProfile`. `MatcherGPU.create(ctx, cfg?)`, `match`, `matchGuided`, `selfTest()`, `clearCache()`,
+  `cacheMemoryBytes()`. `FeaturePipeline` adds `fallbackReason` and `extractFromBitmap`; `createFeaturePipeline`
+  options add `context` (own GPUContext, `null` = no GPU), `siftGPU`, `matcherGPU`, `onFallback`, `selfTest` (default
+  true). Create the pipeline once at start-up: 19 pipelines are compiled up front (blocks the queue on Safari).
+* **CPU equivalence (SIFT)**: same plan / scale space / kernels (`gaussianHalfKernel` weights uploaded) / DoG /
+  26-neighbour strict extrema / Taylor refinement with moves / contrast + edge tests / orientation (36 bins, 6
+  smoothings, peaks ≥ 0.8) / VLFeat descriptor / RootSIFT quantisation, all in f32 on the GPU. GPU candidates are put
+  back into the CPU raster order (octave, start level, row, column) before the `seen` de-duplication, and
+  preselection, describe order (`order` comparator), `octaveToFull` and the final `selectFeatureIndices` run on the
+  CPU with the CPU code ⇒ identical FeatureSet layout and ordering semantics. Measured on 640×480 textures: identical
+  feature counts, 100 % of CPU keypoints reproduced (max position difference 4e-3 px), median descriptor cosine
+  1.00000, ~70 % of descriptors byte-identical, the rest differ by ±1 in a few bytes (f32 vs f64), warped-pair
+  matching precision identical to the CPU pipeline.
+* **SIFT GPU design**: per octave one buffer with all S+3 Gaussian levels (DoG formed on the fly); blurs are
+  separable — shared-memory row/column tiles on hardware adapters, direct loads on software adapters (`cfg.blur`;
+  SwiftShader's barrier emulation makes tiles ~10× slower; both bit-identical); detection appends 8-word records
+  through an atomic counter with capacity guard (grow + re-run; counter + first `1.25 × last count` records read in
+  one round trip); orientation = one 64-thread workgroup per keypoint with per-thread partial histograms in
+  workgroup memory (no float atomics); descriptors = one 64-thread workgroup per (keypoint, orientation) slot,
+  trilinear accumulation with **fixed-point u32 workgroup atomics** (scale `descriptorFixedPoint(σ, S)` = 2^22 for
+  defaults, overflow-safe for 0..1 images), RootSIFT + quantisation + byte packing on the GPU. Work is split into
+  command buffers by a cost budget (`submitBudget`, ≈ pixel-taps). Round trips per extraction: 2 (3 if the candidate
+  guess is too small).
+* **Matcher design**: GEMM-style kernel — 16×16 threads own 64 rows × walk 64-column tiles; 16-dim chunks of both
+  tiles are unpacked (manual shifts) into workgroup memory as f32; each thread accumulates a 4×4 block of exact
+  integer dots (< 2^24 ⇒ exact in f32), keeps a per-row top-2 (f32 score dot·invNorm, ties → smaller index), merged
+  over the 16 column groups in workgroup memory; output per (row, column chunk): (index, dot) of the best two. The host
+  recomputes these similarities **exactly in f64** as match.ts and applies ratio / maxDistance / mutual with the same
+  logic ⇒ results identical to matchCPU / matchGuidedCPU in all tests (100.00 % overlap, incl. real 4096×3366 SIFT
+  sets). Both directions run on the GPU for the mutual check (reverse skipped when `mutual: false`). Guided: `H` →
+  predictions exactly as matchGuidedCPU (sign vote), `positions` (NaN = unconstrained, ±Inf / > r + 1 px outside b =
+  never), `F` → unit epipolar lines in b-centred coordinates; the predicate is evaluated per pair and whole column
+  tiles are culled (rows and columns Morton-sorted, conservative tile boxes +1 px) — 2–4× fewer pairs on warped pairs.
+  Descriptor buffers (packed u32) + f32 inverse norms are cached per FeatureSet (WeakMap + LRU byte budget, default
+  64 MiB, + FinalizationRegistry); a content hash is checked on every call (in-place refills are re-uploaded).
+  Known (negligible) difference: exact f64 ties in guided mode resolve to the smaller index (CPU: grid-walk order).
+* **Robustness**: input errors are plain `Error`s; GPU failures are `GPUFeatureError` (device loss — raced against
+  every wait —, validation / OOM via error scopes, readback failures, unsupported sizes/radii). Every command buffer
+  starts with a **work stamp** (attempt id + executed command buffers, `WorkStamp`), checked in every readback: work
+  dropped by iOS while hidden ⇒ automatic retry (`maxAttempts` 3), then `GPUWorkDroppedError` (transient). The pipeline
+  falls back to the CPU permanently on `GPUFeatureError` / device loss (warn once, `onFallback` once, the failed call
+  is redone on the CPU), and per call only on `GPUWorkDroppedError`. `selfTest()` (synthetic 128×96 image / random
+  descriptor sets vs the CPU) runs at pipeline creation; a mismatch selects the CPU backend.
+* **Memory (GPU)**: SiftGPU per cached processed size (`maxCachedSizes` 2): (S+3) planes × Σ octave pixels × 4 B +
+  one temp plane — 1600×1200: ≈ 69 MB; 640×480 (upsampled 1280×960): ≈ 44 MB; plus the input (u8: 1 B/px, f32: 4 B/px,
+  bitmap: RGBA8 texture 4 B/px; f32 input at the processed size is written straight into the pyramid) and ≈ 3 MB fixed
+  (candidates 65 536 × 32 B, keypoints / orientations / descriptors for maxFeatures × maxOrientations). Octave buffers
+  above the device binding limit throw (lower maxImageSize). MatcherGPU: descriptor cache budget + 16 B × (na + nb) ×
+  chunks per call.
+* **Measured (SwiftShader, informational only — CPU emulation)**: 640×480 (octave −1) ≈ 2.4–4.4 s, 320×240 ≈ 0.6 s;
+  matching 2000×2000 ≈ 2.2 s, 4096×3366 ≈ 3.4 s. `cfg.profile` records per-kernel times for on-device profiling.
+* **TODO / limits**: no on-device (A-series) profiling yet — tile sizes, submit budget and the tiled-vs-direct blur
+  choice should be tuned on an iPhone; descriptors for slots dropped by the final selection are still read back
+  (≤ 128 B × maxFeatures × maxOrientations); the matcher keeps the top-2 per column chunk (a third candidate tying
+  within f32 rounding could in principle swap — never observed).
+
+### `src/ba` — review notes (adversarial review; supersedes conflicting points of the `src/ba` notes above)
+
+* **Verified independently** (`src/ba/review.test.ts`): the LM step equals a brute-force solve of the full damped
+  normal equations (no Schur) to < 1e-7 relative, for every loss, dense and PCG, λ up to 5, with weights, masks,
+  fixed poses/points, 1–3 cameras with mixed refine flags, centre + relative-rotation priors (incl. swapped block order
+  and fixed partners), plus 12 randomised configurations (80 fuzzed once). The λ update matches the exact undamped
+  model decrease (tested at ρ ≈ 0.5). Frozen (rank-deficient) point blocks give exactly the "point held fixed" step.
+* **Fixes**: soft_l1 ρ used `2b(√(1+s/b) − 1)`, which cancels to 0 for s/b ≲ 1e-16 (wrong costs / gain ratios with
+  large loss scales) — now `2s/(√(1+s/b)+1)`; Cauchy / soft_l1 stay finite when s/b overflows. The loss scale b = a² is
+  clamped to [1e-150, 1e150] (a tiny or huge `lossScalePx` produced NaN costs ⇒ 'invalid_initial_cost').
+  Observations whose WEIGHTED squared residual overflows at the input are ignored like non-finite ones (one garbage
+  keypoint no longer aborts the run). A step below `parameterTolerance` is now still taken when it lowers the cost
+  before stopping (Ceres discards it). An already-set `cancel` token returns before the structure build. The PCG
+  preconditioner stores only the diagonal blocks (it allocated a full copy of S).
+* **Caveats for callers**: priors are not robustified — gate GPS centre priors (multipath outliers) in `src/sfm`, or
+  use a large σ. `parameterTolerance` / ‖x‖ depends on the world origin and on the number of points; for the final
+  global BA prefer `parameterTolerance: 0` with `maxIterations` as the bound (COLMAP-style). Explicit Schur cost and
+  pair memory grow with Σ m² (m = views per point): tracks of ~30 views at 500k observations ≈ 1.3 s / iteration on
+  desktop Node with ~85 MB extra.
+
+### `src/geometry` (camera model, poses, LO-MSAC, minimal solvers, two-view, PnP, triangulation, Sim3)
+
+* **API superset of §4.2** (all documented signatures kept). Extras: `normalizedToPixel`, `undistortPixel`,
+  `intrinsicsMatrix[Inverse]` (camera.ts); `poseFromMat34` (pose.ts); `ransacIterations`, `maskToIndices`,
+  `RansacOptions<M>` (generic default param) with `minInlierRatio` (iteration cap, COLMAP semantics),
+  `initialModels` (seed hypotheses), `loIterations`, `loThresholdMultiplier`; estimator extensions `refine`
+  (LO from the current model, e.g. nonlinear), `minRefitSize`, `residualsSqRange` (ransac.ts);
+  `essentialLinearIdx`, `projectToEssential`, `essentialFromPose`, `cheiralityCount`, `CHEIRALITY_MAX_DEPTH`,
+  `sampsonDistancesSq[Range]`, `refineRelativePose` (LM on Huber/Cauchy Sampson error, R left-multiplicative,
+  t on S²), `tangentBasis` (essential.ts); `fundamental8ptIdx`, `enforceRank2`, `fundamentalFromEssential`;
+  `homographyDLTIdx`, `homographyTransferErrorsSq[Range]`, `homographySampleDegenerate`, `decomposeHomography`
+  (Ma–Soatto–Košecká–Sastry, 4 solutions, sign fixed by correspondences); `RefinePoseOptions`,
+  `PnPRansacOptions`; `TwoViewOptions`, `TwoViewGeometryResult` (adds `numInliersE/F/H`,
+  `planarAlternative`), `Essential/Fundamental/HomographyEstimator`, `rotationFromCorrespondences` (Kabsch on
+  bearings); `AlignSim3Options` (`confidence`, `maxIterations`, `fixedScale`); `eigenvaluesNonsymmetric`,
+  `eigenvectorInverseIteration` (eigen.ts). `internal.ts` / `testutil.ts` are not exported.
+* **LO-MSAC**: MSAC cost Σ min(r², T²); every new best model is locally optimised (4 refits on inliers with
+  the threshold shrinking 2T → T, accepted only if the cost drops; Lebeda et al. 2012), plus a final pass
+  at T. Adaptive iterations log(1−p)/log(1−wˢ) from the best inlier count. With `residualsSqRange`, scoring
+  is blocked (128) with an **exact** bail-out once the partial cost exceeds the best (results unchanged,
+  ~2× fewer residual evaluations). Estimators must return fresh model objects from `fit`.
+* **5-point**: Stewénius et al. 2006 action matrix (GRevLex template, 10×20 Gauss–Jordan, action matrix of
+  ℓ = 0.3x + y + 0.7z, balanced Hessenberg/Francis-QR eigenvalues, inverse-iteration eigenvectors) + Gauss–
+  Newton polish on the 10 cubic constraints; near-real complex eigenvalue pairs (|Im| ≤ 0.25(1+|Re|)) are
+  polished and kept only if they converge to a real root. Nistér's degree-10 polynomial was implemented
+  first and rejected: its det(B(z)) coefficients cancel catastrophically for small baselines (true E lost in
+  26 % of noise-free samples at baseline/depth 1e-3…1e-2). Measured (noise-free): 100 % for baseline/depth
+  ≥ 0.01, 98–99 % at 1e-3…1e-2, ~75 % at 1e-4…1e-3 (near-pure rotation; such samples carry no translation
+  information anyway); ~45–60 µs/solve warmed (Node x86), ~4.9 solutions on average.
+* **Two-view** (`estimateTwoViewGeometry`, COLMAP model selection, details in the JSDoc): after E-RANSAC the
+  pose is refined twice — Huber(T) LM on the Sampson error, then the cheirality-consistent pose is refined
+  with a Cauchy kernel at σ̂ = 1.4826·median|r| on the inliers *in front of both cameras*. Reason: random
+  outliers that happen to lie within T of their epipolar line have huge parallax and therefore large
+  leverage on t at small baselines (scene 50 m / baseline 1 m: t error med 1.9° → 0.4°, max 5.5° → 1.0°);
+  about half of them triangulate behind a camera. F is seeded with the F implied by E; H budgets only
+  need to reach the ratio that can change the decision. Defaults: maxErrorPx 4, confidence 0.999,
+  minNumInliers 15, minInlierRatio 0.25, E/F ≥ 0.95, H/(E|F) > 0.8, panoramic below 0.5° median
+  triangulation angle. 'planar' R, t come from the H decomposition (2-D constraint per point, more
+  accurate than E) on the branch selected by E; the other branch of the planar two-fold ambiguity is
+  `planarAlternative` (it cannot be resolved from two views — the mapper should try both with a third
+  view). 'panoramic': R = Kabsch rotation fit refined on its own inliers, t = (0,0,0), inliers = H inliers.
+  `rotationPrior` (gyro) is used only to seed H with K₂RK₁⁻¹ and to declare 'panoramic' when the rotation-
+  only model (refined from the prior with gates ≈2° → 0.6° → maxErrorPx) explains > 80 % of the inliers; it
+  never changes E/F/H/R/t otherwise (tested: identical results with/without prior for general motion).
+* **Measured** (synthetic, RADIAL k1 −0.08, N(0, 0.5–1 px), 30–50 % outliers, 6 seeds each): object 0.5 m
+  wide/narrow baseline rot ≤ 0.03°, t ≤ 0.08° / 0.37°; scene 50 m wide/narrow rot ≤ 0.04°, t ≤ 0.14° /
+  1.3°; backyard 3–100 m t ≤ 0.2°; pure rotation R error ≤ 0.01°; planar pairs within 0.1° of R or
+  `planarAlternative`. 2000 matches / 40 % outliers: ~25–45 ms in Node (x86). **Hopeless pairs are
+  expensive** (no model ⇒ full budget: ~7 k 5-point + 10 k 7-point samples): ≈ 0.7 s at N = 100–300,
+  ≈ 1.1 s at N = 1000 in Node — pass `maxIterations` (≈ 1000–2000) when verifying speculative (retrieval)
+  pairs, or pre-filter by match count; N < max(minNumInliers, 8) returns 'degenerate' immediately and the
+  budget is capped for inlier ratio max(minInlierRatio, minNumInliers/N).
+* **PnP**: Lambda Twist with its own derivation of the plane/cone intersection (the degenerate pencil member
+  with the best-conditioned real line pair is used; both lines intersected with the cone a13·M12 − a12·M13,
+  scaled by λᵀM23λ = a23, GN-refined); 100 % of 5000 random configurations, ~10 µs/solve warmed. EPnP with
+  3 control points for (near-)planar sets (both variants tried when the RMS-thickness ratio < 0.05), β
+  candidates from the paper's approximations, each refined by GN on the leading N and on all β; for n ≤ 6
+  P3P solutions of the first three points are added (EPnP's linearisation fails for some n = 4 non-planar
+  sets). `solvePnPRansac`: P3P + LO-MSAC whose LO step is 4 robust LM iterations (`refine`), then 2 rounds of
+  LM (Huber 0.5·threshold) on all inliers with recount. The threshold is maxErrorPx/f in normalised
+  coordinates (distortion Jacobian ignored).
+* **Triangulation**: DLT is normalised by the mean camera centre and spread (exact to 1e-7 relative at ENU
+  offsets of 1e6), rows equally weighted; returns null at infinity or when all centres coincide.
+  `refinePoint` is LM with analytic RADIAL Jacobians (single shared camera allowed: `cams.length === 1`).
+  `recoverPose`/`cheiralityCount` use midpoint depths and reject points beyond 1000 baselines (COLMAP).
+* **Camera**: `undistortNormalized` solves the 1-D radial equation by safeguarded Newton on the monotone
+  branch of g(r) = r(1 + k1r² + k2r⁴) (exact to < 1e-10 for |k| < 0.5); beyond the invertible radius of a
+  strongly barrel-distorted lens the radius is clamped to the turning point. `scaleIntrinsics` scales f by
+  (sx + sy)/2 (COLMAP's rule for single-focal models).
+* Scratch buffers are module level: all functions are synchronous and non-reentrant (fine in workers — each
+  worker has its own module instance).
+
+### `src/harness/synth` + `e2e/` — review notes (adversarial review; amends the synth notes above)
+
+* **Verified numerically** (`review.test.ts`, `review.gpu.test.ts`), from the consumer side (GT poses +
+  meta `R_cam_device` + `imu.json` only): gyro integration reproduces `R_j R_iᵀ = R_cd ΔR_dev R_cdᵀ`
+  (< 2e-4 rad), `(accelG − accel)/g` = world up in the device frame (`R_cd` maps it to `R·ẑ`), double
+  integration of `R_wd·accelG + g_world` reproduces camera-centre displacements (< 3 mm over 0.75 s), and
+  the IMU agrees with the poses at `tTrue`, not at `t`. Rendered frames: markers at the default full-res
+  intrinsics land < 0.09 px from their RADIAL projections; frame A warped into frame B through GT depth +
+  poses aligns to < 0.015 px (global Lucas–Kanade shift; a 1 px principal-point perturbation is detected).
+  ENU ↔ WGS84 uses the exact meridian / prime-vertical radii; heading = optical-axis azimuth,
+  `headingDeviceTop` ≈ heading − 90° in the landscape yard.
+* **IMU rate is 60 Hz by default** (iOS DeviceMotion is fixed at ~60 Hz, §2.2; was 100 Hz).
+  `imu.timeJitterMs` (default 0) jitters the reported timestamps (values stay on the true sample grid).
+* **Lawn texture**: the yard ground had ≈ 30–70 SIFT features / Mpx (vs ≈ 1500 elsewhere): blade-only
+  detail maps mip-map to flat grey beyond ~2 m. The grass / soil detail maps now carry clumps, tufts and
+  stones (1–50 cm), and the detail shader samples each map at two incommensurate scales / rotations so
+  the ground never repeats with the tile period. Ground now ≈ 1900–3000 features / Mpx.
+* **Metrics**: `scaleError = 1/s − 1` (exact relative scale error of the result, + = too large; was
+  1 − s); `denseAlign: 'se3'` uses a rigid Umeyama fit of the centres (it used the Sim3's R, t with the
+  scale dropped — off by (s − 1)·R·mean, metres at ENU offsets); unknown align modes / bad CLI numbers
+  are errors; the corner distortion error is evaluated on the GT ray through the corner pixel.
+* **Generator safety**: `--name` must be a plain directory name (the target is deleted and recreated).
+
+### `src/dense` — fusion & meshing (undistortion, view selection, fusion, TSDF, marching cubes, simplification, point-cloud filters)
+
+* **Files**: `undistort.ts`, `view-selection.ts`, `fusion.ts`, `tsdf.ts`, `marching-cubes.ts`, `simplify.ts`,
+  `pointcloud.ts`, `kdtree.ts`, `dense-util.ts` (LRU `DepthMapCache`, `Int3HashMap`, `Yielder`,
+  `DenseCancelledError`, local camera helpers), `testutil-scene.ts` (test-only: exact distance to synthetic
+  scenes, GT depth stores with noise / outliers). All CPU, no GPU; async stages yield every ~40 ms and throw
+  `DenseCancelledError` (`name = 'CancelledError'`) when the CancelToken is set.
+* **API superset of §4.6** (documented signatures kept). Extras: `undistortedCamera`, `undistortedSize`,
+  `areaResampleRGBA`; selection results also carry `scores`, `neighboursFromSelection(sel, symmetric = true)`
+  (best-first neighbour lists for fusion); `FusionOptions` (`minViews` 3, `maxDepthError` 0.01,
+  `maxReprojErrorPx` 2 **in depth-map pixels**, `maxNormalErrorDeg` 10, `maxCost`, `step`, `maxNeighbours` 10,
+  `cacheSize`, `usePlaneDepth`, `radiusScale`, `maxPoints`, `filteredStore`, `onStats`); `TsdfOptions`
+  (`maxBlocks`, `autoVoxelPixels`, `adaptiveTruncationPx`, `sdfMode`, `minWeight`, `maxWeight`,
+  `minComponentFraction`, `color`, `maxCost`, `onStats`), `buildTsdfVolume`, `integrateDepthMap`, `TsdfVolume`
+  (`fromFunction` for analytic SDFs); `marchingCubes`, `removeSmallComponents`, `meshComponents`,
+  `meshEdgeStats`, `compactMesh`; `simplifyMesh(mesh, target, { maxError, boundaryWeight, minNormalCos })`;
+  `voxelDownsample`, `statisticalOutlierMask`, `selectPoints`, `filterPointCloud(pc, { voxelSize, statistical:
+  { k, std, scaleAdaptive }, minConfidence })`; `KdTree3`.
+* **Undistortion**: output camera = `scaleIntrinsics(cam, w, h)` with k1 = k2 = 0 (same f / principal point,
+  no crop or FOV change; w, h = round(W·s), round(H·s), s = min(1, maxSize / long side)). Source box-filtered
+  (exact area weights) to the output scale, then every output pixel is inverse-mapped through RADIAL and
+  sampled bilinearly; the box-filtered image is addressed through the source frame with the per-axis §2 rule
+  (rounded sizes give sx ≠ sy). Outside the source or beyond the RADIAL fold radius → RGBA 0.
+* **View selection**: score_j = Σ_shared points w_angle(θ)·w_scale(ρ): (θ/3°)² below 3°, 1 up to 45°, Gaussian
+  fall-off (σ 15°) above; Goesele scale term. Pairs with 75th-percentile θ < 1° (zero baseline — see the
+  PatchMatch review note) or < 5 shared points are dropped; greedy pick with a mild near-duplicate-direction
+  penalty; geometric (frustum) fallback up to `minSources`. Depth range = 1st/99th percentile × 0.8 / 1.25 of
+  the reference's sparse points (fallback: all points in its frustum; then 0.5–200 × median baseline).
+* **Fusion** (COLMAP StereoFusion semantics with two deliberate differences): (1) the depth test uses the
+  neighbour pixel's plane (from its normal) intersected with the projection ray instead of the raw pixel
+  depth (removes the half-pixel lookup error on slanted surfaces: 87.0 → 85.4 % within 0.5 % without it);
+  the reprojection test is forward–backward (neighbour surface point reprojected into the reference);
+  (2) traversal depth is 1 (only the reference's neighbours, no BFS through neighbours of neighbours), which
+  keeps the resident set to reference + neighbours. Pixels are marked fused only when a point is emitted
+  (bit masks per view, 1 bit/px). Point = mean position, normalised mean normal, per-channel median colour,
+  radius = 0.7·z/f/√max(cosθ, 0.2), confidence = views / (1 + #neighbours). `filteredStore` receives depth
+  maps containing only fused (multi-view consistent) pixels — **use it as the input of `tsdfMesh`**.
+  Memory: (maxNeighbours + 2) depth maps resident (20 B/px each) + 1 bit/px/view.
+* **TSDF**: `truncation` is in **voxels** (default 4). 8³ blocks in an open-addressing Int32 hash; 11 B/voxel
+  (Int16 TSDF normalised by τ, Uint16 weight, 3 × Uint16 colour 8.8, Uint8 colour weight) = 5.6 KB/block;
+  default `maxBlocks` 50 000 (≈ 280 MB worst case — lower it on iPhone, e.g. 25–30 k). Auto voxel = 2 pixel
+  footprints at the median depth of the DEPTH maps; an allocation pre-pass counts the blocks of the truncation
+  bands for a ladder of voxel sizes (×√2 per level, windows of 4 levels per pass) and picks the finest level
+  within budget, so a 0.5 m object and a 100 m yard use the same code (×50 scaled sphere test gives identical
+  relative error). All blocks exist before integration ⇒ free-space updates of every view carve outliers in
+  blocks allocated by other views. Per voxel: point-to-plane SDF (pixel normal; ray distance when cos θ < 0.25
+  or no normal) but updates limited to ≤ τ behind the surface ALONG THE RAY (the plane distance alone reaches
+  τ/cos θ deep — bulges at edges/thin parts; fixed), linear weight fall-off from −τ/4 to −τ, w = (z̃/d)²·cos θ,
+  τ_obs = max(τ, 2·d/f). Blocks culled by frustum and a 16 × 16-px tile max-depth map.
+* **Marching cubes**: the 256-case table is generated at load: on every cube face entering/exiting crossings
+  are paired walking counter-clockwise (separates the inside corners — depends only on the face's corner signs,
+  so adjacent cubes agree ⇒ watertight), loops are triangulated with diagonals only between edges that share
+  no cube face (such an edge cannot occur in another cube ⇒ edge-manifold; the noisy-SDF test had 14
+  non-manifold edges with plain fans, 0 now; a centre-vertex fallback exists but no case needs it), ≤ 5
+  triangles per cube. Vertices welded through an (owner voxel, axis) hash; normals = interpolated central-
+  difference TSDF gradients; triangles CCW seen from free space (normals point to the cameras). Edges between
+  two saturated values are skipped (ghost surfaces).
+* **Simplification**: Garland–Heckbert with area-weighted quadrics, boundary planes (weight 100·|e|²),
+  4-ary heap with lazy versioned entries, link condition + boundary-pinch test, normal-flip test
+  (cos ≥ 0.2), colours/normals interpolated at the target's projection on the edge. Output keeps the input
+  vertex order (compacted).
+* **Point-cloud filters — deviation**: SOR uses an exact k-d tree (points stored in tree order) instead of a
+  uniform grid; a grid degenerates when spacing varies 100× (mm-spaced object + dm-spaced houses).
+  `scaleAdaptive` (default when radii exist) divides each kNN mean distance by the point radius (pixel
+  footprint): the plain statistic removed 196/2500 far-wall points and 0/100 outliers in the multi-scale test,
+  the adaptive one 0 and 100/100.
+* **Measured** (Node 22, x86, one core; tests in `src/dense/*.test.ts`):
+  * Undistortion: barrel round trip 0.31 levels mean |Δ| vs a direct pinhole render; dot centroid error
+    0.014 / 0.031 / 0.022 px at full / ½ / ⅓ size; 320×240 in 14 ms.
+  * Fusion of GT depth maps (σ 0.2 %, 3° normal noise, **10 % outliers**), 16 views 160×120: 99.99 % of points
+    within 0.5 % of the true surface, p99 0.26 %, 0 points > 2 %; filtered depth maps 0.001 % bad pixels.
+    640×480 × 16 views, 6 neighbours: 1.6–1.9 s (0.33–0.38 µs/px), 746 k points, 100 % within 0.5 %.
+    On real `patchMatchCPU` output (photometric + geometric, near scene 256×192, 10 views, 4 sources): raw maps
+    → fused 99.53 % within 1 %, 96.9 % within 0.5 % (128×96: 94.9 / 87.0 %, window fattening dominates).
+  * TSDF from 32 GT depth maps of a sphere: closed genus-0 mesh, radius error mean 0.024, max 0.14 voxel;
+    σ 0.3 % noisy maps: mean 0.041 voxel; yawed box p95 0.48 voxel (corners rounded by < 1 voxel); budget of
+    120 blocks → 2 coarsening levels, still closed. Near scene 400×300 × 16 views, 7.5 k blocks: integration
+    ≈ 1.3 s (≈ 30 ns per voxel visit), marching cubes ≈ 0.6 s for 708 k triangles.
+  * Marching cubes on analytic SDFs: sphere χ = 2, torus χ = 0, max vertex error 0.006 voxel, 0 boundary /
+    non-manifold / misoriented edges, also on a high-frequency noisy SDF with 419 components.
+  * Simplification to 25 %: two-sided Hausdorff ≤ 0.033 voxel on a 23 k-triangle sphere, colours within 1.1
+    levels, no flips, closed; 285 k triangles in ≈ 1.3–1.4 s (≈ 4.7 µs/input triangle, memory-bound).
+  * SOR k = 8: 1 M points in 2.3 s (k-d tree build 0.5 s); 93 % of injected outliers removed, 0 inliers.
+* **Limitations / TODO**: everything is CPU — a WebGPU TSDF integration kernel (and fusion kernel) would be
+  10–50× faster on Apple GPUs; fusion traversal depth 1; marching cubes and simplification are synchronous
+  (not cancellable mid-run; run them in the worker); TSDF cannot represent structures thinner than ≈ τ
+  (fences, poles) and rounds sharp edges by ≈ 1 voxel; one voxel size per volume (a coarse yard voxel also
+  applies to a close object in the same scene — split volumes per region would fix it); SOR uses global
+  statistics; depth maps must fit (reference + neighbours) in memory during fusion.
+
+### `src/sensors` — review notes (adversarial review; amends the `src/sensors` notes above)
+
+* **Gyro check D** now decides only after EVERY device axis carried ≥ 2 % of the rotation energy and
+  each matched axis correlates ≥ 0.8 (`stats.gyroCheck.excited/minAxisCorrelation`); until then it keeps
+  accumulating. Before, a pure pan with the phone upright (rotation about device y only — the usual
+  capture motion) "corrected" x/z into a random signed permutation in ~90 % of runs.
+* **CompassSensor**: ψ is reset when the relative event stream has a gap > `restartGapMs` (1 s) and on
+  `start()` — iOS restarts CoreMotion after a suspension with a NEW arbitrary yaw reference (the old ψ
+  biased attitude/heading for ~20 s). `stats.yawResets`.
+* **chooseCamera**: several unidentified rear cameras (locale not covered by the label lists; iOS
+  enumerates Ultra Wide before Wide) ⇒ the median `focusDistance.min` one (ultra-wide shortest, tele
+  longest); `lensMaySwitch` is set for such an ambiguous Apple choice, and an unidentified Apple rear
+  camera gets the main-camera FOV prior (not the 63° webcam prior).
+* **CameraCapture**: `restart()` is superseded by a concurrent `stop()`/`start()` (its stream is stopped;
+  no leaked live camera, no 'running'/'error' state after stop); only automatic restarts count towards
+  the 3-per-10 s limit ('manual'/'visible' do not); the `<video>` is `play()`ed again on unmute/visible
+  (WebKit pauses media of a backgrounded page ⇒ rVFC stalls); returning to visible with a live,
+  unmuted track starts the new `segment` immediately (frames no longer carry the old segment for 1.2 s).
+* **FramePump**: a grab still in flight at `stop()` is discarded (bitmap closed, IMU not drained); failed
+  grabs count towards the rate limit (no 30 Hz error storm).
+* **WakeLock**: a late `release` event of a previous sentinel (iOS dispatches it after resume) no longer
+  orphans the re-acquired lock. **GeoSensor.approximate** follows the newest fix (not sticky after a
+  coarse first cell/Wi-Fi fix).
+* Tests: `src/sensors/review.test.ts` (Node) and `src/sensors/review.gpu.test.ts` (Chromium).

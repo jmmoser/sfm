@@ -53,6 +53,7 @@ export const ZIP_MAX_ENTRIES = 0xffff;
 const SIG_LOCAL = 0x04034b50;
 const SIG_CENTRAL = 0x02014b50;
 const SIG_EOCD = 0x06054b50;
+const SIG_ZIP64_LOCATOR = 0x07064b50;
 const LOCAL_HEADER_SIZE = 30;
 const CENTRAL_HEADER_SIZE = 46;
 const EOCD_SIZE = 22;
@@ -124,12 +125,16 @@ export function normalizeZipPath(name: string): string {
   while (p.startsWith('./')) p = p.slice(2);
   if (p.length === 0) throw new ZipError('Empty file name');
   if (p.startsWith('/') || /^[A-Za-z]:/.test(p)) throw new ZipError(`Absolute path not allowed: ${name}`);
-  const parts = p.split('/');
+  // '.' segments are dropped so 'a/./b' and 'a/b' collide in the duplicate check
+  // (extractors resolve both to the same file).
+  const parts = p.split('/').filter((s) => s !== '.');
   for (let i = 0; i < parts.length; i++) {
     const s = parts[i];
     if (s === '..') throw new ZipError(`Path traversal not allowed: ${name}`);
     if (s === '' && i !== parts.length - 1) throw new ZipError(`Empty path segment: ${name}`);
   }
+  p = parts.join('/');
+  if (p.length === 0) throw new ZipError(`Empty file name: ${name}`);
   // eslint-disable-next-line no-control-regex
   if (/[\u0000-\u001f]/.test(p)) throw new ZipError(`Control character in file name: ${name}`);
   return p;
@@ -138,6 +143,9 @@ export function normalizeZipPath(name: string): string {
 function toBytes(data: Uint8Array | ArrayBuffer | string): Uint8Array {
   if (typeof data === 'string') return encoder.encode(data);
   if (data instanceof Uint8Array) return data;
+  // Any other view (Float32Array, DataView, …) is stored as its raw bytes —
+  // `new Uint8Array(view)` would convert element-wise and corrupt the payload.
+  if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
   return new Uint8Array(data);
 }
 
@@ -244,6 +252,13 @@ function prepareNames(names: string[]): Uint8Array[] {
 function prepareComment(comment: string | undefined): Uint8Array {
   const c = comment ? encoder.encode(comment) : new Uint8Array(0);
   if (c.length > 0xffff) throw new ZipError('Archive comment too long');
+  // A comment containing the EOCD signature makes the archive ambiguous: readers
+  // (Python's zipfile, …) locate the EOCD by scanning backwards for it.
+  for (let i = 0; i + 3 < c.length; i++) {
+    if (c[i] === 0x50 && c[i + 1] === 0x4b && c[i + 2] === 0x05 && c[i + 3] === 0x06) {
+      throw new ZipError('Archive comment must not contain the end-of-central-directory signature');
+    }
+  }
   return c;
 }
 
@@ -379,19 +394,30 @@ export function readZip(input: Uint8Array | ArrayBuffer): ZipEntry[] {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const n = bytes.length;
   if (n < EOCD_SIZE) throw new ZipError('Not a ZIP archive (too short)');
+  // Scan backwards for the EOCD. Prefer a candidate whose comment length ends
+  // exactly at the end of the input (a signature inside the comment is not
+  // the record); fall back to the last plausible one (trailing junk).
   let eocd = -1;
+  let loose = -1;
   const minPos = Math.max(0, n - EOCD_SIZE - 0xffff);
   for (let p = n - EOCD_SIZE; p >= minPos; p--) {
-    if (dv.getUint32(p, true) === SIG_EOCD) {
+    if (dv.getUint32(p, true) !== SIG_EOCD) continue;
+    const end = p + EOCD_SIZE + dv.getUint16(p + 20, true);
+    if (end === n) {
       eocd = p;
       break;
     }
+    if (loose < 0 && end <= n) loose = p;
   }
+  if (eocd < 0) eocd = loose;
   if (eocd < 0) throw new ZipError('Not a ZIP archive (no end of central directory)');
   const count = dv.getUint16(eocd + 10, true);
   const cdSize = dv.getUint32(eocd + 12, true);
   const cdOffset = dv.getUint32(eocd + 16, true);
-  if (cdOffset === 0xffffffff || count === 0xffff) throw new ZipError('ZIP64 archives are not supported');
+  // 0xFFFF / 0xFFFFFFFF are only ZIP64 markers when a ZIP64 locator precedes the
+  // EOCD; a plain archive may legitimately hold exactly 65 535 entries.
+  const hasZip64Locator = eocd >= 20 && dv.getUint32(eocd - 20, true) === SIG_ZIP64_LOCATOR;
+  if (hasZip64Locator || cdOffset === 0xffffffff || cdSize === 0xffffffff) throw new ZipError('ZIP64 archives are not supported');
   if (cdOffset + cdSize > n) throw new ZipError('Corrupt central directory');
 
   const utf8 = new TextDecoder('utf-8');

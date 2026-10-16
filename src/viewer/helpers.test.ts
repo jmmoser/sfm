@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  fitInverseDepthPlane,
+  surfaceDepthAt,
   boundsSphere,
   cameraCenter,
   cameraUp,
@@ -263,6 +265,36 @@ describe('formatting & depth helpers', () => {
   });
 });
 
+describe('surface depth fit', () => {
+  it('recovers the depth of a plane from asymmetric samples (1/z affine)', () => {
+    const a = 1 / 6.5;
+    const b = -0.004;
+    const c = 0.0025;
+    const u: number[] = [];
+    const v: number[] = [];
+    const z: number[] = [];
+    for (const [du, dv] of [[1, 2], [3, 1], [4, 4], [2, 5], [6, 0.5], [0.5, 3]]) {
+      u.push(du);
+      v.push(dv);
+      z.push(1 / (a + b * du + c * dv));
+    }
+    expect(surfaceDepthAt(u, v, z, u.length)).toBeCloseTo(6.5, 9);
+    const p = fitInverseDepthPlane(u, v, z, u.length)!;
+    expect(p.b).toBeCloseTo(b, 9);
+    expect(p.c).toBeCloseTo(c, 9);
+  });
+
+  it('handles collinear and tiny sample sets', () => {
+    const a = 0.2;
+    const u = [1, 2, 3, 4];
+    const v = [2, 4, 6, 8];
+    const z = u.map((x, i) => 1 / (a + 0.01 * x - 0.003 * v[i]));
+    expect(surfaceDepthAt(u, v, z, 4)).toBeCloseTo(5, 6);
+    expect(surfaceDepthAt([0.2], [0.1], [3], 1)).toBeCloseTo(3, 9);
+    expect(Number.isNaN(surfaceDepthAt([], [], [], 0))).toBe(true);
+  });
+});
+
 describe('pickNearestProjected', () => {
   // Simple column-major projection: camera at origin looking down -Z (three.js convention).
   function perspective(fovY: number, aspect: number, near: number, far: number): Float64Array {
@@ -285,6 +317,35 @@ describe('pickNearestProjected', () => {
     ]);
     expect(pickNearestProjected(pos, 3, mvp, 200, 200, 100, 100, 5)).toBe(1);
     expect(pickNearestProjected(pos, 3, mvp, 200, 200, 10, 10, 5)).toBe(-1);
+  });
+
+  it('estimates the surface depth on the tap ray for an oblique dense plane', () => {
+    // Camera at origin looking down −Z; plane through (0, 0, −5) tilted 60° about X.
+    const mvp = perspective(Math.PI / 3, 1, 0.1, 100);
+    const pts: number[] = [];
+    const tilt = (60 * Math.PI) / 180;
+    for (let i = -100; i <= 100; i++) {
+      for (let j = -100; j <= 100; j++) {
+        const s = i * 0.01;
+        const t = j * 0.01;
+        pts.push(s, t * Math.cos(tilt), -5 - t * Math.sin(tilt));
+      }
+    }
+    const pos = new Float32Array(pts);
+    const out = { covered: false, w: 0 };
+    // tap slightly off-centre; true depth from the ray/plane intersection
+    const px = 205.3;
+    const py = 188.7;
+    const idx = pickNearestProjected(pos, pos.length / 3, mvp, 400, 400, px, py, 14, { sizePx: 4 }, out);
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(out.covered).toBe(true);
+    const f = 1 / Math.tan(Math.PI / 6);
+    const rx = ((px / 400) * 2 - 1) / f;
+    const ry = (1 - (py / 400) * 2) / f;
+    // ray (rx, ry, −1)·w ; plane: y·sin + (z + 5)·cos = 0 ⇒ w (ry sin − cos) + 5 cos = 0
+    const wTrue = (5 * Math.cos(tilt)) / (Math.cos(tilt) - ry * Math.sin(tilt));
+    expect(Math.abs(out.w - wTrue) / wTrue).toBeLessThan(1e-3);
+    expect(Math.abs(rx)).toBeLessThan(1);
   });
 
   it('is fast enough for 2 M points (fallback path)', () => {

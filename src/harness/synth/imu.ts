@@ -9,6 +9,10 @@
  * SAME accelerometer noise/bias realisation is applied to `accel` and `accelG`
  * (on iOS both come from one sensor; `acceleration` is derived by subtracting the
  * fused gravity estimate).
+ *
+ * Rate: iOS Safari delivers DeviceMotion at a fixed ~60 Hz (ARCHITECTURE §2.2), so that
+ * is the default. `timeJitterMs` optionally perturbs the REPORTED timestamps (values stay
+ * those of the regular true sample times), like event delivery jitter on a device.
  */
 import type { ImuSample } from '../../core/types';
 import { SynthRng } from './rng';
@@ -17,8 +21,13 @@ import type { Trajectory, TrajectoryState } from './trajectory';
 export const GRAVITY = 9.81;
 
 export interface ImuConfig {
-  /** Sample rate (Hz). Default 100. */
+  /** Sample rate (Hz). Default 60 (iOS DeviceMotion). */
   rateHz: number;
+  /**
+   * σ (ms) of Gaussian jitter added to the reported timestamps (clamped to ±2.5σ, kept
+   * strictly increasing). Default 0 (timestamps exactly on the true clock).
+   */
+  timeJitterMs: number;
   /** Gyro white noise σ per sample (rad/s). Default 0.004. */
   gyroNoise: number;
   /** Accelerometer white noise σ per sample (m/s²). Default 0.04. */
@@ -32,7 +41,8 @@ export interface ImuConfig {
 }
 
 export const DEFAULT_IMU_CONFIG: ImuConfig = {
-  rateHz: 100,
+  rateHz: 60,
+  timeJitterMs: 0,
   gyroNoise: 0.004,
   accelNoise: 0.04,
   gyroBias: [0.003, -0.002, 0.0015],
@@ -73,12 +83,21 @@ export function simulateImu(
 ): ImuSample[] {
   const c = { ...DEFAULT_IMU_CONFIG, ...config };
   const rng = new SynthRng(c.seed).derive('imu');
+  const jrng = new SynthRng(c.seed).derive('imu-time-jitter');
   const n = Math.floor((endS - startS) * c.rateHz + 1e-9) + 1;
   const out: ImuSample[] = new Array(n);
+  const minGapMs = 250 / c.rateHz;
+  let prevT = -Infinity;
   for (let k = 0; k < n; k++) {
     const tau = startS + k / c.rateHz;
     const s = traj.evaluate(tau);
-    const m = idealImu(s, t0Ms + tau * 1000);
+    let tMs = t0Ms + tau * 1000;
+    if (c.timeJitterMs > 0) {
+      const j = Math.max(-2.5, Math.min(2.5, jrng.gaussian())) * c.timeJitterMs;
+      tMs = Math.max(tMs + j, prevT + minGapMs);
+    }
+    prevT = tMs;
+    const m = idealImu(s, tMs);
     const g = m.gyro,
       a = m.accel!,
       ag = m.accelG!;

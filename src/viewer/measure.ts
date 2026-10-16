@@ -48,6 +48,8 @@ export class MeasureTool {
   private metric = false;
   /** Marker radius in CSS px. */
   markerRadiusPx = 6;
+  private labelX = NaN;
+  private labelY = NaN;
 
   constructor(container: HTMLElement) {
     this.markerA = new Mesh(this.markerGeom, this.markerMatA);
@@ -108,6 +110,7 @@ export class MeasureTool {
   }
 
   clear(): void {
+    this.labelX = NaN;
     this.a = null;
     this.b = null;
     this.markerA.visible = false;
@@ -171,20 +174,21 @@ export class MeasureTool {
     const visible = _w.z > -1 && _w.z < 1 && Math.abs(_w.x) <= 1.2 && Math.abs(_w.y) <= 1.2;
     if (!visible) {
       this.label.style.display = 'none';
+      this.labelX = NaN;
       return;
     }
     const x = (_w.x * 0.5 + 0.5) * cssWidth;
     const y = (0.5 - _w.y * 0.5) * cssHeight;
+    this.labelX = x;
+    this.labelY = y;
     this.label.style.display = 'block';
     this.label.style.transform = `translate(${x.toFixed(1)}px, ${y.toFixed(1)}px) translate(-50%, -140%)`;
   }
 
   /** Label geometry for screenshots: text and CSS-px anchor, or null. */
   labelForScreenshot(): { text: string; x: number; y: number } | null {
-    if (!(this.a && this.b) || this.label.style.display === 'none') return null;
-    const m = /translate\(([-\d.]+)px, ([-\d.]+)px\)/.exec(this.label.style.transform);
-    if (!m) return null;
-    return { text: this.text, x: parseFloat(m[1]), y: parseFloat(m[2]) };
+    if (!(this.a && this.b) || this.label.style.display === 'none' || !Number.isFinite(this.labelX)) return null;
+    return { text: this.text, x: this.labelX, y: this.labelY };
   }
 
   dispose(): void {

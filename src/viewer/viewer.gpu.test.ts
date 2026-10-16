@@ -224,6 +224,48 @@ describe('Viewer rendering', () => {
     v.setPointCloud(pc, { splats: true });
     const big = countNonBackground(v.readPixels());
     expect(big).toBeGreaterThan(small * 8);
+    // confidence threshold hides low-confidence points (here: half of them)
+    pc.confidence = new Float32Array(pc.count).map((_, i) => (i % 2 ? 0.9 : 0.1));
+    v.setPointCloud(pc, { splats: true, minConfidence: 0.5, softShading: true });
+    const half = countNonBackground(v.readPixels());
+    expect(half).toBeLessThan(big * 0.75);
+    expect(half).toBeGreaterThan(big * 0.25);
+  });
+});
+
+describe('Viewer interaction', () => {
+  it('draws the interactive subset of huge clouds only while the view moves', async () => {
+    const v = makeViewer({ interactivePointBudget: 2000 });
+    v.setPointCloud(planeCloud(1, 0.01, 0, [255, 255, 255])); // 40401 points
+    v.renderNow();
+    expect(v.getStats().lodActive).toBe(false);
+    v.controls.dispatchEvent({ type: 'start' });
+    await nextFrame();
+    await nextFrame();
+    expect(v.getStats().lodActive).toBe(true);
+    v.controls.dispatchEvent({ type: 'end' });
+    for (let i = 0; i < 30 && v.framePending; i++) await nextFrame();
+    expect(v.getStats().lodActive).toBe(false);
+  });
+
+  it("autoFit 'follow' tracks growing live content until the user moves the view", async () => {
+    const v = makeViewer({ autoFit: 'follow' });
+    const a = planeCloud(0.5, 0.1, 0, [200, 200, 200]);
+    v.setSparsePoints(a.positions, a.colors);
+    const t0 = v.getOrbitTarget();
+    expect(Math.hypot(t0[0], t0[1])).toBeLessThan(0.1);
+    const b = planeCloud(0.5, 0.1, 0, [200, 200, 200]);
+    for (let i = 0; i < b.count; i++) b.positions[3 * i] += 10;
+    v.setSparsePoints(b.positions, b.colors);
+    for (let i = 0; i < 60 && v.framePending; i++) await nextFrame();
+    const t1 = v.getOrbitTarget();
+    expect(Math.abs(t1[0] - 10)).toBeLessThan(0.2);
+    v.controls.dispatchEvent({ type: 'start' });
+    v.controls.dispatchEvent({ type: 'end' });
+    v.setSparsePoints(a.positions, a.colors);
+    for (let i = 0; i < 60 && v.framePending; i++) await nextFrame();
+    const t2 = v.getOrbitTarget();
+    expect(Math.abs(t2[0] - 10)).toBeLessThan(0.2);
   });
 });
 
@@ -295,11 +337,16 @@ describe('Viewer framing', () => {
 });
 
 describe('Viewer picking / measuring', () => {
-  for (const pickMode of ['auto', 'cpu'] as const) {
-    it(`measures distances on a synthetic plane (${pickMode} picking)`, () => {
+  const cases = [
+    ['auto', 'mesh'],
+    ['auto', 'points'],
+    ['cpu', 'points'],
+  ] as const;
+  for (const [pickMode, content] of cases) {
+    it(`measures distances on a synthetic plane (${pickMode} picking, ${content})`, () => {
       const v = makeViewer({ pickMode });
-      if (pickMode === 'auto') v.setMesh(planeMesh(2, 16, [180, 180, 180]));
-      else v.setPointCloud(planeCloud(2, 0.02, 0, [180, 180, 180]));
+      if (content === 'mesh') v.setMesh(planeMesh(2, 16, [180, 180, 180]));
+      else v.setPointCloud(planeCloud(2, 0.02, 0, [180, 180, 180]), { pointSizePx: 3 });
       v.renderNow();
       const A = [-1, 0.5, 0];
       const B = [1, -0.5, 0];
@@ -313,11 +360,20 @@ describe('Viewer picking / measuring', () => {
       expect(v.getStats().pickMode).toBe(pickMode === 'auto' ? 'gpu' : 'cpu');
       const truth = Math.hypot(2, 1);
       expect(Math.abs(r.distance - truth) / truth).toBeLessThan(0.01);
-      expect(Math.hypot(r.a[0] - A[0], r.a[1] - A[1], r.a[2] - A[2])).toBeLessThan(0.03);
-      expect(Math.hypot(r.b[0] - B[0], r.b[1] - B[1], r.b[2] - B[2])).toBeLessThan(0.03);
-      expect(dt).toBeLessThan(500);
+      // 240×180 px canvas, oblique view: 1 px ≈ 2–4 cm on the plane.
+      expect(Math.hypot(r.a[0] - A[0], r.a[1] - A[1], r.a[2] - A[2])).toBeLessThan(0.015);
+      expect(Math.hypot(r.b[0] - B[0], r.b[1] - B[1], r.b[2] - B[2])).toBeLessThan(0.015);
+      expect(dt).toBeLessThan(2000); // SwiftShader software rendering
       // Off-content tap → null.
       expect(v.pickPoint([2, 2])).toBeNull();
+      // After the view changes (displayed frame or not), picks stay correct.
+      for (const render of [true, false]) {
+        v.camera.position.lerp(v.controls.target, 0.25);
+        v.controls.update();
+        if (render) v.renderNow();
+        const q = v.pickPoint(v.worldToScreen(A)!)!;
+        expect(Math.hypot(q[0] - A[0], q[1] - A[1], q[2] - A[2])).toBeLessThan(0.015);
+      }
     });
   }
 
@@ -333,7 +389,7 @@ describe('Viewer picking / measuring', () => {
     expect(Math.hypot(p[0] - 0.05, p[1] - 0.05)).toBeLessThan(0.09);
   });
 
-  it('measure mode: two taps produce a callback, markers and a formatted label', () => {
+  it('measure mode: two taps produce a callback, markers and a formatted label', async () => {
     const v = makeViewer();
     v.setMesh(planeMesh(2, 16, [180, 180, 180]));
     v.renderNow();
@@ -351,6 +407,8 @@ describe('Viewer picking / measuring', () => {
     expect(label.textContent).toMatch(/^\d+(\.\d+)? cm$/);
     v.setUnits(false);
     expect(label.textContent).toMatch(/units$/);
+    const shot = await v.screenshot(); // composites the label into the PNG
+    expect(shot.type).toBe('image/png');
     v.stopMeasure();
     expect(label.style.display).toBe('none');
   });

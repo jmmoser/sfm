@@ -38,7 +38,7 @@ import {
 import type { CameraIntrinsics, PointCloud, Pose, TriangleMesh, Vec3 } from '../core/types';
 import { CameraOverlay, type ViewerCamera } from './cameras';
 import { createOrbitControls, TapDetector, TargetAnimator, type OrbitControls, type TapInfo } from './controls';
-import { EDLPass } from './edl';
+import { EDLPass, ZOOM_SIZE } from './edl';
 import {
   boundsOfPoints,
   boundsSphere,
@@ -48,8 +48,10 @@ import {
   goldenStridePermutation,
   linearizeDepth,
   niceStep,
+  surfaceDepthAt,
   percentileAlong,
   pickNearestProjected,
+  raycastTriangles,
   robustBoundsOfSamples,
   subsamplePositions,
   unionBounds,
@@ -125,13 +127,16 @@ export interface ViewerStats {
   near: number;
   far: number;
   pixelRatio: number;
+  /** The last frame drew the interactive subset of a huge dense cloud. */
+  lodActive: boolean;
   densePoints: number;
   sparsePoints: number;
   triangles: number;
   cameras: number;
 }
 
-type ScreenPoint = { x: number; y: number } | readonly [number, number];
+/** Screen position in CSS px relative to the container's top-left: {x, y} or [x, y]. */
+export type ScreenPoint = { x: number; y: number } | ArrayLike<number>;
 
 interface Layer {
   samples: Float32Array; // world-frame subsample for bounds / grid
@@ -156,6 +161,8 @@ interface MeshLayer extends Layer {
 
 const BOUNDS_SAMPLES = 40000;
 const PICK_RADIUS_CSS = 14;
+/** Magnification of the sub-pixel pick pass (64² target ⇒ ±8 device px around the tap). */
+const PICK_ZOOM = 4;
 const Y_UP = new Vector3(0, 1, 0);
 
 const _v = new Vector3();
@@ -170,7 +177,10 @@ function viewDepthToWindow(z: number, near: number, far: number): number {
 }
 
 function toXY(p: ScreenPoint): { x: number; y: number } {
-  return Array.isArray(p) ? { x: (p as readonly number[])[0], y: (p as readonly number[])[1] } : (p as { x: number; y: number });
+  const o = p as { x?: unknown; y?: unknown };
+  if (typeof o.x === 'number' && typeof o.y === 'number') return { x: o.x, y: o.y };
+  const a = p as ArrayLike<number>;
+  return { x: a[0], y: a[1] };
 }
 
 export class Viewer {
@@ -201,6 +211,10 @@ export class Viewer {
   private readonly targetAnim: TargetAnimator;
   private readonly resizeObserver: ResizeObserver | null;
   private readonly maxPointSize: number;
+  /** Original inline `position` of the container when the viewer made it relative. */
+  private readonly restorePosition: string | null;
+  /** fitToContent() requested while the container had no size: run it on the first real resize. */
+  private pendingFit = false;
 
   private dense: DenseLayer | null = null;
   private denseMaterial = new PointCloudMaterial({ sizePx: 2 });
@@ -258,6 +272,16 @@ export class Viewer {
   private viewAnim: { fromPos: Vector3; toPos: Vector3; fromTarget: Vector3; toTarget: Vector3; t0: number } | null = null;
   private gridActive = false;
   private lastPickMode: 'gpu' | 'cpu' = 'gpu';
+  private lastFrameLod = false;
+  /** Bumped whenever what the content target would show changes (content, display, size). */
+  private contentVersion = 0;
+  /** View signature of the last full-quality render into the EDL target (reused by picking). */
+  private readonly targetSig = new Float64Array(36).fill(NaN);
+  private readonly curSig = new Float64Array(36);
+  private pickU = new Float64Array(0);
+  private pickV = new Float64Array(0);
+  private pickZ = new Float64Array(0);
+  private pickD2 = new Float64Array(0);
   private readonly listeners: [EventTarget, string, EventListener][] = [];
 
   constructor(container: HTMLElement, opts: ViewerOptions = {}) {
@@ -275,7 +299,10 @@ export class Viewer {
     this.bgAlpha = transparent ? 0 : 1;
     if (!transparent) this.bgColor.set(this.opts.background);
 
-    if (getComputedStyle(container).position === 'static') container.style.position = 'relative';
+    const prevPosition = container.style.position;
+    const madeRelative = getComputedStyle(container).position === 'static';
+    if (madeRelative) container.style.position = 'relative';
+    this.restorePosition = madeRelative ? prevPosition : null;
     const canvas = document.createElement('canvas');
     Object.assign(canvas.style, {
       position: 'absolute',
@@ -286,19 +313,32 @@ export class Viewer {
       display: 'block',
       touchAction: 'none',
       outline: 'none',
+      userSelect: 'none',
+      webkitUserSelect: 'none',
     } satisfies Partial<CSSStyleDeclaration>);
+    // iOS: no long-press callout / tap flash on the canvas.
+    canvas.style.setProperty('-webkit-touch-callout', 'none');
+    canvas.style.setProperty('-webkit-tap-highlight-color', 'transparent');
     container.appendChild(canvas);
     this.canvas = canvas;
 
-    this.renderer = new WebGLRenderer({
-      canvas,
-      antialias: this.opts.antialias,
-      alpha: transparent,
-      powerPreference: 'high-performance',
-      preserveDrawingBuffer: false,
-      depth: true,
-      stencil: false,
-    });
+    try {
+      this.renderer = new WebGLRenderer({
+        canvas,
+        antialias: this.opts.antialias,
+        alpha: transparent,
+        powerPreference: 'high-performance',
+        preserveDrawingBuffer: false,
+        depth: true,
+        stencil: false,
+      });
+    } catch (e) {
+      // No WebGL (Lockdown Mode, too many contexts, GPU process crash): leave the
+      // container as it was so the app can show a message instead.
+      canvas.remove();
+      if (madeRelative) container.style.position = prevPosition;
+      throw e;
+    }
     this.renderer.autoClear = false;
     const gl = this.renderer.getContext();
     const range = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE) as Float32Array | number[] | null;
@@ -336,7 +376,14 @@ export class Viewer {
       this.edl.onContextRestored();
       this.sizeDirty = true;
       this.resize();
+      // Resume animations / damping that were cut off by the loss.
+      this.requestRender();
     }) as EventListener);
+    // iOS Safari: keep pinch gestures on the canvas from zooming the page
+    // (belt and braces with touch-action: none).
+    const noGesture = ((e: Event) => e.preventDefault()) as EventListener;
+    this.listen(canvas, 'gesturestart', noGesture);
+    this.listen(canvas, 'gesturechange', noGesture);
 
     this.resizeObserver = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => this.resize()) : null;
     this.resizeObserver?.observe(container);
@@ -355,27 +402,35 @@ export class Viewer {
     const useConf = !!conf && (opts.minConfidence ?? 0) > 0;
     if (opts.pointSizePx !== undefined) this.densePointSizeCss = opts.pointSizePx;
 
-    const same =
-      pc &&
-      this.dense &&
+    // Same positions / colours ⇒ keep the GPU buffers (option changes, new radii /
+    // confidence). In-place edits of the arrays are NOT detected: pass new arrays.
+    let same =
+      !!pc &&
+      !!this.dense &&
       this.dense.source.positions === pc.positions &&
       this.dense.source.colors === pc.colors &&
-      this.dense.count === pc.count;
+      this.dense.source.count === pc.count;
+    if (same && this.dense) {
+      // A new per-point array of another byte size cannot be uploaded into the
+      // existing GL buffer (three cannot resize, and a replaced attribute's buffer
+      // would leak): rebuild the layer.
+      for (const [name, arr] of [
+        ['radius', useRadius ? radii : undefined],
+        ['confidence', useConf ? conf : undefined],
+      ] as const) {
+        const cur = this.dense.geometry.getAttribute(name) as BufferAttribute | undefined;
+        if (cur && arr && cur.array !== arr && cur.array.byteLength !== arr.byteLength) same = false;
+      }
+    }
     if (!same) {
       this.disposeDense();
       if (pc && pc.count > 0) this.dense = this.buildDense(pc);
       this.boundsDirty = true;
     }
-    if (this.dense) {
-      const g = this.dense.geometry;
-      if (useRadius && radii && !g.getAttribute('radius')) g.setAttribute('radius', new BufferAttribute(radii, 1));
-      if (useConf && conf && !g.getAttribute('confidence')) g.setAttribute('confidence', new BufferAttribute(conf, 1));
-      if (this.dense.lodGeometry) {
-        for (const name of ['radius', 'confidence']) {
-          const a = g.getAttribute(name);
-          if (a && !this.dense.lodGeometry.getAttribute(name)) this.dense.lodGeometry.setAttribute(name, a);
-        }
-      }
+    if (this.dense && pc) {
+      this.dense.source = pc;
+      if (useRadius && radii) this.syncDenseAttribute('radius', radii);
+      if (useConf && conf) this.syncDenseAttribute('confidence', conf);
     }
     this.denseMaterial.setOptions({
       useRadius,
@@ -423,6 +478,22 @@ export class Viewer {
       lodSizeScale = Math.min(2, Math.sqrt(n / budget));
     }
     return { source: pc, count: n, geometry, points, lodGeometry, lodPoints, lodSizeScale, samples, bounds };
+  }
+
+  /** Attach (or replace the values of) a per-point float attribute of the dense layer. */
+  private syncDenseAttribute(name: 'radius' | 'confidence', arr: Float32Array): void {
+    const d = this.dense!;
+    const cur = d.geometry.getAttribute(name) as BufferAttribute | undefined;
+    if (cur) {
+      if (cur.array === arr) return;
+      // Same byte size (guaranteed by setPointCloud): re-upload into the existing buffer.
+      cur.array = arr;
+      cur.needsUpdate = true;
+      return;
+    }
+    const a = new BufferAttribute(arr, 1);
+    d.geometry.setAttribute(name, a);
+    d.lodGeometry?.setAttribute(name, a);
   }
 
   private disposeDense(): void {
@@ -530,6 +601,7 @@ export class Viewer {
 
   /** 'z': world is gravity aligned (Z up). 'auto': estimate up from the camera poses. */
   setWorldUp(up: 'z' | 'auto'): void {
+    if (this.disposed) return;
     this.worldUpMode = up;
     if (up === 'z') {
       this.upWorld = new Float64Array([0, 0, 1]);
@@ -571,15 +643,18 @@ export class Viewer {
       root.quaternion.copy(q);
       root.updateMatrixWorld(true);
     }
+    this.contentVersion++;
   }
 
   setDisplay(opts: DisplayOptions): void {
+    if (this.disposed) return;
     const d = this.display;
     for (const k of Object.keys(opts) as (keyof DisplayOptions)[]) {
       const v = opts[k];
       if (v !== undefined) (d as Record<string, unknown>)[k] = v;
     }
     if (this.meshLayer) this.meshLayer.mesh.material = this.meshMaterial(!!this.meshLayer.geometry.getAttribute('color'));
+    this.contentVersion++;
     this.requestRender();
   }
 
@@ -601,6 +676,7 @@ export class Viewer {
   // ---------------------------------------------------------------- bounds / framing
 
   private onContentChanged(): void {
+    this.contentVersion++;
     const realContent = !!(this.dense || this.sparse || this.meshLayer);
     const anyContent = realContent || this.cams.length > 0;
     if (!anyContent) {
@@ -680,7 +756,10 @@ export class Viewer {
       const s = boundsSphere(clipBox);
       _v.set(s.center[0], s.center[1], s.center[2]);
       this.contentRoot.localToWorld(_v);
-      this.clipSphere = new Sphere(_v.clone(), s.radius * 1.02);
+      // Degenerate content (all points coincide, no grid / cameras) would give a
+      // zero-thickness near/far range that clips everything: keep a minimum radius.
+      const minRadius = 0.05 * (this.contentBounds?.radius ?? sceneRadius);
+      this.clipSphere = new Sphere(_v.clone(), Math.max(s.radius * 1.02, minRadius));
     } else {
       this.clipSphere = null;
     }
@@ -742,6 +821,12 @@ export class Viewer {
   /** Frame the robust bounds of the content (points / mesh; cameras when nothing else). */
   fitToContent(animate = false): void {
     if (this.disposed) return;
+    if (this.width === 0 || this.height === 0) {
+      // Hidden / not laid out yet: the aspect ratio is unknown. Frame on the first real resize.
+      this.pendingFit = true;
+      return;
+    }
+    this.pendingFit = false;
     this.recomputeBounds();
     const b = this.contentBounds;
     if (!b) return;
@@ -863,12 +948,13 @@ export class Viewer {
       const lod = lowQuality && !!dense.lodPoints;
       dense.points.visible = this.display.points && !lod;
       if (dense.lodPoints) dense.lodPoints.visible = this.display.points && lod;
-      this.denseMaterial.setOptions({ sizePx: this.densePointSizeCss * pr, minSizePx: 1, maxSizePx: maxSize });
+      this.denseMaterial.setSizes(this.densePointSizeCss * pr, 1, maxSize);
       this.denseMaterial.updateView(projScale, lod ? dense.lodSizeScale : 1);
+      this.lastFrameLod = lod;
     }
     if (this.sparse) {
       this.sparse.points.visible = this.display.points;
-      this.sparseMaterial.setOptions({ sizePx: this.display.sparsePointSizePx * pr, minSizePx: 1, maxSizePx: maxSize });
+      this.sparseMaterial.setSizes(this.display.sparsePointSizePx * pr, 1, maxSize);
       this.sparseMaterial.updateView(projScale, 1);
     }
     if (this.meshLayer) this.meshLayer.mesh.visible = this.display.mesh;
@@ -883,10 +969,15 @@ export class Viewer {
 
     this.measure.update(this.camera, this.overlayRoot, this.width, this.height);
 
-    const hasContent =
-      (this.display.points && (!!dense || !!this.sparse)) || (this.display.mesh && !!this.meshLayer);
-    const useEdl = this.display.edl && this.edl.supported && hasContent;
-    if (useEdl) this.renderContentTarget();
+    const pointsVisible = this.display.points && (!!dense || !!this.sparse);
+    const hasContent = pointsVisible || (this.display.mesh && !!this.meshLayer);
+    // EDL shades points only: a mesh alone is drawn directly (keeps canvas MSAA).
+    const useEdl = this.display.edl && this.edl.supported && pointsVisible;
+    if (useEdl) {
+      this.renderContentTarget();
+      if (!lowQuality || !dense?.lodPoints) this.targetSig.set(this.viewSignature());
+      else this.targetSig[0] = NaN;
+    }
     r.setRenderTarget(null);
     r.setClearColor(this.bgColor, this.bgAlpha);
     r.clear(true, true, false);
@@ -902,6 +993,18 @@ export class Viewer {
     }
     r.render(this.overlayScene, this.camera);
     this.frames++;
+  }
+
+  /** Camera matrices + content version + size: equal signatures ⇒ identical content target. */
+  private viewSignature(): Float64Array {
+    const sig = this.curSig;
+    sig.set(this.camera.matrixWorld.elements, 0);
+    sig.set(this.camera.projectionMatrix.elements, 16);
+    sig[32] = this.contentVersion;
+    sig[33] = this.width;
+    sig[34] = this.height;
+    sig[35] = this.pixelRatio;
+    return sig;
   }
 
   private renderContentTarget(): void {
@@ -929,10 +1032,11 @@ export class Viewer {
     this.camera.updateProjectionMatrix();
     const db = this.renderer.getDrawingBufferSize(_v2);
     this.edl.setSize(db.x, db.y);
-    if (!this.contextLost) {
-      this.cancelFrame();
-      this.renderFrame(false);
-    }
+    this.contentVersion++;
+    if (this.pendingFit) this.fitToContent(false);
+    // Resizing clears the canvas: redraw synchronously (no blank frame). A pending
+    // frame (e.g. damping) stays scheduled.
+    if (!this.contextLost) this.renderFrame(false);
   }
 
   dispose(): void {
@@ -972,11 +1076,16 @@ export class Viewer {
       /* ignore */
     }
     this.canvas.remove();
+    if (this.restorePosition !== null) this.container.style.position = this.restorePosition;
   }
 
   /** PNG of the current view (full quality; includes the measurement label). */
   screenshot(): Promise<Blob> {
     if (this.disposed) return Promise.reject(new Error('Viewer disposed'));
+    // A lost context has no drawing buffer: toBlob would yield a blank image.
+    if (this.contextLost || this.renderer.getContext().isContextLost()) {
+      return Promise.reject(new Error('WebGL context lost'));
+    }
     this.renderFrame(false);
     let src: HTMLCanvasElement = this.canvas;
     const label = this.measure.labelForScreenshot();
@@ -1030,6 +1139,7 @@ export class Viewer {
       near: this.camera.near,
       far: this.camera.far,
       pixelRatio: this.pixelRatio,
+      lodActive: this.lastFrameLod,
       densePoints: this.dense?.count ?? 0,
       sparsePoints: this.sparse?.count ?? 0,
       triangles: this.meshLayer?.source.triangleCount ?? 0,
@@ -1067,15 +1177,15 @@ export class Viewer {
    *  1. render the content depth (normal splat sizes) and read a ±14 CSS px
    *     window around each tap: the nearest covered pixel gives the visible
    *     ("front") surface depth z_A — occlusion-correct for points and meshes;
-   *  2. when points are shown, render again with every point as a 1 px splat:
-   *     each covered pixel then holds the depth of a point whose centre projects
-   *     into it. The hit is placed on the tap ray at the mean depth of such
-   *     pixels near the tap that belong to the front surface (z ≤ 1.05 · pass-A
-   *     depth at the same pixel),
+   *  2. render a ×4 magnified 64² window around the tap with every point as a
+   *     1 px splat: each covered sub-pixel holds the depth of a point whose
+   *     centre projects into it, or of the mesh, at ¼ px precision. The hit is placed on the tap ray at the depth of a planar fit
+   *     (1/z affine in screen space) to such pixels near the tap that belong to
+   *     the front surface (z ≤ 1.05 · pass-A depth at the same pixel),
    *     which removes the bias of screen-aligned splats (flat at their centre's
    *     depth) on oblique surfaces.
-   * Cost is independent of the number of points (two renders + ≤ 2 tiny
-   * readbacks). CPU fallback: see pickNearestProjected().
+   * Cost is independent of the number of points (1 + 1 per tap renders and
+   * tiny readbacks, a few ms). CPU fallback: see pickNearestProjected().
    */
   pickPoints(ps: ScreenPoint[]): (Vec3 | null)[] {
     if (this.disposed || this.contextLost || this.width === 0 || this.height === 0) return ps.map(() => null);
@@ -1094,12 +1204,12 @@ export class Viewer {
     if (dense) {
       dense.points.visible = this.display.points;
       if (dense.lodPoints) dense.lodPoints.visible = false;
-      this.denseMaterial.setOptions({ sizePx: this.densePointSizeCss * pr, minSizePx: 1, maxSizePx: maxSize });
+      this.denseMaterial.setSizes(this.densePointSizeCss * pr, 1, maxSize);
       this.denseMaterial.updateView(projScale, 1);
     }
     if (this.sparse) {
       this.sparse.points.visible = this.display.points;
-      this.sparseMaterial.setOptions({ sizePx: this.display.sparsePointSizePx * pr, minSizePx: 1, maxSizePx: maxSize });
+      this.sparseMaterial.setSizes(this.display.sparsePointSizePx * pr, 1, maxSize);
     }
     if (this.meshLayer) this.meshLayer.mesh.visible = this.display.mesh;
 
@@ -1114,19 +1224,43 @@ export class Viewer {
       return { gx: p.x * sx, gy: H - p.y * sy }; // GL convention (origin bottom-left)
     });
 
-    this.renderContentTarget();
+    // Reuse the last displayed frame's content target when nothing changed since
+    // (common case: tapping a still view) — saves one full render.
+    const sig = this.viewSignature();
+    let reuse = this.edl.hasTarget;
+    for (let i = 0; i < 36 && reuse; i++) reuse = sig[i] === this.targetSig[i];
+    if (!reuse) {
+      this.renderContentTarget();
+      this.targetSig.set(this.viewSignature());
+    }
     const front = taps.map((t) => this.edl.readDepthWindow(this.renderer, t.gx, t.gy, rPx));
-    const pointsShown = this.display.points && (!!dense || !!this.sparse);
-    let exact: (ReturnType<EDLPass['readDepthWindow']> | null)[] = taps.map(() => null);
-    if (pointsShown) {
+    // Pass B: magnified (×PICK_ZOOM) render of ±8 device px around each tap with
+    // every point as a 1 px splat → sub-pixel depths (points and mesh).
+    const exact: (Float32Array | null)[] = taps.map(() => null);
+    const offsets = taps.map((t) => ({
+      x: Math.round(t.gx * PICK_ZOOM - ZOOM_SIZE / 2),
+      y: Math.round((H - t.gy) * PICK_ZOOM - ZOOM_SIZE / 2), // top-left origin
+    }));
+    {
       const mats = [this.denseMaterial, this.sparseMaterial];
       const saved = mats.map((m) => [m.uniforms.uMinSize.value as number, m.uniforms.uMaxSize.value as number]);
       for (const m of mats) {
         m.uniforms.uMinSize.value = 1;
         m.uniforms.uMaxSize.value = 1;
       }
-      this.renderContentTarget();
-      exact = taps.map((t) => this.edl.readDepthWindow(this.renderer, t.gx, t.gy, rPx));
+      this.edlWeight.value = 0;
+      for (let k = 0; k < taps.length; k++) {
+        exact[k] = this.edl.readZoomedDepth(
+          this.renderer,
+          this.contentScene,
+          this.camera,
+          W * PICK_ZOOM,
+          H * PICK_ZOOM,
+          offsets[k].x,
+          offsets[k].y,
+        );
+      }
+      this.edlWeight.value = 1;
       mats.forEach((m, k) => {
         m.uniforms.uMinSize.value = saved[k][0];
         m.uniforms.uMaxSize.value = saved[k][1];
@@ -1179,47 +1313,100 @@ export class Viewer {
       let px = tapCovered ? gx : win.x0 + (best % win.size) + 0.5;
       let py = tapCovered ? gy : win.y0 + Math.floor(best / win.size) + 0.5;
       let depth = bestDepth;
-      // 2. refine with the 1 px point depths of the front surface around the tap.
+      // 2. refine with the sub-pixel point depths of the front surface around the tap.
       const ex = exact[k];
-      if (ex && ex.size === win.size && ex.x0 === win.x0 && ex.y0 === win.y0) {
-        const ax = gx - ex.x0 - 0.5;
-        const ay = gy - ex.y0 - 0.5;
-        const r2 = (2 * pr + 1) * (2 * pr + 1);
-        let sum = 0;
-        let cnt = 0;
-        let nb = -1;
+      if (ex) {
+        const ns = ZOOM_SIZE * ZOOM_SIZE;
+        if (this.pickU.length < ns) {
+          this.pickU = new Float64Array(ns);
+          this.pickV = new Float64Array(ns);
+          this.pickZ = new Float64Array(ns);
+          this.pickD2 = new Float64Array(ns);
+        }
+        const U = this.pickU;
+        const V = this.pickV;
+        const Z = this.pickZ;
+        const D2 = this.pickD2;
+        const { x: offX, y: offY } = offsets[k];
+        let m = 0;
         let nbD2 = Infinity;
-        for (let j = 0; j < ex.size; j++) {
-          for (let i = 0; i < ex.size; i++) {
-            const d = ex.depths[j * ex.size + i];
-            const dA = win.depths[j * ex.size + i];
-            if (!valid(d) || !valid(dA)) continue;
-            // Front surface only: the 1 px point must not lie (much) behind the
-            // front-most splat drawn at the same pixel in pass A (5 % covers the
+        let nbX = 0;
+        let nbY = 0;
+        let nbDepth = 1;
+        for (let j = 0; j < ZOOM_SIZE; j++) {
+          for (let i = 0; i < ZOOM_SIZE; i++) {
+            const d = ex[j * ZOOM_SIZE + i];
+            if (!valid(d)) continue;
+            // Sample position in device px, GL convention (origin bottom-left).
+            const sxp = (offX + i + 0.5) / PICK_ZOOM;
+            const syp = H - (offY + (ZOOM_SIZE - 1 - j) + 0.5) / PICK_ZOOM;
+            const ia = Math.floor(sxp) - win.x0;
+            const ja = Math.floor(syp) - win.y0;
+            if (ia < 0 || ja < 0 || ia >= win.size || ja >= win.size) continue;
+            const dA = win.depths[ja * win.size + ia];
+            if (!valid(dA)) continue;
+            // Front surface only: the point must not lie (much) behind the
+            // front-most splat drawn at that pixel in pass A (5 % covers the
             // splat bias on oblique surfaces; anything further is occluded).
             const z = linearizeDepth(d, near, far);
             if (z > linearizeDepth(dA, near, far) * 1.05) continue;
-            const d2 = (i - ax) * (i - ax) + (j - ay) * (j - ay);
-            if (d2 <= r2) {
-              sum += z;
-              cnt++;
-            }
+            const du = sxp - gx;
+            const dv = syp - gy;
+            const d2 = du * du + dv * dv;
+            U[m] = du;
+            V[m] = dv;
+            Z[m] = z;
+            D2[m] = d2;
+            m++;
             if (d2 < nbD2) {
               nbD2 = d2;
-              nb = j * ex.size + i;
+              nbX = sxp;
+              nbY = syp;
+              nbDepth = d;
             }
           }
         }
-        if (cnt > 0) {
-          // Surface found around the tap: hit on the tap ray at its mean depth.
+        // Nearest samples (all within ~2 CSS px, at least 16 when available).
+        const rSmall2 = (2 * pr + 1) * (2 * pr + 1);
+        let inSmall = 0;
+        for (let q = 0; q < m; q++) if (D2[q] <= rSmall2) inSmall++;
+        const want = Math.min(m, Math.max(16, inSmall));
+        const swap = (a: number, b: number) => {
+          let t = U[a];
+          U[a] = U[b];
+          U[b] = t;
+          t = V[a];
+          V[a] = V[b];
+          V[b] = t;
+          t = Z[a];
+          Z[a] = Z[b];
+          Z[b] = t;
+          t = D2[a];
+          D2[a] = D2[b];
+          D2[b] = t;
+        };
+        if (want < m && want === inSmall) {
+          // All samples within the small radius: O(m) partition (up to ~1–4 k samples per tap).
+          for (let q = 0, w = 0; q < m; q++) if (D2[q] <= rSmall2) swap(w++, q);
+        } else if (want < m) {
+          // < 16 within the radius: the 16 nearest (partial selection, 16·m).
+          for (let q = 0; q < want; q++) {
+            let bi = q;
+            for (let r = q + 1; r < m; r++) if (D2[r] < D2[bi]) bi = r;
+            if (bi !== q) swap(q, bi);
+          }
+        }
+        const zTap = want > 0 && (tapCovered || inSmall > 0) ? surfaceDepthAt(U, V, Z, want) : NaN;
+        if (Number.isFinite(zTap) && zTap > near && zTap < far) {
+          // Surface around the tap: hit on the tap ray at the fitted depth.
           px = gx;
           py = gy;
-          depth = viewDepthToWindow(sum / cnt, near, far);
-        } else if (nb >= 0 && !tapCovered) {
-          // Tap in a gap: snap to the nearest point centre of the front surface.
-          px = ex.x0 + (nb % ex.size) + 0.5;
-          py = ex.y0 + Math.floor(nb / ex.size) + 0.5;
-          depth = ex.depths[nb];
+          depth = viewDepthToWindow(zTap, near, far);
+        } else if (m > 0 && !tapCovered) {
+          // Tap in a gap: snap to the nearest point of the front surface.
+          px = nbX;
+          py = nbY;
+          depth = nbDepth;
         }
       }
       _v.set((px / W) * 2 - 1, (py / H) * 2 - 1, 2 * depth - 1);
@@ -1250,13 +1437,18 @@ export class Viewer {
     };
     const pr = this.pixelRatio;
     if (this.display.points && this.dense) {
-      const useRadius = !!this.dense.geometry.getAttribute('radius') && this.denseMaterial.usesRadius;
+      // Use exactly the attributes the GPU draws with (radius / confidence filter).
+      const g = this.dense.geometry;
+      const radiusAttr = this.denseMaterial.usesRadius ? (g.getAttribute('radius') as BufferAttribute | undefined) : undefined;
+      const confAttr = this.denseMaterial.usesConfidence ? (g.getAttribute('confidence') as BufferAttribute | undefined) : undefined;
       consider(this.dense.source.positions, this.dense.count, {
         sizePx: this.densePointSizeCss,
-        radii: useRadius ? this.dense.source.radii : undefined,
+        radii: radiusAttr ? (radiusAttr.array as Float32Array) : undefined,
         projScale,
         minPx: 1 / pr,
         maxPx: Math.min(64 * pr, this.maxPointSize) / pr,
+        confidence: confAttr ? (confAttr.array as Float32Array) : undefined,
+        minConfidence: this.denseMaterial.minConfidence,
       });
     }
     if (this.display.points && this.sparse) {
@@ -1265,7 +1457,27 @@ export class Viewer {
       });
     }
     if (this.display.mesh && this.meshLayer) {
-      consider(this.meshLayer.source.positions, this.meshLayer.source.vertexCount, { sizePx: 1 });
+      const src = this.meshLayer.source;
+      // Vertices as 1 px points: snapping when the tap is just off the mesh.
+      consider(src.positions, src.vertexCount, { sizePx: 1 });
+      // Exact surface under the tap (also inside large triangles): ray in the WORLD frame.
+      _v.copy(this.camera.position);
+      this.contentRoot.worldToLocal(_v);
+      _w.set((p.x / this.width) * 2 - 1, 1 - (p.y / this.height) * 2, 0.5).unproject(this.camera);
+      this.contentRoot.worldToLocal(_w);
+      _w.sub(_v).normalize();
+      const t = raycastTriangles(src.positions, src.indices, src.triangleCount, _v.x, _v.y, _v.z, _w.x, _w.y, _w.z);
+      if (Number.isFinite(t)) {
+        const hx = _v.x + t * _w.x;
+        const hy = _v.y + t * _w.y;
+        const hz = _v.z + t * _w.z;
+        const w = e[3] * hx + e[7] * hy + e[11] * hz + e[15]; // view depth (clip w)
+        if (w > 0 && (!bestCovered || w < bestW)) {
+          bestW = w;
+          bestCovered = true;
+          best = new Float64Array([hx, hy, hz]);
+        }
+      }
     }
     if (!best) return null;
     if (!bestCovered) return best; // tap in a gap: snap to the nearest point

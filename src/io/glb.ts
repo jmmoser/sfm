@@ -297,11 +297,10 @@ export function encodeGLB(input: GLBInput): ArrayBuffer {
   // ---- JSON ---------------------------------------------------------------
   const asset: Record<string, unknown> = { version: '2.0', generator: input.generator ?? GLB_GENERATOR };
   if (input.extras) asset.extras = input.extras;
-  const gltf: Record<string, unknown> = {
-    asset,
-    scene: 0,
-    scenes: [{ name, nodes: nodes.map((_, i) => i) }],
-  };
+  // glTF schema: scene.nodes has minItems 1 — an empty scene omits the property.
+  const scene: Record<string, unknown> = { name };
+  if (nodes.length) scene.nodes = nodes.map((_, i) => i);
+  const gltf: Record<string, unknown> = { asset, scene: 0, scenes: [scene] };
   if (nodes.length) gltf.nodes = nodes;
   if (meshes.length) gltf.meshes = meshes;
   if (materials.length) gltf.materials = materials;

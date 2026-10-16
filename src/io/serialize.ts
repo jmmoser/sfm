@@ -30,13 +30,17 @@ const u32Scratch = new Uint32Array(f32Scratch.buffer);
 /**
  * Convert a number to IEEE-754 binary16 bits (round-to-nearest-even, overflow
  * to ±Infinity, gradual underflow to subnormals, NaN preserved as quiet NaN).
- * The value is first rounded to float32 (double rounding through float32 can
- * differ from direct double→half rounding only for values within 2^-24 ulp of
- * a tie, which cannot occur for float32 inputs).
+ * Correctly rounded for any double: the intermediate float32 is rounded to ODD
+ * (an inexact result gets its last bit set as a sticky bit), which makes the
+ * second rounding to 11 significant bits exact (24 ≥ 11 + 2). Plain RNE to
+ * float32 first could land exactly on a half-way tie and round the wrong way.
  */
 export function float32ToFloat16Bits(value: number): number {
   f32Scratch[0] = value;
-  const x = u32Scratch[0];
+  let x = u32Scratch[0];
+  if ((x & 1) === 0 && f32Scratch[0] !== value && value === value && (x & 0x7f800000) !== 0x7f800000) {
+    x += Math.abs(f32Scratch[0]) < Math.abs(value) ? 1 : -1; // nextafter toward value → odd
+  }
   const sign = (x >>> 16) & 0x8000;
   const exp = (x >>> 23) & 0xff;
   let mant = x & 0x7fffff;
@@ -363,7 +367,7 @@ export function deserializePointCloud(input: ArrayBuffer | Uint8Array, opts: Dec
 // TriangleMesh
 // ---------------------------------------------------------------------------
 
-/** Indices are stored as u16 when vertexCount ≤ 65536 (lossless). */
+/** Indices are stored as u16 when every index is ≤ 65535 (lossless, also for corrupt input). */
 export function serializeTriangleMesh(mesh: TriangleMesh, opts: SerializeOptions = {}): ArrayBuffer {
   const nv = mesh.vertexCount;
   const nt = mesh.triangleCount;
@@ -372,7 +376,9 @@ export function serializeTriangleMesh(mesh: TriangleMesh, opts: SerializeOptions
     'TriangleMesh arrays shorter than counts',
   );
   const idx = mesh.indices.subarray(0, 3 * nt);
-  const idxField: Field = nv <= 65536 ? { arr: Uint16Array.from(idx), dtype: DType.U16 } : { arr: idx, dtype: DType.U32 };
+  let maxIndex = 0;
+  if (nv <= 65536) for (let i = 0; i < idx.length; i++) if (idx[i] > maxIndex) maxIndex = idx[i];
+  const idxField: Field = nv <= 65536 && maxIndex <= 0xffff ? { arr: Uint16Array.from(idx), dtype: DType.U16 } : { arr: idx, dtype: DType.U32 };
   return packContainer(SerialKind.TriangleMesh, [
     { u32: nv },
     { u32: nt },
@@ -475,23 +481,37 @@ const TYPED_CTORS: Record<TypedArrayName, { from(a: ArrayLike<number>): ArrayBuf
 };
 
 function encodeNumber(v: number): number | string {
+  if (Object.is(v, -0)) return '-0'; // JSON.stringify(-0) === '0'
   return Number.isFinite(v) ? v : String(v); // 'NaN' | 'Infinity' | '-Infinity'
 }
+
+/** Objects that have no JSON-safe form here and would otherwise silently become `{}`. */
+const UNSUPPORTED_TAGS = new Set([
+  'ArrayBuffer', 'SharedArrayBuffer', 'DataView', 'Set', 'WeakSet', 'WeakMap', 'Date', 'RegExp', 'Blob', 'File', 'Promise',
+]);
 
 /**
  * Convert a value into a JSON-safe tree:
  *  - typed arrays → `{ "$typed": "Float64Array", "data": [ ... ] }` (exact:
  *    JSON numbers round-trip doubles; non-finite entries become strings),
- *  - non-finite numbers → `{ "$num": "NaN" | "Infinity" | "-Infinity" }`,
+ *  - non-finite numbers and −0 → `{ "$num": "NaN" | "Infinity" | "-Infinity" | "-0" }`
+ *    (inside typed arrays the bare string),
  *  - Map → `{ "$map": [[key, value], ...] }`,
  *  - plain objects / arrays recursively; `undefined` object members are dropped.
- * Objects whose own keys include `$typed`, `$num` or `$map` are not supported.
+ * Objects whose own keys include `$typed`, `$num` or `$map` are not supported;
+ * Set, Date, RegExp, ArrayBuffer, DataView, Blob… throw a TypeError instead of
+ * silently becoming `{}`.
  */
 export function toJSONSafe(value: unknown): unknown {
-  if (typeof value === 'number') return Number.isFinite(value) ? value : { $num: String(value) };
+  if (typeof value === 'number') {
+    if (Object.is(value, -0)) return { $num: '-0' };
+    return Number.isFinite(value) ? value : { $num: String(value) };
+  }
   if (value === null || typeof value !== 'object') return value;
-  if (ArrayBuffer.isView(value) && !(value instanceof DataView)) {
-    const name = Object.prototype.toString.call(value).slice(8, -1) as TypedArrayName; // realm-safe
+  const tag = Object.prototype.toString.call(value).slice(8, -1); // realm-safe
+  if (UNSUPPORTED_TAGS.has(tag)) throw new TypeError(`toJSONSafe: ${tag} is not supported (it would be lost)`);
+  if (ArrayBuffer.isView(value)) {
+    const name = tag as TypedArrayName;
     if (!(name in TYPED_CTORS)) throw new TypeError(`toJSONSafe: unsupported typed array ${name}`);
     const src = value as unknown as ArrayLike<number>;
     const data = new Array<number | string>(src.length);

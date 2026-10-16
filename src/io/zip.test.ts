@@ -1,9 +1,27 @@
-import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { crc32, createZip, createZipBlob, normalizeZipPath, readZip, ZipError, type ZipEntryInput } from './zip';
+
+// Node built-ins through an untyped dynamic import: the main tsconfig is
+// browser-typed (no @types/node), and this file must typecheck under it.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const nodeImport = (m: string): Promise<any> => import(/* @vite-ignore */ m);
+const { execFileSync } = (await nodeImport('node:child_process')) as {
+  execFileSync(cmd: string, args: string[], opts: { encoding: 'utf-8' }): string;
+};
+const { mkdtempSync, readFileSync, rmSync, writeFileSync } = (await nodeImport('node:fs')) as {
+  mkdtempSync(prefix: string): string;
+  readFileSync(path: string): Uint8Array;
+  rmSync(path: string, opts: { recursive: boolean; force: boolean }): void;
+  writeFileSync(path: string, data: Uint8Array): void;
+};
+const { tmpdir } = (await nodeImport('node:os')) as { tmpdir(): string };
+const { join } = (await nodeImport('node:path')) as { join(...parts: string[]): string };
+
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
 
 const dir = mkdtempSync(join(tmpdir(), 'sfm-zip-test-'));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));
@@ -88,7 +106,7 @@ describe('createZip', () => {
       expect(info.crc).toBe(crc32(bytes));
       expect(info.dt).toEqual([2024, 5, 17, 13, 45, 22]);
       const extracted = readFileSync(join(dir, 'basic-out', files[i].name));
-      expect(Buffer.compare(extracted, Buffer.from(bytes))).toBe(0);
+      expect(bytesEqual(extracted, bytes)).toBe(true);
     }
   });
 

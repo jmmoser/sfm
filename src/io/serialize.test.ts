@@ -33,6 +33,15 @@ function rng(seed: number): () => number {
 }
 
 /** Fast structural equality: typed arrays compared by type + bytes, other fields by Object.is. */
+/** Byte-wise equality of two views (no Node Buffer: the main tsconfig is browser-typed). */
+function bytesEqual(a: ArrayBufferView, b: ArrayBufferView): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  const ua = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+  const ub = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+  for (let i = 0; i < ua.length; i++) if (ua[i] !== ub[i]) return false;
+  return true;
+}
+
 function expectSame(a: object, b: object): void {
   const ka = Object.keys(a).filter((k) => (a as Record<string, unknown>)[k] !== undefined).sort();
   const kb = Object.keys(b).filter((k) => (b as Record<string, unknown>)[k] !== undefined).sort();
@@ -43,7 +52,7 @@ function expectSame(a: object, b: object): void {
     if (ArrayBuffer.isView(x)) {
       expect(ArrayBuffer.isView(y) && y.constructor === x.constructor, k).toBe(true);
       const yb = y as ArrayBufferView;
-      expect(Buffer.compare(Buffer.from(x.buffer, x.byteOffset, x.byteLength), Buffer.from(yb.buffer, yb.byteOffset, yb.byteLength)), k).toBe(0);
+      expect(bytesEqual(x, yb), k).toBe(true);
     } else expect(Object.is(x, y), k).toBe(true);
   }
 }

@@ -189,7 +189,7 @@ export function buildObjectScene(o: Partial<ObjectSceneOptions> = {}): SynthScen
     const edge = b.material(b.texture(T.woodTexture(px(1024), px(64), R('table-edge'), { boards: 1 })));
     const top = new Mesh(new BoxGeometry(tableW, tableD, topT), [edge, edge, edge, edge, b.material(topTex), edge]);
     top.position.set(0, 0, TABLE_TOP_Z - topT / 2);
-    b.add(top);
+    b.add(top, { focus: true });
     const legMat = b.material(b.texture(T.woodTexture(px(128), px(1024), R('table-legs'), { boards: 1, light: [150, 105, 70], dark: [90, 60, 35] })));
     for (const sx of [-1, 1])
       for (const sy of [-1, 1]) {
@@ -200,41 +200,41 @@ export function buildObjectScene(o: Partial<ObjectSceneOptions> = {}): SynthScen
     // placemat under the object, magazine, mug, pen
     const mat = new Mesh(new PlaneGeometry(0.44, 0.32), b.material(b.texture(T.fabricTexture(px(1100), px(800), R('placemat'), [196, 180, 140]))));
     mat.position.set(0, 0, TABLE_TOP_Z + 0.0015);
-    b.add(mat);
+    b.add(mat, { focus: true });
     const mag = new Mesh(new PlaneGeometry(0.28, 0.21), b.material(b.texture(T.magazineTexture(px(840), px(630), R('magazine')))));
     mag.position.set(0.4, 0.21, TABLE_TOP_Z + 0.001);
     mag.rotation.z = 0.35;
-    b.add(mag);
+    b.add(mag, { focus: true });
     const mug = new Mesh(new CylinderGeometry(0.04, 0.037, 0.095, 48, 1), b.material(b.texture(T.packagingAtlas(2, 1, px(512), R('mug')), {})));
     mug.rotation.x = Math.PI / 2;
     mug.position.set(-0.42, -0.2, TABLE_TOP_Z + 0.0475);
-    b.add(mug);
+    b.add(mug, { focus: true });
     const pen = new Mesh(new CylinderGeometry(0.005, 0.005, 0.14, 12, 1).rotateZ(Math.PI / 2), b.material(null, { color: [0.1, 0.2, 0.7] }));
     pen.rotation.z = 1.1;
     pen.position.set(0.35, -0.25, TABLE_TOP_Z + 0.005);
-    b.add(pen);
+    b.add(pen, { focus: true });
   }
 
   // ---------------- the object (~25 cm) ----------------
   {
     const ped = new Mesh(atlasBoxUVs(new BoxGeometry(0.14, 0.14, 0.04), 3, 2), b.material(b.texture(T.marbleTexture(px(1536), px(1024), R('pedestal')))));
     ped.position.set(0, 0, OBJECT_BASE_Z + 0.02);
-    b.add(ped);
+    b.add(ped, { focus: true });
     // torus knot standing on the pedestal (local extent ±0.09 in its plane, ±0.04 thick)
     const knotGeo = new TorusKnotGeometry(0.06, 0.016, 400, 40, 2, 3);
     const knotTex = b.texture(T.cellsTexture(px(4096), px(512), R('knot'), 900));
     const knot = new Mesh(knotGeo, b.material(knotTex));
     knot.rotation.set(Math.PI / 2, 0.2, 0.3);
     knot.position.set(0, 0, OBJECT_BASE_Z + 0.04 + 0.106);
-    b.add(knot);
+    b.add(knot, { focus: true });
     const sphere = new Mesh(new SphereGeometry(0.045, 96, 64), b.material(b.texture(T.globeTexture(px(1024), px(512), R('globe')))));
     sphere.position.set(0.15, 0.075, OBJECT_BASE_Z + 0.045);
     sphere.rotation.set(0.3, -0.2, 0.5);
-    b.add(sphere);
+    b.add(sphere, { focus: true });
     const box = new Mesh(atlasBoxUVs(new BoxGeometry(0.07, 0.05, 0.1), 3, 2), b.material(b.texture(T.packagingAtlas(3, 2, px(512), R('box')))));
     box.position.set(-0.145, -0.065, OBJECT_BASE_Z + 0.05);
     box.rotation.z = 0.45;
-    b.add(box);
+    b.add(box, { focus: true });
   }
 
   // Dark "outside" beyond the room is never visible; a dome keeps misses well defined.
@@ -249,6 +249,7 @@ export function buildObjectScene(o: Partial<ObjectSceneOptions> = {}): SynthScen
     name: 'object',
     scene: b.scene,
     surfaceMeshes: b.surfaceMeshes,
+    focusMeshes: b.focusMeshes,
     depthHidden: b.depthHidden,
     near: 0.02,
     far: 40,

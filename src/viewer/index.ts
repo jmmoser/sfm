@@ -5,9 +5,10 @@ export {
   type DisplayOptions,
   type MeasureResult,
   type ViewerStats,
+  type ScreenPoint,
 } from './viewer';
 export { PointCloudMaterial, patchMeshMaterial, type PointsMaterialOptions } from './points-material';
-export { EDLPass, PICK_WINDOW_MAX, type DepthWindow, type EDLSettings } from './edl';
+export { EDLPass, PICK_WINDOW_MAX, ZOOM_SIZE, type DepthWindow, type EDLSettings } from './edl';
 export {
   CameraOverlay,
   frustumCorners,
@@ -44,9 +45,13 @@ export {
   unpackRGBAToDepth,
   linearizeDepth,
   pickNearestProjected,
+  raycastTriangles,
+  fitInverseDepthPlane,
+  surfaceDepthAt,
   goldenStridePermutation,
   type Bounds3,
   type RobustBounds,
   type RobustBoundsOptions,
   type PickSplatModel,
+  type InverseDepthPlane,
 } from './helpers';

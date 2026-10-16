@@ -45,6 +45,8 @@ export interface SynthScene {
   scene: Scene;
   /** Meshes contributing to ground-truth surface sampling (world matrices up to date). */
   surfaceMeshes: Mesh[];
+  /** Subset of surfaceMeshes forming the object of interest (densely sampled GT). */
+  focusMeshes: Mesh[];
   /** Objects hidden while rendering depth / visibility (sky dome). */
   depthHidden: Object3D[];
   near: number;
@@ -70,6 +72,7 @@ export interface MaterialOptions {
 export class SceneBuilder {
   readonly scene = new Scene();
   readonly surfaceMeshes: Mesh[] = [];
+  readonly focusMeshes: Mesh[] = [];
   readonly depthHidden: Object3D[] = [];
   private readonly textures: Texture[] = [];
   private readonly geometries: BufferGeometry[] = [];
@@ -117,7 +120,12 @@ export class SceneBuilder {
     return m;
   }
 
-  /** Unlit material modulating a macro map by up to two tiled detail maps. */
+  /**
+   * Unlit material modulating a macro map by up to two tiled detail maps. Each detail map
+   * is sampled at two incommensurate scales / rotations (ratio 1/φ, +2.4 rad) and the
+   * deviations are summed, so the detail never repeats with the tile period (a strictly
+   * periodic ground texture would create false feature matches).
+   */
   detailMaterial(
     map: Texture,
     detailA: { tex: Texture; scale: number; rot: number },
@@ -125,13 +133,20 @@ export class SceneBuilder {
     opts: { maskFromAlpha: boolean; strength: number },
   ): MeshBasicMaterial {
     const m = new MeshBasicMaterial({ map, vertexColors: true });
+    for (const d of [detailA.tex, detailB.tex]) {
+      d.wrapS = d.wrapT = RepeatWrapping; // detail UVs span many tiles
+      d.needsUpdate = true;
+    }
     const rot = (a: number) => [Math.cos(a), Math.sin(a), -Math.sin(a), Math.cos(a)];
     m.onBeforeCompile = (shader) => {
       shader.uniforms.detailA = { value: detailA.tex };
       shader.uniforms.detailB = { value: detailB.tex };
       shader.uniforms.detailRotA = { value: rot(detailA.rot) };
       shader.uniforms.detailRotB = { value: rot(detailB.rot) };
+      shader.uniforms.detailRotA2 = { value: rot(detailA.rot + 2.4) };
+      shader.uniforms.detailRotB2 = { value: rot(detailB.rot + 2.4) };
       shader.uniforms.detailScale = { value: [detailA.scale, detailB.scale] };
+      shader.uniforms.detailScale2 = { value: [detailA.scale * 0.6180339887, detailB.scale * 0.6180339887] };
       shader.fragmentShader = shader.fragmentShader
         .replace(
           '#include <map_pars_fragment>',
@@ -140,35 +155,42 @@ uniform sampler2D detailA;
 uniform sampler2D detailB;
 uniform mat2 detailRotA;
 uniform mat2 detailRotB;
-uniform vec2 detailScale;`,
+uniform mat2 detailRotA2;
+uniform mat2 detailRotB2;
+uniform vec2 detailScale;
+uniform vec2 detailScale2;`,
         )
         .replace(
           '#include <map_fragment>',
           `#ifdef USE_MAP
   vec4 macroC = texture2D( map, vMapUv );
-  float dA = texture2D( detailA, detailRotA * ( vMapUv * detailScale.x ) ).r;
-  float dB = texture2D( detailB, detailRotB * ( vMapUv * detailScale.y ) ).r;
+  float dA = texture2D( detailA, detailRotA * ( vMapUv * detailScale.x ) ).r
+           + texture2D( detailA, detailRotA2 * ( vMapUv * detailScale2.x ) + vec2( 0.37, 0.71 ) ).r - 0.5;
+  float dB = texture2D( detailB, detailRotB * ( vMapUv * detailScale.y ) ).r
+           + texture2D( detailB, detailRotB2 * ( vMapUv * detailScale2.y ) + vec2( 0.53, 0.19 ) ).r - 0.5;
   float maskG = ${opts.maskFromAlpha ? 'macroC.a' : '0.5'};
-  float detail = ${opts.maskFromAlpha ? 'mix( dB, dA, maskG )' : '0.5 * ( dA + dB )'};
+  float detail = clamp( ${opts.maskFromAlpha ? 'mix( dB, dA, maskG )' : '0.5 * ( dA + dB )'}, 0.0, 1.0 );
   diffuseColor.rgb *= macroC.rgb * ( 1.0 + ${opts.strength.toFixed(4)} * ( 2.0 * detail - 1.0 ) );
 #endif`,
         );
     };
-    m.customProgramCacheKey = () => `detail-${opts.maskFromAlpha}-${opts.strength}`;
+    m.customProgramCacheKey = () => `detail2-${opts.maskFromAlpha}-${opts.strength}`;
     this.materials.push(m);
     return m;
   }
 
   /**
    * Add a mesh (shading baked from its world-space normals). `gt=false` excludes it
-   * from ground-truth surface sampling; `depth=false` hides it in depth passes.
+   * from ground-truth surface sampling; `focus` marks the object of interest (extra
+   * dense GT samples); `depth=false` hides it in depth passes.
    */
-  add(mesh: Mesh, o: { gt?: boolean; depth?: boolean; shade?: boolean; ao?: (z: number) => number; parent?: Object3D } = {}): Mesh {
+  add(mesh: Mesh, o: { gt?: boolean; focus?: boolean; depth?: boolean; shade?: boolean; ao?: (z: number) => number; parent?: Object3D } = {}): Mesh {
     (o.parent ?? this.scene).add(mesh);
     mesh.updateMatrixWorld(true);
     if (o.shade !== false) bakeShading(mesh.geometry, mesh.matrixWorld, this.light, this.ambient, o.ao);
     if (!this.geometries.includes(mesh.geometry)) this.geometries.push(mesh.geometry);
     if (o.gt !== false) this.surfaceMeshes.push(mesh);
+    if (o.gt !== false && o.focus) this.focusMeshes.push(mesh);
     if (o.depth === false) this.depthHidden.push(mesh);
     mesh.matrixAutoUpdate = false;
     return mesh;

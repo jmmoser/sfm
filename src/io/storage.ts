@@ -16,6 +16,14 @@
  * `StorageQuotaError` when the origin's quota is exhausted (QuotaExceededError
  * from the request, the transaction abort, or the open call).
  *
+ * Connection loss (docs/research/ios-platform.md §2.5): WebKit closes the
+ * IDBDatabase when the IndexedDB server connection is lost (backgrounding,
+ * network-process crash) and we close it ourselves on `versionchange`. A
+ * transaction that cannot start (InvalidStateError) or is aborted with
+ * InvalidStateError / UnknownError while the connection can no longer start
+ * transactions is retried ONCE on a freshly opened connection (an aborted
+ * transaction committed nothing, so the retry is safe). `close()` is final.
+ *
  * Timestamps in SessionMeta are wall-clock epoch ms (`Date.now()`), not the
  * `performance.now()` domain, because they persist across page loads.
  */
@@ -102,6 +110,13 @@ function isQuotaError(e: unknown): boolean {
   return err.name === 'QuotaExceededError' || err.code === 22 || (err.name === 'UnknownError' && /quota/i.test(err.message ?? ''));
 }
 
+function errorName(e: unknown): string | undefined {
+  return e && typeof e === 'object' ? (e as { name?: string }).name : undefined;
+}
+
+/** Errors with which an engine refuses to store a Blob (old WebKit, private modes). */
+const BLOB_REFUSAL_ERRORS = new Set(['DataCloneError', 'UnknownError', 'NotSupportedError', 'DataError']);
+
 function mapError(e: unknown, what: string): unknown {
   if (e instanceof StorageQuotaError || e instanceof SessionNotFoundError) return e;
   if (isQuotaError(e)) return new StorageQuotaError(`Storage quota exceeded while ${what}`, e);
@@ -129,6 +144,40 @@ function checkKey(key: string): void {
 
 type TxBody<T> = (tx: IDBTransaction, setResult: (v: T) => void, fail: (e: unknown) => void) => void;
 
+/** Open (and create / upgrade) the database; the connection closes itself on versionchange. */
+function openDatabase(dbName: string): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    let req: IDBOpenDBRequest;
+    try {
+      req = globalThis.indexedDB.open(dbName, DB_VERSION);
+    } catch (e) {
+      reject(mapError(e, 'opening the database'));
+      return;
+    }
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(S_SESSIONS)) db.createObjectStore(S_SESSIONS, { keyPath: 'id' });
+      for (const s of [S_FRAMES, S_FRAME_DATA, S_BLOBS, S_JSON]) {
+        if (!db.objectStoreNames.contains(s)) db.createObjectStore(s);
+      }
+    };
+    req.onsuccess = () => {
+      const db = req.result;
+      // Let a newer version / deleteDatabase (another tab) proceed instead of
+      // blocking it; the store reconnects on its next operation.
+      db.onversionchange = () => db.close();
+      resolve(db);
+    };
+    req.onerror = () => reject(mapError(req.error, 'opening the database'));
+    // onblocked: an older connection is open elsewhere; it closes itself on
+    // versionchange (see above), after which onsuccess fires.
+  });
+}
+
+async function toBufferedBlob(data: Blob): Promise<BufferedBlob> {
+  return { $blobBuffer: await data.arrayBuffer(), type: data.type };
+}
+
 export interface SessionStoreOpenOptions {
   /**
    * Store Blobs as ArrayBuffers (workaround for engines that cannot persist
@@ -140,15 +189,23 @@ export interface SessionStoreOpenOptions {
 export class SessionStore {
   static readonly DB_VERSION = DB_VERSION;
 
+  private conn: IDBDatabase;
   private blobsAsBuffers: boolean;
   private closed = false;
+  private reopening: Promise<void> | null = null;
 
   private constructor(
-    readonly db: IDBDatabase,
+    db: IDBDatabase,
     readonly dbName: string,
     opts: SessionStoreOpenOptions,
   ) {
+    this.conn = db;
     this.blobsAsBuffers = !!opts.blobsAsArrayBuffers;
+  }
+
+  /** The current connection (replaced when the store reconnects after a connection loss). */
+  get db(): IDBDatabase {
+    return this.conn;
   }
 
   /** True when IndexedDB is available in this realm. */
@@ -157,36 +214,9 @@ export class SessionStore {
   }
 
   /** Open (and create / upgrade) the database. */
-  static open(dbName = 'sfm', opts: SessionStoreOpenOptions = {}): Promise<SessionStore> {
-    return new Promise((resolve, reject) => {
-      if (!SessionStore.isSupported()) {
-        reject(new Error('IndexedDB is not available in this context'));
-        return;
-      }
-      let req: IDBOpenDBRequest;
-      try {
-        req = globalThis.indexedDB.open(dbName, DB_VERSION);
-      } catch (e) {
-        reject(mapError(e, 'opening the database'));
-        return;
-      }
-      req.onupgradeneeded = () => {
-        const db = req.result;
-        if (!db.objectStoreNames.contains(S_SESSIONS)) db.createObjectStore(S_SESSIONS, { keyPath: 'id' });
-        for (const s of [S_FRAMES, S_FRAME_DATA, S_BLOBS, S_JSON]) {
-          if (!db.objectStoreNames.contains(s)) db.createObjectStore(s);
-        }
-      };
-      req.onsuccess = () => {
-        const db = req.result;
-        // Let a newer version (another tab) upgrade instead of blocking it.
-        db.onversionchange = () => db.close();
-        resolve(new SessionStore(db, dbName, opts));
-      };
-      req.onerror = () => reject(mapError(req.error, 'opening the database'));
-      // onblocked: an older connection is open elsewhere; it closes itself on
-      // versionchange (see above), after which onsuccess fires.
-    });
+  static async open(dbName = 'sfm', opts: SessionStoreOpenOptions = {}): Promise<SessionStore> {
+    if (!SessionStore.isSupported()) throw new Error('IndexedDB is not available in this context');
+    return new SessionStore(await openDatabase(dbName), dbName, opts);
   }
 
   /** Delete a whole database (tests / "reset app"). */
@@ -201,10 +231,11 @@ export class SessionStore {
     });
   }
 
+  /** Close the connection for good (later calls reject with InvalidStateError). */
   close(): void {
     if (!this.closed) {
       this.closed = true;
-      this.db.close();
+      this.conn.close();
     }
   }
 
@@ -212,7 +243,68 @@ export class SessionStore {
   // Transaction helper
   // -------------------------------------------------------------------------
 
-  private tx<T>(
+  /** Replace a lost connection (shared by concurrent callers). */
+  private reconnect(): Promise<void> {
+    if (!this.reopening) {
+      const old = this.conn;
+      this.reopening = openDatabase(this.dbName).then(
+        (db) => {
+          this.reopening = null;
+          if (this.closed) {
+            db.close();
+            return;
+          }
+          try {
+            old.close();
+          } catch {
+            /* already closed */
+          }
+          this.conn = db;
+        },
+        (e: unknown) => {
+          this.reopening = null;
+          throw e;
+        },
+      );
+    }
+    return this.reopening;
+  }
+
+  /**
+   * True when `e` is a connection-level failure: InvalidStateError / UnknownError
+   * AND `conn` can no longer start a transaction (probe). A genuine error on a
+   * healthy connection is not retried.
+   */
+  private isConnectionLoss(e: unknown, conn: IDBDatabase): boolean {
+    const name = errorName(e);
+    if (name !== 'InvalidStateError' && name !== 'UnknownError') return false;
+    try {
+      conn.transaction(S_SESSIONS, 'readonly'); // no requests → commits immediately
+      return false;
+    } catch {
+      return true;
+    }
+  }
+
+  private async tx<T>(
+    stores: string[],
+    mode: IDBTransactionMode,
+    what: string,
+    body: TxBody<T>,
+    durability?: 'default' | 'relaxed' | 'strict',
+  ): Promise<T> {
+    const conn = this.conn;
+    try {
+      return await this.runTx(conn, stores, mode, what, body, durability);
+    } catch (e) {
+      if (this.closed || !this.isConnectionLoss(e, conn)) throw e;
+      if (this.conn === conn) await this.reconnect();
+      return this.runTx(this.conn, stores, mode, what, body, durability);
+    }
+  }
+
+  private runTx<T>(
+    db: IDBDatabase,
     stores: string[],
     mode: IDBTransactionMode,
     what: string,
@@ -225,7 +317,7 @@ export class SessionStore {
       let failed = false;
       let tx: IDBTransaction;
       try {
-        tx = durability ? this.db.transaction(stores, mode, { durability }) : this.db.transaction(stores, mode);
+        tx = durability ? db.transaction(stores, mode, { durability }) : db.transaction(stores, mode);
       } catch (e) {
         reject(mapError(e, what));
         return;
@@ -270,23 +362,28 @@ export class SessionStore {
     };
   }
 
-  private async blobValue(data: Blob): Promise<Blob | BufferedBlob> {
-    if (!this.blobsAsBuffers) return data;
-    return { $blobBuffer: await data.arrayBuffer(), type: data.type };
-  }
-
-  /** Retry a Blob write as ArrayBuffer once if the engine refuses Blobs. */
-  private async withBlobFallback<T>(hasBlob: boolean, op: () => Promise<T>): Promise<T> {
+  /**
+   * Run a write that stores a Blob; if the engine refuses it, retry once with
+   * the Blob as an ArrayBuffer. Buffer mode becomes permanent ONLY if that retry
+   * succeeds — an error caused by something else (e.g. a non-cloneable frame
+   * info) fails both attempts and leaves Blob storage untouched.
+   */
+  private async withBlobFallback<T>(hasBlob: boolean, op: (asBuffers: boolean) => Promise<T>): Promise<T> {
+    const asBuffers = this.blobsAsBuffers;
     try {
-      return await op();
+      return await op(asBuffers);
     } catch (e) {
-      const name = (e as { name?: string } | null)?.name;
-      if (!hasBlob || this.blobsAsBuffers || e instanceof StorageQuotaError || e instanceof SessionNotFoundError) throw e;
-      if (name === 'DataCloneError' || name === 'UnknownError' || name === 'NotSupportedError' || name === 'DataError') {
-        this.blobsAsBuffers = true;
-        return op();
+      if (!hasBlob || asBuffers || e instanceof StorageQuotaError || e instanceof SessionNotFoundError) throw e;
+      if (!BLOB_REFUSAL_ERRORS.has(errorName(e) ?? '')) throw e;
+      let result: T;
+      try {
+        result = await op(true);
+      } catch (e2) {
+        if (e2 instanceof StorageQuotaError || e2 instanceof SessionNotFoundError) throw e2;
+        throw e; // not a Blob problem: report the original error, keep Blob mode
       }
-      throw e;
+      this.blobsAsBuffers = true;
+      return result;
     }
   }
 
@@ -369,8 +466,8 @@ export class SessionStore {
    */
   async putFrame(sessionId: string, frameId: number, jpeg: Blob, info: unknown): Promise<void> {
     checkFrameId(frameId);
-    await this.withBlobFallback(true, async () => {
-      const value = await this.blobValue(jpeg);
+    await this.withBlobFallback(true, async (asBuffers) => {
+      const value = asBuffers ? await toBufferedBlob(jpeg) : jpeg; // awaited BEFORE the transaction starts
       return this.tx<void>(
         [S_SESSIONS, S_FRAMES, S_FRAME_DATA],
         'readwrite',
@@ -471,8 +568,8 @@ export class SessionStore {
       value = copy.buffer;
     } else throw new TypeError('putBlob: data must be a Blob, ArrayBuffer or ArrayBufferView');
     const isBlob = value instanceof Blob;
-    await this.withBlobFallback(isBlob, async () => {
-      const stored = isBlob ? await this.blobValue(value as Blob) : value;
+    await this.withBlobFallback(isBlob, async (asBuffers) => {
+      const stored = isBlob && asBuffers ? await toBufferedBlob(value as Blob) : value; // before the transaction
       return this.tx<void>([S_BLOBS], 'readwrite', `storing blob '${key}'`, (tx) => {
         tx.objectStore(S_BLOBS).put(stored, [sessionId, key]);
       });

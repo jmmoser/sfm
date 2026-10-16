@@ -261,6 +261,27 @@ function parseHeader(text: string): { format: Format; elements: PlyElement[]; co
 /** Value source abstracting ascii / binary bodies. */
 interface ValueStream {
   read(type: ScalarType): number;
+  /** Bytes (ascii: latin1 characters) left in the body. */
+  remaining(): number;
+}
+
+/**
+ * Reject an element whose declared row count cannot fit in the remaining body
+ * BEFORE anything is allocated from it: a corrupt / hostile header (e.g.
+ * `element vertex 200000000` on a tiny file) would otherwise trigger a
+ * multi-GB allocation (jetsam on iOS) before the truncation is noticed.
+ * Binary rows need ≥ the size of every scalar / list count; ascii values need
+ * ≥ 1 character + 1 separator each (the very last value needs none).
+ */
+function checkElementFits(el: PlyElement, stream: ValueStream, ascii: boolean): void {
+  if (el.count === 0) return;
+  let minRow = 0;
+  for (const p of el.props) minRow += ascii ? 2 : TYPE_SIZE[p.countType ?? p.type];
+  const need = el.count * minRow - (ascii && minRow > 0 ? 1 : 0);
+  const left = stream.remaining();
+  if (need > left) {
+    throw new Error(`PLY: unexpected end of data: element '${el.name}' declares ${el.count} rows (≥ ${need} bytes) but only ${left} bytes remain`);
+  }
 }
 
 class BinaryStream implements ValueStream {
@@ -269,6 +290,9 @@ class BinaryStream implements ValueStream {
   constructor(u8: Uint8Array, start: number, readonly le: boolean) {
     this.dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
     this.o = start;
+  }
+  remaining(): number {
+    return this.dv.byteLength - this.o;
   }
   read(type: ScalarType): number {
     const dv = this.dv;
@@ -292,6 +316,9 @@ class AsciiStream implements ValueStream {
   private o: number;
   constructor(private s: string, start: number) {
     this.o = start;
+  }
+  remaining(): number {
+    return this.s.length - this.o;
   }
   read(_type: ScalarType): number {
     const s = this.s;
@@ -379,7 +406,10 @@ export function decodePLY(input: ArrayBuffer | Uint8Array): PLYDecodeResult {
   let tri: Uint32Array | null = null;
   let triCount = 0;
 
+  const ascii = format === 'ascii';
   for (const el of elements) {
+    checkElementFits(el, stream, ascii);
+    if (el.props.length === 0) continue; // nothing to read (avoid spinning over a huge count)
     if (el.name === 'vertex') {
       const n = el.count;
       vertexCount = n;
@@ -470,11 +500,15 @@ export function decodePLY(input: ArrayBuffer | Uint8Array): PLYDecodeResult {
       hasFace = true;
       const listIdx = el.props.findIndex((p) => !!p.countType && p.name.startsWith('vertex_ind'));
       if (listIdx < 0 && el.count > 0) throw new Error('PLY: face element lacks vertex_indices list');
-      let cap = Math.max(16, 3 * el.count);
+      const lp = el.props[listIdx];
+      // Output indices ≤ 3 per polygon vertex, and every vertex index costs ≥ its
+      // type size (ascii: ≥ 2 characters): bound the initial capacity by the data
+      // as well as by the declared count (it still grows on demand).
+      const perIndex = ascii ? 2 : lp ? TYPE_SIZE[lp.type] : 1;
+      let cap = Math.max(16, Math.min(3 * el.count, 3 * Math.floor(stream.remaining() / perIndex)));
       let T = new Uint32Array(cap);
       let m = 0;
       const poly: number[] = [];
-      const lp = el.props[listIdx];
       if (
         stream instanceof BinaryStream &&
         el.props.length === 1 &&
@@ -496,11 +530,15 @@ export function decodePLY(input: ArrayBuffer | Uint8Array): PLYDecodeResult {
             T2.set(T);
             T = T2;
           }
-          const v0 = dv.getUint32(o, le);
-          for (let j = 1; j + 1 < c; j++) {
-            T[m++] = v0;
-            T[m++] = dv.getUint32(o + 4 * j, le);
-            T[m++] = dv.getUint32(o + 4 * j + 4, le);
+          if (c >= 3) {
+            // (A polygon with < 3 vertices has no v0: reading it would run past the
+            // end of the buffer when such a face is the last one.)
+            const v0 = dv.getUint32(o, le);
+            for (let j = 1; j + 1 < c; j++) {
+              T[m++] = v0;
+              T[m++] = dv.getUint32(o + 4 * j, le);
+              T[m++] = dv.getUint32(o + 4 * j + 4, le);
+            }
           }
           o += 4 * c;
         }

@@ -110,6 +110,16 @@ export class PointCloudMaterial extends ShaderMaterial {
     return this.flags.useRadius;
   }
 
+  /** True when points below `minConfidence` are hidden. */
+  get usesConfidence(): boolean {
+    return this.flags.useConfidence;
+  }
+
+  /** Current confidence threshold (only effective when `usesConfidence`). */
+  get minConfidence(): number {
+    return this.uniforms.uMinConfidence.value as number;
+  }
+
   /** Update defines / uniforms (unspecified options keep their value). Recompiles only when a define changes. */
   setOptions(opts: PointsMaterialOptions): void {
     const f = this.flags;
@@ -133,6 +143,13 @@ export class PointCloudMaterial extends ShaderMaterial {
     if (opts.minSizePx !== undefined) this.uniforms.uMinSize.value = opts.minSizePx;
     if (opts.maxSizePx !== undefined) this.uniforms.uMaxSize.value = opts.maxSizePx;
     if (opts.minConfidence !== undefined) this.uniforms.uMinConfidence.value = opts.minConfidence;
+  }
+
+  /** Per-frame size uniforms (drawing-buffer px); allocation-free. */
+  setSizes(sizePx: number, minSizePx: number, maxSizePx: number): void {
+    this.uniforms.uSize.value = sizePx;
+    this.uniforms.uMinSize.value = minSizePx;
+    this.uniforms.uMaxSize.value = maxSizePx;
   }
 
   /**

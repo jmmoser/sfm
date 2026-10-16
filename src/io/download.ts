@@ -9,7 +9,9 @@
  *     - User dismisses the sheet → AbortError → resolves 'cancelled'.
  *     - NotAllowedError (the transient user activation expired, e.g. because
  *       building the file took several seconds), TypeError or any other failure
- *       → fall back to step 2.
+ *       → fall back to step 2 — EXCEPT in an iOS Home Screen web app
+ *       (`navigator.standalone`), where `<a download>` is broken: the share
+ *       error is rethrown so the UI can ask for another tap.
  *  2. `<a download>` with an object URL (revoked after `revokeDelayMs`, default
  *     60 s — iOS opens a download confirmation and reads the URL lazily).
  *
@@ -56,11 +58,41 @@ export function mimeTypeForFilename(filename: string): string {
   return MIME_BY_EXT[ext] ?? 'application/octet-stream';
 }
 
-/** Replace characters that are invalid in file names on iOS / Windows. */
+const MAX_FILENAME = 200;
+
+/** First `n` UTF-16 units of `s`, without splitting a surrogate pair. */
+function truncateUnits(s: string, n: number): string {
+  if (s.length <= n) return s;
+  const c = s.charCodeAt(n - 1);
+  return s.slice(0, c >= 0xd800 && c <= 0xdbff ? n - 1 : n);
+}
+
+/**
+ * Replace characters that are invalid in file names on iOS / Windows. Long
+ * names are shortened to 200 UTF-16 units KEEPING the extension (the share
+ * sheet, Files and download managers infer the type from it) and never split
+ * a surrogate pair.
+ */
 export function sanitizeFilename(name: string): string {
   // eslint-disable-next-line no-control-regex
   const s = name.replace(/[\u0000-\u001f<>:"/\\|?*]+/g, '_').replace(/^[\s.]+|[\s.]+$/g, '');
-  return s.length ? s.slice(0, 200) : 'download';
+  if (!s.length) return 'download';
+  if (s.length <= MAX_FILENAME) return s;
+  const ext = /\.[^.\s]{1,16}$/.exec(s)?.[0] ?? '';
+  const base = truncateUnits(s.slice(0, s.length - ext.length), MAX_FILENAME - ext.length).replace(/[\s.]+$/, '');
+  return (base || 'download') + ext;
+}
+
+/**
+ * iOS/iPadOS Home Screen web app (`navigator.standalone` exists only on Apple
+ * WebKit and is true only in standalone mode). There `<a download>` with a
+ * Blob URL is broken (preview sheet / stuck "navigation-less" state, WebKit
+ * 275288, 290847 — docs/research/ios-platform.md §3), so it is never used as
+ * an automatic fallback.
+ */
+function isIOSStandalone(): boolean {
+  const nav = (globalThis as { navigator?: Navigator & { standalone?: boolean } }).navigator;
+  return nav?.standalone === true;
 }
 
 function errorName(e: unknown): string | undefined {
@@ -96,7 +128,9 @@ export async function saveFile(data: Blob, filename: string, opts: SaveFileOptio
         return 'shared';
       } catch (e) {
         if (errorName(e) === 'AbortError') return 'cancelled';
-        if (mode === 'share') throw e;
+        // In an iOS Home Screen app the download fallback is broken: rethrow
+        // (typically NotAllowedError — ask the user to tap "Save" again).
+        if (mode === 'share' || isIOSStandalone()) throw e;
         // NotAllowedError (no user activation), InvalidStateError (another share
         // in progress), DataError… → fall back to a download.
       }

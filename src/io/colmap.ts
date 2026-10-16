@@ -6,7 +6,8 @@
  *    centre of the top-left pixel at (0.5, 0.5); we put it at (0, 0)).
  *  - Image pose QW QX QY QZ TX TY TZ = world-to-camera rotation (Hamilton,
  *    w ≥ 0) and translation — identical to our `Pose` convention.
- *  - POINTS2D x/y get +0.5. POINT3D_ID −1 marks an unmatched keypoint.
+ *  - POINTS2D x/y get +0.5. POINT3D_ID −1 marks an unmatched keypoint (also
+ *    written for ids that are not among the exported points).
  * Numbers are written with JavaScript's shortest round-trip representation, so
  * export → import is exact up to the ±0.5 shift (≤ 1 ulp).
  *
@@ -104,7 +105,24 @@ function checkName(name: string): void {
   if (!name || /\s/.test(name)) throw new Error(`COLMAP export: image name must be non-empty without whitespace: '${name}'`);
 }
 
-/** Build the three COLMAP text files. Returned in order cameras, images, points3D. */
+/**
+ * COLMAP parses ids / sizes with stoul/stoll: a negative or fractional value
+ * would be written verbatim and wrap or truncate on import.
+ */
+function uint(v: number, what: string, min = 0): number {
+  if (!Number.isSafeInteger(v) || v < min) throw new RangeError(`COLMAP export: ${what} must be an integer ≥ ${min}, got ${v}`);
+  return v;
+}
+
+/**
+ * Build the three COLMAP text files. Returned in order cameras, images, points3D.
+ *
+ * Validation: ids must be non-negative integers, every image must reference an
+ * exported camera and every track element an exported image and an existing
+ * POINTS2D index (COLMAP would crash on such references). POINTS2D entries that
+ * reference a point id missing from `model.points` (e.g. filtered before
+ * export) are written as -1.
+ */
 export function exportColmapText(model: ColmapModelInput): ColmapTextFile[] {
   // cameras.txt
   const cam: string[] = [
@@ -112,13 +130,29 @@ export function exportColmapText(model: ColmapModelInput): ColmapTextFile[] {
     '#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]',
     `# Number of cameras: ${model.cameras.length}`,
   ];
+  const cameraIds = new Set<number>();
   for (const { id, cam: c } of model.cameras) {
-    cam.push(`${id} RADIAL ${c.width} ${c.height} ${num(c.f)} ${num(c.cx + 0.5)} ${num(c.cy + 0.5)} ${num(c.k1)} ${num(c.k2)}`);
+    cameraIds.add(uint(id, 'camera id'));
+    cam.push(
+      `${id} RADIAL ${uint(c.width, 'camera width', 1)} ${uint(c.height, 'camera height', 1)} ` +
+        `${num(c.f)} ${num(c.cx + 0.5)} ${num(c.cy + 0.5)} ${num(c.k1)} ${num(c.k2)}`,
+    );
   }
+
+  const pointIds = new Set<number>();
+  for (const p of model.points) pointIds.add(uint(p.id, 'point id'));
+  const imagesById = new Map<number, ColmapModelInput['images'][number]>();
+  for (const im of model.images) {
+    imagesById.set(uint(im.id, 'image id'), im);
+    if (!cameraIds.has(uint(im.cameraId, `camera id of image ${im.id}`))) {
+      throw new RangeError(`COLMAP export: image ${im.id} references missing camera ${im.cameraId}`);
+    }
+  }
+  const p3 = (id: number): number => (id >= 0 && pointIds.has(id) ? id : -1);
 
   // images.txt
   let numObs = 0;
-  for (const im of model.images) for (const p of im.points2D) if (p.point3D >= 0) numObs++;
+  for (const im of model.images) for (const p of im.points2D) if (p3(p.point3D) >= 0) numObs++;
   const meanObs = model.images.length ? numObs / model.images.length : 0;
   const img: string[] = [
     '# Image list with two lines of data per image:',
@@ -134,7 +168,7 @@ export function exportColmapText(model: ColmapModelInput): ColmapTextFile[] {
     const parts = new Array<string>(im.points2D.length);
     for (let k = 0; k < im.points2D.length; k++) {
       const p = im.points2D[k];
-      parts[k] = `${num(p.x + 0.5)} ${num(p.y + 0.5)} ${p.point3D >= 0 ? p.point3D : -1}`;
+      parts[k] = `${num(p.x + 0.5)} ${num(p.y + 0.5)} ${p3(p.point3D)}`;
     }
     img.push(parts.join(' '));
   }
@@ -148,10 +182,17 @@ export function exportColmapText(model: ColmapModelInput): ColmapTextFile[] {
     '#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)',
     `# Number of points: ${model.points.length}, mean track length: ${meanTrack}`,
   ];
-  const c8 = (v: number): number => Math.max(0, Math.min(255, Math.round(v)));
+  const c8 = (v: number): number => (v >= 0 ? Math.min(255, Math.round(v)) : 0); // NaN → 0
   for (const p of model.points) {
     let line = `${p.id} ${num(p.xyz[0])} ${num(p.xyz[1])} ${num(p.xyz[2])} ${c8(p.color[0])} ${c8(p.color[1])} ${c8(p.color[2])} ${num(p.error)}`;
-    for (const t of p.track) line += ` ${t.image} ${t.point2D}`;
+    for (const t of p.track) {
+      const im = imagesById.get(t.image);
+      if (!im) throw new RangeError(`COLMAP export: point ${p.id} track references missing image ${t.image}`);
+      if (!Number.isSafeInteger(t.point2D) || t.point2D < 0 || t.point2D >= im.points2D.length) {
+        throw new RangeError(`COLMAP export: point ${p.id} track references POINTS2D ${t.point2D} of image ${t.image} (has ${im.points2D.length})`);
+      }
+      line += ` ${t.image} ${t.point2D}`;
+    }
     pts.push(line);
   }
 

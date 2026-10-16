@@ -42,6 +42,7 @@ import {
   AlwaysDepth,
   type Camera,
   type Object3D,
+  type PerspectiveCamera,
   type WebGLRenderer,
 } from 'three';
 import { unpackRGBAToDepth } from './helpers';
@@ -115,6 +116,8 @@ void main() {
 
 /** Max side of the pick window in drawing-buffer pixels. */
 export const PICK_WINDOW_MAX = 63;
+/** Side of the magnified pick target (pixels of the virtual zoomed image). */
+export const ZOOM_SIZE = 64;
 
 export interface DepthWindow {
   /** Window depths (row-major, row 0 = BOTTOM row in GL convention), 1 = background. */
@@ -154,6 +157,7 @@ export class EDLPass {
   private readonly compositeMaterial: ShaderMaterial;
   private readonly pickMaterial: ShaderMaterial;
   private pickTarget: WebGLRenderTarget | null = null;
+  private zoomTarget: WebGLRenderTarget | null = null;
   private readonly pickBytes = new Uint8Array(4 * (PICK_WINDOW_MAX + 1) * (PICK_WINDOW_MAX + 1));
   private readbackOk: boolean | null = null;
   private edlDefine = true;
@@ -368,6 +372,10 @@ export class EDLPass {
     const size = 2 * rr + 1;
     const x0 = Math.floor(cx) - rr;
     const y0 = Math.floor(cy) - rr;
+    return { depths: this.readRegion(renderer, rt, x0, y0, size), size, x0, y0 };
+  }
+
+  private readRegion(renderer: WebGLRenderer, rt: WebGLRenderTarget, x0: number, y0: number, size: number): Float32Array {
     const u = this.pickMaterial.uniforms;
     u.tDepth.value = rt.depthTexture;
     (u.uOrigin.value as Vector2).set(x0, y0);
@@ -377,7 +385,42 @@ export class EDLPass {
     for (let i = 0; i < size * size; i++) {
       depths[i] = unpackRGBAToDepth(bytes[4 * i], bytes[4 * i + 1], bytes[4 * i + 2], bytes[4 * i + 3]);
     }
-    return { depths, size, x0, y0 };
+    return depths;
+  }
+
+  /**
+   * Render a magnified sub-window of the view into a small (ZOOM_SIZE²) target
+   * and read its depth: the view is treated as a virtual image of
+   * (fullWidth × fullHeight) px (= drawing buffer × zoom) of which the square
+   * (offsetX, offsetY, ZOOM_SIZE) — top-left origin, like setViewOffset — is
+   * drawn. Used for sub-pixel accurate picking. Returns depths with row 0 = the
+   * BOTTOM row of the sub-window, or null if unsupported.
+   */
+  readZoomedDepth(
+    renderer: WebGLRenderer,
+    scene: Object3D,
+    camera: PerspectiveCamera,
+    fullWidth: number,
+    fullHeight: number,
+    offsetX: number,
+    offsetY: number,
+  ): Float32Array | null {
+    if (!this.supported) return null;
+    if (!this.zoomTarget) {
+      this.zoomTarget = EDLPass.createTarget(ZOOM_SIZE, ZOOM_SIZE, this.depthTextureType === 'uint' ? UnsignedIntType : FloatType);
+    }
+    const rt = this.zoomTarget;
+    camera.setViewOffset(fullWidth, fullHeight, offsetX, offsetY, ZOOM_SIZE, ZOOM_SIZE);
+    try {
+      renderer.setRenderTarget(rt);
+      renderer.setClearColor(0x000000, 0);
+      renderer.clear(true, true, false);
+      renderer.render(scene, camera);
+      renderer.setRenderTarget(null);
+    } finally {
+      camera.clearViewOffset();
+    }
+    return this.readRegion(renderer, rt, 0, 0, ZOOM_SIZE);
   }
 
   /** Forget cached GPU-side state after a context restore (targets are re-created lazily by three). */
@@ -391,6 +434,9 @@ export class EDLPass {
     this.target = null;
     this.pickTarget?.dispose();
     this.pickTarget = null;
+    this.zoomTarget?.depthTexture?.dispose();
+    this.zoomTarget?.dispose();
+    this.zoomTarget = null;
     this.geometry.dispose();
     this.compositeMaterial.dispose();
     this.pickMaterial.dispose();

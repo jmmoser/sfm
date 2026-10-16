@@ -417,7 +417,95 @@ export function linearizeDepth(d: number, near: number, far: number): number {
   return (2 * near * far) / (far + near - z * (far - near));
 }
 
-let _cand = new Float64Array(3 * 4096);
+/** Fitted inverse-depth plane 1/z = a + b·u + c·v over screen offsets (u, v). */
+export interface InverseDepthPlane {
+  a: number;
+  b: number;
+  c: number;
+}
+
+/**
+ * Least-squares fit of 1/z = a + b·u + c·v (exact for a planar surface under
+ * perspective projection) from samples of view depth z at screen offsets (u, v).
+ * Collinear samples: slope along their direction only. < 3 samples (or a
+ * degenerate fit): constant inverse-distance-weighted mean (b = c = 0).
+ * Null when n = 0.
+ */
+export function fitInverseDepthPlane(
+  u: ArrayLike<number>,
+  v: ArrayLike<number>,
+  z: ArrayLike<number>,
+  n: number,
+): InverseDepthPlane | null {
+  if (n <= 0) return null;
+  let su = 0;
+  let sv = 0;
+  let suu = 0;
+  let suv = 0;
+  let svv = 0;
+  let r1 = 0;
+  let ru = 0;
+  let rv = 0;
+  let wm = 0;
+  let wmy = 0;
+  for (let i = 0; i < n; i++) {
+    const y = 1 / z[i];
+    const a = u[i];
+    const b = v[i];
+    su += a;
+    sv += b;
+    suu += a * a;
+    suv += a * b;
+    svv += b * b;
+    r1 += y;
+    ru += a * y;
+    rv += b * y;
+    const w = 1 / (1 + a * a + b * b);
+    wm += w;
+    wmy += w * y;
+  }
+  const constant: InverseDepthPlane = { a: wmy / wm, b: 0, c: 0 };
+  if (n < 3) return constant;
+  // Centred moments for conditioning.
+  const ub = su / n;
+  const vb = sv / n;
+  const yb = r1 / n;
+  const cuu = suu / n - ub * ub;
+  const cuv = suv / n - ub * vb;
+  const cvv = svv / n - vb * vb;
+  const cuy = ru / n - ub * yb;
+  const cvy = rv / n - vb * yb;
+  const det = cuu * cvv - cuv * cuv;
+  const tr = cuu + cvv;
+  if (tr <= 1e-12) return constant;
+  let b: number;
+  let c: number;
+  if (det > 1e-6 * tr * tr) {
+    b = (cuy * cvv - cvy * cuv) / det;
+    c = (cvy * cuu - cuy * cuv) / det;
+  } else {
+    // Collinear samples: direction of the (rank-1) covariance, slope along it.
+    let ex = cuu >= cvv ? cuu : cuv;
+    let ey = cuu >= cvv ? cuv : cvv;
+    const en = Math.hypot(ex, ey);
+    ex /= en;
+    ey /= en;
+    const k = (cuy * ex + cvy * ey) / tr;
+    b = k * ex;
+    c = k * ey;
+  }
+  const a = yb - b * ub - c * vb;
+  if (!(a > 0) || !Number.isFinite(a) || !Number.isFinite(b) || !Number.isFinite(c)) return constant;
+  return { a, b, c };
+}
+
+/** Surface view depth on the ray through screen offset (0, 0); NaN when n = 0. See fitInverseDepthPlane. */
+export function surfaceDepthAt(u: ArrayLike<number>, v: ArrayLike<number>, z: ArrayLike<number>, n: number): number {
+  const p = fitInverseDepthPlane(u, v, z, n);
+  return p ? 1 / p.a : NaN;
+}
+
+let _cand = new Float64Array(5 * 4096);
 
 /** How points are sized on screen, for the CPU picker's coverage test. */
 export interface PickSplatModel {
@@ -429,6 +517,12 @@ export interface PickSplatModel {
   projScale?: number;
   minPx?: number;
   maxPx?: number;
+  /**
+   * Per-point confidence; points with confidence < `minConfidence` are skipped
+   * (they are not drawn either, see PointCloudMaterial).
+   */
+  confidence?: ArrayLike<number>;
+  minConfidence?: number;
 }
 
 /**
@@ -439,12 +533,12 @@ export interface PickSplatModel {
  * projection lies within `radiusPx` of (px, py) (continuous coordinates, origin
  * at the top-left corner of a `width × height` viewport, like clientX/Y). Then it emulates the depth buffer: among the
  * points whose splat (see `splat`) covers the tapped pixel, those of the FRONT
- * surface (view depth w within 3 % of the front-most, i.e. what the depth buffer
- * shows) are kept and the one closest to the tap is returned. If no splat covers
- * it (tap in a gap), the point nearest on screen wins (ties → front).
- * `out` (optional) receives whether a splat covered the pixel and the surface
- * depth on the tap ray (mean w of the front covering splats; the nearest point's
- * w otherwise) so callers can place the hit on the ray, like the GPU path.
+ * surface (what the depth buffer shows) are kept and the one closest to the tap
+ * is returned. If no splat covers it (tap in a gap), the point nearest on screen
+ * wins (ties → front). `out` (optional) receives whether a splat covered the
+ * pixel and the surface depth on the tap ray (planar fit of 1/w over the front
+ * surface points around the tap, see surfaceDepthAt; the nearest point's w when
+ * not covered) so callers can place the hit on the ray, like the GPU path.
  * One O(n) pass of ~20 flops per point (≈ 10–30 ms per 2 M points on one core)
  * plus a pass over the few candidates; allocation-free in steady state.
  */
@@ -480,6 +574,8 @@ export function pickNearestProjected(
   const r2 = radiusPx * radiusPx;
   let nc = 0;
   const n = Math.min(count, Math.floor(positions.length / 3));
+  const conf = splat.confidence && (splat.minConfidence ?? 0) > 0 ? splat.confidence : null;
+  const minConf = splat.minConfidence ?? 0;
   for (let i = 0, j = 0; i < n; i++, j += 3) {
     const x = positions[j];
     const y = positions[j + 1];
@@ -494,14 +590,18 @@ export function pickNearestProjected(
     const dy = (m1 * x + m5 * y + m9 * z + m13 - ty * w) * sy;
     const dw2 = dx2 + dy * dy;
     if (dw2 > rw2) continue;
-    if (3 * nc + 3 > _cand.length) {
+    if (conf && conf[i] < minConf) continue; // hidden by the confidence filter (same test as the shader)
+    if (5 * nc + 5 > _cand.length) {
       const grown = new Float64Array(_cand.length * 2);
       grown.set(_cand);
       _cand = grown;
     }
-    _cand[3 * nc] = i;
-    _cand[3 * nc + 1] = dw2 / (w * w);
-    _cand[3 * nc + 2] = w;
+    const o = 5 * nc;
+    _cand[o] = i;
+    _cand[o + 1] = dx / w;
+    _cand[o + 2] = dy / w;
+    _cand[o + 3] = dw2 / (w * w);
+    _cand[o + 4] = w;
     nc++;
   }
   const fixedHalf = 0.5 * Math.max(1, splat.sizePx ?? 1);
@@ -514,16 +614,19 @@ export function pickNearestProjected(
   let near = -1;
   let nearD2 = Infinity;
   let nearW = Infinity;
+  let ncov = 0;
   for (let k = 0; k < nc; k++) {
-    const i = _cand[3 * k];
-    const d2 = _cand[3 * k + 1];
-    const w = _cand[3 * k + 2];
+    const o = 5 * k;
+    const i = _cand[o];
+    const d2 = _cand[o + 3];
+    const w = _cand[o + 4];
     let half = fixedHalf;
     if (radii && proj > 0) half = 0.5 * Math.min(maxPx, Math.max(minPx, (2 * radii[i] * proj) / w));
     const h = Math.max(0.5, half);
     if (d2 <= h * h) {
       if (w < coverW) coverW = w;
-      _cand[3 * k + 1] = -1 - d2; // mark as covering (keep d2 recoverable)
+      _cand[o] = -1 - i; // mark as covering
+      ncov++;
     }
     if (d2 < nearD2 - 1 || (Math.abs(d2 - nearD2) <= 1 && w < nearW)) {
       near = i;
@@ -531,41 +634,133 @@ export function pickNearestProjected(
       nearW = w;
     }
   }
-  if (coverW === Infinity) {
+  if (ncov === 0) {
     if (out) {
       out.covered = false;
       out.w = nearW;
     }
     return near;
   }
-  // Pass 2: covering splats of the front surface (within 3 % of the front-most
-  // depth). Their mean depth is an unbiased estimate of the surface depth on the
-  // tap ray (the front-most alone is biased towards the camera on oblique
-  // surfaces); the one closest to the tap is returned.
-  const wMax = coverW * 1.03;
-  let sumW = 0;
-  let nW = 0;
+  // Pass 2: the front surface. Seed = covering splats within 3 % of the
+  // front-most depth; fit 1/w = a + b·dx + c·dy (planar patch) and re-select all
+  // candidates within ±2 % of that patch (catches the far side of oblique
+  // surfaces, excludes occluded ones); the depth at the tap is 1/a. The returned
+  // index is the front covering point closest to the tap.
+  if (_su.length < nc) {
+    _su = new Float64Array(nc * 2);
+    _sv = new Float64Array(nc * 2);
+    _sz = new Float64Array(nc * 2);
+  }
+  let m = 0;
   let cover = -1;
   let coverD2 = Infinity;
+  const wMax = coverW * 1.03;
   for (let k = 0; k < nc; k++) {
-    const m = _cand[3 * k + 1];
-    if (m >= 0) continue;
-    const w = _cand[3 * k + 2];
+    const o = 5 * k;
+    if (_cand[o] >= 0) continue;
+    const w = _cand[o + 4];
     if (w > wMax) continue;
-    const d2 = -1 - m;
-    sumW += w;
-    nW++;
-    if (d2 < coverD2) {
-      coverD2 = d2;
-      cover = _cand[3 * k];
+    _su[m] = _cand[o + 1];
+    _sv[m] = _cand[o + 2];
+    _sz[m] = w;
+    m++;
+    if (_cand[o + 3] < coverD2) {
+      coverD2 = _cand[o + 3];
+      cover = -1 - _cand[o];
+    }
+  }
+  let wTap = surfaceDepthAt(_su, _sv, _sz, m);
+  const plane = m >= 3 ? fitInverseDepthPlane(_su, _sv, _sz, m) : null;
+  if (plane) {
+    // Re-select every candidate consistent with the seed patch (±2 % in 1/w).
+    let m2 = 0;
+    for (let k = 0; k < nc; k++) {
+      const o = 5 * k;
+      const du = _cand[o + 1];
+      const dv = _cand[o + 2];
+      const pred = plane.a + plane.b * du + plane.c * dv;
+      const yi = 1 / _cand[o + 4];
+      if (!(pred > 0) || Math.abs(yi - pred) > 0.02 * pred) continue;
+      _su[m2] = du;
+      _sv[m2] = dv;
+      _sz[m2] = _cand[o + 4];
+      m2++;
+    }
+    if (m2 >= 3) {
+      const w2 = surfaceDepthAt(_su, _sv, _sz, m2);
+      if (Number.isFinite(w2)) wTap = w2;
     }
   }
   if (out) {
     out.covered = true;
-    out.w = sumW / nW;
+    out.w = wTap;
   }
   return cover;
 }
+
+/**
+ * Closest ray–triangle intersection (Möller–Trumbore, double-sided, float64).
+ * Ray `o + t·d` in the same frame as `positions`; returns the smallest t > tMin
+ * (in units of |d|), or Infinity when nothing is hit. Indices out of range are
+ * skipped. One pass of ~40 flops per triangle (≈ 10–20 ms per 1 M triangles on
+ * one core) — used by the CPU picking fallback for meshes.
+ */
+export function raycastTriangles(
+  positions: ArrayLike<number>,
+  indices: ArrayLike<number>,
+  triangleCount: number,
+  ox: number,
+  oy: number,
+  oz: number,
+  dx: number,
+  dy: number,
+  dz: number,
+  tMin = 0,
+): number {
+  const nt = Math.min(triangleCount, Math.floor(indices.length / 3));
+  const nv = Math.floor(positions.length / 3);
+  let best = Infinity;
+  for (let k = 0; k < nt; k++) {
+    const i0 = indices[3 * k];
+    const i1 = indices[3 * k + 1];
+    const i2 = indices[3 * k + 2];
+    if (i0 >= nv || i1 >= nv || i2 >= nv) continue;
+    const ax = positions[3 * i0];
+    const ay = positions[3 * i0 + 1];
+    const az = positions[3 * i0 + 2];
+    const e1x = positions[3 * i1] - ax;
+    const e1y = positions[3 * i1 + 1] - ay;
+    const e1z = positions[3 * i1 + 2] - az;
+    const e2x = positions[3 * i2] - ax;
+    const e2y = positions[3 * i2 + 1] - ay;
+    const e2z = positions[3 * i2 + 2] - az;
+    // p = d × e2, det = e1 · p
+    const px = dy * e2z - dz * e2y;
+    const py = dz * e2x - dx * e2z;
+    const pz = dx * e2y - dy * e2x;
+    const det = e1x * px + e1y * py + e1z * pz;
+    if (det === 0 || !Number.isFinite(det)) continue;
+    const inv = 1 / det;
+    const sx = ox - ax;
+    const sy = oy - ay;
+    const sz = oz - az;
+    const u = (sx * px + sy * py + sz * pz) * inv;
+    if (u < 0 || u > 1) continue;
+    // q = s × e1
+    const qx = sy * e1z - sz * e1y;
+    const qy = sz * e1x - sx * e1z;
+    const qz = sx * e1y - sy * e1x;
+    const v = (dx * qx + dy * qy + dz * qz) * inv;
+    if (v < 0 || u + v > 1) continue;
+    const t = (e2x * qx + e2y * qy + e2z * qz) * inv;
+    if (t > tMin && t < best) best = t;
+  }
+  return best;
+}
+
+let _su = new Float64Array(256);
+let _sv = new Float64Array(256);
+let _sz = new Float64Array(256);
 
 /**
  * First `k` entries of the golden-ratio stride permutation of [0, n): i ↦ (i·P)

@@ -85,7 +85,10 @@ export class TapDetector {
       if (e.pointerType === 'mouse' && e.button !== 0) return;
       const p = this.local(e);
       this.active.set(e.pointerId, { x0: p.x, y0: p.y, t0: e.timeStamp, moved: false });
-      if (this.active.size > 1) this.multi = true;
+      if (this.active.size > 1) {
+        this.multi = true;
+        this.last = null; // a pinch between two taps must not make them a double tap
+      }
     };
     this.onMove = (e) => {
       const a = this.active.get(e.pointerId);

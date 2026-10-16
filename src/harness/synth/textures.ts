@@ -164,7 +164,7 @@ function drawGlyph(ctx: Ctx, x: number, y: number, h: number, rng: SynthRng): nu
 function drawText(ctx: Ctx, x: number, y: number, w: number, lineH: number, lines: number, color: string, rng: SynthRng, justify = false): void {
   ctx.save();
   ctx.strokeStyle = color;
-  ctx.lineWidth = Math.max(0.6, lineH * 0.09);
+  ctx.lineWidth = lineH * 0.09; // (no pixel floor: callers may draw in metre units)
   ctx.lineCap = 'round';
   const cap = lineH * 0.62;
   for (let l = 0; l < lines; l++) {
@@ -229,7 +229,7 @@ export function woodTexture(w: number, h: number, rng: SynthRng, opts: { light?:
   for (let b = 0; b < boards; b++) {
     boardTint.push(jitterColor([1, 1, 1], rng, 0.12));
     boardPhase.push(rng.next() * 10);
-    boardFreq.push((3 + 4 * rng.next()) / bh);
+    boardFreq.push((5 + 7 * rng.next()) / bh);
     const c: number[] = [];
     if (opts.stagger) {
       let x = -rng.next() * w * 0.5;
@@ -246,7 +246,8 @@ export function woodTexture(w: number, h: number, rng: SynthRng, opts: { light?:
     const ring = (yy + 18 * warp.data[i] * (bh / 40)) * boardFreq[b] + boardPhase[b] + 0.002 * x;
     let v = 0.5 + 0.5 * Math.sin(2 * Math.PI * ring);
     v = Math.pow(v, 3);
-    const t = Math.min(1, Math.max(0, 0.15 + 0.55 * v + 0.25 * fine.data[i]));
+    const streak = 0.5 + 0.5 * Math.sin(2 * Math.PI * (ring * 6.3 + 2 * fine.data[i]));
+    const t = Math.min(1, Math.max(0, 0.12 + 0.45 * v + 0.12 * streak + 0.25 * fine.data[i]));
     const col = mix(light, dark, t);
     const tint = boardTint[b];
     let seam = 1;
@@ -261,11 +262,11 @@ export function woodTexture(w: number, h: number, rng: SynthRng, opts: { light?:
   for (let k = 0; k < knots; k++) {
     const x = rng.next() * w,
       y = rng.next() * h;
-    const r = bh * (0.06 + 0.12 * rng.next());
+    const r = bh * (0.03 + 0.07 * rng.next());
     for (let ring = 4; ring >= 0; ring--) {
-      ctx.fillStyle = rgbStr(mix(dark, [50, 30, 15], 0.2 + 0.15 * ring), 0.35);
+      ctx.fillStyle = rgbStr(mix(dark, [50, 30, 15], 0.2 + 0.15 * ring), 0.22);
       ctx.beginPath();
-      ctx.ellipse(x, y, r * (1 + ring * 0.6) * 1.8, r * (1 + ring * 0.4), 0, 0, Math.PI * 2);
+      ctx.ellipse(x, y, r * (1 + ring * 0.35) * 1.8, r * (1 + ring * 0.25), 0, 0, Math.PI * 2);
       ctx.fill();
     }
   }
@@ -707,12 +708,38 @@ export function marbleTexture(w: number, h: number, rng: SynthRng): Canvas2D {
 // Outdoor textures
 // ---------------------------------------------------------------------------
 
-/** Grayscale (mean ≈ 0.5) tileable grass-blade detail map. */
+/**
+ * Grayscale (mean ≈ 0.5) tileable lawn detail map. Structure at every scale a camera
+ * sees the lawn at (≈ 2 m … 15 m away): clumps / bare patches (fbm, down to tile/5),
+ * tufts with dark gaps and light tips (1–6 % of the tile), then individual blades. A
+ * blade-only map is fine-grained noise that mip-maps to a flat grey beyond ~2 m, leaving
+ * the ground featureless for SIFT (it was ≈ 30–70 features / Mpx vs ≈ 1500 elsewhere).
+ */
 export function grassDetailTexture(size: number, rng: SynthRng): Canvas2D {
   const { canvas, ctx } = makeCanvas(size, size);
-  ctx.fillStyle = 'rgb(105,105,105)';
-  ctx.fillRect(0, 0, size, size);
-  const n = Math.round(size * size * 0.045);
+  const f = fbm(size, size, rng, { baseCells: 5, octaves: 9, gain: 0.68 });
+  paintPixels(ctx, size, size, (_x, _y, i, c) => {
+    const v = 118 + 52 * f.data[i];
+    c[0] = c[1] = c[2] = v;
+  });
+  // tufts: dark gaps between them and sunlit tops
+  const nt = Math.round(size * size * 0.0022);
+  for (let i = 0; i < nt; i++) {
+    const x = rng.next() * size,
+      y = rng.next() * size;
+    const r = size * (0.004 + 0.022 * Math.pow(rng.next(), 2));
+    const dark = rng.next() < 0.5;
+    const l = dark ? Math.round(20 + 50 * rng.next()) : Math.round(185 + 60 * rng.next());
+    ctx.fillStyle = `rgba(${l},${l},${l},${(0.45 + 0.4 * rng.next()).toFixed(3)})`;
+    const rot = rng.next() * Math.PI,
+      ecc = 0.35 + 0.65 * rng.next();
+    drawWrapped(size, size, x, y, r * 2, (ox, oy) => {
+      ctx.beginPath();
+      ctx.ellipse(x + ox, y + oy, r, r * ecc, rot, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+  const n = Math.round(size * size * 0.035);
   ctx.lineCap = 'round';
   for (let i = 0; i < n; i++) {
     const x = rng.next() * size,
@@ -720,7 +747,7 @@ export function grassDetailTexture(size: number, rng: SynthRng): Canvas2D {
     const len = size * (0.006 + 0.016 * rng.next());
     const a = rng.next() * Math.PI * 2;
     const l = Math.round(40 + 190 * Math.pow(rng.next(), 1.3));
-    ctx.strokeStyle = `rgb(${l},${l},${l})`;
+    ctx.strokeStyle = `rgba(${l},${l},${l},0.85)`;
     ctx.lineWidth = 0.8 + 1.6 * rng.next();
     const dx = Math.cos(a) * len,
       dy = Math.sin(a) * len;
@@ -734,14 +761,38 @@ export function grassDetailTexture(size: number, rng: SynthRng): Canvas2D {
   return canvas;
 }
 
-/** Grayscale (mean ≈ 0.5) tileable soil / pebble detail map. */
+/**
+ * Grayscale (mean ≈ 0.5) tileable soil / gravel detail map: fbm, clods and stones from
+ * a few mm up to ≈ 3 % of the tile (≈ 10 cm on a 3.7 m tile) with a shadowed side, and
+ * fine grit.
+ */
 export function soilDetailTexture(size: number, rng: SynthRng): Canvas2D {
   const { canvas, ctx } = makeCanvas(size, size);
-  const f = fbm(size, size, rng, { baseCells: 8, octaves: 7, gain: 0.6 });
+  const f = fbm(size, size, rng, { baseCells: 8, octaves: 8, gain: 0.66 });
   paintPixels(ctx, size, size, (_x, _y, i, c) => {
     const v = 128 + 50 * f.data[i];
     c[0] = c[1] = c[2] = v;
   });
+  // stones / clods (larger ones rarer), lit from one side
+  const ns = Math.round(size * 1.2);
+  for (let i = 0; i < ns; i++) {
+    const x = rng.next() * size,
+      y = rng.next() * size;
+    const r = size * (0.003 + 0.028 * Math.pow(rng.next(), 3));
+    const l = Math.round(rng.next() < 0.5 ? 60 + 60 * rng.next() : 150 + 90 * rng.next());
+    const rot = rng.next() * Math.PI,
+      ecc = 0.55 + 0.45 * rng.next();
+    drawWrapped(size, size, x, y, r * 2.5, (ox, oy) => {
+      ctx.fillStyle = 'rgba(0,0,0,0.45)';
+      ctx.beginPath();
+      ctx.ellipse(x + ox + 0.25 * r, y + oy + 0.3 * r, r, r * ecc, rot, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = `rgb(${l},${l},${l})`;
+      ctx.beginPath();
+      ctx.ellipse(x + ox, y + oy, r, r * ecc, rot, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
   for (let i = 0; i < size * 6; i++) {
     const x = rng.next() * size,
       y = rng.next() * size,
@@ -912,9 +963,10 @@ export function groundMacroTexture(
     const col = mix(grassA, grassB, 0.5 + 0.5 * f2.data[i]);
     const d = Math.max(0, Math.min(1, (v - 0.35) * 4)); // dirt patches
     const cc = mix(col, dirt, d);
-    c[0] = cc[0] * (1 + 0.15 * v);
-    c[1] = cc[1] * (1 + 0.15 * v);
-    c[2] = cc[2] * (1 + 0.15 * v);
+    const k = 1 + 0.22 * v + 0.12 * f2.data[i];
+    c[0] = cc[0] * k;
+    c[1] = cc[1] * k;
+    c[2] = cc[2] * k;
   });
   paintPixels(mctx, size, size, (_x, _y, i, c) => {
     const d = Math.max(0, Math.min(1, (f1.data[i] - 0.35) * 4));
@@ -929,11 +981,6 @@ export function groundMacroTexture(
   paint(ctx, mctx);
   ctx.restore();
   mctx.restore();
-  // flowers / clover specks
-  for (let i = 0; i < size * 20; i++) {
-    ctx.fillStyle = rgbStr(rng.next() < 0.5 ? [235, 235, 210] : hsl(50 + 20 * rng.next(), 0.8, 0.6), 0.7);
-    ctx.fillRect(rng.next() * size, rng.next() * size, 1, 1);
-  }
   const rgb = ctx.getImageData(0, 0, size, size).data;
   const msk = mctx.getImageData(0, 0, size, size).data;
   const out = new Uint8Array(size * size * 4);
