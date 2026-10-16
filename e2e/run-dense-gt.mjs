@@ -4,7 +4,7 @@
  *
  *   node e2e/run-dense-gt.mjs [object|yard|all|<dataset> ...] [--max-size N] [--views N] [--stride N]
  *        [--first N] [--frames i,j,...] [--sources N] [--iterations N] [--geom-iterations N] [--no-geometric]
- *        [--multiscale] [--tsdf] [--debug-views N] [--sparse N] [--tag NAME] [--out DIR]
+ *        [--geom-passes N] [--preset fast|balanced|max] [--multiscale] [--tsdf] [--debug-views N] [--sparse N] [--tag NAME] [--out DIR]
  *        [--set key=json ...] [--no-render] [--no-metrics] [--verbose]
  *        [--save-maps] [--load-maps RUN] [--fusion-input geo|photo] [--no-consistency] [--oracle]
  *
@@ -54,7 +54,7 @@ export const CHROMIUM_ARGS = [
 ];
 
 const USAGE = `usage: node e2e/run-dense-gt.mjs [object|yard|all|<dataset> ...] [--max-size N] [--views N] [--stride N] [--first N]
-       [--frames i,j,...] [--sources N] [--iterations N] [--geom-iterations N] [--no-geometric] [--multiscale] [--tsdf]
+       [--frames i,j,...] [--sources N] [--iterations N] [--geom-iterations N] [--no-geometric] [--geom-passes N] [--preset fast|balanced|max] [--multiscale] [--tsdf]
        [--debug-views N] [--sparse N] [--tag NAME] [--out DIR] [--set key=json ...] [--no-render] [--no-metrics] [--verbose]
        [--save-maps] [--load-maps RUN] [--fusion-input geo|photo] [--no-consistency] [--oracle]`;
 
@@ -86,6 +86,11 @@ export function parseArgs(argv) {
     else if (a === '--iterations') setPath(o.cfg, 'pm.iterations', int(1));
     else if (a === '--geom-iterations') setPath(o.cfg, 'geo.geometricIterations', int(1));
     else if (a === '--no-geometric') o.cfg.geometric = false;
+    else if (a === '--geom-passes') o.cfg.geometricPasses = int(1);
+    else if (a === '--preset') {
+      o.cfg.preset = next();
+      if (!['fast', 'balanced', 'max'].includes(o.cfg.preset)) throw new Error('--preset must be fast | balanced | max');
+    }
     else if (a === '--multiscale') o.cfg.multiScale = true;
     else if (a === '--tsdf') o.cfg.tsdf = true;
     else if (a === '--debug-views') o.cfg.debugViews = int(0);
@@ -371,6 +376,11 @@ async function runScene(page, scene, opts, outDir) {
   console.log('\nper-stage timings (ms): ' + JSON.stringify(Object.fromEntries(Object.entries(summary.timings).map(([k, v]) => [k, Math.round(v)]))));
   console.log('\nper-view (eval vs surfel GT; exact = dataset depth map):\n' + viewTable(summary));
   if (summary.aggregate) console.log('\nper-view aggregates (pixel-weighted):\n' + aggTable(summary.aggregate));
+  if (summary.halo) {
+    const h = summary.halo;
+    const fr = (c) => `${h.rejected[c]}/${h.all[c]} (${pc(h.rejected[c] / Math.max(1, h.all[c]))})`;
+    console.log(`halo filter (fusion input): rejected / valid by GT class: no GT ${fr('noGt')}, >5% ${fr('bad')}, 1-5% ${fr('mid')}, <=1% ${fr('good')}`);
+  }
 
   const datasetDir = join(ROOT, 'e2e', 'data', scene);
   const ds0 = await loadDataset(datasetDir, { points: false });

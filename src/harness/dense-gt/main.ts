@@ -25,23 +25,29 @@
 import type { CameraIntrinsics, PointCloud, Pose, RGBAImage, TriangleMesh } from '../../core/types';
 import { getGPU } from '../../gpu/device';
 import {
+  DENSE_PRESETS,
   MemoryDepthMapStore,
   PatchMatchGPU,
+  filterPointCloud,
   fuseDepthMaps,
   neighboursFromSelection,
   selectSourceViews,
   tsdfMesh,
   undistortImage,
+  depthHaloMask,
+  removeDepthHalos,
   type DenseView,
   type DepthMap,
   type FusionOptions,
   type FusionStats,
+  type PointCloudFilterOptions,
   type PatchMatchGPUTimings,
   type PatchMatchOptions,
   type PatchMatchSelfTestResult,
   type TsdfOptions,
   type TsdfStats,
   type ViewSelectionOptions,
+  type DenseQuality,
 } from '../../dense';
 import { encodeMeshPLY, encodePLY } from '../../io/ply';
 import { Viewer } from '../../viewer';
@@ -62,6 +68,13 @@ import { costToRGBA, depthToRGBA, errorToRGBA, evalDepth, panelPNG, surfaceMask,
 export interface DenseGTConfig {
   /** Dataset directory name under e2e/data (e.g. 'object', 'yard'). */
   dataset: string;
+  /**
+   * Start from `DENSE_PRESETS[preset]` (sources, iterations, geometric passes, multi-scale, view
+   * selection, fusion incl. object/scene minViews, halo filter, SOR); explicit fields override it.
+   * The image size and the number of views stay the harness's (`maxSize`, `maxViews`):
+   * SwiftShader is too slow for the preset sizes.
+   */
+  preset?: DenseQuality;
   /** Base URL of the dataset (default `/e2e/data/<dataset>/`). */
   baseUrl?: string;
   /** Explicit frame indices (overrides first/stride/maxViews). */
@@ -90,9 +103,18 @@ export interface DenseGTConfig {
   fullResIterations?: number;
   /** Run the geometric-consistency pass (default true). */
   geometric?: boolean;
+  /** Number of geometric passes (default 1); pass k uses the maps of pass k − 1 as prior and sources. */
+  geometricPasses?: number;
   /** Overrides for the geometric pass. */
   geo?: Partial<PatchMatchOptions>;
   fusion?: Partial<FusionOptions>;
+  /**
+   * Apply `removeDepthHalos` (default options) to the fusion input maps before fusion, as the
+   * engine does (default false). Independent of `fusion.haloFilter`.
+   */
+  preHalo?: boolean;
+  /** `filterPointCloud` options applied to the fused cloud before scoring (default: none). */
+  filter?: PointCloudFilterOptions;
   /** TSDF mesh of the fusion-filtered maps (default false). */
   tsdf?: boolean | TsdfOptions;
   /** Per-view depth evaluation (default true). */
@@ -154,6 +176,14 @@ export interface ViewStats {
   eval?: { photo: ViewEval; geo?: ViewEval; fused: ViewEval; half?: ViewEval; consistent?: ViewEval };
   /** vs the dataset's exact depth map (frames with a depth file only). */
   exact?: { surfelVsExact: ViewEval; photo: ViewEval; geo?: ViewEval; fused: ViewEval };
+  /** Halo filter on the fusion input (when `fusion.haloFilter` or `preHalo` is set): pixel counts by GT error class. */
+  halo?: HaloCounts;
+}
+
+/** Valid pixels of a depth map by error class vs the surfel GT: noGt (sky), bad (> 5 %), mid (1–5 %), good (≤ 1 %). */
+export interface HaloCounts {
+  all: { noGt: number; bad: number; mid: number; good: number };
+  rejected: { noGt: number; bad: number; mid: number; good: number };
 }
 
 export interface DenseGTResult {
@@ -174,6 +204,8 @@ export interface DenseGTResult {
   /** Name of the GT set used for completeness ('focus' | 'base') and its subset visibility. */
   completenessSet: string;
   completenessVisibility: Uint8Array | null;
+  /** Sum of the per-view halo counts (when `fusion.haloFilter` or `preHalo` is set). */
+  halo: HaloCounts | null;
   /** Kept for debug panels / rendering. */
   _views: DenseView[];
   _debug: { frame: number; png: Blob }[];
@@ -324,7 +356,34 @@ function aggregate(views: ViewStats[], pick: (v: ViewStats) => DepthEval | undef
 
 // ------------------------------------------------------------------ main pipeline
 
-async function runDenseGT(config: DenseGTConfig): Promise<DenseGTResult> {
+/** Effective config: `DENSE_PRESETS[config.preset]` under the explicit fields. */
+function applyPreset(config: DenseGTConfig, isObject: boolean): DenseGTConfig {
+  if (!config.preset) return config;
+  const P = DENSE_PRESETS[config.preset];
+  if (!P) throw new Error(`unknown preset ${config.preset}`);
+  return {
+    ...config,
+    numSources: config.numSources ?? P.numSources,
+    pm: { ...P.patchMatch, iterations: P.iterations, ...(config.pm ?? {}) },
+    geo: { geometricIterations: P.geometricIterations, ...(config.geo ?? {}) },
+    geometric: config.geometric ?? P.geometricPasses > 0,
+    geometricPasses: config.geometricPasses ?? Math.max(1, P.geometricPasses),
+    multiScale: config.multiScale ?? P.multiScale,
+    fullResIterations: config.fullResIterations ?? P.fullResIterations,
+    selection: { ...P.viewSelection, ...(config.selection ?? {}) },
+    fusion: {
+      ...P.fusion,
+      minViews: isObject ? P.fusionMinViewsObject : P.fusionMinViewsScene,
+      maxNeighbours: P.fusionMaxNeighbours,
+      ...(config.fusion ?? {}),
+    },
+    preHalo: config.preHalo ?? P.haloFilter,
+    filter: config.filter ?? (P.sorK > 0 ? { statistical: { k: P.sorK, std: P.sorStd } } : undefined),
+  };
+}
+
+async function runDenseGT(configIn: DenseGTConfig): Promise<DenseGTResult> {
+  let config = configIn;
   const T: Record<string, number> = {};
   const tAll = performance.now();
   let tStage = tAll;
@@ -337,6 +396,7 @@ async function runDenseGT(config: DenseGTConfig): Promise<DenseGTResult> {
   const meta = (await (await fetchOk(join(base, 'meta.json'))).json()) as SynthMetaLite;
   const allFrames = (await (await fetchOk(join(base, 'frames.json'))).json()) as SynthFrameLite[];
   const isObject = meta.scene === 'object';
+  config = applyPreset(config, isObject);
   const maxViews = config.maxViews ?? (isObject ? 24 : 30);
   const first = config.first ?? 0;
   const stride = config.stride ?? Math.max(1, Math.floor((allFrames.length - first) / maxViews));
@@ -528,23 +588,44 @@ async function runDenseGT(config: DenseGTConfig): Promise<DenseGTResult> {
     await runPass('photo', views, pmOpts, null, photo, (k, p) => (vstats[k].photo = p));
   }
   if (!config.loadMaps && !config.oracle && config.geometric !== false) {
-    geoMaps = new Map();
     const gOpts: Partial<PatchMatchOptions> = { ...pmOpts, ...(config.geo ?? {}), geometric: true };
-    await runPass(
-      'geo',
-      views,
-      gOpts,
-      (k) => {
-        const s = sel.get(views[k].id)!;
-        return { prior: photo.get(views[k].id)!, sourceDepths: s.sources.map((id) => photo.get(id)!) };
-      },
-      geoMaps,
-      (k, p) => (vstats[k].geo = p),
-    );
+    // pass k reads the maps of pass k − 1 (prior + sources); the photometric maps for the first
+    const passes = Math.max(1, Math.floor(config.geometricPasses ?? 1));
+    let prev: Map<number, DepthMap> = photo;
+    for (let gp = 0; gp < passes; gp++) {
+      const cur = new Map<number, DepthMap>();
+      const src = prev;
+      await runPass(
+        'geo',
+        views,
+        gOpts,
+        (k) => {
+          const s = sel.get(views[k].id)!;
+          return { prior: src.get(views[k].id)!, sourceDepths: s.sources.map((id) => src.get(id)!) };
+        },
+        cur,
+        (k, p) => {
+          if (gp === 0) vstats[k].geo = p;
+          else {
+            vstats[k].geo!.ms += p.ms;
+            vstats[k].geo!.validPx = p.validPx;
+          }
+        },
+      );
+      prev = cur;
+    }
+    geoMaps = prev;
   }
   pm?.destroy();
   const store = new MemoryDepthMapStore();
-  const fusionSrc = config.fusionInput === 'photo' || !geoMaps ? photo : geoMaps;
+  const fusionRaw = config.fusionInput === 'photo' || !geoMaps ? photo : geoMaps;
+  let fusionSrc = fusionRaw;
+  if (config.preHalo) {
+    const m = new Map<number, DepthMap>();
+    for (const v of views) m.set(v.id, removeDepthHalos(fusionSrc.get(v.id)!, v.image, v.cam));
+    fusionSrc = m;
+    stage('preHalo');
+  }
   for (const [id, dm] of fusionSrc) await store.put(id, dm);
 
   // ---- fusion ------------------------------------------------------------------------
@@ -552,7 +633,7 @@ async function runDenseGT(config: DenseGTConfig): Promise<DenseGTResult> {
   const filtered = new MemoryDepthMapStore();
   const neighbours = neighboursFromSelection(sel);
   let lastP = 0;
-  const cloud = await fuseDepthMaps(
+  let cloud = await fuseDepthMaps(
     views,
     store,
     neighbours,
@@ -567,6 +648,12 @@ async function runDenseGT(config: DenseGTConfig): Promise<DenseGTResult> {
   );
   stage('fusion');
   log(`[dense-gt] fusion: ${cloud.count} points, ${JSON.stringify(fstats)}`);
+  if (config.filter) {
+    const n0 = cloud.count;
+    cloud = filterPointCloud(cloud, config.filter);
+    stage('filter');
+    log(`[dense-gt] filterPointCloud ${JSON.stringify(config.filter)}: ${n0} → ${cloud.count} points`);
+  }
 
   // ---- TSDF --------------------------------------------------------------------------
   let mesh: TriangleMesh | null = null;
@@ -604,6 +691,22 @@ async function runDenseGT(config: DenseGTConfig): Promise<DenseGTResult> {
       geo: gdm ? evalBoth(gdm, gt.depth, gt.normal, tau, mask) : undefined,
       fused: evalBoth(fdm ?? empty, gt.depth, gt.normal, tau, mask),
     };
+    const hopt = config.fusion?.haloFilter || (config.preHalo ? {} : null);
+    let haloMask: Uint32Array | null = null;
+    if (hopt) {
+      const src = fusionRaw.get(v.id)!;
+      haloMask = depthHaloMask(src, v.image, v.cam, hopt);
+      const hc: HaloCounts = { all: { noGt: 0, bad: 0, mid: 0, good: 0 }, rejected: { noGt: 0, bad: 0, mid: 0, good: 0 } };
+      for (let i = 0; i < src.depth.length; i++) {
+        const z = src.depth[i];
+        if (!(z > 0)) continue;
+        const zg = gt.depth[i];
+        const cls: keyof HaloCounts['all'] = !(zg > 0) ? 'noGt' : Math.abs(z - zg) > 0.05 * zg ? 'bad' : Math.abs(z - zg) > 0.01 * zg ? 'mid' : 'good';
+        hc.all[cls]++;
+        if (haloMask && (haloMask[i >>> 5] >>> (i & 31)) & 1) hc.rejected[cls]++;
+      }
+      vstats[k].halo = hc;
+    }
     if (config.consistencyCoverage !== false) {
       // this view as the only fusion reference: all its multi-view-consistent pixels
       const only = new Map<number, number[]>([[v.id, neighbours.get(v.id) ?? []]]);
@@ -648,6 +751,17 @@ async function runDenseGT(config: DenseGTConfig): Promise<DenseGTResult> {
         { img: gdm ? errorToRGBA(gdm.depth, ref, W, H) : depthToRGBA(empty.depth, W, H, 1, 2), label: 'geometric error' },
         { img: errorToRGBA((fdm ?? empty).depth, ref, W, H), label: 'fused pixels: error' },
       ];
+      if (haloMask) {
+        const src = fusionRaw.get(v.id)!;
+        const img = errorToRGBA(src.depth, ref, W, H);
+        for (let i = 0; i < W * H; i++) {
+          if (!((haloMask[i >>> 5] >>> (i & 31)) & 1)) continue;
+          img.data[4 * i] = 255;
+          img.data[4 * i + 1] = 0;
+          img.data[4 * i + 2] = 255;
+        }
+        tiles.push({ img, label: 'fusion input, magenta = halo-rejected' });
+      }
       debug.push({ frame: v.id, png: await panelPNG(tiles, 4) });
     }
   }
@@ -684,6 +798,12 @@ async function runDenseGT(config: DenseGTConfig): Promise<DenseGTResult> {
     agg.exactGeoSurface = aggregate(vstats, (v) => v.exact?.geo?.surface);
     agg.exactFusedAll = aggregate(vstats, (v) => v.exact?.fused.all);
   }
+  let haloSum: HaloCounts | null = null;
+  for (const v of vstats) {
+    if (!v.halo) continue;
+    haloSum ??= { all: { noGt: 0, bad: 0, mid: 0, good: 0 }, rejected: { noGt: 0, bad: 0, mid: 0, good: 0 } };
+    for (const g of ['all', 'rejected'] as const) for (const c of ['noGt', 'bad', 'mid', 'good'] as const) haloSum[g][c] += v.halo[g][c];
+  }
   T.total = performance.now() - tAll;
 
   const result: DenseGTResult = {
@@ -702,6 +822,7 @@ async function runDenseGT(config: DenseGTConfig): Promise<DenseGTResult> {
     mesh,
     completenessSet: compSet.name,
     completenessVisibility: compVis,
+    halo: haloSum,
     _views: views,
     _debug: debug,
     _maps: config.saveMaps ? { half, photo, geo: geoMaps } : null,

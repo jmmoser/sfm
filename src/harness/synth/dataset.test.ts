@@ -22,4 +22,26 @@ describe('loadSynthDataset', () => {
     expect(ds.intrinsics().f).toBe(500);
     await expect(loadSynthDataset('/missing', fetchFn)).rejects.toThrow(/meta.json/);
   });
+
+  it('an optional file answered with HTML (Vite index.html fallback, HTTP 200) counts as missing', async () => {
+    const files: Record<string, unknown> = {
+      '/d/meta.json': { name: 'x', intrinsics: { f: 500, cx: 1, cy: 2, k1: 0, k2: 0, width: 4, height: 3 } },
+      '/d/frames.json': [],
+      '/d/imu.json': [],
+      '/d/heading.json': [],
+    };
+    const fetchFn = async (u: string) => ({
+      ok: true,
+      status: 200,
+      json: async () => {
+        if (u in files) return files[u];
+        throw new SyntaxError("Unexpected token '<', \"<!doctype \"... is not valid JSON");
+      },
+      arrayBuffer: async () => new ArrayBuffer(0),
+    });
+    const ds = await loadSynthDataset('/d/', fetchFn);
+    expect(ds.geo).toBeNull();
+    delete files['/d/imu.json'];
+    await expect(loadSynthDataset('/d/', fetchFn)).rejects.toThrow(/JSON/);
+  });
 });

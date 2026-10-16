@@ -1,0 +1,23 @@
+{
+  "$doc": "Pass/fail limits of node e2e/run-e2e.mjs (initial values; tighten as the engine matures). Resolution per run: default <- <meta.scene> (object | yard) <- datasets[<dataset name>]. Check names and their meaning: e2e/lib/e2e-checks.mjs (CHECKS). {min, max} bound the value; 'claims' require the result's MetricInfo to claim a property when the sensors it needs were passed (metric / gravityAligned: IMU or GPS; northAligned: compass or GPS). Checks of properties that are not claimed (scale, gravity, heading) and dense checks without a dense run are skipped. registrationRate is registered / images the engine tried (stats.images, else live keyframes). Yard dense limits are lower than object: with EXACT poses the dense stage reaches ~0.23-0.34 completeness at tau = 0.1 m on that 120 m scene (e2e/README.md, dense-gt reference run).",
+  "default": {
+    "registrationRate": { "min": 0.9 },
+    "focalErrorPct": { "max": 2 },
+    "scaleError": { "max": 0.1 },
+    "gravityErrorDeg": { "max": 2 },
+    "headingErrorDeg": { "max": 10 },
+    "denseCompleteness": { "min": 0.5 },
+    "claims": { "metric": true, "gravityAligned": true }
+  },
+  "object": {
+    "ateRelative": { "max": 0.01 },
+    "denseAccuracyMedianRel": { "max": 0.01 }
+  },
+  "yard": {
+    "ateRelative": { "max": 0.02 },
+    "denseAccuracyMedian": { "max": 0.1 },
+    "denseCompleteness": { "min": 0.2 },
+    "claims": { "metric": true, "gravityAligned": true, "northAligned": true }
+  },
+  "datasets": {}
+}

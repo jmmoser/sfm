@@ -23,16 +23,21 @@
  */
 import type { CancelToken, PointCloud, ProgressCallback } from '../core/types';
 import { DepthMapCache, Yielder, growF32, growU8, relativeTransform, scaleCamera } from './dense-util';
+import { depthHaloMask, type HaloFilterOptions } from './depth-filter';
 import type { DenseView, DepthMap, DepthMapStore } from './types';
 
 export interface FusionOptions {
-  /** Minimum number of consistent views per point, reference included. Default 3. */
+  /**
+   * Minimum number of consistent views per point, reference included. Default 3 (kept for
+   * compatibility; the tuned presets use 2 — `DENSE_PRESETS`, ARCHITECTURE §6 "Dense tuning
+   * results").
+   */
   minViews: number;
   /** Maximum relative depth difference. Default 0.01. */
   maxDepthError: number;
   /** Maximum forward–backward reprojection error in the reference (pixels of the depth map). Default 2. */
   maxReprojErrorPx: number;
-  /** Maximum angle between normals (degrees). Default 10. */
+  /** Maximum angle between normals (degrees). Default 10 (the tuned presets use 15 together with the halo filter). */
   maxNormalErrorDeg: number;
   /** Pixels with a photometric cost above this are ignored. Default 2 (all valid pixels). */
   maxCost: number;
@@ -52,6 +57,13 @@ export interface FusionOptions {
   radiusScale: number;
   /** Stop after this many points. Default Infinity. */
   maxPoints: number;
+  /**
+   * Colour-guided halo removal at depth discontinuities (`depthHaloMask`, depth-filter.ts),
+   * applied to every depth map before fusion: rejected pixels are neither references nor
+   * supports, and are absent from `filteredStore`. null / false = off (default). Do not combine
+   * with maps already cleaned by `removeDepthHalos` (a second pass erodes edges further).
+   */
+  haloFilter: Partial<HaloFilterOptions> | null | false;
   /** If set, consistency-filtered depth maps (only fused pixels) are written here. */
   filteredStore?: DepthMapStore;
   /** Receives statistics when fusion finishes. */
@@ -70,6 +82,7 @@ export const DEFAULT_FUSION_OPTIONS: Readonly<Omit<FusionOptions, 'filteredStore
   usePlaneDepth: true,
   radiusScale: 0.7,
   maxPoints: Infinity,
+  haloFilter: null,
 });
 
 export interface FusionStats {
@@ -82,6 +95,10 @@ export interface FusionStats {
   cacheHits: number;
   cacheMisses: number;
   timeMs: number;
+  /** Pixels rejected by the halo filter (all views). */
+  haloRejected?: number;
+  /** Time spent in the halo filter (ms). */
+  haloMs?: number;
 }
 
 /** Neighbour parameters, flat: R (9), t (3), f, cx, cy, w, h — ref-camera frame → neighbour. */
@@ -411,11 +428,34 @@ export async function fuseDepthMaps(
   for (const v of views) maxNb = Math.max(maxNb, Math.min(maxNbOpt, (neighbours.get(v.id) ?? []).length));
   const cache = new DepthMapCache(store, o.cacheSize > 0 ? o.cacheSize : maxNb + 2);
   const masks = new Map<number, Uint32Array>();
+  // halo-rejected pixels are pre-set in the fused masks (never used) and removed again
+  // when the filtered maps are written
+  const rejects = new Map<number, Uint32Array>();
+  const haloOpts = o.haloFilter ? o.haloFilter : null;
+  let haloRejected = 0;
+  let haloMs = 0;
   const maskFor = (vi: number, dm: DepthMap): Uint32Array => {
     let m = masks.get(vi);
     if (!m || m.length * 32 < dm.width * dm.height) {
       m = new Uint32Array((dm.width * dm.height + 31) >>> 5);
       masks.set(vi, m);
+      if (haloOpts) {
+        const th = performance.now();
+        const v = views[vi];
+        const rej = depthHaloMask(dm, v.image, v.cam, haloOpts);
+        if (rej) {
+          for (let w = 0; w < m.length; w++) {
+            m[w] |= rej[w];
+            let b = rej[w];
+            while (b) {
+              b &= b - 1;
+              haloRejected++;
+            }
+          }
+          rejects.set(vi, rej);
+        } else rejects.delete(vi);
+        haloMs += performance.now() - th;
+      }
     }
     return m;
   };
@@ -519,8 +559,10 @@ export async function fuseDepthMaps(
       const depth = new Float32Array(n);
       const normal = new Float32Array(3 * n);
       const cost = new Float32Array(n).fill(2);
+      const rej = rejects.get(vi);
       for (let i = 0; i < n; i++) {
         if (!((mask[i >>> 5] >>> (i & 31)) & 1)) continue;
+        if (rej && (rej[i >>> 5] >>> (i & 31)) & 1) continue;
         depth[i] = dm.depth[i];
         normal[3 * i] = dm.normal[3 * i];
         normal[3 * i + 1] = dm.normal[3 * i + 1];
@@ -540,6 +582,7 @@ export async function fuseDepthMaps(
     cacheHits: cache.hits,
     cacheMisses: cache.misses,
     timeMs: performance.now() - t0,
+    ...(haloOpts ? { haloRejected, haloMs } : {}),
   });
   return {
     count,

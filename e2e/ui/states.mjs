@@ -2,7 +2,8 @@
 /**
  * UI edge states at iPhone size, each in a fresh context (isolated storage), with screenshots in
  * e2e/out/ui/state-*.png:
- *   engine-missing   real EngineClient + placeholder worker → clear "engine unavailable" card
+ *   engine-missing   real EngineClient + a stub worker that answers NotImplementedError (a build
+ *                    without the engine) → clear "engine unavailable" card
  *   install-hint     iOS Safari UA, not standalone → "Install to Home Screen" card
  *   cpu-mode         no WebGPU → "CPU mode — slower" banner
  *   lockdown         no WebGPU, camera, IndexedDB → Lockdown Mode explanation, New scan disabled
@@ -59,6 +60,14 @@ async function scenario(name, fn) {
 
 await scenario('engine-missing', async () => {
   const { page, context } = await newPage();
+  // The real engine worker exists now: serve a stub module in its place that answers every
+  // request like the old placeholder did (NotImplementedError).
+  await context.route(/engine\.worker\.ts/, (route) =>
+    route.fulfill({
+      contentType: 'text/javascript',
+      body: `self.onmessage = (ev) => { const r = ev.data; if (r && typeof r.id === 'number') self.postMessage({ id: r.id, ok: false, error: { name: 'NotImplementedError', message: 'engine not implemented yet' } }); };`,
+    }),
+  );
   await startCapture(page, base);
   await page.waitForSelector('[data-testid="capture-error"]', { timeout: 60000 });
   const text = await page.locator('[data-testid="capture-error"]').textContent();
@@ -68,7 +77,7 @@ await scenario('engine-missing', async () => {
   await by(page, 'new-scan').waitFor();
   check(true, 'back to home from the error card');
   await context.close();
-  // The placeholder worker answers with an error: expected console noise is none.
+  // The stub worker answers with an error: expected console noise is none.
 });
 
 await scenario('install-hint', async () => {

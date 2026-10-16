@@ -1933,3 +1933,286 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   targets, no clipped text) with screenshots `e2e/out/ui/layout-*.png`.
 * **Still unverified on a device**: Safari's `inert`/focus behaviour with VoiceOver; whether a
   `devicemotion`/camera prompt makes the page `hidden` (it should not); share of 100+ MB files.
+
+### `src/engine` + `src/workers/engine.worker.ts` (PhotogrammetryEngine, worker)
+
+* **Files**: `engine.ts` (PhotogrammetryEngine), `live.ts` (LiveSession: frame analysis, keyframes, mapping
+  queue, hand-eye check, 'auto' mode; CaptureState, ImuLog), `frame-ingest.ts` (orientation, frame
+  preparation, colours, overlay, gravity), `refine.ts`, `dense.ts` (densify, mesh, PatchMatchHolder),
+  `export.ts`, `persistence.ts` (EngineStore: Memory / SessionStore-backed; record formats), `image-cache.ts`
+  (byte-bounded LRU, JPEG decode), `depth-store.ts`, `presets.ts`, `cpu-pipeline.ts`, `types.ts`, `index.ts`;
+  `testutil.ts` is TEST-ONLY (synthetic orbit captures with exact IMU, not exported).
+* **API (ENGINE.md §2, superset)**: `new PhotogrammetryEngine(options, config?)`; `init`, `processFrame`,
+  `finishCapture(progress?, cancel?)`, `refine`, `densify`, `mesh`, `exportModel`, `loadSession(id, options?)`
+  (works without `init`), `setHidden`, `flush()` (wait for background mapping + writes), `on('live' | 'log' |
+  'error', cb)`, `recoverGPU()`, `releaseResultMemory()`, `releasePipeline()`, accessors `liveSession`,
+  `sparseModel`, `sparseResult`, `denseCloudResult`, `meshResult`, `engineStore`. `EngineConfig` (tuning:
+  injected store / pipeline, SIFT overrides, `mapping: 'background' | 'inline'`, keyframe / live / mapper /
+  dense overrides, pair budgets, memory budget) is the 2nd constructor argument, and the worker accepts it as
+  the `engineConfig` extension field of `init` / `loadSession` options.
+* **SparseCamera extension**: refine / loadSession cameras carry `t` (capture ms) and `frameIndex`
+  (FrameInput.index of the source frame, else the engine's 0-based frame counter) — type `SparseCameraEx`
+  (`SparseCamera & { t?, frameIndex? }`, protocol.ts unchanged; structured clones keep the fields).
+* **No static import of the WebGPU feature modules**: `sift-gpu.ts` / `match-gpu.ts` read `GPUBufferUsage` at
+  module load, which throws where WebGPU does not exist (older iOS, Lockdown, Node) and would kill the whole
+  worker module. `features/extractor` is imported dynamically only when `navigator.gpu` exists; otherwise
+  `cpu-pipeline.ts` (extractSiftCPU + matchCPU) is used.
+* **Orientation**: canonical θ₀ = first accepted frame's θ; frames at another θ are rotated (k clockwise
+  quarter turns) before analysis; frames < 500 ms after a θ change are dropped; a landscape bitmap in a
+  portrait UI is a RAW sensor buffer (upright for θ = 90), a portrait bitmap in a landscape UI is dropped.
+  **Hand-eye check**: once ≥ 6 keyframes are registered (and again with the refined poses before the world
+  alignment), the visual relative rotations of consecutive keyframes are compared with R_cd(θ)·ΔR_gyro·R_cdᵀ for
+  θ ∈ {0, 90, 180, 270}; a clearly better hypothesis (median < 4° and < ½ of the runner-up) replaces
+  R_cam_device of every keyframe (FrameInfo.R_cam_device / gravityCam) and is logged. LiveUpdate.overlay is in
+  the coordinates of the frame AS SUBMITTED (inverse canonical turn).
+* **Live**: per frame ≤ 640 px RGBA copy (sharpness, colours), blur / motion pre-gate (no features for
+  rejected frames), SIFT at the preset working size (`extractFromBitmap` with the bitmap or the rotated
+  OffscreenCanvas on the GPU, a working-size gray image on the CPU), H-guided matching to the last keyframe
+  (H = K R_c K⁻¹ from the gyro, radius 8 % of the long side, unguided fallback below 30 inliers), two-view
+  verification (≤ 400 RANSAC iterations), rotation-compensated parallax, KeyframeSelector. Keyframes go to a
+  serial **mapping queue** ('background': the frame response returns first, the model update arrives as a
+  `live` event; 'inline' for deterministic harness / tests): previous 6 keyframes (4 on the CPU tier) +
+  vocabulary retrieval (trained with 256 words after 25 keyframes, then incremental) + spatial neighbours of
+  the last registered keyframe (look-at distance, ≤ 45°), each matched (unguided) and verified (≤ 2000 / 1000
+  RANSAC iterations; the tracking geometry of the reference pair is reused), DB + graph update,
+  `LiveMapper.addKeyframe`. Everything that a respawned worker needs is persisted per keyframe (JPEG q 0.92,
+  features, colours, pairs, IMU chunk, GPS, state).
+* **Refine**: vocabulary retrained (512 words) when it covered < 50 % of the keyframes; pairs sequential 10 +
+  retrieval 15 + spatial 10 (75°) minus every pair already tried; live model: pending keyframes retried, full
+  global refinement; offline `runIncrementalSfM` (live-refined intrinsics as the initial guess); the better
+  model (registered images, then mean reprojection error) is CLONED (the live model keeps its frame) and
+  aligned with `computeWorldAlignment` (camera–IMU offset searched around the last estimate, GPS fixes, compass
+  'auto' reference). **Deviation**: when the IMU scale is rejected only for low excitation but the fit is
+  excellent (R² ≥ 0.9, σ ≤ 3 %, excitation ≥ 0.03 m/s²) it is accepted with σ = max(2σ, 2 %) and a warning
+  (e2e `object` orbit with GT poses: 0.3 % scale error at 0.06 m/s², rejected by the 0.08 floor).
+* **Dense**: preset table of ENGINE.md (+ `DENSE_PRESETS` of src/dense when exported, read defensively by
+  field name; `removeDepthHalos` applied to the final maps when exported) → evenly spread view subset →
+  JPEG decode at the dense size + `undistortImage` through an LRU (15 % of the memory budget) → selectSourceViews
+  → PatchMatchGPU (self-tested once; CPU at ≤ 320–480 px otherwise; device loss ⇒ recreate once, else
+  'gpu-lost') photometric + geometric passes → fusion (min views 3 object / 2 scene, colour thumbnails within
+  8 % of the budget) → SOR. Depth maps live in IndexedDB + LRU: the session store when persisting, otherwise a
+  scratch session in the separate database `sfm-scratch` (deleted on dispose, stale ones purged after 1 h).
+  Mesh: TSDF on the fusion-filtered maps (object mode: maxDepth = 2 × median sparse depth; block budget ≤ 25 %
+  of the memory budget) + optional simplification; after a reload the filtered maps come from IndexedDB.
+* **Worker**: one engine per `init` (the feature pipeline is reused across inits with the same SIFT config);
+  progress throttled to 10 Hz per request; cancel tokens per request; frame / live results transferred;
+  results the engine keeps are cloned, persisted dense clouds / meshes are transferred and dropped from the
+  engine (reloaded for export); GPU device loss ⇒ `recoverGPU()`, fatal `gpu-lost` when no adapter is left.
+* **Measured** (CPU features in Chromium, inline engine, every frame): e2e `yard` (240 frames) → 80 keyframes,
+  80/80 registered, ATE 1.25 cm (3.2e-4 of the extent), scale error −0.08 % (IMU + GPS), gravity 0.017°,
+  heading −2.6° (GPS 4-DOF), focal 0.05 %, time offset −24.7 ms (true −25); e2e `object` (200 frames) → 90/90,
+  ATE 0.27 mm, scale error +0.4 % (IMU, low-excitation acceptance, σ 2 %), gravity 0.015°, heading −0.54°
+  (compass), focal −0.003 %, time offset −25.0 ms. Node unit tests (240×320 synthetic
+  orbit): scale < 3 %, ATE < 5 mm, gravity < 1°.
+* **Limits / TODO**: no relocalisation into a second live model when tracking is lost for good (offline SfM
+  handles disconnected captures); the 'auto' mode decision (optical-axis convergence) is heuristic; principal
+  point is not refined (1.8 px on the synthetic data); depth maps of non-persistent sessions without
+  IndexedDB stay in memory; on-device (A-series) timings not measured yet.
+
+### `src/engine` + harness — e2e integration notes (amends the `src/engine` notes above)
+
+* **Runs** (`node e2e/run-e2e.mjs <object|yard> --engine worker`, every frame, all sensors, fast preset,
+  `--dense-size 480` for SwiftShader; the real worker through `EngineClient`): every check of
+  `e2e/thresholds.json` passes on both datasets — numbers in `e2e/README.md` ("Engine end-to-end
+  results"). `--engine inline` gives the same accuracy (parity). Feature extraction ran on the CPU
+  (`engineConfig.featureBackend: 'cpu'`, below) for the full runs; the GPU SIFT / matcher path through the
+  worker (object, every 2nd frame) gives the same accuracy class (ATE 2.0e-4, rotation 0.039°, scale
+  +0.86 %), at 25 s per frame on SwiftShader.
+* **`EngineConfig.featureBackend: 'auto' | 'cpu'`** (new): CPU SIFT / matching although WebGPU exists,
+  PatchMatch stays on the GPU. GPU and CPU SIFT produce the same features (features GPU notes); on
+  SwiftShader GPU SIFT costs ≈ 4–8 s per 720×960 frame and GPU matching ≈ 2 s per pair (CPU: ≈ 0.3–0.5 s /
+  ≈ 0.05 s), so full captures are only practical with the CPU backend there. Part of `pipelineKey`.
+* **Back-pressure of background mapping** (`EngineConfig.maxMappingBacklog`, default 2): a keyframe frame's
+  response waits until ≤ 2 keyframes are queued / being mapped. Before, the mapping queue grew without
+  bound whenever mapping was slower than the keyframe rate (one JS thread shared with frame analysis):
+  at the end of the e2e captures only 31/90 (object) and 36/80 (yard) keyframes were mapped live — the
+  user saw a stale model / guidance — and `finishCapture` needed 20–28 s to drain. Now 90/90 and 80/80
+  live, `finishCapture` < 1 s; the frame rate drops instead (the FramePump just delivers fewer frames).
+* **Principal point refined in the final BA of refine** (`EngineConfig.refinePrincipalPoint`, default: when
+  ≥ 20 images are registered): one global BA with (f, cx, cy, k1, k2) free on a clone of the chosen model;
+  kept only if the principal point stays within 10 % of the image size of the centre and the mean
+  reprojection error does not grow. A fixed, offset principal point is absorbed by a constant rotation of
+  every camera: on the e2e datasets (true offset 1.8 px) the mean rotation error drops 0.135° → 0.054°
+  (object) and 0.149° → 0.059° (yard), the principal point error 1.80 → 0.3–0.5 px, yard ATE 1.26 → 0.88 cm.
+  `stats.principalPoint` says what happened. Mapping (live / offline) still keeps it fixed (COLMAP).
+* **`DENSE_PRESETS` option blocks are passed through**: besides the flat numbers, the `patchMatch` (every
+  PatchMatch pass), `viewSelection` (over the capture mode's depth margins) and `fusion` blocks of
+  `src/dense/presets.ts` now reach the dense module (they were ignored: e.g. the tuned
+  `viewSelection.depthMarginMin` 0.5 and `fusion.maxNormalErrorDeg` 15), and `haloFilter: false` in the
+  preset disables the engine's halo pass. Fusion never gets its own halo filter when the engine already
+  applied `removeDepthHalos` to the depth maps (the preset's "not both" rule).
+* **Harness fixes** (`src/harness/engine`): the compass feed emulates `CompassSensor` (device-top azimuth
+  while the top is within 45° of horizontal, else the optical axis — the `compassReference: 'auto'` the
+  world alignment assumes; the dataset's optical-axis `heading` read as a device-top heading is 90° off in
+  the landscape yard — with `--no-gps` the yard heading error is now −0.15°); the live summary is refreshed
+  after `finishCapture` (it was taken before the mapping queue drained). `loadSynthDataset` treats an
+  optional file answered with Vite's index.html as missing (object has no geo.json). `e2e/ui/states.mjs`
+  `engine-missing` serves a stub worker now that the real worker exists.
+* **Remaining** (by impact): yard dense completeness 0.38 at τ = 0.1 m (grazing ground, far houses at
+  480 px; GT-pose reference 0.23–0.34); yard heading −2.7° = GPS 4-DOF yaw (the compass is not fused when
+  GPS decides the yaw — and must not be until the app applies the magnetic declination:
+  `CompassSensor.setDeclination` is never called, so compass headings on a device are MAGNETIC, e.g. ≈ +15°
+  off in Seattle); dense timings on SwiftShader (≈ 25–45 s per 480 px view) say nothing about Apple GPUs.
+
+### `src/dense` — Dense tuning results (GT-pose harness, 2026-10)
+
+* **Setup**: `e2e/run-dense-gt.mjs` with exact poses, so every error is MVS or fusion. Reference
+  ("full") runs: 480 px; object 24 views (360×480), yard 30 views (480×360), stride 8; 8 sources;
+  6 photometric + 3 geometric iterations. τ = `denseTau` (object 13.6 mm, yard 0.1 m); P / C / F =
+  precision / completeness / F-score at τ, identity alignment. Fusion experiments re-fuse the
+  saved reference maps (`--load-maps`, seconds each). PatchMatch experiments run on "mini"
+  subsets at 480 px (yard frames 0–112 = 15 views, object frames 0–88 = 12 views). Each is
+  re-fused with the reference and with the tuned fusion, and compared on Csub, the completeness
+  of the GT samples visible in the used views. SwiftShader was shared with other jobs (load 5–12),
+  so timings are relative only. One change at a time; a change was kept only when it helped object
+  AND yard without costing the other metric materially.
+* **API additions (backward compatible)**:
+  * `depth-filter.ts`: `depthHaloMask(dm, image, cam, opts?)` returns a 1-bit mask;
+    `removeDepthHalos(dm, image, cam, opts?)` returns a cleaned copy; `DEFAULT_HALO_FILTER_OPTIONS`.
+  * `FusionOptions.haloFilter`: the same filter inside fusion (default off). `FusionStats` gains
+    `haloRejected` / `haloMs`.
+  * `presets.ts`: `DENSE_PRESETS`, `DensePreset`, `DenseQuality`.
+  * Harness: `--preset`, `--geom-passes`, `preHalo`, `filter`, and halo-rejection statistics per
+    GT error class.
+* **Fusion experiments** (full maps; P / C / F):
+
+  | # | Setting | object | yard |
+  |---|---|---|---|
+  | 0 | reference: `minViews` 3, normal 10° | .9991 / .9601 / .9792 | .9885 / .2307 / .3741 |
+  | 1 | `minViews` 2 | .9982 / .9875 / .9928 | .9777 / .3376 / .5019 |
+  | 2 | 1 + normal 20° · 30° · off | .9978 / .9889 / .9934 · .9976 / .9898 / .9937 · .9965 / .9924 / .9944 | .9641 / .3599 / .5242 · .9541 / .3691 / .5323 · .9122 / .3846 / .5411 |
+  | 3 | 1 + low-angle rule (largest triangulation angle < 3° · 5° ⇒ 3 views) | .9982 / .9875 / .9928 · .9983 / .9875 / .9929 | .9846 / .3169 / .4795 · .9879 / .2964 / .4560 |
+  | 4 | 1 + halo filter, colour-mean rule, r 4 (dropped) | .9986 / .9867 / .9926 | .9802 / .3349 / .4993 |
+  | 5 | 1 + halo filter, vote rule, r 4 · r 8 step 2 | .9985 / .9865 / .9925 · .9996 / .9872 / .9933 | .9809 / .3355 / .5000 · .9828 / .3343 / .4989 |
+  | 6 | 5 (r 8) + normal 12° · **15°** · 20° | .9997 / .9877 / .9936 · .9995 / .9882 / .9939 · .9995 / .9885 / .9939 | .9814 / .3402 / .5053 · .9780 / .3476 / .5129 · .9743 / .3556 / .5211 |
+  | 7 | 1 + normal 15°, no halo filter | .9980 / .9886 / .9933 | .9705 / .3515 / .5160 |
+  | 8 | **6 (15°) with halo step 4** (3× cheaper, same result) = tuned fusion | .9996 / .9883 / .9939 | .9788 / .3473 / .5127 |
+  | 9 | 8 + `maxDepthError` 0.02 | .9996 / .9887 / .9941 | .9771 / .3520 / .5175 |
+  | 10 | 8 + `maxNeighbours` 6 · 8 (reference 10) | .9997 / .9870 / .9933 · .9997 / .9880 / .9938 | .9794 / .3473 / .5127 · .9788 / .3475 / .5129 |
+  | 11 | 8 + SOR k 8, σ 1.5 · 2.5 · 4 | .9998 / .9844 / .9920 · .9998 / .9865 / .9931 · .9997 / .9877 / .9937 | .9838 / .3282 / .4922 · .9816 / .3386 / .5035 · .9801 / .3438 / .5090 |
+  | 12 | 8, halo filter applied twice (map + fusion) | .9998 / .9880 / .9939 | .9819 / .3440 / .5095 |
+  | 13 | 8 on photometric maps (no geometric pass) | .9997 / .9880 / .9938 | .9821 / .3351 / .4997 |
+  | 14 | 8 on yard maps computed with `depthMarginMin` 0.5 | — | .9809 / .3522 / .5183 |
+
+  TSDF mesh of the fusion-filtered maps, P / C / F: object .990 / .938 / .963 → .999 / .974 / .987
+  (tuned); yard .898 / .216 / .348 → .844 / .340 / .484. Building the TSDF input with `minViews` 3
+  (cloud with 2) is worse on both: object .9998 / .943 / .970, yard .883 / .245 / .384.
+* **PatchMatch experiments** (mini subsets; Csub / P with the reference fusion → with the tuned
+  fusion; "≤1 % / >5 %" = geometric-pass pixels within 1 % / off by more than 5 % of the surfel
+  GT; PM s = PatchMatch seconds, contended):
+
+  | run | yard Csub / P: ref fusion → tuned | yard ≤1 % / >5 % | object Csub / P: ref fusion → tuned | object ≤1 % / >5 % | PM s yard / object |
+  |---|---|---|---|---|---|
+  | reference settings (8 sources, 6 + 3 iterations, margin 0.8) | 0.3083 / 0.9905 → 0.5234 / 0.9797 | 84.2 / 9.8 | 0.8296 / 0.9999 → 0.9166 / 0.9997 | 84.4 / 8.7 | 726 / 969 |
+  | `depthMarginMin` 0.5 (base of the rows below) | 0.3076 / 0.9906 → 0.5277 / 0.9810 | 87.7 / 6.5 | 0.8235 / 1.0000 → 0.9167 / 0.9998 | 84.0 / 9.3 | 914 / 1214 |
+  | multi-scale (½-res 6 it → full-res 2 it prior → geometric) | 0.3102 / 0.9899 → 0.5286 / 0.9795 | 88.2 / 6.2 | 0.8209 / 0.9999 → 0.9151 / 0.9996 | 84.8 / 8.4 | 823 / 643 |
+  | 5 sources | 0.3041 / 0.9903 → 0.5253 / 0.9810 | 87.6 / 6.5 | 0.8176 / 1.0000 → 0.9085 / 0.9995 | 83.0 / 9.9 | 686 / 702 |
+  | 4 photometric iterations | 0.3065 / 0.9909 → 0.5242 / 0.9811 | 87.8 / 6.4 | 0.8223 / 1.0000 → 0.9151 / 0.9998 | 83.9 / 9.5 | 767 / 754 |
+  | 2 geometric iterations | 0.3087 / 0.9906 → 0.5287 / 0.9809 | 87.8 / 6.4 | 0.8223 / 1.0000 → 0.9155 / 0.9998 | 84.1 / 9.3 | 970 / 1178 |
+  | 2 geometric passes | 0.3139 / 0.9897 → 0.5299 / 0.9796 | 88.0 / 6.5 | 0.8323 / 1.0000 → 0.9157 / 0.9997 | 84.7 / 9.2 | 1066 / 1160 |
+
+* **Kept**:
+  1. `minViews` 2 for object and scene mode: the largest gain. Keyframe-spaced views rarely give
+     3 agreeing maps; with GT depth fed into fusion, C goes 0.316 → 0.461 on yard and
+     0.983 → 0.998 on object.
+  2. The colour-guided halo filter (`depthHaloMask` / `removeDepthHalos`, `depth-filter.ts`) on
+     the final maps. It rejects 66–68 % of the > 5 % outliers and 81 % of the sky estimates, for
+     0.9–1.2 % of the ≤ 1 % pixels. With `minViews` 2 and 10°, yard points farther than τ fall
+     from 21.4 k to 16.3 k, and 0–10 m precision is 99.8–100 %. Object points farther than τ fall
+     from 388 to 192 in the final run, which removes most of the visible beige silhouette halos. Cost ≈ 45 ms
+     per 480 px map.
+  3. Normal threshold 15° with the halo filter. PatchMatch normals of far and grazing surfaces
+     are noisy, and 15° buys back the completeness the filter costs (row 8 vs row 1: object
+     +0.14 P / +0.08 C, yard +0.11 P / +0.97 C).
+  4. `depthMarginMin` 0.5 in view selection. The 1st-percentile sparse depth misses the near
+     ground in 25 of 30 yard views: the GT sparse samples are area-uniform, and real SfM tracks
+     are short there. With the wider bound, the yard maps lose a third of their > 5 % outliers
+     (11.5 → 7.7 %) and 0–5 m completeness rises from 56 to 68 %. On object it is neutral with the
+     tuned fusion (Csub 0.9166 → 0.9167), but −0.6 pt with the reference fusion.
+  5. Cheaper PatchMatch for `fast`, measured with the tuned fusion (object / yard Csub):
+     * 4 photometric iterations: −0.16 / −0.35 pt;
+     * 5 sources: −0.8 / −0.24 pt, and −25–38 % PatchMatch time;
+     * 2 geometric iterations: −0.12 / +0.10 pt.
+* **Not kept**:
+  * low-angle rule: trades far-field completeness for precision at about 3:1;
+  * SOR: it removes sparse but correct far points (yard −0.9 pt C for +0.3 pt P at σ 2.5), so the
+    presets set `sorK` 0;
+  * `maxDepthError` 0.02: yard +0.5 C / −0.2 P, object ±0, too small to decide on;
+  * applying the halo filter twice: it erodes edges (yard −0.3 pt C);
+  * multi-scale: quality-neutral (yard Csub +0.1 / P −0.15, object −0.16 / −0.02), but 25–45 %
+    cheaper in the photometric stage. The engine has no multi-scale driver, so `multiScale: false`;
+  * a second geometric pass: +0.6 / +0.9 pt Csub with the reference fusion, but within ±0.2 pt
+    with the tuned one (yard +0.2 / P −0.14, object −0.1), for +33 % PatchMatch time. `max`
+    therefore keeps one pass.
+
+  The function defaults (`DEFAULT_FUSION_OPTIONS`, `DEFAULT_VIEW_SELECTION_OPTIONS`,
+  `DEFAULT_PATCHMATCH_OPTIONS`) are unchanged, because existing tests pin them (`minViews` 2 or
+  15° breaks `fusion.test` / `dense-e2e.test`). The tuned values live in `DENSE_PRESETS`.
+* **Final vs reference** (full views, 480 px, `--preset balanced`):
+
+  | | object P / C / F, acc med / p90, mesh F | yard P / C / F, acc med / p90, mesh F |
+  |---|---|---|
+  | reference | 0.9991 / 0.960 / 0.979, 0.11 / 0.59 mm, 0.963 | 0.9885 / 0.231 / 0.374, 3.4 / 31 mm, 0.348 |
+  | tuned | 0.9997 / 0.987 / 0.994, 0.13 / 0.63 mm, 0.987 | 0.9809 / 0.352 / 0.518, 2.9 / 33 mm, 0.492 |
+
+  Yard by distance to the nearest camera, C (P): 0–5 m 31 → 68 % (100 → 100 %), 5–10 m
+  52 → 76 % (99.9 → 99.8 %), 10–20 m 42 → 61 % (99.4 → 97.9 %), 20–40 m 24 → 36 % (94 → 88 %),
+  > 40 m 3.6 → 6.2 % (65 → 53 %).
+
+  The precision cost of `minViews` 2 is far-field depth noise at 480 px: the wrong far points are
+  1.6–1.8 τ off (median), not gross errors. A sky-coloured fringe also remains on roof and tree
+  outlines (28 % of the remaining > τ points); a third of the sky-coloured points are within τ.
+
+  The object's accuracy median and p90 rise slightly (0.11 → 0.13 mm and 0.59 → 0.63 mm) because
+  2-view points are noisier. Precision at τ rises, and the focus box stays at 99.96 %.
+* **`DENSE_PRESETS`** (`src/dense/presets.ts`, exported from `src/dense`;
+  `src/engine/presets.ts` reads the flat fields). Shared by all presets: halo filter on,
+  `minViews` 2 for object and scene, normal 15°, `depthMarginMin` 0.5, SOR off, no multi-scale.
+
+  | preset | dense max side | max views | sources | photometric it | geometric passes × it | fusion neighbours | work per view (MP·src·it) | SwiftShader est. per view | iPhone est. (30–100×) |
+  |---|---|---|---|---|---|---|---|---|---|
+  | `fast` | 800 | 40 | 5 | 4 | 1 × 2 | 6 | 14 | ≈ 45 s | 0.5–1.5 s per view, ≤ 1 min for 40 views |
+  | `balanced` | 1280 | 80 | 8 | 6 | 1 × 3 | 8 | 89 | ≈ 4.7 min | 3–9 s per view, 4–13 min for 80 views |
+  | `max` | 1600 | 150 | 8 | 6 | 1 × 3 | 8 | 138 | ≈ 7.4 min | 4.5–15 s per view, 11–37 min for 150 views |
+
+  Image sizes and view counts are the engine's earlier values. They are kept because resolution
+  and views are the levers for far content (GT-depth bounds above). On SwiftShader they could
+  only be checked at 480 px.
+
+  The engine reads the flat fields: `maxImageSize`, `maxViews`, `numSources`, `iterations`,
+  `geometricPasses`, `geometricIterations`, `cpuMaxImageSize`, `fusionMinViews*`,
+  `fusionMaxNeighbours` and `sorK` / `sorStd`. It also applies `removeDepthHalos`. It does NOT
+  yet pass `fusion.maxNormalErrorDeg` (15°) to `fuseDepthMaps`, nor `viewSelection.depthMarginMin`
+  (0.5) to `selectSourceViews` (its `modeConfig` uses 0.8 / 0.7). To get the measured result it
+  should spread `DENSE_PRESETS[q].fusion` and `.viewSelection` into those calls.
+
+  Cost model: PatchMatch time ∝ MP × sources × (photometric + geometric iterations), where one
+  geometric iteration costs about the same as a photometric one. On SwiftShader (4 cores,
+  uncontended) this is ≈ 3.2 s per MP·source·iteration. An iPhone GPU is assumed to be
+  30–100× faster; that is not measured. Fusion plus the halo filter take ≈ 0.6 µs per pixel per
+  view on one x86 core. Memory: fusion keeps (`fusionMaxNeighbours` + 2) × 20 B/px resident,
+  which is ≈ 370 MB at 1600 px with 8 neighbours. That is why `max` uses 8 neighbours, not 10:
+  row 10 shows no quality loss.
+* **Far vs near range**: nothing in the pipeline assumes a depth scale:
+  * depth ranges are per view, with inverse-depth sampling;
+  * the fusion tests are relative (1 % depth, 2 px, 15°);
+  * the halo filter works in pixels and relative depth;
+  * the TSDF voxel is automatic.
+
+  The yard houses at 20–50 m are resolution-limited at 480 px: the pixel footprint is ≈ τ at
+  40 m, and GT depth fed into fusion reaches only 14 % completeness beyond 40 m at 480 px and 21 %
+  at 960 px. That is why the presets keep 800–1600 px. The near ground (2–5 m) needed the wider
+  near bound.
+* **Remaining issues**:
+  * Far-field precision with 2-view points depends on resolution and view count. More keyframes
+    in large scenes help most: with GT depth, 60 instead of 30 yard views raises C from 0.461 to
+    0.570.
+  * Sky halos wider than the 8 px window survive, because plane propagation extends roofs and
+    trees into the sky consistently across views. A PatchMatch-side fix is still needed, such as a
+    centre-segment texture test.
+  * Low-texture walls in the object room stay sparse.
+  * The engine has no multi-scale driver.
+  * The yard TSDF mesh loses precision to the noisier far points.
+  * Not tested: topK, the ACMH thresholds, the perturbation schedule, sigmaColor, window size,
+    and relaxing source selection at trajectory turns (yard frame 184 keeps 3 sources).
+  * Timings on Apple GPUs are still unmeasured.

@@ -95,7 +95,14 @@ export async function loadSynthDataset(baseUrl: string, fetchFn: FetchLike = (u)
       if (optional) return null;
       throw new Error(`failed to load ${rel}: HTTP ${r.status}`);
     }
-    return (await r.json()) as T;
+    if (!optional) return (await r.json()) as T;
+    // the Vite dev server answers a missing file with its index.html (HTTP 200): an optional
+    // file that is not JSON is missing (the object scene has no geo.json)
+    try {
+      return (await r.json()) as T;
+    } catch {
+      return null;
+    }
   };
   const [meta, frames, imu, headings, geo] = await Promise.all([
     get<SynthMeta>('meta.json'),
