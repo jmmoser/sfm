@@ -22,7 +22,7 @@ import { Disposer, h, replaceChildren } from '../dom';
 import { exportFilename, formatBytes, formatCount, formatDuration, modeLabel, qualityLabel } from '../format';
 import { icon, type IconName } from '../icons';
 import type { ProcessingStep, Route } from '../router';
-import { clearDenseResume, denseResumable, denseResumeQuality, memoryStatRows, northInfo } from '../model-info';
+import { builtQuality, clearDenseResume, denseResumable, denseResumeQuality, memoryStatRows, northInfo } from '../model-info';
 
 interface DisplayState {
   points: boolean;
@@ -198,8 +198,9 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     // the interrupted run's preset (null: unknown — older records)
     const resumeQ = resumable ? denseResumeQuality(r) : null;
     let q: QualityPreset = resumeQ ?? app.results.quality;
-    // Resuming needs the interrupted run's settings: another quality starts over.
-    let syncResume = (): void => undefined;
+    // Resuming needs the interrupted run's settings: another quality starts over; a model built
+    // at another quality than the picked one can be rebuilt.
+    const syncs: (() => void)[] = [];
     const quality = segmented<QualityPreset>(
       'Quality',
       [
@@ -210,7 +211,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       q,
       (v) => {
         q = v;
-        syncResume();
+        for (const f of syncs) f();
       },
     );
     const build = (steps: ProcessingStep[]): void => {
@@ -218,16 +219,34 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       app.results.quality = q;
       app.navigate({ type: 'BUILD', steps });
     };
-    const item = (o: { icon: IconName; title: string; done: string | null; desc: string; steps: ProcessingStep[]; testId: string; disabled?: boolean }): HTMLElement =>
-      h(
-        'div',
-        { class: 'build-item' },
-        h('span', { class: 'build-icon' }, icon(o.icon, { size: 22 })),
-        h('div', { class: 'build-text' }, h('span', { class: 'build-title', text: o.title }), h('span', { class: 'build-sub', text: o.done ?? o.desc })),
-        o.done
-          ? chip('Built', 'good', 'check')
-          : button({ label: 'Build', variant: 'primary', size: 'sm', testId: o.testId, disabled: o.disabled, onClick: () => build(o.steps) }),
-      );
+    const item = (o: {
+      icon: IconName;
+      title: string;
+      /** What was built (null: not built yet) and at which quality. */
+      done: { sub: string; quality: QualityPreset } | null;
+      desc: string;
+      /** Sub line when rebuilding at quality `q`. */
+      rebuildDesc: (q: QualityPreset) => string;
+      steps: ProcessingStep[];
+      testId: string;
+      disabled?: boolean;
+    }): HTMLElement => {
+      const sub = h('span', { class: 'build-sub' });
+      const action = h('div', { class: 'build-action' });
+      const sync = (): void => {
+        const built = o.done && o.done.quality === q;
+        sub.textContent = !o.done ? o.desc : built ? `${o.done.sub} · ${qualityLabel(o.done.quality)}` : o.rebuildDesc(q);
+        replaceChildren(
+          action,
+          built
+            ? chip('Built', 'good', 'check')
+            : button({ label: o.done ? 'Rebuild' : 'Build', variant: 'primary', size: 'sm', testId: o.testId, disabled: o.disabled, onClick: () => build(o.steps) }),
+        );
+      };
+      syncs.push(sync);
+      sync();
+      return h('div', { class: 'build-item' }, h('span', { class: 'build-icon' }, icon(o.icon, { size: 22 })), h('div', { class: 'build-text' }, h('span', { class: 'build-title', text: o.title }), sub), action);
+    };
     const content = [
       section('Quality', quality.el),
       section(
@@ -240,8 +259,9 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
             : item({
                 icon: 'points',
                 title: 'Dense point cloud',
-                done: r.dense ? `${formatCount(r.dense.count)} points` : null,
+                done: r.dense ? { sub: `${formatCount(r.dense.count)} points`, quality: builtQuality(r, 'dense') } : null,
                 desc: 'Multi-view stereo on every photo. A few minutes.',
+                rebuildDesc: (q) => `Rebuilds at ${qualityLabel(q)} quality${r.mesh ? ' and removes the mesh' : ''}.`,
                 steps: ['densify'],
                 testId: 'build-dense',
                 disabled: !r.sparse,
@@ -249,8 +269,9 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
           item({
             icon: 'mesh',
             title: 'Mesh',
-            done: r.mesh ? `${formatCount(r.mesh.triangleCount)} triangles` : null,
+            done: r.mesh ? { sub: `${formatCount(r.mesh.triangleCount)} triangles`, quality: builtQuality(r, 'mesh') } : null,
             desc: r.dense ? 'A coloured surface from the dense cloud.' : 'Builds the dense cloud first, then the surface.',
+            rebuildDesc: (q) => `Rebuilds the dense cloud and mesh at ${qualityLabel(q)} quality.`,
             steps: r.dense ? ['mesh'] : ['densify', 'mesh'],
             testId: 'build-mesh',
             disabled: !r.sparse,
@@ -275,7 +296,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
         },
       });
       const title = h('span', { class: 'build-title' });
-      syncResume = () => {
+      const syncResume = (): void => {
         const same = q === quality0;
         title.textContent = same ? 'Resume dense reconstruction' : 'Dense point cloud';
         sub.textContent = !same
@@ -285,6 +306,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
             : 'Interrupted — continues from the saved depth maps if they were made at this quality, otherwise starts over.';
         setButtonLabel(btn, same ? 'Resume' : 'Build');
       };
+      syncs.push(syncResume);
       syncResume();
       return h('div', { class: 'build-item build-item-resume', 'data-testid': 'build-dense-resume' }, h('span', { class: 'build-icon' }, icon('refresh', { size: 22 })), h('div', { class: 'build-text' }, title, sub), btn);
     }

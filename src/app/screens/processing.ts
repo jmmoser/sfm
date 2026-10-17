@@ -298,18 +298,21 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
           const dense = await app.engine.densify({ quality }, (e) => onProgress('densify', e));
           if (closed) return;
           app.results.dense = dense;
+          app.results.mesh = null; // the engine dropped the mesh of the previous cloud
+          app.results.stats = { ...app.results.stats, denseQuality: quality };
           clearDenseResume();
           completeStep('densify');
           showPreview();
-          void app.updateSession(route.sessionId, { status: 'dense', stats: { densePoints: dense.count } });
+          void app.updateSession(route.sessionId, { status: 'dense', stats: { densePoints: dense.count, denseQuality: quality } });
         } else {
           setActive('meshing');
           renderStage('meshing');
           const mesh = await app.engine.mesh({ quality }, (e) => onProgress('mesh', e));
           if (closed) return;
           app.results.mesh = mesh;
+          app.results.stats = { ...app.results.stats, meshQuality: quality };
           completeStep('mesh');
-          void app.updateSession(route.sessionId, { status: 'meshed', stats: { triangles: mesh.triangleCount } });
+          void app.updateSession(route.sessionId, { status: 'meshed', stats: { triangles: mesh.triangleCount, meshQuality: quality } });
         }
       }
     } catch (e) {

@@ -2388,6 +2388,11 @@ h3 {
   min-width: 0;
 }
 
+.build-action {
+  display: flex;
+  flex: none;
+}
+
 .export-title,
 .build-title {
   font-weight: 650;

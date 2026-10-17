@@ -147,6 +147,19 @@ try {
   await sleep(2000);
   await shot(page, '15-viewer-mesh');
 
+  step('rebuild at another quality');
+  await byTest('tool-build').tap();
+  await byTest('sheet-build').waitFor();
+  check(!(await page.locator('[data-testid="build-mesh"]').count()), 'the mesh shows Built at its own quality');
+  const other = (await page.locator('[data-testid="sheet-build"] .segment[aria-checked="true"]').getAttribute('data-value')) === 'max' ? 'fast' : 'max';
+  await page.locator(`[data-testid="sheet-build"] .segment[data-value="${other}"]`).tap();
+  await byTest('build-mesh').waitFor({ timeout: 2000 });
+  check(/Rebuild/.test((await byTest('build-mesh').textContent()) ?? ''), 'another quality offers Rebuild');
+  await sleep(300);
+  await shot(page, '15b-rebuild');
+  await page.keyboard.press('Escape');
+  await byTest('sheet-build').waitFor({ state: 'detached' });
+
   step('export');
   await byTest('tool-export').tap();
   await byTest('sheet-export').waitFor();

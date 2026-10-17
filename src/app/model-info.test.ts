@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { SparseResult } from '../workers/protocol';
-import { clearDenseResume, denseResumable, denseResumeQuality, memoryStatRows, northInfo } from './model-info';
+import { builtQuality, clearDenseResume, denseResumable, denseResumeQuality, memoryStatRows, northInfo } from './model-info';
 
 const sparse = { points: { count: 0, positions: new Float32Array(0), colors: new Uint8Array(0) }, cameras: [], stats: {} } as unknown as SparseResult;
 const cloud = { count: 1, positions: new Float32Array(3), colors: new Uint8Array(3) };
@@ -29,6 +29,16 @@ describe('denseResumeQuality', () => {
     const st: Record<string, number | string> = { denseResumablePass: 1, denseResumableQuality: 'max', denseInterrupted: 1, denseInterruptedQuality: 'fast', keyframes: 9 };
     clearDenseResume(st);
     expect(st).toEqual({ keyframes: 9 });
+  });
+});
+
+describe('builtQuality', () => {
+  it('reads the recorded preset per model, else the scan preset', () => {
+    const r = { quality: 'balanced' as const, stats: { denseQuality: 'max', meshQuality: 'fast' } };
+    expect(builtQuality(r, 'dense')).toBe('max');
+    expect(builtQuality(r, 'mesh')).toBe('fast');
+    expect(builtQuality({ quality: 'balanced', stats: {} }, 'mesh')).toBe('balanced');
+    expect(builtQuality({ quality: 'fast', stats: { denseQuality: 'bogus' } }, 'dense')).toBe('fast');
   });
 });
 

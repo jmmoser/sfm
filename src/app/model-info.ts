@@ -32,6 +32,15 @@ export function denseResumeQuality(r: Pick<Results, 'stats'>): QualityPreset | n
   return null;
 }
 
+/**
+ * Quality preset the dense cloud / mesh was built with (`denseQuality` / `meshQuality`, set by
+ * the Processing screen). Older records lack them: the scan's preset is the best guess.
+ */
+export function builtQuality(r: Pick<Results, 'stats' | 'quality'>, what: 'dense' | 'mesh'): QualityPreset {
+  const v = r.stats[what === 'dense' ? 'denseQuality' : 'meshQuality'];
+  return v === 'fast' || v === 'balanced' || v === 'max' ? v : r.quality;
+}
+
 /** Drop the dense-resume markers (a densify finished, or refine invalidated the stored depth maps). */
 export function clearDenseResume(stats: Stats): void {
   delete stats.denseResumablePass;
