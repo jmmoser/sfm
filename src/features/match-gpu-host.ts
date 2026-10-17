@@ -62,7 +62,9 @@ export function descriptorInvNorms(fs: FeatureSet): Float64Array {
  * 32-bit content hash of count and descriptors (and keypoint positions when requested):
  * four interleaved FNV-1a-style lanes over the descriptor bytes as u32 words, so the
  * multiply chains run in parallel (the hash is checked on every match call to detect
- * descriptor arrays refilled in place). Independent of the array's alignment.
+ * descriptor arrays refilled in place). Each lane rotates after its multiply, so the top
+ * bit feeds back (plain word-wise FNV cancels when bit 31 flips in two words). Independent
+ * of the array's alignment.
  */
 export function descriptorHash(fs: FeatureSet, withPositions = false): number {
   const n = fs.count;
@@ -79,6 +81,10 @@ export function descriptorHash(fs: FeatureSet, withPositions = false): number {
     h1 = Math.imul(h1 ^ words[k + 1], P);
     h2 = Math.imul(h2 ^ words[k + 2], P);
     h3 = Math.imul(h3 ^ words[k + 3], P);
+    h0 = (h0 << 13) | (h0 >>> 19);
+    h1 = (h1 << 13) | (h1 >>> 19);
+    h2 = (h2 << 13) | (h2 >>> 19);
+    h3 = (h3 << 13) | (h3 >>> 19);
   }
   let h = Math.imul(Math.imul(Math.imul(h0 ^ h1, P) ^ h2, P) ^ h3, P);
   if (withPositions) {

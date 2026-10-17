@@ -236,6 +236,14 @@ describe('match-gpu host helpers', () => {
     expect(descriptorStats(a).hash).not.toBe(h0);
     a.descriptors[777] ^= 1;
     expect(descriptorStats(a).hash).toBe(h0);
+    expect(descriptorStats(un).hash).toBe(h0);
+    // bit 31 flipped in two words of the same lane (16 bytes apart): plain FNV cancels this
+    a.descriptors[3] ^= 0x80;
+    a.descriptors[19] ^= 0x80;
+    expect(descriptorStats(a).hash).not.toBe(h0);
+    a.descriptors[3] ^= 0x80;
+    a.descriptors[19] ^= 0x80;
+    expect(descriptorStats(a).hash).toBe(h0);
   });
 
   it('predictWithHomography is invariant to the sign of H and flags points beyond infinity', () => {

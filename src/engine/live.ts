@@ -15,7 +15,7 @@
  * `LiveMapper.addKeyframe`, vocabulary training / indexing, the R_cam_device hand-eye check,
  * 'auto' mode resolution, persistence and a `live` event with the decimated model.
  */
-import type { CameraIntrinsics, FeatureSet, FrameInfo, GeoFix, ImuSample, Mat3, MatchPairs, Pose, TwoViewGeometry } from '../core/types';
+import type { CameraIntrinsics, CancelToken, FeatureSet, FrameInfo, GeoFix, ImuSample, Mat3, MatchPairs, Pose, TwoViewGeometry } from '../core/types';
 import type { FeaturePipeline } from '../features/extractor';
 import { deserializeFeatureSet, serializeFeatureSet } from '../io/serialize';
 import { estimateTwoViewGeometry } from '../geometry/twoview';
@@ -429,6 +429,7 @@ export class LiveSession {
     this.mapper = new LiveMapper(this.state.db, this.state.graph, {
       hfovPriorDeg: deps.hfovPriorDeg ?? 69,
       rotationCheck: this.rotationCheck(),
+      reportReprojError: false, // never read here; a full reprojection per keyframe
       ...(deps.config.live ?? {}),
     });
   }
@@ -1192,15 +1193,17 @@ export class LiveSession {
   /**
    * GPU half of `matchPair`: putative matches of a keyframe pair, null when a set is missing or
    * too small. Split from `verifyPair` so a caller can match the next pair while it verifies this
-   * one (refine): still one GPU job at a time, queued on the engine's GPU chain.
+   * one (refine): still one GPU job at a time, queued on the engine's GPU chain. A job that
+   * reaches the GPU after `cancel` is set does no work and returns null.
    */
-  async putativeMatches(a: number, b: number): Promise<MatchPairs | null> {
+  async putativeMatches(a: number, b: number, cancel?: CancelToken): Promise<MatchPairs | null> {
     const st = this.state;
     const fa = st.db.features.get(a);
     const fb = st.db.features.get(b);
     if (!fa || !fb || !st.records.has(a) || !st.records.has(b) || fa.count < 8 || fb.count < 8) return null;
-    const pipeline = this.deps.pipeline();
-    return this.deps.gpu(() => pipeline.match(fa, fb));
+    // the pipeline is read when the job runs: a GPU-loss recovery queued ahead of a prefetched
+    // job has replaced it by then
+    return this.deps.gpu(async () => (cancel?.cancelled ? null : this.deps.pipeline().match(fa, fb)));
   }
 
   /** CPU half of `matchPair`: two-view verification of putative matches and the gyro gate. */
@@ -1248,7 +1251,7 @@ export class LiveSession {
     }
     // vocabulary retrieval (the BoW is kept for indexing this keyframe below: quantised once)
     let bow: { vocab: VocabularyIndex; bow: BowVector } | null = null;
-    if (st.vocab && nRet > 0) {
+    if (st.vocab && st.vocab.size > 0 && nRet > 0) {
       bow = { vocab: st.vocab, bow: st.vocab.computeBow(fs) };
       const res = st.vocab.query(bow.bow, nRet + 4, (x: number) => chosen.has(x));
       let k = 0;

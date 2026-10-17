@@ -44,6 +44,11 @@ export interface LiveMapperOptions extends MapperOptions {
   globalBATimeMs: number;
   /** Pending keyframes retried after a successful registration (default 4). */
   retryPendingPerKeyframe: number;
+  /**
+   * `addKeyframe` reports the model's mean reprojection error (default true). It reprojects
+   * every observation per keyframe; the engine never reads it and turns it off (NaN then).
+   */
+  reportReprojError: boolean;
 }
 
 export const DEFAULT_LIVE_OPTIONS: Readonly<
@@ -59,6 +64,7 @@ export const DEFAULT_LIVE_OPTIONS: Readonly<
     | 'globalBAEvery'
     | 'globalBATimeMs'
     | 'retryPendingPerKeyframe'
+    | 'reportReprojError'
   >
 > = Object.freeze({
   initWindow: 30,
@@ -71,17 +77,15 @@ export const DEFAULT_LIVE_OPTIONS: Readonly<
   globalBAEvery: 15,
   globalBATimeMs: 800,
   retryPendingPerKeyframe: 4,
+  reportReprojError: true,
 });
 
 export interface LiveKeyframeResult {
   registered: boolean;
   initialized: boolean;
   numPoints: number;
-  /**
-   * Mean reprojection error (px) of the model (0 before initialisation). Computed on
-   * read: it reprojects every observation, and the engine never reads it.
-   */
-  readonly reprojError: number;
+  /** Mean reprojection error (px) of the model (0 before initialisation; NaN when not reported). */
+  reprojError: number;
 }
 
 export interface LiveSnapshot {
@@ -160,15 +164,11 @@ export class LiveMapper {
     this.maybeGlobalBA();
     this.timings.total += now() - t0;
     this.timings.keyframes++;
-    const rec = this.rec,
-      initialized = this.isInit;
     return {
-      registered: rec.images.get(id)!.registered,
-      initialized,
-      numPoints: rec.numPoints,
-      get reprojError() {
-        return initialized ? rec.meanReprojectionError() : 0;
-      },
+      registered: this.rec.images.get(id)!.registered,
+      initialized: this.isInit,
+      numPoints: this.rec.numPoints,
+      reprojError: !this.isInit ? 0 : this.opts.reportReprojError ? this.rec.meanReprojectionError() : NaN,
     };
   }
 

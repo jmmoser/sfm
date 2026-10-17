@@ -42,7 +42,11 @@ export class PatchMatchHolder {
   private tried = false;
   reason: string | null = null;
 
-  constructor(private readonly preferGPU: boolean) {}
+  /** `denseOverrides`: EngineConfig.dense, so the precompiled source buckets cover an overridden numSources. */
+  constructor(
+    private readonly preferGPU: boolean,
+    private readonly denseOverrides: Partial<DensePresetConfig> = {},
+  ) {}
 
   async get(): Promise<PatchMatchGPU | null> {
     if (this.pm) return this.pm;
@@ -57,10 +61,10 @@ export class PatchMatchHolder {
         this.reason = 'WebGPU unavailable';
         return null;
       }
-      // Precompile only the source buckets the quality presets use (a config override
-      // with more sources compiles its bucket lazily).
-      const presetSources = Math.max(...(['fast', 'balanced', 'max'] as const).map((q) => resolveDensePreset(q).numSources));
-      const pm = await PatchMatchGPU.create(ctx, undefined, presetSources);
+      // Precompile only the source buckets densify can use (any quality, with the config's
+      // overrides): a compile failure then still falls back to the CPU here, not mid-densify.
+      const maxSources = Math.max(...(['fast', 'balanced', 'max'] as const).map((q) => Math.min(16, resolveDensePreset(q, this.denseOverrides).numSources)));
+      const pm = await PatchMatchGPU.create(ctx, undefined, maxSources);
       const st = await pm.selfTest();
       if (!st.ok) {
         pm.destroy();

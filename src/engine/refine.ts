@@ -269,10 +269,11 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   let verified = 0;
   let lastYield = now();
   // One-deep prefetch: pair i+1 is matched on the GPU while pair i is verified on the CPU
-  // (the GPU chain still runs one job at a time). Rejections surface when awaited.
+  // (the GPU chain still runs one job at a time). Rejections surface when awaited; after a
+  // cancel the queued job skips its match.
   const putative = (i: number): Promise<MatchPairs | null> | null => {
     if (i >= pairs.length) return null;
-    const p = live.putativeMatches(pairs[i][0], pairs[i][1]);
+    const p = live.putativeMatches(pairs[i][0], pairs[i][1], cancel);
     p.catch(() => undefined);
     return p;
   };
