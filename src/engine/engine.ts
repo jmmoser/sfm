@@ -41,6 +41,7 @@ import { PatchMatchHolder, rebuildColourViews, runDensify, runMesh, type DenseOu
 import { buildExport } from './export';
 import { closeSource } from './frame-ingest';
 import { LiveSession } from './live';
+import { modelKeypoints, originalKeypoints } from './refine-camera';
 import {
   MemoryEngineStore,
   SessionEngineStore,
@@ -676,6 +677,7 @@ export class PhotogrammetryEngine {
       })),
       metric: this.sparse.metric,
       stats: this.sparse.stats,
+      rollingShutter: this.model.rollingShutter ?? null,
     };
     try {
       await this.store.putBinary('sparse/model', packSparseModel(this.model));
@@ -732,6 +734,8 @@ export class PhotogrammetryEngine {
       const buf = await this.store.getBinary('sparse/model');
       if (buf) {
         this.model = unpackSparseModel(buf);
+        const meta = await this.store.getValue<SparseMetaRecord>('sparse/meta').catch(() => null);
+        this.model.rollingShutter = meta?.rollingShutter ?? null;
         return this.model;
       }
     }
@@ -868,11 +872,23 @@ export class PhotogrammetryEngine {
   // ------------------------------------------------------------------------------------------
   // export
 
+  /**
+   * Features of a keyframe for the exports, with keypoints consistent with the model's poses: refine
+   * corrects the keypoints for rolling shutter IN MEMORY, the store keeps the originals — after a
+   * reload / respawn they are corrected again from the persisted `SparseModel.rollingShutter`.
+   */
   private async featuresOf(id: number): Promise<FeatureSet | null> {
-    const fs = this.live?.state.db.features.get(id);
-    if (fs) return fs;
+    const st = this.live?.state;
+    const mem = st?.db.features.get(id);
+    if (st && mem) {
+      const kp = modelKeypoints(this.model, id, originalKeypoints(st, id) ?? mem.keypoints, { st, keypoints: mem.keypoints });
+      return kp === mem.keypoints ? mem : { ...mem, keypoints: kp };
+    }
     const buf = await this.store?.getBinary(`kf/${id}/features`);
-    return buf ? deserializeFeatureSet(buf) : null;
+    if (!buf) return null;
+    const fs = deserializeFeatureSet(buf);
+    const kp = modelKeypoints(this.model, id, fs.keypoints, null);
+    return kp === fs.keypoints ? fs : { ...fs, keypoints: kp };
   }
 
   /**
@@ -936,6 +952,7 @@ export class PhotogrammetryEngine {
     const meta = await store.getValue<SparseMetaRecord>('sparse/meta').catch(() => null);
     if (mb && meta) {
       this.model = unpackSparseModel(mb);
+      this.model.rollingShutter = meta.rollingShutter ?? null;
       this.sparse = {
         points: modelPointCloud(this.model),
         cameras: meta.cameras.map((c) => ({

@@ -100,9 +100,12 @@ export interface EngineConfig {
    * (live and refine), and refine prefers the model without gyro breaks (src/sfm/gyro.ts).
    */
   gyroGate?: boolean;
-  /** Tolerance of the gyro gates (defaults: 5° + 0.3°/s × |Δt| (0.1°/s once the bias is estimated) + 5 % of the rotation). */
+  /** Tolerance of the gyro gates (defaults: 5° + 0.3°/s × |Δt| + 5 % of the rotation). */
   gyroTolerance?: Partial<GyroToleranceOptions>;
-  /** Estimate the gyro bias / camera–IMU offset from the live keyframes every 10 registrations (default true). */
+  /**
+   * Estimate the gyro bias / camera–IMU offset from the live keyframes every 10 registrations
+   * during capture (default false; refine always calibrates once before the rolling-shutter estimation).
+   */
   liveGyroCalibration?: boolean;
   /**
    * Rolling shutter estimated in refine (default true, needs the gyro): readout axis / direction /
@@ -111,7 +114,21 @@ export interface EngineConfig {
    */
   estimateRollingShutter?: boolean;
   /** Options of the rolling-shutter estimation (search range, acceptance threshold, …). */
-  rollingShutterOptions?: Partial<RollingShutterEstimateOptions> & { minImages?: number; maxImages?: number; minOmega?: number };
+  rollingShutterOptions?: Partial<RollingShutterEstimateOptions> & {
+    minImages?: number;
+    maxImages?: number;
+    minOmega?: number;
+    maxObsPerImage?: number;
+    refineFocal?: boolean;
+    refinePrincipalPoint?: boolean;
+    /**
+     * Translational term of the correction (default true): camera velocity from the neighbouring
+     * keyframes × inverse depth of each keypoint's 3-D point (needed on close-range orbits).
+     */
+    translation?: boolean;
+    /** Estimation passes, each on the model re-adjusted with the previous estimate (default 2). */
+    passes?: number;
+  };
   /**
    * Readout of this device, known in advance (e.g. estimated by an earlier capture: stats
    * rsReadoutMs / rsSweepDevice): every keyframe's keypoints are corrected live and the motion gate
@@ -120,11 +137,21 @@ export interface EngineConfig {
   rollingShutter?: RollingShutterDevice | null;
   /** Motion gate (rad/s) while a known rolling shutter is corrected live (default 2.0). */
   rsMaxAngularSpeed?: number;
+  /**
+   * Model choice of refine (after gyro breaks and registered images): the live or offline model whose
+   * share of explained verified correspondences is higher by more than this wins (default 0.015);
+   * otherwise the lower mean reprojection error.
+   */
+  modelChoiceExplainedGap?: number;
   /** Per-image focal lengths tied to the shared focal in the final refinement (default true; kept only if it helps). */
   perImageFocal?: boolean;
-  /** Prior σ of the per-image focal (relative, default 0.005) and the required reprojection improvement (default 0.03). */
+  /** Prior σ of the per-image focal (relative, default 0.005) and the required reprojection improvement (default 0.005). */
   perImageFocalSigma?: number;
   perImageFocalMinImprovement?: number;
+  /** Minimum lag-1 autocorrelation (time order) of the per-image focal lengths (default 0.6: focus breathing is smooth). */
+  perImageFocalMinAutocorrelation?: number;
+  /** Maximum alternations of the shared-camera re-refinement without the breathing and the per-image focal BA (default 6; stops early once the principal point moves < 0.25 px). */
+  perImageFocalRounds?: number;
   /**
    * Back-pressure of 'background' mapping: a keyframe frame's response waits until at most this
    * many keyframes are queued or being mapped (default 2; -1 = never wait). Without it the live
@@ -195,4 +222,24 @@ export interface SparseModel {
   trackOffsets: Uint32Array;
   trackImages: Uint32Array;
   trackFeatures: Uint32Array;
+  /**
+   * Rolling shutter the keypoints were corrected for (refine), with each registered image's camera
+   * angular velocity: the dense stage removes it from the images too (its poses are those of the
+   * frame stamp, the pixels are not). Persisted in `sparse/meta`; absent = none.
+   */
+  rollingShutter?: SparseRollingShutter | null;
+}
+
+/** Rolling-shutter data of a sparse model (plain JSON). */
+export interface SparseRollingShutter {
+  axis: 'rows' | 'cols';
+  /** Signed readout (ms) of the canonical image (src/sfm/rolling-shutter.ts). */
+  readoutMs: number;
+  /** Camera angular velocity (rad/s, camera frame) per image id at its frame time. */
+  omega: Record<number, [number, number, number]>;
+  /**
+   * Translational term per image id: camera-frame velocity of the camera centre divided by the
+   * image's median scene depth (1/s); absent = rotation only.
+   */
+  nu?: Record<number, [number, number, number]>;
 }

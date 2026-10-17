@@ -40,7 +40,7 @@ import {
   samplesBetween,
   type HeadingRow,
 } from './feed';
-import { bbox, mapCamerasToFrames, medianIntrinsics, normalizeIntrinsics, poseToJSON, stageTimings, type CameraLike, type DeliveredRef } from './result';
+import { bbox, keyframeSourceIndex, mapCamerasToFrames, medianIntrinsics, normalizeIntrinsics, poseToJSON, stageTimings, type CameraLike, type DeliveredRef } from './result';
 import type { CloudSummary, FrameRecord, HarnessConfig, HarnessError, HarnessResult, LiveSummary, ProgressRecord, ResolvedHarnessConfig } from './types';
 
 // ------------------------------------------------------------------ dataset
@@ -531,7 +531,8 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
         frameMs.push(rec.wallMs);
         if (upd.decision === 'keyframe') {
           keyframeMs.push(rec.wallMs);
-          result.live.keyframeIndices.push(f.index);
+          // a held (best-of-window) keyframe comes from an earlier frame than this update's
+          result.live.keyframeIndices.push(keyframeSourceIndex(upd.timings, (d) => plan[d]?.index, f.index));
         }
         if (upd.tracking === 'lost') result.live.trackingLostFrames++;
         if (!result.live.timeToInit && upd.tracking === 'tracking') {

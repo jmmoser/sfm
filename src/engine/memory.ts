@@ -112,6 +112,10 @@ export interface CaptureMemoryInput {
   imuSamples: number;
   /** Bytes of writes handed to the store and not yet completed (JPEG blobs, features, …). */
   pendingWriteBytes?: number;
+  /** Original keypoints of rolling-shutter corrected keyframes (`CaptureState.rsOriginal`). */
+  rsOriginal?: ReadonlyMap<number, Float32Array>;
+  /** Frame held by best-of-window keyframing (source bitmap, rotated canvas, small copy). */
+  heldFrameBytes?: number;
 }
 
 /** Estimated resident memory of a capture, by component. */
@@ -143,6 +147,12 @@ export function captureMemory(c: CaptureMemoryInput): MemoryBreakdown {
     imu: c.imuSamples * MEM.imuSample,
   };
   if (c.pendingWriteBytes) out.pendingWrites = c.pendingWriteBytes;
+  if (c.rsOriginal && c.rsOriginal.size) {
+    let b = 0;
+    for (const kp of c.rsOriginal.values()) b += kp.byteLength + 16;
+    out.rsOriginal = b;
+  }
+  if (c.heldFrameBytes) out.heldFrame = c.heldFrameBytes;
   return out;
 }
 

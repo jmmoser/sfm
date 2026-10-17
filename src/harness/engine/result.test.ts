@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { CameraIntrinsics } from '../../core/types';
-import { bbox, mapCamerasToFrames, medianIntrinsics, normalizeIntrinsics, poseToJSON, stageTimings, type CameraLike, type DeliveredRef } from './result';
+import { bbox, keyframeSourceIndex, mapCamerasToFrames, medianIntrinsics, normalizeIntrinsics, poseToJSON, stageTimings, type CameraLike, type DeliveredRef } from './result';
 import type { ProgressRecord } from './types';
 
 const K: CameraIntrinsics = { width: 720, height: 960, f: 750, cx: 360, cy: 480, k1: -0.03, k2: 0.005 };
@@ -101,5 +101,17 @@ describe('stageTimings / misc', () => {
     expect(poseToJSON(pose(2))).toEqual({ R: [1, 0, 0, 0, 1, 0, 0, 0, 1], t: [2, 0, 0] });
     expect(bbox(Float32Array.of(0, 1, 2, -1, NaN, 0, 3, -2, 1), 3)).toEqual({ min: [0, -2, 1], max: [3, 1, 2] });
     expect(bbox(new Float32Array(0), 0)).toBeNull();
+  });
+});
+
+describe('keyframeSourceIndex (live-trajectory mapping of keyframes)', () => {
+  it('a held (best-of-window) keyframe maps to its own, earlier frame; others to the update frame', () => {
+    const plan = [0, 4, 8, 12, 16].map((index) => ({ index }));
+    const of = (d: number): number | undefined => plan[d]?.index;
+    // the update of delivered frame 3 (dataset 12) created a keyframe from delivered frame 1 (dataset 4)
+    expect(keyframeSourceIndex({ keyframeFrameIndex: 1, total: 5 }, of, 12)).toBe(4);
+    expect(keyframeSourceIndex({ total: 5 }, of, 12)).toBe(12);
+    expect(keyframeSourceIndex(undefined, of, 12)).toBe(12);
+    expect(keyframeSourceIndex({ keyframeFrameIndex: 99 }, of, 12)).toBe(12); // unknown frame
   });
 });

@@ -591,3 +591,142 @@ offline model, chosen by 0.592 vs 0.611 px, misregisters keyframe 212 by 109° /
 gives ATE 4.2e-2 (1.1e-3 = 4.2 cm without it), rejects the IMU scale (R² −0.00) and leaves the
 GPS scale (−6 %). Likewise the `abl-yard-shake` baseline without its keyframe 87: ATE 2.5e-4, GPS
 scale −7.3 %.
+
+### Real-capture robustness (2026-10, CPU features, worker engine)
+
+What changed (details and the evidence for each choice: ARCHITECTURE §6 "Real-capture robustness"):
+hard rotation limit (keyframes forced through fast pans) and best-of-window keyframing; gyro gates on
+verified pairs, registrations and initial pairs (live and refine) and gyro-consistent model choice
+(breaks, isolated outliers, explained correspondences); spatial candidates from the gyro-propagated pose;
+gyro bias / camera–IMU offset calibration in refine; robust R² of the IMU scale; rolling-shutter estimation
+(short subset BA per hypothesis, gyro rotation + translation from the neighbouring keyframes × point depth,
+2 passes) with keypoint correction and rolling-shutter-corrected dense views; per-image focal lengths (focus
+breathing) with the shared camera re-refined without the breathing.
+Same command as the baselines above (`--no-dense --no-mesh`, `featureBackend: 'cpu'`), final code, tag `final4`
+(the -real rows: the sparse part of the 480 px dense runs `final4-dense480`); the baselines in parentheses.
+
+| dataset | kf reg (model) | ATE / extent | rot° p50 | focal % (vs mean GT f) | pp px | scale % (source) | grav° | head° | Δt ms | decisions | lost | sparse P | rolling shutter (truth) | per-image focal |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| object (clean) | 92/92 (live) | 2.1e-4 (2.1e-4) | 0.07 (0.05) | +0.04 | 0.7 (0.4) | +0.3 (imu) | 0.01 | −0.83 (−0.36) | −24.9 | 108/92/0/0 | 0 | 0.980 | none | kept shared |
+| object-real | 89/89 (live) | **2.8e-4** (8.6e-4) | **0.08** (0.73) | +0.08 (−0.04) | **1.0** (8.1) | **−0.8** (−4.3) (imu) | 0.02 | −0.54 | −25.1 | 102/89/9/0 | 0 | 0.980 | cols −21.7 ms (−22) | refined, r = 0.92 |
+| yard (clean) | 80/80 (live) | 2.2e-4 (2.2e-4) | 0.05 (0.05) | +0.07 | 0.4 (0.3) | +0.1 (imu+gps) | 0.01 | −0.64 | −24.9 | 160/80/0/0 | 0 | 0.920 | none | kept shared |
+| yard-real | 81/81 (live) | **3.1e-4** (0.103) | **0.09** (152) | +0.15 (−0.08) | **0.3** (6.1) | **+1.6** (−1.9) (imu+gps) | **0.06** (3.55) | **−0.93** (+7.80) | **−25.1** (−29.4) | 154/81/5/0 | **0** (22) | **0.899** (0.028) | rows 22.0 ms (22) | refined, r = 0.87 |
+
+Bold = changed materially against the realism engineer's baseline (in parentheses). r = correlation of the
+per-image focal lengths with the GT focal lengths (rms error 0.07 / 0.13 % against a GT spread of 0.19 / 0.26 %;
+a shared focal has an rms error equal to the spread). The clean datasets keep their ATE; their rotation p50
+0.05 → 0.07° (object) is the orbit's weakly observable pitch ↔ c_y mode (pp 0.4 → 0.7 px) moving with the pair
+set (the gyro gate drops 12 false object pairs: `p0a` 0.07° with identical keyframes), the heading change follows
+the 2 extra keyframes (best-of-window: `nobow` −0.36°).
+
+Ablations (one artefact family each; final code, tags `final4` / `rst2`):
+
+| dataset | ATE / extent | rot° p50 | pp px | scale % | Δt ms | rolling shutter (truth) | per-image focal |
+|---|---|---|---|---|---|---|---|
+| abl-yard-shake | 1.6e-4 (0.033) | 0.05 (1.21) | 0.3 (0.2) | −0.2 (−4.7, gps) | −25.1 (−25.0) | none | kept shared |
+| abl-yard-rs | 2.5e-4 (7.8e-4) | 0.05 (0.25) | 0.5 (2.5) | +0.7 (+5.3) | −24.9 (−27.8) | rows 22.4 ms (22) | kept shared |
+| abl-object-rs | 2.2e-4 (5.1e-4) | 0.04 (0.49) | 0.3 (5.0) | +0.0 (−3.0) | −25.5 (−24.5) | cols −19.1 ms (−22) | kept shared |
+| abl-object-breath | 2.7e-4 (8.0e-4) | 0.08 (0.47) | 1.0 (5.9) | +0.2 (−0.1) | −25.0 (−25.0) | none | refined, r = 0.98 |
+
+Step by step on the -real datasets (each row adds to the previous; tags `p0a`, `p1c`, `calib2` / `p2a`, `fin`,
+`expl`, `final3-dense480`, `rst2`):
+
+| step | yard-real ATE / rot° / pp px / scale % | object-real ATE / rot° / pp px / scale % |
+|---|---|---|
+| baseline | 0.103 / 152 / 6.1 / −1.9 (gps) | 8.6e-4 / 0.73 / 8.1 / −4.3 |
+| + hard rotation limit, gyro gates, gyro model choice, spatial candidates, live calibration (`p0a`) | 2.8e-3 / 0.43 / 6.3 / +3.9 | 1.1e-3 / 0.75 / 8.6 / −3.9 |
+| + rolling shutter (rotation only, subset BA), best-of-window (`p1c`) | 1.2e-3 / 0.15 / 0.7 / +2.0 | 7.6e-4 / 0.45 / 3.1 / −1.1 |
+| + per-image focal with shared re-refinement (`calib2` / `p2a`) | 7.0e-4 / 0.12 / 0.7 / +1.1 | 5.4e-4 / 0.38 / 2.2 / −0.2 |
+| live calibration off, calibration in refine (`fin`) | 3.4e-4 / 0.10 / 0.5 / +2.3 | 5.5e-4 / 0.41 / 2.5 / −0.6 |
+| model choice with explained correspondences (`expl`) | 2.6e-4 / 0.09 / 0.6 / +1.4 (offline) | 5.4e-4 / 0.41 / 2.5 / −0.6 |
+| up to 6 rounds of the per-image focal / shared camera alternation (`final3-dense480`) | 3.4e-4 / 0.10 / 0.5 / +2.3 (live) | 4.7e-4 / 0.27 / 0.5 / −0.6 |
+| + translational rolling-shutter term, 2 passes (`rst2`; final) | 3.3e-4 / 0.10 / 0.4 / +1.8 (live) | 2.9e-4 / 0.07 / 0.9 / −0.8 |
+
+yard-real: from `final3` on, the live model closes the loop by itself (86.2 % explained, offline 87.1 %, below the
+1.5-point gap) and is kept; an unclosed live model measured 2.5e-3 (`expl` chose the offline one, 2.6e-4).
+
+Dense (480 px, 40 views, same preset as the baselines):
+
+| dataset (run) | precision | completeness | F | accuracy p50 / p90 |
+|---|---|---|---|---|
+| object-real baseline (`dense480`) | 0.9991 | 0.9926 | 0.9958 | 1.3 / 2.4 mm |
+| object-real, rotation-only rolling shutter (`final3-dense480`) | 0.9995 | 0.9887 | 0.9940 | 3.1 / 4.0 mm |
+| object-real final (`final4-dense480`) | 0.9996 | 0.9933 | 0.9964 | **0.31 / 1.05 mm** |
+| object clean (above) | 0.9997 | 0.996 | 0.998 | 0.24 / 0.81 mm |
+| yard-real, rotation-only rolling shutter (`final3-dense480`) | 0.961 | 0.347 | 0.510 | 9.6 / 50 mm |
+| yard-real final (`final4-dense480`) | 0.961 | 0.352 | 0.515 | 8.8 / 46 mm |
+| yard clean (above) | 0.964 | 0.379 | 0.545 | 6.7 / 42 mm |
+
+The yard-real baseline was not densified (its sparse model is broken). The 3.1 mm of `final3` was a RIGID offset of
+the cloud against the cameras (`--dense-align sim3+icp`: 0.35 mm p50, as the baseline's 0.35 mm): every camera
+pitched by −0.26° with the object 3 mm lower — the rotation-only correction's under-corrected roll term on the
+orbit (ARCHITECTURE "Rolling shutter"); the translational term removes it.
+
+Variants measured and rejected:
+
+* Relaxed keyframe gates alone (`kfgate`): fixes `abl-yard-shake` but not `yard-real` (an offline model with one
+  keyframe misplaced by 109° wins on reprojection error) — the hard rotation limit keeps the blur rules for
+  normal frames, the gyro gates and model choice handle the rest.
+* Rolling shutter scored against FIXED points (motion-only BA): right axis and direction, but rows 3.3 / cols −4.6 ms
+  on yard-real / object-real (points triangulated from distorted pans resist); a subset BA with only the 30 fastest
+  images free: 17.2 / −8.1 ms; every image free: 21.9 / −20.7 ms. Shared focal fixed / free / free + principal point
+  in that BA: −15.1 / −16.8 / −16.9 ms on abl-object-rs.
+* Rotation-only rolling shutter (the first P1 version): object-real rotation 0.27° (a constant −0.26° pitch), dense
+  p50 3.1 mm, abl-object-rs −16.5 of −22 ms and rotation 0.21°. With the translational term, ONE pass: object-real
+  2.98e-4 / 0.11° / pp 1.4 px, abl-object-rs 2.26e-4 / 0.05°; two passes (kept): 2.87e-4 / 0.07° / 0.9 px and
+  2.24e-4 / 0.04° (on a synthetic orbit built on distorted keypoints the second pass moves −18.5 → −21.7 of −22 ms).
+* Per-image focal accepted on a ≥ 3 % reprojection drop: accepted on object-real while absorbing residual
+  rolling shutter (correlation −0.84 with |ω|, lag-1 autocorrelation −0.14, rms error 0.32 % > the 0.19 %
+  spread) yet rejected on abl-object-breath where it was right (−1.6 %). Now ≥ 0.5 % AND autocorrelation ≥ 0.6.
+  Without the shared re-refinement (forced on abl-object-breath): ATE 4.2e-4, pp 5.6 px; one round 3.7e-4 / 4.6 px;
+  2 / 4 / 6 rounds: pp 3.6 / 2.0 / 1.0 px, rotation 0.29 / 0.17 / 0.08°. A 1 % prior instead of 0.5 %: no change.
+* Gyro bias / offset calibration DURING capture (now opt-in): yard ATE 2.4–2.7e-4 in 3 runs (2.1–2.2e-4
+  without), yard-real 7.0e-4 (3.3e-4), object 2.19e-4 (2.05e-4). Its bias is biased by rolling shutter
+  (x 0.5 vs 3.0 mrad/s), and the gyro tolerance tightened to 0.1°/s with it rejected 4 correct 31–35 s
+  loop-closure pairs (gyro 5° off GT there) — the tolerance stays 0.3°/s.
+* Best-of-window: neutral here (object-real: identical decisions; object: 3 of 92 keyframes one frame
+  earlier, ATE 2.19e-4 either way, rotation 0.06 → 0.08°); kept on.
+
+`e2e/thresholds.json` has `datasets` entries for `object-real` / `yard-real`, tighter than their scene's limits so
+that what these datasets were built for is caught (checked on the stored runs: the baselines and `p0a` fail them, on
+object-real also `expl` and the rotation-only `final3`; `final4` / `rst2` pass with a 2–6× margin, completeness
+0.35 vs 0.28 on yard-real): registration ≥ 0.95, ATE / extent
+≤ 7e-4 / 1e-3, rotation p50 ≤ 0.25° / 0.3°, focal ≤ 0.5 / 1 %, scale ≤ 2.5 / 5 %, gravity ≤ 0.5°, heading ≤ 3°,
+dense accuracy p50 ≤ 6e-4 of the extent (0.8 mm) / 2 cm, completeness ≥ 0.98 / 0.28.
+
+Refine time (SwiftShader host, two runs in parallel): object-real 77 s (baseline 65 s: ≈ 25 BAs of the
+rolling-shutter passes, two live-model re-adjustments, the per-image focal rounds), yard-real 65 s (baseline
+112 s, broken model), clean object / yard 55 / 48 s (rolling-shutter screen only). The yard-real gyro gates reject
+≈ 120 verified pairs per run (live + refine), every one checked against GT ≥ 6° off while the bias-compensated
+gyro is within 0.2–1.6°.
+
+#### Adversarial review (2026-10, same command, tag `rev1`; implementer's final runs in parentheses)
+
+| dataset | kf reg (model) | ATE / extent | rot° p50 | pp px | focal % | scale % | live-trajectory ATE / extent |
+|---|---|---|---|---|---|---|---|
+| object | 92/92 (live) | 2.2e-4 (2.1e-4) | 0.07 (0.07) | 0.7 (0.7) | +0.04 | +0.3 | **1.7e-4** (1.9e-3) |
+| yard | 80/80 (live) | 2.2e-4 (2.2e-4) | 0.05 (0.05) | 0.4 (0.4) | +0.07 | +0.1 | 1.3e-3 (1.4e-3) |
+| object-real | 89/89 (live) | 2.8e-4 (2.9e-4) | 0.08 (0.07) | 0.9 (0.9) | +0.09 | −0.9 | 1.0e-3 (1.0e-3) |
+| yard-real | 81/81 (offline) | 2.1e-4 (3.3e-4, live) | 0.08 (0.10) | 0.3 (0.4) | +0.14 | +1.0 | 4.5e-3 (4.4e-3) |
+
+object-real dense 480 px (`rev3-dense480`): P 0.9995, C 0.9936, accuracy p50 / p90 0.31 / 1.06 mm (`final4`: 0.9996 /
+0.9933 / 0.31 / 1.05 mm). The sparse pipeline is unchanged by the fixes (same keyframes, readouts cols −21.6 / rows 21.9 ms); yard-real picked
+the offline model this time (live 84.9 vs offline 87.1 % explained: the live model's loop closure varies with the
+background-mapping timing). Fixed: the live-trajectory metric mapped a best-of-window keyframe to the LATER frame whose
+update reported it (object: 3 held keyframes ⇒ 1.9e-3 instead of 1.7e-4; `keyframeSourceIndex`); the dense colour
+thumbnails (fusion / TSDF colours) were the UNcorrected images in session; the dense ω were re-queried after the
+alignment moved the time offset (now the ω each keyframe was corrected with, `CaptureState.rsOmega`); COLMAP POINTS2D
+after a reload / respawn were the original keypoints against rolling-shutter-corrected poses (up to ≈ 12 px at the
+image edges in fast pans); `rsOriginal` / the held frame were missing from the capture memory estimate.
+
+Measured, not adopted:
+
+* Per-image focal with up to 12 rounds (`perImageFocalRounds: 12`, object-real): the alternation stops at round 8 with
+  c_y +0.43 px from the centre (GT −1.0): pp 1.46 px, rotation 0.118° (6 rounds: 0.87 px, 0.077°) at the same
+  reprojection error (0.566 px). The 6-round cap stops the slow drift along the orbit's pitch ↔ c_y mode near the truth
+  on object-real / abl-object-breath; it is not convergence (ARCHITECTURE "Real-capture robustness", Limits).
+* Gyro re-calibration on the rolling-shutter-corrected live model before the second readout pass (tag `rev2`): the
+  offset calibrated on the distorted model is biased by where the features sit in the frame (yard-real −30.5,
+  abl-yard-rs −27.9 ms; truth −25) and becomes −25.1 / −24.9 ms with the true bias, but accuracy was neutral
+  (object-real 2.79e-4 / 0.071°, abl-yard-rs 2.50e-4 / 0.06°, abl-object-rs 2.27e-4 / 0.04°) and worse on yard-real
+  (same live model: pp 0.4 → 1.3 px, rotation 0.10 → 0.13°).

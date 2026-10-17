@@ -216,3 +216,29 @@ describe('runIncrementalSfM', () => {
     expect(eb.focalError).toBeLessThan(0.01);
   });
 });
+
+describe('rotationCheck (external rotation consistency, e.g. the gyro)', () => {
+  it('rejected registrations / initial pairs stay unregistered; the check sees the PnP pose', async () => {
+    const scene = smallOrbit(16, 4);
+    const { db } = buildSyntheticDatabase(scene, { verify: false });
+    const banned = scene.imageIds[9];
+    const seen: number[] = [];
+    const models = await runIncrementalSfM(db, {
+      intrinsics: { ...scene.camera },
+      multipleModels: false,
+      rotationCheck: {
+        pose: (id, pose) => {
+          seen.push(id);
+          // the PnP pose is the true one up to the model's similarity: plausible rotation matrix
+          expect(Math.abs(rotationAngle(pose.R))).toBeLessThanOrEqual(Math.PI);
+          return id !== banned;
+        },
+        pair: (a, b) => a !== banned && b !== banned,
+      },
+    });
+    const rec = models[0];
+    expect(seen).toContain(banned);
+    expect(rec.images.get(banned)!.registered).toBe(false);
+    expect(rec.numRegisteredImages).toBe(15);
+  });
+});

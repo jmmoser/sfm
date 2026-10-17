@@ -38,6 +38,21 @@ const isInt = (v: unknown): v is number => typeof v === 'number' && Number.isInt
 const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 
 /**
+ * Dataset frame index of the keyframe a 'keyframe' LiveUpdate created. Best-of-window keyframing
+ * (src/sfm/keyframes.ts) can make an EARLIER, held frame the keyframe: the update of the later
+ * frame then names its source in `timings.keyframeFrameIndex` (FrameInput.index of the held frame
+ * = the harness's delivered counter). Otherwise the keyframe is the update's own frame (`current`).
+ */
+export function keyframeSourceIndex(timings: Record<string, number> | undefined, datasetIndexOfDelivered: (delivered: number) => number | undefined, current: number): number {
+  const k = timings?.keyframeFrameIndex;
+  if (isInt(k)) {
+    const idx = datasetIndexOfDelivered(k);
+    if (idx !== undefined) return idx;
+  }
+  return current;
+}
+
+/**
  * Map every camera to the dataset frame it came from. Per camera, in this order:
  *  1. `frameIndex` (extension field, src/engine SparseCameraEx): FrameInput.index of the source
  *     frame (= the harness's delivered counter), else LiveUpdate.frameIndex;

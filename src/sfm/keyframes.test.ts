@@ -168,6 +168,37 @@ describe('KeyframeSelector', () => {
     expect(s2.isForced(cand(1002, { rotationSinceLastKFRad: 3 * D, angularSpeed: 2.5 }))).toBe(false);
   });
 
+  it('best of window: the sharpest deferred frame becomes the keyframe when nothing sharper arrives', () => {
+    const s = warmed();
+    const thr = s.parallaxThresholdPx(W);
+    // window: 70 (held), 82 (better: replaces), 74 (worse: not held) … deadline at ≥ 250 ms with 72
+    expect(s.evaluate(cand(300, { medianParallaxPx: thr + 5, sharpness: 70 }))).toMatchObject({ decision: 'skip', hold: true });
+    expect(s.heldTime).toBe(300);
+    expect(s.evaluate(cand(400, { medianParallaxPx: thr + 6, sharpness: 82 }))).toMatchObject({ decision: 'skip', hold: true });
+    const d = s.evaluate(cand(480, { medianParallaxPx: thr + 7, sharpness: 74 }));
+    expect(d.decision).toBe('skip');
+    expect(d.hold).toBeUndefined();
+    expect(s.heldTime).toBe(400);
+    const k = s.evaluate(cand(560, { medianParallaxPx: thr + 8, sharpness: 72 }));
+    expect(k).toMatchObject({ decision: 'keyframe', trigger: 'parallax', useHeld: true });
+    expect(s.lastKeyframeTime).toBe(400);
+    expect(s.heldTime).toBeNull();
+    // a sharp frame inside the window is taken as before (and drops the held one)
+    expect(s.evaluate(cand(800, { medianParallaxPx: 2 * thr, sharpness: 70 })).hold).toBe(true);
+    const k2 = s.evaluate(cand(900, { medianParallaxPx: 2 * thr, sharpness: 99 }));
+    expect(k2).toMatchObject({ decision: 'keyframe' });
+    expect(k2.useHeld).toBeUndefined();
+    expect(s.heldTime).toBeNull();
+    // a fast-rotating frame scores lower than an equally sharp slow one
+    expect(s.candidateScore(cand(0, { sharpness: 80, angularSpeed: 1.0 }))).toBeLessThan(s.candidateScore(cand(0, { sharpness: 80, angularSpeed: 0.1 })));
+    // when the trigger disappears the held frame is dropped; off ⇒ no hold
+    expect(s.evaluate(cand(1100, { medianParallaxPx: 2 * thr, sharpness: 70 })).hold).toBe(true);
+    s.evaluate(cand(1150, { medianParallaxPx: 1 }));
+    expect(s.heldTime).toBeNull();
+    const off = warmed({ bestOfWindow: false });
+    expect(off.evaluate(cand(300, { medianParallaxPx: thr + 5, sharpness: 70 })).hold).toBeUndefined();
+  });
+
   it('revert / reset', () => {
     const s = warmed();
     s.evaluate(cand(500, { medianParallaxPx: 500 }));

@@ -2685,3 +2685,134 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
     object at std < 2: 16 % and 14.5 %). The net effect is +0.17 pt whole-scene P for −0.02 pt C. This is the first case
     to re-check on device. If real walls keep good but less coherent depths, lower `skyMinCoherence`. At 0.35 the clean
     yard keeps 1,425 sky-coloured points farther than τ instead of 707 (row 6).
+
+### Real-capture robustness (gyro gates, forced / best-of-window keyframes, rolling shutter, focus breathing; amends the `src/sfm` and `src/engine` notes above)
+
+* **Problem** (e2e `yard-real` / `abl-yard-shake`, README "Yard breakdown"): a fast pan left a 35–45° keyframe gap (blur
+  rejection + sharpness deferral), the keyframes after it could not register, and the walk was reconnected through FALSE
+  two-view pairs (repeated fence boards: 60–80 inliers, rotation 100°+ off) that nothing checked against the gyro — one
+  model made of rigid fragments joined by a wrong rotation (ATE 0.10 of the extent, rotation 152°). Rolling shutter and
+  focus breathing were absorbed by the principal point (2.5–8 px ⇒ 0.25–0.7° rotation error) and biased the IMU scale /
+  time offset.
+* **Hard rotation limit** (`KeyframeSelector`, `hardRotationDeg` 20): a keyframe is FORCED at the last frame before the
+  gyro rotation since the last keyframe would pass the limit (rotation ≥ ½ maxRotationDeg and rotation + |ω| × the median
+  frame interval ≥ limit) or at the first frame past it. Forced frames are not deferred, are blur-rejected only below
+  `forcedBlurRatio` (0.25) × the median sharpness and motion-rejected only above `forcedMaxAngularSpeed` (3 rad/s). The
+  engine's pre-gate (no features for rejected frames) is now `KeyframeSelector.gate`, i.e. the same relaxed rule; the gyro
+  rotation since the last keyframe is computed for every frame. `LiveSession.stats.forcedKeyframes`.
+* **Best-of-window keyframing** (`bestOfWindow`, default on): while a soft trigger waits ≤ `maxDeferMs` for a sharper frame,
+  the best candidate of the window (`candidateScore` = sharpness / (1 + |ω| / 2 rad/s)) is HELD (`decision.hold`); when the
+  window ends without a sharp enough frame, the held frame becomes the keyframe if it scores better than the current one
+  (`decision.useHeld`) instead of whichever frame arrives at the deadline. The engine keeps at most ONE held frame (its
+  prepared image, features, tracking geometry; released on drop / segment change / finishCapture / dispose). A keyframe made
+  from a held frame is answered on the LATER frame's LiveUpdate: `timings.keyframeFrameIndex` names the frame it came from
+  (SparseCameraEx.frameIndex is always right; the harness's live-trajectory mapping uses it, `keyframeSourceIndex` — it
+  used the later frame before).
+* **Gyro consistency** (`src/sfm/gyro.ts`): `GyroReference` = incremental, bias-compensated 2nd-order Magnus integration
+  of the IMU log (amortised O(new samples), rebuilt only when the bias changes or a sample is inserted out of order),
+  queried at CAMERA times (IMU = camera + offset), rotations camera(ta) → camera(tb) = R_cd · R_wd(tb)ᵀR_wd(ta) · R_cdᵀ;
+  `angularVelocityCam`. Tolerance = 5° + 0.3°/s·|Δt| + 5 % of the rotation (`EngineConfig.gyroTolerance`; NOT tightened
+  when a bias is known: the bias estimate comes from RS-biased vision rotations — yard-real x component 0.5 instead of 3.0
+  mrad/s ⇒ 5° over a 32 s loop closure — and 0.1°/s rejected correct loop-closure pairs). Gates
+  (active once R_cam_device is verified — a wrong mapping would reject every correct pair — `EngineConfig.gyroGate`):
+  * verified pairs (live matching, the per-frame tracking geometry, refine matching — `LiveSession.gatePair`): rejected
+    when the rotation disagrees; a planar pair whose ambiguous `planarAlternative` agrees is switched to it;
+  * registrations and initial pairs (live and offline mapping): `MapperOptions.rotationCheck` (new, generic hook) —
+    `checkPoseRotation` compares the PnP rotation with gyro-propagated rotations of the 3 registered images nearest in
+    time (majority vote: a neighbour may itself be wrong);
+  * models (refine): `gyroConsistency` of consecutive registered keyframes → breaks (fragments) and isolated outliers.
+    Isolated outliers of the chosen model are deregistered before the final refinement.
+* **Model choice** (refine, live vs offline): fewer gyro breaks (beyond isolated outliers), then more registered images,
+  then — new — the share of verified two-view correspondences between registered images whose two features observe the
+  same 3-D point (`explainedCorrespondenceRatio`) when it differs by > 1.5 points (`modelChoiceExplainedGap`), then the
+  mean reprojection error. A live model that did not close the 1.03-lap yard loop (its start and end tracks stay apart:
+  PnP of the returning keyframes follows the recent points) has the same reprojection error as the closed offline one
+  (0.392 vs 0.393 px) but explains fewer correspondences (84.2 vs 87.1 %): ATE 2.5e-3 vs 2.6e-4. Clean captures differ by
+  0.4–0.8 points (choice unchanged).
+  Verified against GT on the e2e datasets: every rejected pair (12 object, ≈ 105 clean yard, ≈ 130 yard-real) had a
+  vision rotation ≥ 6° off while the bias-compensated gyro was within 0.2–1.6° of the truth.
+* **Spatial candidates while lost**: the new keyframe's look-at point uses the gyro-propagated rotation of the last
+  registered keyframe (its centre), not the stale keyframe's own view (its neighbours looked 85–100° away).
+* **Gyro calibration** (`LiveSession.calibrateGyro`): `estimateTimeOffset` on the registered keyframes of the refined live
+  model gives the gyro bias (adopted with ≥ 8 consistent pairs) and the camera–IMU offset (when reliable) BEFORE the
+  rolling-shutter estimation, which needs ω at the right time (with the offset still 0: yard-real readout 19.1 instead of
+  21.9 ms, principal point 8.6 instead of 0.5 px off). Bias persisted (`EngineStateRecord.gyroBias`). The same calibration
+  every 10 registrations DURING capture is opt-in (`EngineConfig.liveGyroCalibration`): it changes the keyframe selection
+  (rotation since the last keyframe) and measured equal or worse (yard ATE 2.4–2.7e-4 in 3 runs vs 2.1–2.2e-4, yard-real
+  7.0e-4 vs 3.3e-4, object 2.19e-4 vs 2.05e-4).
+* **IMU scale R²** (`estimateMetricScale`): computed with the robust (Huber) weights of the fit.
+* **Rolling shutter** (`src/sfm/rolling-shutter.ts`, `src/engine/refine-camera.ts`): model = axis (rows / cols of the
+  canonical image) + signed readout time; a keypoint at line s is mapped from t + (s − ½)·readout to the frame time by the
+  gyro rotation homography in undistorted normalised coordinates (x₀ = exp([ω_c τ]×) x_τ, ω_c over ±12 ms) plus the
+  first-order translational term x₀ += τ ρ (v_xy − x v_z) (`RSTranslation`: v = camera-frame velocity of the camera centre,
+  central difference of the registered keyframes nearest in time, `cameraVelocities`; ρ = inverse depth of the keypoint's
+  3-D point, the image's median for keypoints without one, `inverseDepths`; scene units cancel), then distorted back.
+  The translational term is what makes close-range orbits right: there the camera moves sideways at ≈ |ω| × the object
+  distance and that image motion cancels the yaw term at the orbit centre, so a rotation-only model settles on an
+  EFFECTIVE readout (abl-object-rs: −16.5 of −22 ms) that under-corrects the roll term (the rotation about the vertical has
+  a roll component when the camera looks down); a horizontal readout with roll bends the image ∝ x², i.e. every camera
+  pitches by a common angle and the object moves vertically against the camera ring (a near-gauge of orbits: object
+  height ↔ camera pitch ↔ c_y). Measured: the rotation error was a constant pitch (−0.20 / −0.26° on abl-object-rs /
+  object-real; rot p50 0.21 / 0.27°) and the object-real dense cloud sat 3.3 mm off the GT once aligned on the cameras
+  (the shape itself, ICP-aligned, as good as the baseline's: 0.35 mm p50); with the term rot p50 0.04 / 0.07°.
+  Estimated in refine on the refined live model (if gyro-consistent; else on the chosen model): hypotheses scored
+  by the robust (Cauchy 1 px) cost after a SHORT BA on a subset (`RSBundleCost`: every registered image free with a gauge,
+  ≤ 40 points per image, ≤ 8 observations per point, shared focal free, ≤ 10 LM iterations; velocities and observation
+  depths from the input model): 0, ±10 / ±25 ms on both axes pick axis and direction, safeguarded parabolic interpolation
+  narrows the time to ≈ 1 ms (≈ 12–18 BAs, ≈ 3–6 s on SwiftShader). A second pass (`rollingShutterOptions.passes`, default
+  2) repeats it on the model re-adjusted with the first estimate, narrowed around it (0.85 / 1 / 1.15 ×, ≈ 8 BAs): the short
+  BAs start from the input model, and one built on distorted keypoints pulls the readout towards 0 (synthetic orbit with
+  2 % focal error: −18.5 → −21.7 of −22 ms; e2e object-real −21.8 → −21.4, abl-object-rs −19.1 → −19.1, yard-real
+  22.0 → 22.0). Accepted when the cost drops ≥ 3 % (and |readout| ≥ 3 ms); then every keyframe's keypoints are corrected
+  IN PLACE from the saved originals (`CaptureState.rsOriginal`; the FeatureSet, live / offline reconstructions and clones
+  share the arrays), triangulator caches invalidated, the live model re-adjusted and the offline SfM run on corrected
+  keypoints. Estimates are absolute (from the originals), so refine can run again. Stats `rollingShutter`, `rsBest`,
+  `rsImprovementPct`, device-frame `rsReadoutMs` / `rsSweepDevice` (`rsModelToDevice`: −x_dev = the iPhone sweep of
+  e2e/README), persisted `EngineStateRecord.rollingShutter`. **Dense**: the corrected poses are those of the frame stamp
+  while the pixels are still rolling-shutter skewed (object-real: dense accuracy p50 1.3 → 2.7 mm, completeness 0.993 →
+  0.976 although the poses got better), so `SparseModel.rollingShutter` (model + each image's ω, persisted in
+  `sparse/meta`) makes `runDensify` warp every undistorted view to the frame stamp (`rsCorrectPinholeImage`: x_τ =
+  exp(−[ωτ]×)x₀, bilinear; the translational term with `nu` = v / the image's median depth, exact only at that depth —
+  the pixels' own depths are what PatchMatch computes) and enters the dense resume key. The ω of the model are those each
+  keyframe's keypoints were corrected with (`CaptureState.rsOmega`, `sparseRollingShutter`; not a new gyro query after
+  the alignment moved the time offset), ν only for keyframes corrected with the translational term, and the gyro window
+  is the same (±12 ms, `RS_OMEGA_HALF_WINDOW_MS`) for the estimation, the keypoints and the dense images. The colour
+  thumbnails that fusion / TSDF sample are made from the corrected views too (`denseViewImage`; they were the
+  uncorrected images in session while `rebuildColourViews` corrected them after a reload). Exports: POINTS2D are the
+  corrected keypoints — in session the in-memory ones, after a reload / respawn re-derived from the persisted model
+  (`modelKeypoints`: original keypoints + ω + ν·ρ_f/ρ_median from the model's points, < 1e-3 px from the in-session
+  correction on the same model); the exported JPEGs stay the original, skewed frames. A readout known in advance (`EngineConfig.rollingShutter`, device
+  frame) is applied live to every new keyframe (the store keeps the original keypoints; restore re-applies it), kept by
+  refine unless the data contradict it, and raises the motion gate to `rsMaxAngularSpeed` (2 rad/s): the RS-aware motion
+  rejection. A fixed-points (motion-only) test was tried first: it finds axis and direction but only 15–20 % of the
+  readout (points triangulated from RS-distorted pans resist), hence the subset BA with free points.
+* **Per-image focal** (focus breathing; `BAProblem.focalPriors` + `IncrementalMapper.adjustGlobalBundleFocalPriors` +
+  `refinePerImageFocal`): after the shared (f, c, k) refinement every registered image gets its own camera, focal free with
+  a prior N(f̄, (0.5 % f̄)²), principal point / distortion fixed. Kept only when the mean reprojection error drops ≥ 0.5 %
+  AND the focal lengths are smooth in time (lag-1 autocorrelation ≥ 0.6 — focus breathing follows the lagged focus
+  distance; per-image focal lengths that absorbed residual rolling shutter correlated −0.84 with |ω| at autocorrelation
+  −0.14). Then the shared camera is re-refined WITHOUT the breathing: a per-image focal is exactly a scaling of the keypoints
+  about the principal point by f̄/f_i (RADIAL distortion acts on normalised coordinates), so the keypoints are rescaled
+  temporarily, (f, c, k) refined, and the per-image focal lengths re-expressed around the new f̄ and polished. The per-image
+  focal lengths are only partly observable per image (focal ↔ dolly: they recover ≈ 0.6 of the breathing, a looser 1 %
+  prior changes nothing), so this alternation converges linearly: up to 6 rounds (`perImageFocalRounds`) until the shared
+  principal point moves < 0.25 px (abl-object-breath, pp error after 1 / 2 / 4 / 6 rounds: 4.6 / 3.6 / 2.0 / 1.0 px,
+  rotation 0.36 / 0.29 / 0.17 / 0.08°). Dense / export use the per-image cameras; `stats.focalPx` is the median.
+* **Measured**: README "Real-capture robustness".
+* **Limits**: the translational RS term is first order with keyframe-rate velocities (hand shake between keyframes is not
+  in it) and the dense images get it only at each image's median depth; abl-object-rs still converges to 19.1 of 22 ms
+  (its poses nevertheless reach the clean dataset's accuracy, ATE 2.2e-4, rotation 0.04°); the
+  per-image focal is weakly observable per image (focal ↔ dolly) and the alternation with the shared camera is a slow
+  block-coordinate descent (a joint BA would need intrinsics shared ACROSS cameras) that is STOPPED by the 6-round cap, not
+  converged: on object-real / abl-object-breath c_y still moves 0.4–0.5 px per round at round 6 (reprojection error flat,
+  0.509–0.511 px) and walks PAST the ground truth — object-real with 12 rounds stops at round 8 with c_y +0.43 px from the
+  image centre against −1.0 px GT: pp error 1.46 px, rotation 0.118° (6 rounds: 0.87 px, 0.077°); abl-object-breath
+  extrapolates to ≈ +0.5 px. The fixed point is biased along the orbit's weak pitch ↔ c_y mode (the 0.5 % prior keeps
+  part of the breathing in the shared camera), so the cap acts as an early-stopping regulariser tuned on these two
+  datasets (a principal-point prior or a joint shared-intrinsics BA would make it principled); the camera–IMU offset the
+  readout passes query ω with comes from the DISTORTED live model and is biased by where the features sit in the frame
+  (yard-real −30.5 / abl-yard-rs −27.9 ms, truth −25 — the alignment later finds −25.1 on the corrected model);
+  re-calibrating before the second pass gives −25.1 / −24.9 ms but measured neutral, and worse on yard-real (pp 0.4 →
+  1.3 px, e2e/README "Adversarial review"), so it is not done; no live RS estimation
+  during capture (only a configured readout is applied live). Memory: `rsOriginal` (a copy of the keypoints of every
+  corrected keyframe, ≈ 11 % of the features) and the best-of-window held frame are counted in `captureMemory`.

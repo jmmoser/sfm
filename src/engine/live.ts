@@ -171,6 +171,14 @@ export class CaptureState {
    */
   rollingShutter: RollingShutterModel | null = null;
   readonly rsOriginal = new Map<number, Float32Array>();
+  /**
+   * Camera angular velocity (rad/s, camera frame) each corrected keyframe's keypoints were corrected
+   * with: the dense stage / exports must correct the images with exactly these (not a later gyro
+   * query, whose offset / bias / R_cam_device may have changed since).
+   */
+  readonly rsOmega = new Map<number, Float64Array>();
+  /** Corrected keyframes whose correction included the translational term. */
+  readonly rsTranslated = new Set<number>();
 
   /** R_cam_device of the canonical images. */
   cameraFromDevice(): Mat3 {
@@ -187,6 +195,19 @@ interface TrackingRef {
   id: number;
   fs: FeatureSet;
   t: number;
+  width: number;
+  height: number;
+}
+
+/** A frame kept by best-of-window keyframing (its prepared image, features and tracking geometry). */
+interface HeldFrame {
+  f: FrameInput;
+  frameIndex: number;
+  prep: PreparedFrame;
+  fs: FeatureSet;
+  k: number;
+  trackGeom: TwoViewGeometry | null;
+  refId: number | null;
   width: number;
   height: number;
 }
@@ -381,7 +402,11 @@ export class LiveSession {
     gyroPlanarSwaps: 0,
     /** Live gyro calibrations (bias / time offset from the registered keyframes). */
     gyroCalibrations: 0,
+    /** Keyframes taken from an earlier, better frame of a deferral window (best-of-window). */
+    heldKeyframes: 0,
   };
+  /** Frame held by best-of-window keyframing (null = none). */
+  private held: HeldFrame | null = null;
   /** Bias-aware gyro integration (camera frame) shared by tracking, gates and refine. */
   private readonly gyroRef = new GyroReference();
   private gyroCalibratedAt = 0;
@@ -450,10 +475,14 @@ export class LiveSession {
     return g.numSamples >= 2 ? g : null;
   }
 
-  /** Tolerance of the gyro checks (the drift allowance shrinks once the bias is estimated). */
+  /**
+   * Tolerance of the gyro checks. The drift allowance (0.3°/s) is NOT reduced once a bias is
+   * estimated: the estimate comes from vision rotations that rolling shutter biases (e2e yard-real:
+   * x component 0.5 instead of 3.0 mrad/s ⇒ 5° over a 32 s loop closure), and correct loop-closure
+   * pairs were rejected with 0.1°/s.
+   */
   gyroTolerance(): Partial<GyroToleranceOptions> {
-    const t = this.deps.config.gyroTolerance ?? {};
-    return { driftDegPerS: this.state.gyroBias ? 0.1 : 0.3, ...t };
+    return { ...(this.deps.config.gyroTolerance ?? {}) };
   }
 
   /**
@@ -514,33 +543,50 @@ export class LiveSession {
   }
 
   /**
-   * Gyro bias and camera–IMU offset from the registered live keyframes (every 10 registrations
-   * once 12 are registered and R_cam_device is verified): `estimateTimeOffset` (vision vs gyro
-   * relative rotations, robust). The bias is adopted when ≥ 8 pairs agree, the offset when the
-   * estimate is reliable. Improves the gyro prediction of tracking / guided matching and tightens
-   * the gyro gates (the drift allowance drops from 0.3 to 0.1°/s).
+   * Opt-in (`EngineConfig.liveGyroCalibration: true`): gyro bias and camera–IMU offset from the
+   * registered live keyframes every 10 registrations once 12 are registered and R_cam_device is
+   * verified (`calibrateGyro`). Off by default: on the e2e captures it changed the keyframe
+   * selection (rotation since the last keyframe) without a measurable benefit and the final
+   * accuracy was equal or worse (yard ATE 2.7e-4 vs 2.1e-4, yard-real 7.0e-4 vs 3.3e-4); refine
+   * calibrates once on the refined live model instead.
    */
   private maybeCalibrateGyro(): void {
     const st = this.state;
-    if (this.deps.config.liveGyroCalibration === false || !st.cameraThetaVerified) return;
+    if (this.deps.config.liveGyroCalibration !== true || !st.cameraThetaVerified) return;
+    const n = this.mapper.reconstruction.numRegisteredImages;
+    if (n < 12 || n - this.gyroCalibratedAt < 10) return;
+    this.gyroCalibratedAt = n;
+    this.calibrateGyro('live');
+  }
+
+  /**
+   * Gyro bias + camera–IMU offset from the registered keyframes of the live model
+   * (`estimateTimeOffset`: vision vs gyro relative rotations, robust; the bias is adopted with ≥ 8
+   * consistent pairs, the offset when reliable). Refine calls it on the refined live model before
+   * the rolling-shutter estimation (which needs ω at the right time); `maybeCalibrateGyro` during
+   * capture when enabled. Returns true when the bias (and, if reliable, the offset) was updated.
+   */
+  calibrateGyro(label: 'live' | 'refine' = 'live'): boolean {
+    const st = this.state;
+    if (!st.cameraThetaVerified || st.imu.samples.length < 10) return false;
     const kfs = this.registeredKeyframes();
-    if (kfs.length < 12 || kfs.length - this.gyroCalibratedAt < 10) return;
-    this.gyroCalibratedAt = kfs.length;
+    if (kfs.length < 12) return false;
     const Rcd = st.cameraFromDevice();
     const ik: InertialKeyframe[] = kfs.map((k) => ({ t: k.t, R_wc: mat3TransposeOf(k.pose.R), C: poseCentre(k.pose), R_cam_device: Rcd }));
     const cur = st.timeOffsetMs ?? 0;
     const t0 = now();
     const r = estimateTimeOffset(ik, st.imu.samples, { initialOffsetMs: cur, searchRangeMs: st.gyroBias ? 60 : 150, maxPairGapMs: 2000 });
-    if (!r || r.numInliers < 8 || ![...r.gyroBias].every(Number.isFinite)) return;
+    if (!r || r.numInliers < 8 || ![...r.gyroBias].every(Number.isFinite)) return false;
     st.gyroBias = [r.gyroBias[0], r.gyroBias[1], r.gyroBias[2]];
     if (r.reliable) st.timeOffsetMs = r.offsetMs;
     this.stats.gyroCalibrations++;
     this.deps.log(
       'info',
-      `live gyro calibration (${kfs.length} keyframes, ${Math.round(now() - t0)} ms): bias ${st.gyroBias.map((x) => (x * 1000).toFixed(1)).join(', ')} mrad/s, ` +
+      `${label} gyro calibration (${kfs.length} keyframes, ${Math.round(now() - t0)} ms): bias ${st.gyroBias.map((x) => (x * 1000).toFixed(1)).join(', ')} mrad/s, ` +
         `time offset ${r.reliable ? `${r.offsetMs.toFixed(1)} ms` : `kept ${cur.toFixed(1)} ms (σ ${r.stdMs.toFixed(1)} ms)`}`,
     );
     this.persistState();
+    return true;
   }
 
   // ------------------------------------------------------------------------------------------
@@ -599,6 +645,7 @@ export class LiveSession {
     const seg = typeof f.segment === 'number' ? f.segment : 0;
     if (this.segment !== null && seg !== this.segment) {
       this.selector.resetTracking();
+      this.releaseHeld();
       this.ref = null;
     }
     this.segment = seg;
@@ -665,6 +712,7 @@ export class LiveSession {
         // frame size changed (camera format switch): start a new tracking segment
         this.deps.log('warn', `frame size changed ${this.ref.width}x${this.ref.height} → ${W}x${H}: new tracking segment`);
         this.selector.resetTracking();
+        this.releaseHeld();
         this.ref = null;
       }
       const ref = this.ref;
@@ -683,6 +731,12 @@ export class LiveSession {
       }
       let decision = this.selector.evaluate(cand);
       if (decision.decision === 'keyframe' && decision.forced) this.stats.forcedKeyframes++;
+      if (decision.decision === 'keyframe' && decision.useHeld && !this.held) {
+        // the engine keeps every frame the selector holds — defensive: keyframe = this frame
+        this.selector.revertLastKeyframe();
+        this.selector.commitKeyframe(f.t);
+        decision = { ...decision, useHeld: false };
+      }
       if (decision.decision === 'keyframe' && (st.captureFinished || this.disposed)) {
         // finishCapture / refine started while this frame was being analysed: no new keyframe
         // (its mapping job would change the live model under refine)
@@ -697,13 +751,28 @@ export class LiveSession {
         timings.memoryLimited = 1;
       }
       const overlay = overlayPoints(fs, W, H, kOut, this.deps.config.overlayMaxPoints ?? ENGINE_DEFAULTS.overlayMaxPoints);
+      // best-of-window keyframing: the selector holds this frame as the best of a deferral window,
+      // or makes the held frame the keyframe (one frame kept at most)
+      let src: HeldFrame = { f, frameIndex, prep, fs, k: verdict.k, trackGeom, refId: ref ? ref.id : null, width: W, height: H };
+      if (decision.decision === 'keyframe' && decision.useHeld && this.held) {
+        src = this.held;
+        this.held = null;
+        this.stats.heldKeyframes++;
+        // the keyframe is an EARLIER frame than the one this update answers (for consumers that map
+        // keyframes to frames by the 'keyframe' decision, e.g. the e2e live-trajectory metric)
+        timings.keyframeFrameIndex = src.frameIndex;
+      } else if (decision.hold) {
+        this.releaseHeld();
+        this.held = src;
+        handedOff = true;
+      } else if (this.selector.heldTime === null) this.releaseHeld();
       let mapped: Promise<void> | null = null;
       if (decision.decision === 'keyframe') {
         const tk = now();
-        const id = this.createKeyframe(f, frameIndex, prep, fs, verdict.k);
-        handedOff = true;
-        const job: MappingJob = { id, tracking: ref && trackGeom ? { other: ref.id, geom: trackGeom } : null };
-        this.ref = { id, fs, t: f.t, width: W, height: H };
+        const id = this.createKeyframe(src.f, src.frameIndex, src.prep, src.fs, src.k);
+        if (src.prep === prep) handedOff = true;
+        const job: MappingJob = { id, tracking: src.refId !== null && src.trackGeom ? { other: src.refId, geom: src.trackGeom } : null };
+        this.ref = { id, fs: src.fs, t: src.f.t, width: src.width, height: src.height };
         mapped = this.enqueue(job);
         timings.keyframe = now() - tk;
       }
@@ -896,6 +965,10 @@ export class LiveSession {
       vocab: st.vocab,
       imuSamples: st.imu.samples.length,
       pendingWriteBytes: this.pendingWriteBytes,
+      // a readout known in advance keeps every keyframe's original keypoints (+ ≈ 11 % of the features)
+      rsOriginal: st.rsOriginal,
+      // the best-of-window frame: full-size source (+ rotated canvas) and the small copy
+      heldFrameBytes: this.held ? 2 * 4 * this.held.width * this.held.height + this.held.prep.small.data.byteLength : 0,
     });
   }
 
@@ -1005,6 +1078,7 @@ export class LiveSession {
 
   /** Resolves when the mapping queue is empty and all writes are done. */
   async flush(): Promise<void> {
+    if (this.state.captureFinished) this.releaseHeld();
     for (;;) {
       const q = this.queue;
       await q;
@@ -1448,8 +1522,16 @@ export class LiveSession {
     return st.order.length;
   }
 
+  /** Drop the frame held by best-of-window keyframing. */
+  private releaseHeld(): void {
+    if (!this.held) return;
+    this.held.prep.release();
+    this.held = null;
+  }
+
   dispose(): void {
     this.disposed = true;
+    this.releaseHeld();
     this.ref = null;
   }
 }

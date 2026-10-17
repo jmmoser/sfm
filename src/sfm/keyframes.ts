@@ -15,7 +15,10 @@
  *   - tracking lost: inliers < `minInliers`;
  *   - `maxIntervalMs` elapsed while the camera is moving;
  * never earlier than `minIntervalMs` after the previous keyframe. Soft triggers wait up to
- * `maxDeferMs` for a sharper frame. The first keyframe is taken once `sharpnessWarmup` frames
+ * `maxDeferMs` for a sharper frame, holding the best candidate of that window, which becomes the
+ * keyframe when nothing sharper arrives (best-of-window, `bestOfWindow`). A HARD rotation limit
+ * (`hardRotationDeg`, gyro rotation incl. the next frame's) forces keyframes through fast pans with
+ * relaxed blur / motion gates. The first keyframe is taken once `sharpnessWarmup` frames
  * have been seen (so it is not blurry). Guidance for the UI is attached to every decision.
  * Pure rotation (rotation without rotation-compensated parallax) ⇒ 'translate_more'.
  */
@@ -68,6 +71,10 @@ export interface KeyframeDecision {
   trigger?: KeyframeTrigger;
   /** True when the hard rotation limit forced the keyframe (`KeyframeSelector.isForced`). */
   forced?: boolean;
+  /** 'skip' only: keep this frame as the best candidate of the deferral window (replaces any held one). */
+  hold?: boolean;
+  /** 'keyframe' only: the HELD frame (time `heldTime` before this call) is the keyframe, not this one. */
+  useHeld?: boolean;
 }
 
 /** Options of `KeyframeSelector`. */
@@ -121,6 +128,17 @@ export interface KeyframeSelectorOptions {
   hardRotationDeg: number;
   forcedBlurRatio: number;
   forcedMaxAngularSpeed: number;
+  /**
+   * Best-of-window keyframing (default true): while a soft trigger is deferred for a sharper frame,
+   * the best candidate of the window (`candidateScore`: sharpness, penalised by the angular speed)
+   * is HELD (decision.hold — the engine keeps that one frame); when the window ends without a sharp
+   * enough frame, the held frame becomes the keyframe if it scores better than the current one
+   * (decision.useHeld) instead of whatever frame happens to arrive at the deadline. Memory is
+   * bounded: at most one held frame.
+   */
+  bestOfWindow: boolean;
+  /** Angular speed (rad/s) that halves a candidate's score (default 2). */
+  scoreAngularSpeed: number;
 }
 
 /** Defaults of `KeyframeSelectorOptions`. */
@@ -149,6 +167,8 @@ export const DEFAULT_KEYFRAME_OPTIONS: KeyframeSelectorOptions = {
   hardRotationDeg: 20,
   forcedBlurRatio: 0.25,
   forcedMaxAngularSpeed: 3,
+  bestOfWindow: true,
+  scoreAngularSpeed: 2,
 };
 
 const DEG = Math.PI / 180;
@@ -173,6 +193,9 @@ export class KeyframeSelector {
   private histBest = new Float64Array(HISTORY);
   private histLen = 0;
   private deferStart: number | null = null;
+  /** Best candidate of the current deferral window (best-of-window keyframing). */
+  private heldT: number | null = null;
+  private heldScore = -Infinity;
   private kfCount = 0;
   /** Recent frame intervals (ms) for the hard-rotation prediction. */
   private dtRing = new Float64Array(5);
@@ -237,6 +260,23 @@ export class KeyframeSelector {
     this.bestInliers = 0;
     this.histLen = 0;
     this.deferStart = null;
+    this.dropHeld();
+  }
+
+  /** Time of the frame held as the best candidate of the deferral window (null = none). */
+  get heldTime(): number | null {
+    return this.heldT;
+  }
+
+  private dropHeld(): void {
+    this.heldT = null;
+    this.heldScore = -Infinity;
+  }
+
+  /** Keyframe quality of a candidate: sharpness / (1 + angular speed / scoreAngularSpeed). */
+  candidateScore(c: KeyframeCandidate): number {
+    const w = Number.isFinite(c.angularSpeed) ? Math.max(0, c.angularSpeed) : 0;
+    return c.sharpness / (1 + w / Math.max(1e-6, this.options.scoreAngularSpeed));
   }
 
   /** Make the frame at time t the reference keyframe. */
@@ -254,6 +294,7 @@ export class KeyframeSelector {
     this.lastKfT = t;
     this.bestInliers = 0;
     this.deferStart = null;
+    this.dropHeld();
     this.kfCount++;
   }
 
@@ -274,6 +315,7 @@ export class KeyframeSelector {
       this.bestInliers = 0;
     }
     this.deferStart = null;
+    this.dropHeld();
     this.kfCount = Math.max(0, this.kfCount - 1);
   }
 
@@ -411,14 +453,29 @@ export class KeyframeSelector {
     } else if (trigger !== null && forced) reason += ` (hard rotation limit ${o.hardRotationDeg}°)`;
     if (trigger === null) {
       this.deferStart = null;
+      this.dropHeld();
       return { decision: 'skip', reason: 'view has not changed enough', guidance };
     }
-    // Soft triggers: wait briefly for a sharper frame (never at the hard rotation limit).
-    if (!forced && trigger !== 'tracking_lost' && overlap >= o.hardOverlap && Number.isFinite(ref) && c.sharpness < o.deferSharpnessRatio * ref) {
+    // Soft triggers: wait briefly for a sharper frame (never at the hard rotation limit), holding
+    // the best candidate of the window (best-of-window keyframing).
+    const soft = !forced && trigger !== 'tracking_lost' && overlap >= o.hardOverlap && Number.isFinite(ref);
+    const score = this.candidateScore(c);
+    if (soft && c.sharpness < o.deferSharpnessRatio * ref) {
       if (this.deferStart === null) this.deferStart = c.t;
       if (c.t - this.deferStart < o.maxDeferMs) {
+        if (o.bestOfWindow && score > this.heldScore) {
+          this.heldT = c.t;
+          this.heldScore = score;
+          return { decision: 'skip', reason: `${reason}; waiting for a sharper frame (best so far)`, guidance, hold: true };
+        }
         return { decision: 'skip', reason: `${reason}; waiting for a sharper frame`, guidance };
       }
+    }
+    if (soft && o.bestOfWindow && this.heldT !== null && this.heldScore > score) {
+      const t = this.heldT;
+      const hs = this.heldScore;
+      this.commitKeyframe(t);
+      return { decision: 'keyframe', reason: `${reason}; the best frame of the window (score ${fmt(hs)} > ${fmt(score)})`, guidance, trigger, useHeld: true };
     }
     this.commitKeyframe(c.t);
     return forced ? { decision: 'keyframe', reason, guidance, trigger, forced } : { decision: 'keyframe', reason, guidance, trigger };

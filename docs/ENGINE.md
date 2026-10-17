@@ -87,21 +87,32 @@ picks object vs scene after initialisation from the scene depth / baseline.
 ### Frame flow (live)
 1. Rotate to the session's canonical orientation (first frame's θ) when needed;
    `R_cam_device` for the session follows from θ₀.
-2. Small gray copy (≤ 320 px) → sharpness; IMU angular speed → blur/motion gate.
+2. Small gray copy (≤ 320 px) → sharpness; IMU angular speed + gyro rotation since the
+   last keyframe → blur/motion gate (`KeyframeSelector.gate`; relaxed when the hard
+   rotation limit forces a keyframe through a fast pan).
 3. Features at the preset's working resolution (GPU path takes the ImageBitmap
    directly). Per-feature colours sampled from a ≤ 640 px RGBA copy.
 4. Match to the last keyframe, guided by the gyro rotation homography
    `H = K R_c K⁻¹` with `R_c = R_cam_device · R_{d(t)←d(t_kf)} · R_cam_deviceᵀ`;
    verify with two-view geometry; compute rotation-compensated parallax.
-5. `KeyframeSelector` decision. On keyframe: JPEG to IndexedDB (async), add to DB,
-   match against the previous 6 keyframes + retrieval candidates (+ spatial
-   neighbours when registered), verify, update the graph, `LiveMapper.addKeyframe`.
+5. `KeyframeSelector` decision (soft triggers wait briefly for a sharper frame and keep
+   the best frame of that window — best-of-window — which may become the keyframe on a
+   later frame). On keyframe: JPEG to IndexedDB (async), add to DB, match against the
+   previous 6 keyframes + retrieval candidates (+ spatial neighbours of the gyro-propagated
+   pose of the last registered keyframe), verify, reject pairs whose rotation disagrees
+   with the gyro, update the graph, `LiveMapper.addKeyframe` (registrations checked
+   against the gyro too).
 
 ### Refine
 Train/extend the vocabulary → candidate pairs (sequential 10, retrieval 15,
-spatial 10) → match + verify → `runIncrementalSfM` → keep the better of live vs
-offline → final global BA (focal + k1 + k2) → filter/retriangulate → world
-alignment (`sfm/world.ts`) → persist.
+spatial 10) → match + verify (+ gyro gate) → refine the live model → gyro calibration
+(bias, camera–IMU offset) → rolling-shutter estimation on the live model (gyro rotation +
+translation from the neighbouring keyframes × point depth; 2 passes) and keypoint
+correction → `runIncrementalSfM` (gyro-checked registrations) → keep the better of live
+vs offline (gyro breaks, then registered images, then explained correspondences, then
+reprojection error; isolated gyro outliers deregistered) → final global BA (focal + principal point + k1 + k2) →
+per-image focal lengths (focus breathing; kept only if they help) → world alignment
+(`sfm/world.ts`) → persist. Details: ARCHITECTURE §6 "Real-capture robustness".
 
 ### Dense / mesh
 Views stream from IndexedDB through an LRU image cache; depth maps go through a

@@ -19,7 +19,7 @@ import { computeWorldAlignment, type WorldAlignment, type WorldKeyframe } from '
 import { gyroConsistency, timedRotations, type GyroConsistency } from '../sfm/gyro';
 import { median } from '../math/stats';
 import { handEyeCheck, type LiveSession } from './live';
-import { refinePerImageFocal, refineRollingShutter, rsStats, type RefineRSResult } from './refine-camera';
+import { refinePerImageFocal, refineRollingShutter, rsStats, sparseRollingShutter, type RefineRSResult } from './refine-camera';
 import { pairToStored, type EngineStore, type StoredPair, type StoredPairs } from './persistence';
 import { ENGINE_DEFAULTS } from './presets';
 import type { EngineConfig, SparseCameraEx, SparseModel, SparseResultEx } from './types';
@@ -187,6 +187,30 @@ async function indexVocabulary(
   }
 }
 
+/**
+ * Fraction of the verified two-view correspondences between registered images that the model
+ * explains: both features observe the SAME 3-D point. A model that failed to close a loop keeps the
+ * start and the end of the loop in separate tracks (the loop pairs' correspondences are split), so
+ * its ratio is lower, while its reprojection error can be as low as that of a closed model (e2e
+ * yard-real: live 0.392 px with a 17 cm loop gap vs offline 0.393 px).
+ */
+export function explainedCorrespondenceRatio(rec: Reconstruction, db: FeatureDatabase): number {
+  let total = 0,
+    explained = 0;
+  for (const [a, b, g] of db.pairs()) {
+    const ia = rec.images.get(a),
+      ib = rec.images.get(b);
+    if (!ia || !ib || !ia.registered || !ib.registered) continue;
+    const inl = g.inliers;
+    for (let k = 0; k < inl.length; k += 2) {
+      const pa = ia.point3D[inl[k]];
+      total++;
+      if (pa >= 0 && pa === ib.point3D[inl[k + 1]]) explained++;
+    }
+  }
+  return total > 0 ? explained / total : 0;
+}
+
 /** Full refine pipeline. */
 export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, cancel?: CancelToken): Promise<RefineOutput> {
   const live = deps.live;
@@ -290,6 +314,9 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     liveRec = live.mapper.reconstruction;
   }
   checkCancel(cancel, 'reconstruction');
+  // gyro bias / camera–IMU offset from the refined live model (the rolling-shutter estimation needs
+  // ω at the right time; the live calibration may be off or stale)
+  if (liveRec && liveRec.numRegisteredImages >= 12 && cfg.estimateRollingShutter !== false) live.calibrateGyro('refine');
   // Model choice: gyro consistency first (a model whose consecutive keyframes disagree with the
   // gyro beyond isolated outliers is made of fragments joined by a wrong rotation), then the
   // registered images, then the mean reprojection error.
@@ -307,15 +334,41 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     const prev = st.rollingShutter;
     report('reconstruction', 0.08, 'rolling shutter');
     await tick();
-    rs = refineRollingShutter(rec, st, gyro!, cfg.rollingShutterOptions ?? {}, live.liveRollingShutter());
-    Object.assign(stats, rsStats(rs, st.cameraFromDevice()));
-    deps.log('info', `rolling shutter: ${rs.applied ? `${rs.applied.axis} ${rs.applied.readoutMs.toFixed(1)} ms (${rs.corrected} keyframes corrected)` : 'none'} — ${rs.reason}`);
-    if (rs.applied || prev) {
+    const rsOpts = cfg.rollingShutterOptions ?? {};
+    const readjust = async (): Promise<void> => {
       // keypoints changed in place: drop cached normalised coordinates and re-adjust
       live.mapper.incrementalMapper.triangulator.invalidate();
       mapper.triangulator.invalidate();
       await mapper.iterativeGlobalRefinement(undefined, cancel, true);
+    };
+    let r = refineRollingShutter(rec, st, gyro!, rsOpts, live.liveRollingShutter());
+    const first = r;
+    if (r.applied || prev) await readjust();
+    // further passes on the model re-adjusted with the estimate (the short BAs start from the input
+    // model: built on distorted keypoints it pulls the readout towards 0), narrowed around it
+    let passes = 1;
+    for (let p = 2; p <= Math.max(1, rsOpts.passes ?? 2) && r.applied && r.estimate; p++) {
+      checkCancel(cancel, 'reconstruction');
+      // NOT re-calibrated here although the offset calibrated on the rolling-shutter DISTORTED live
+      // model is biased by where the features sit in the frame (e2e yard-real −30.5 / abl-yard-rs
+      // −27.9 ms, truth −25; re-calibrating on the corrected model gives −25.1 / −24.9 ms and the
+      // true bias): measured neutral on abl-*-rs / object-real and worse on yard-real (principal
+      // point 0.4 → 1.3 px, rotation 0.10 → 0.13°) — ARCHITECTURE "Real-capture robustness"
+      const before = r.applied;
+      r = refineRollingShutter(rec, st, gyro!, { ...rsOpts, around: before }, before);
+      passes = p;
+      await readjust();
+      if (!r.applied || r.applied.axis !== before.axis || Math.abs(r.applied.readoutMs - before.readoutMs) < 0.5) break;
     }
+    rs = r;
+    Object.assign(stats, rsStats(r, st.cameraFromDevice()));
+    if (first.estimate) stats.rsImprovementPct = Math.round(1000 * first.estimate.improvement) / 10;
+    stats.rsPasses = passes;
+    if (passes > 1 && first.applied) stats.rsPass1 = `${first.applied.axis} ${first.applied.readoutMs.toFixed(1)} ms`;
+    deps.log(
+      'info',
+      `rolling shutter: ${r.applied ? `${r.applied.axis} ${r.applied.readoutMs.toFixed(1)} ms (${r.corrected} keyframes corrected, ${passes} pass(es)${r.translation ? ', with translation' : ''})` : 'none'} — ${first.reason}`,
+    );
   };
   if (rsEnabled && liveRec && liveRec.numRegisteredImages >= 10 && (consistency(liveRec)?.breaksWithoutOutliers ?? 0) === 0) {
     await runRS(liveRec, live.mapper.incrementalMapper);
@@ -360,7 +413,19 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   if (!offline && !liveRec) throw new Error('reconstruction failed: no initial pair found (move the camera sideways while scanning)');
   const lb = lc ? lc.breaksWithoutOutliers : 0,
     ob = oc ? oc.breaksWithoutOutliers : 0;
-  if (!offline || (liveRec && (lb < ob || (lb === ob && (lr > or || (lr === or && le <= oe)))))) {
+  // explained correspondences: a model that did not close a loop splits the loop pairs' tracks
+  const lx = liveRec ? explainedCorrespondenceRatio(liveRec, st.db) : 0,
+    ox = offline ? explainedCorrespondenceRatio(offline, st.db) : 0;
+  stats.liveExplained = Math.round(1000 * lx) / 1000;
+  stats.offlineExplained = Math.round(1000 * ox) / 1000;
+  const minExplainedGap = cfg.modelChoiceExplainedGap ?? 0.015;
+  const liveBetter = (): boolean => {
+    if (lb !== ob) return lb < ob;
+    if (lr !== or) return lr > or;
+    if (Math.abs(lx - ox) > minExplainedGap) return lx > ox;
+    return le <= oe;
+  };
+  if (!offline || (liveRec && liveBetter())) {
     chosen = liveRec!;
     which = 'live';
   } else {
@@ -390,6 +455,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   stats.gyroRejectedPairs = live.stats.gyroRejectedPairs;
   stats.gyroRejectedPoses = live.stats.gyroRejectedPoses;
   stats.forcedKeyframes = live.stats.forcedKeyframes;
+  stats.heldKeyframes = live.stats.heldKeyframes;
   // final global BA with the principal point free (well constrained by the many views of a
   // finished capture; fixed during mapping as in COLMAP). A fixed, offset principal point is
   // absorbed by a constant rotation of every camera (≈ 0.14° per 1.8 px on the e2e datasets).
@@ -411,9 +477,15 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   if (cfg.perImageFocal !== false && chosen.numRegisteredImages >= 10) {
     report('reconstruction', 0.985, 'per-image focal');
     try {
-      const pf = await refinePerImageFocal(chosen, st.db, st.graph, { ...(which === 'live' ? live.mapper.incrementalMapper.opts : mapperOpts) }, {
+      const mo = { ...(which === 'live' ? live.mapper.incrementalMapper.opts : mapperOpts) };
+      const ppOn = cfg.refinePrincipalPoint !== false && chosen.numRegisteredImages >= ppMin;
+      const pf = await refinePerImageFocal(chosen, st.db, st.graph, mo, {
         sigmaRel: cfg.perImageFocalSigma ?? 0.005,
-        minImprovement: cfg.perImageFocalMinImprovement ?? 0.03,
+        minImprovement: cfg.perImageFocalMinImprovement,
+        minAutocorrelation: cfg.perImageFocalMinAutocorrelation,
+        timeOrder: order,
+        rounds: cfg.perImageFocalRounds,
+        refinePrincipalPoint: ppOn ? (r) => refinePrincipalPoint(r, st.db, st.graph, mo, cancel) : undefined,
         cancel,
       });
       if (pf.accepted) chosen = pf.rec;
@@ -427,7 +499,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   }
   stats.reconstructionMs = Math.round(now() - tRec);
   report('reconstruction', 1, `${which} model: ${chosen.numRegisteredImages}/${order.length} images, ${chosen.numPoints} points`);
-  deps.log('info', `refine: live ${lr} images (${le.toFixed(3)} px), offline ${or} images (${oe.toFixed(3)} px) → ${which}`);
+  deps.log('info', `refine: live ${lr} images (${le.toFixed(3)} px, ${(100 * lx).toFixed(1)} % explained), offline ${or} images (${oe.toFixed(3)} px, ${(100 * ox).toFixed(1)} % explained) → ${which}`);
 
   // ---------------------------------------------------------------- alignment
   const tAl = now();
@@ -503,6 +575,10 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
 
   // ---------------------------------------------------------------- result
   const model = modelFromReconstruction(chosen, order);
+  // the keypoints were corrected for rolling shutter: the dense stage corrects the images too (with
+  // the ω / translation each keyframe's keypoints were corrected with), exports re-derive them
+  const srs = sparseRollingShutter(st, chosen, model.images.map((im) => im.id));
+  if (srs) model.rollingShutter = srs;
   const cameras: SparseCameraEx[] = model.images.map((im) => {
     const r = st.records.get(im.id);
     return {

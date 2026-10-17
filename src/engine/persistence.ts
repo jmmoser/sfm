@@ -24,7 +24,7 @@
 import type { CameraIntrinsics, GeoFix, ImuSample, Mat3, MetricInfo, RGBAImage, TwoViewConfig, TwoViewGeometry, Vec3 } from '../core/types';
 import { SessionStore, type SessionMeta } from '../io/storage';
 import type { CaptureMode, QualityPreset } from '../workers/protocol';
-import type { KeyframeRecord, SparseModel } from './types';
+import type { KeyframeRecord, SparseModel, SparseRollingShutter } from './types';
 
 /** Image of a stored keyframe. */
 export type StoredImage = Blob | RGBAImage;
@@ -335,6 +335,8 @@ export interface SparseMetaRecord {
   cameras: { id: number; pose: { R: number[]; t: number[] }; intrinsics: CameraIntrinsics; t: number; frameIndex: number }[];
   metric: MetricInfo;
   stats: Record<string, number | string>;
+  /** SparseModel.rollingShutter (absent in older records). */
+  rollingShutter?: SparseRollingShutter | null;
 }
 
 /** Persisted dense views (`dense/meta`). */

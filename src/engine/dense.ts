@@ -19,6 +19,7 @@ import { simplifyMesh } from '../dense/simplify';
 import { tsdfMesh } from '../dense/tsdf';
 import type { DenseView, DepthMap, DepthMapStore } from '../dense/types';
 import { undistortImage, undistortedCamera } from '../dense/undistort';
+import { rsCorrectPinholeImage } from '../sfm/rolling-shutter';
 import { neighboursFromSelection, selectSourceViews, type SourceViewSelection } from '../dense/view-selection';
 import { getGPU } from '../gpu/device';
 import { median } from '../math/stats';
@@ -147,6 +148,7 @@ function denseKey(model: SparseModel, refs: number[], settings: { maxSize: numbe
       passes: settings.passes,
       mode: settings.mode,
       halo: settings.halo,
+      rs: model.rollingShutter ? [model.rollingShutter.axis, model.rollingShutter.readoutMs, !!model.rollingShutter.nu] : null,
       pm: [p.iterations, p.geometricIterations, p.numSources, p.patchMatch ?? {}, p.viewSelection ?? {}],
     }),
   );
@@ -334,9 +336,11 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
       const stored = await deps.store.getFrameImage(id);
       if (!stored) throw new Error(`keyframe image ${id} missing`);
       const rgba = await decodeStoredImage(stored, g.cam.width, g.cam.height);
-      const und = undistortImage(rgba, g.distorted, maxSize);
+      const und = denseViewImage(rgba, g.distorted, maxSize, model, id);
       const view: DenseView = { id, cam: und.cam, pose: g.pose, image: und.image };
       if (!colour.has(id)) {
+        // colour thumbnail of the SAME (rolling-shutter corrected) image: fusion / TSDF sample it
+        // at the projection with the frame-stamp pose
         const w = und.image.width,
           h = und.image.height;
         const s = Math.min(1, Math.sqrt(colourBytesPerView / (4 * w * h)));
@@ -559,10 +563,23 @@ export async function rebuildColourViews(store: EngineStore, model: SparseModel,
     if (!cam || !stored) continue;
     const fs = fitSize(v.cam.width, v.cam.height, maxSide);
     const rgba = await decodeStoredImage(stored, fs.width, fs.height);
-    const und = undistortImage(rgba, cam as CameraIntrinsics, maxSide);
-    out.push({ id: v.id, cam: v.cam, pose, image: und.image });
+    out.push({ id: v.id, cam: v.cam, pose, image: denseViewImage(rgba, cam as CameraIntrinsics, maxSide, model, v.id).image });
   }
   return out;
+}
+
+/**
+ * Pinhole (undistorted, ≤ maxSize) image of a keyframe for the dense stage. When the model's
+ * keypoints were rolling-shutter corrected (`SparseModel.rollingShutter`), its poses are those of
+ * the frame stamp and the pixels are corrected too (`rsCorrectPinholeImage`), else every
+ * fast-rotating view is skewed against its pose. Used for the PatchMatch views AND their colour
+ * thumbnails (fusion / TSDF), in-session and after a reload alike.
+ */
+export function denseViewImage(rgba: RGBAImage, distorted: CameraIntrinsics, maxSize: number, model: SparseModel, id: number): { image: RGBAImage; cam: CameraIntrinsics } {
+  const und = undistortImage(rgba, distorted, maxSize);
+  const rs = model.rollingShutter;
+  const w = rs ? rs.omega[id] : undefined;
+  return { cam: und.cam, image: rs && w ? rsCorrectPinholeImage(und.image, und.cam, w, rs, rs.nu?.[id] ?? null) : und.image };
 }
 
 export interface MeshDeps {

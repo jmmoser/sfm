@@ -119,5 +119,13 @@ describe('captureMemory', () => {
     expect(b.imu).toBe(600 * MEM.imuSample);
     expect(b.pendingWrites).toBe(5 * MB);
     expect(sumBreakdown(b)).toBeGreaterThan(b.features);
+    expect(b.rsOriginal).toBeUndefined();
+    // rolling-shutter originals (a copy of the keypoints of every corrected keyframe) and the
+    // best-of-window held frame are resident too
+    const rsOriginal = new Map([...db.features].map(([id, f]) => [id, f.keypoints.slice()] as [number, Float32Array]));
+    const b2 = captureMemory({ db, graph, rec: null, vocab: null, imuSamples: 600, rsOriginal, heldFrameBytes: 3 * MB });
+    expect(b2.rsOriginal).toBe(3 * (16 * n + 16));
+    expect(b2.heldFrame).toBe(3 * MB);
+    expect(sumBreakdown(b2)).toBe(sumBreakdown(b) - 5 * MB + b2.rsOriginal + 3 * MB);
   });
 });
