@@ -11,7 +11,10 @@
  *    A landscape bitmap in a portrait UI (θ ∈ {0, 180}) is such a raw buffer, which is upright
  *    for θ = 90 — it is treated as captured at θ = 90. A portrait bitmap in a landscape UI is
  *    not explained by any delivery path (transient) and is dropped. The remaining ambiguity
- *    (raw buffer vs upright frame in landscape-270) is resolved by the engine's hand-eye check.
+ *    (raw buffer vs upright frame in landscape-270) is resolved by the engine's hand-eye check —
+ *    unless the frame says it is raw (`FrameInput.rawBuffer`, the MediaStreamTrackProcessor path):
+ *    then the delivery path is known from the first frame and every landscape bitmap is upright
+ *    for θ = 90 whatever the UI rotation.
  *
  * Image preparation (ENGINE.md "Frame flow"): a ≤ 640 px RGBA copy (per-feature colours +
  * sharpness), the feature input (ImageBitmap / rotated OffscreenCanvas for the GPU SIFT, a gray
@@ -92,12 +95,24 @@ export class OrientationTracker {
     this.rawDelivery = raw;
   }
 
-  /** Decide for one frame (`width`/`height` = bitmap size as submitted). */
-  classify(f: { width: number; height: number; screenAngle: number; t: number }): OrientationVerdict {
+  /**
+   * Decide for one frame (`width`/`height` = bitmap size as submitted). `raw` = the capture path
+   * declares raw sensor buffers: it overrides the shape-based guess, also a persisted
+   * `rawDelivery = false` of a session resumed on another path (its earlier keyframes were
+   * upright frames, so θ₀ is NOT re-interpreted then).
+   */
+  classify(f: { width: number; height: number; screenAngle: number; t: number; raw?: boolean }): OrientationVerdict {
     const ui = snap(f.screenAngle);
     if (this.lastUI !== null && ui !== this.lastUI) this.changeT = f.t;
     this.lastUI = ui;
     if (Number.isFinite(f.t) && f.t - this.changeT < this.settleMs) return { ok: false, reason: `within ${this.settleMs} ms of a UI rotation` };
+    if (f.raw) {
+      if (f.height > f.width) return { ok: false, reason: `portrait ${f.width}x${f.height} frame from a raw-buffer path` };
+      if (this.rawDelivery === null) this.noteDelivery(true);
+      else this.rawDelivery = true;
+      if (this.thetaSession === null) this.thetaSession = 90;
+      return { ok: true, effectiveTheta: 90, k: canonicalRotation(this.thetaSession, 90), raw: true };
+    }
     const portraitUI = ui === 0 || ui === 180;
     const landscapeBitmap = f.width > f.height;
     const portraitBitmap = f.height > f.width;

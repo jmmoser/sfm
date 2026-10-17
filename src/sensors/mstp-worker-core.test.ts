@@ -73,7 +73,7 @@ function setup(opts: { unsupported?: boolean; bitmap?: (f: FrameLike) => Promise
     },
     toBitmap: opts.bitmap ?? ((f) => Promise.resolve({ width: f.displayWidth, height: f.displayHeight, close() {} } as unknown as ImageBitmap)),
     now: () => 1234,
-    timeOrigin: 5000,
+    timeOrigin: () => 5000,
   };
   return { core: new CameraWorkerCore(env), events, transfers, readers };
 }
@@ -92,7 +92,7 @@ describe('CameraWorkerCore', () => {
     expect(f1.closed).toBe(false);
     readers[0].push(f2);
     await tick();
-    expect(f1.closed).toBe(true); // replaced ⇒ closed at once
+    expect(f1.closed).toBe(true); // replaced ⇒ closed at once (KEEP_FRAMES = 1)
     expect(f2.closed).toBe(false);
 
     core.handle({ type: 'grab', id: 7, gen: 1, seq: 2, maxSide: 1280 });
@@ -103,18 +103,23 @@ describe('CameraWorkerCore', () => {
     expect(transfers[events.indexOf(grabbed!)]).toHaveLength(1);
     expect(f2.closed).toBe(false); // still current
 
-    core.handle({ type: 'grab', id: 8, gen: 1, seq: 1 });
-    core.handle({ type: 'grab', id: 9, gen: 0, seq: 2 });
+    const f3 = new FakeFrame(1_066_666);
+    readers[0].push(f3);
+    await tick();
+    expect(f2.closed).toBe(true);
+    core.handle({ type: 'grab', id: 10, gen: 1, seq: 2 });
+    core.handle({ type: 'grab', id: 11, gen: 0, seq: 3 });
     await tick();
     expect(events.filter((e) => e.type === 'grabbed').slice(1)).toEqual([
-      { type: 'grabbed', id: 8, error: 'stale' },
-      { type: 'grabbed', id: 9, error: 'no frame' },
+      { type: 'grabbed', id: 10, error: 'stale' },
+      { type: 'grabbed', id: 11, error: 'no frame' },
     ]);
 
     core.handle({ type: 'detach' });
     await tick();
     expect(readers[0].cancelled).toBe(true);
     expect(f2.closed).toBe(true);
+    expect(f3.closed).toBe(true);
     expect(track.stopped).toBe(true);
     expect(events.some((e) => e.type === 'ended')).toBe(false); // a detached track is not reported
   });
@@ -129,7 +134,7 @@ describe('CameraWorkerCore', () => {
     readers[0].push(f1);
     await tick();
     core.handle({ type: 'grab', id: 1, gen: 3, seq: 1 });
-    readers[0].push(new FakeFrame(20));
+    readers[0].push(new FakeFrame(20)); // f1 is replaced while being converted
     await tick();
     expect(f1.closed).toBe(false); // pinned by the conversion
     finish!();
@@ -154,6 +159,31 @@ describe('CameraWorkerCore', () => {
     await tick();
     expect(b.events.at(-1)).toEqual({ type: 'ended', gen: 2 });
     expect(f.closed).toBe(true);
+  });
+
+  it('reads a transferred ReadableStream (main-thread processor) and reads timeOrigin at attach', async () => {
+    let origin = 5000;
+    const events: CameraWorkerEvent[] = [];
+    const core = new CameraWorkerCore({
+      post: (m) => events.push(m),
+      createReader: () => {
+        throw new Error('must not create a processor for a stream');
+      },
+      toBitmap: () => Promise.resolve({ close() {} } as unknown as ImageBitmap),
+      now: () => 1,
+      timeOrigin: () => origin,
+    });
+    const r = new FakeReader();
+    const readable = { getReader: () => r } as unknown as ReadableStream<unknown>;
+    core.handle({ type: 'attach', gen: 1, readable, maxBufferSize: 2 });
+    r.push(new FakeFrame(7));
+    await tick();
+    expect(events.map((e) => e.type)).toEqual(['attached', 'frame']);
+    expect(events[0]).toMatchObject({ timeOrigin: 5000 });
+    origin = 9000; // e.g. after the device slept
+    core.handle({ type: 'attach', gen: 2, readable: { getReader: () => new FakeReader() } as unknown as ReadableStream<unknown>, maxBufferSize: 2 });
+    expect(events.at(-1)).toEqual({ type: 'attached', gen: 2, timeOrigin: 9000 });
+    expect(r.cancelled).toBe(true);
   });
 
   it('a new attach replaces the previous track', async () => {

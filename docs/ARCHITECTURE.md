@@ -449,10 +449,14 @@ class CameraCapture {
 // mstp-camera.ts — prototype, opt-in with `?camera=mstp` (ios-camera.md §7 ladder step A). A FramePump
 // camera: a clone of CameraCapture's track is read with MediaStreamTrackProcessor in
 // workers/camera.worker.ts (Chromium: the main-thread processor's stream is transferred instead).
-// Frames keep the sensor orientation on iOS (fixedOrientation ⇒ raw buffers, classified by the
-// engine's OrientationTracker); t = VideoFrame.timestamp mapped by FrameClock (min arrival latency
-// over 300 frames); timeSource 'frameTimestamp'. Falls back to CameraCapture's rVFC path only
-// before the first frame; re-attaches after camera restarts and worker errors.
+// Frames keep the sensor orientation on iOS: fixedOrientation ⇒ PumpFrame/FrameInput.rawBuffer ⇒
+// OrientationTracker / FrameOrientationTracker treat every landscape bitmap as upright for θ = 90
+// (portrait ones are dropped). t = VideoFrame.timestamp mapped by FrameClock (min arrival latency
+// over 300 frames, kept across interruptions); timeSource 'frameTimestamp'. The worker keeps ONE
+// frame open (two stalled the capture pool); late announcements are skipped and a stale grab is a
+// StaleFrameError FramePump retries on the next frame. Frames are dispatched only while
+// CameraCapture is 'running'. Falls back to the rVFC path only before the first frame; re-attaches
+// after camera restarts, worker errors and a 3 s stall (watchdog, onStall).
 class MstpFrameSource implements FramePumpCamera {
   constructor(camera: CameraCapture, opts?: MstpFrameSourceOptions)
   start(): Promise<'mstp' | 'fallback'>; stop(): void

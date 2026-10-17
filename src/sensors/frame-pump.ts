@@ -10,7 +10,10 @@
  * Frames are skipped while the page is hidden, within `settleMs` (500 ms) of a UI rotation
  * (Safari 26.x transient mis-rotation) and when the bitmap aspect contradicts the UI rotation
  * (transient; re-baselined after 1.5 s of consistent contradiction) — unless the camera reports
- * `fixedOrientation` (raw sensor buffers, which never follow the UI rotation).
+ * `fixedOrientation` (raw sensor buffers, which never follow the UI rotation): those frames are
+ * marked `rawBuffer`, and a portrait one (the source rotated after all) is dropped instead.
+ * A grab rejected with a {@link StaleFrameError} (the frame was already replaced) is not an
+ * error and does not use up the rate-limit slot: the next frame is tried at once.
  * The consumer OWNS the bitmap (close or transfer it).
  */
 import type { GeoFix, ImuSample, Mat3, Vec3 } from '../core/types';
@@ -43,6 +46,13 @@ export interface PumpFrame {
   gravityDevice: Vec3 | null;
   /** Camera capture segment (changes after an interruption ⇒ relocalise / new segment). */
   segment: number;
+  /** Raw sensor-orientation buffer (camera `fixedOrientation`): upright for θ = 90 in any UI rotation. */
+  rawBuffer: boolean;
+}
+
+/** grabFrame() rejection: the reported frame was replaced before it could be grabbed (retry the next one). */
+export class StaleFrameError extends Error {
+  override readonly name = 'StaleFrameError';
 }
 
 export interface FramePumpCamera {
@@ -103,6 +113,8 @@ export interface FramePumpStats {
   skippedHidden: number;
   skippedOrientation: number;
   skippedAspect: number;
+  /** Grabs whose frame had already been replaced (StaleFrameError). */
+  skippedStale: number;
   aspectRebaselines: number;
   errors: number;
   /** Exponential moving average of the consumer time (ms). */
@@ -134,6 +146,7 @@ export class FramePump {
     skippedHidden: 0,
     skippedOrientation: 0,
     skippedAspect: 0,
+    skippedStale: 0,
     aspectRebaselines: 0,
     errors: 0,
     consumerMs: 0,
@@ -220,7 +233,9 @@ export class FramePump {
     }
     const theta = this.tracker.angle;
     this.busyFlag = true;
-    // Counted at the attempt so that failing grabs are retried at targetHz, not on every frame.
+    // Counted at the attempt so that failing grabs are retried at targetHz, not on every frame
+    // (a stale grab gives the slot back: deliver() restores prevT).
+    const prevT = this.lastDeliveredT;
     this.lastDeliveredT = t;
     // grabFrame() is invoked synchronously here (async functions run until their first await),
     // so the bitmap is the frame this callback reported.
@@ -231,7 +246,7 @@ export class FramePump {
     } catch (e) {
       grab = Promise.reject(e);
     }
-    void this.deliver(grab, t, meta.timeSource, meta.segment, theta, this.runGen);
+    void this.deliver(grab, t, meta.timeSource, meta.segment, theta, this.runGen, prevT);
   };
 
   private checkAspect(w: number, h: number, theta: number): boolean {
@@ -265,9 +280,11 @@ export class FramePump {
     segment: number,
     theta: ScreenAngle,
     gen: number,
+    prevT: number,
   ): Promise<void> {
     let bitmap: ImageBitmap | null = null;
     let handedOut = false;
+    const raw = this.o.camera.fixedOrientation === true;
     try {
       bitmap = await grab;
       if (gen !== this.runGen) {
@@ -276,7 +293,8 @@ export class FramePump {
         bitmap = null;
         return;
       }
-      if (!this.o.camera.fixedOrientation && !this.checkAspect(bitmap.width, bitmap.height, theta)) {
+      if (raw ? bitmap.height > bitmap.width : !this.checkAspect(bitmap.width, bitmap.height, theta)) {
+        if (raw) console.warn('[sensors] portrait frame from a raw-buffer camera path: dropped', { w: bitmap.width, h: bitmap.height });
         this.stats.skippedAspect++;
         bitmap.close();
         bitmap = null;
@@ -306,6 +324,7 @@ export class FramePump {
         attitude: c?.attitudeAt ? c.attitudeAt(t) : null,
         gravityDevice: m?.gravityAt ? m.gravityAt(t) : null,
         segment,
+        rawBuffer: raw,
       };
       this.stats.delivered++;
       const t0 = performance.now();
@@ -325,8 +344,13 @@ export class FramePump {
       const dt = performance.now() - t0;
       this.stats.consumerMs = this.stats.consumerMs === 0 ? dt : this.stats.consumerMs + 0.2 * (dt - this.stats.consumerMs);
     } catch (e) {
-      this.stats.errors++;
       bitmap?.close();
+      if (!handedOut && e instanceof StaleFrameError) {
+        this.stats.skippedStale++;
+        if (this.lastDeliveredT === t) this.lastDeliveredT = prevT; // give the rate-limit slot back
+        return;
+      }
+      this.stats.errors++;
       if (!handedOut && gen !== this.runGen) return; // failure of a grab abandoned by stop()
       if (this.o.onError) this.o.onError(e);
       else console.error('[sensors] FramePump:', e);

@@ -88,6 +88,32 @@ describe('frame ingest', () => {
     expect(v).toMatchObject({ ok: true, k: 3 });
   });
 
+  it('declared raw buffers are upright for θ = 90 in every UI rotation from the first frame', () => {
+    // landscape-90 start, then a direct flip to landscape-270 (no portrait frame in between)
+    const o = new OrientationTracker(500);
+    let v = o.classify({ width: 640, height: 480, screenAngle: 90, t: 0, raw: true });
+    expect(v).toMatchObject({ ok: true, effectiveTheta: 90, k: 0, raw: true });
+    expect(o.rawDelivery).toBe(true);
+    v = o.classify({ width: 640, height: 480, screenAngle: 270, t: 100 });
+    expect(v.ok).toBe(false); // settling
+    v = o.classify({ width: 640, height: 480, screenAngle: 270, t: 700, raw: true });
+    expect(v).toMatchObject({ ok: true, effectiveTheta: 90, k: 0 }); // without the flag: θ 270, k 2
+    // a session started in landscape-270 is not ambiguous
+    const s = new OrientationTracker(500);
+    s.classify({ width: 640, height: 480, screenAngle: 270, t: 0, raw: true });
+    expect(s.thetaSession).toBe(90);
+    expect(s.sessionAmbiguous).toBe(false);
+    // a portrait bitmap from a raw path is dropped
+    expect(s.classify({ width: 480, height: 640, screenAngle: 270, t: 10, raw: true }).ok).toBe(false);
+    // resumed session captured with upright frames (rawDelivery false, θ₀ = 270): raw frames rotate into it
+    const r = new OrientationTracker(500, 270);
+    r.rawDelivery = false;
+    v = r.classify({ width: 640, height: 480, screenAngle: 270, t: 0, raw: true });
+    expect(v).toMatchObject({ ok: true, effectiveTheta: 90, k: 2 });
+    expect(r.thetaSession).toBe(270); // not re-interpreted: its keyframes were upright for 270
+    expect(r.rawDelivery).toBe(true);
+  });
+
   it('rotates RGBA frames into the canonical orientation and maps the overlay back', () => {
     const W = 40,
       H = 30;

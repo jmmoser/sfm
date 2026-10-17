@@ -263,6 +263,7 @@ describe('MstpFrameSource (fake camera, real worker)', () => {
       const mode = await src.start();
       expect(src.fallbackReason).toBeNull();
       expect(mode).toBe('mstp');
+      expect(src.stats.transport).toBe('stream'); // Chromium: tracks are not transferable
 
       const got: { t: number; meta: FrameMeta; at: number }[] = [];
       const off = src.onFrame((t, meta) => got.push({ t, meta: { ...meta }, at: performance.now() }));
@@ -299,7 +300,10 @@ describe('MstpFrameSource (fake camera, real worker)', () => {
         expect(f.timeSource).toBe('frameTimestamp');
         f.bitmap.close();
       }
-      expect(pump.stats.errors).toBe(src.stats.staleGrabs + src.stats.grabErrors);
+      expect(pump.stats.errors).toBe(0);
+      expect(src.stats.grabErrors).toBe(0);
+      expect(pump.stats.skippedStale).toBe(src.stats.staleGrabs);
+      expect(frames.every((f) => f.rawBuffer)).toBe(true);
     } finally {
       src.stop();
       cam.stop();

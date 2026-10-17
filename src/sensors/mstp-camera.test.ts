@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { CameraStartResult, CameraState, FrameCallback, FrameMeta } from './camera';
-import { FrameClock, MstpFrameSource, type MstpCamera, type WorkerLike } from './mstp-camera';
+import { StaleFrameError } from './frame-pump';
+import { FrameClock, MstpFrameSource, type MstpCamera, type MstpFrameSourceOptions, type WorkerLike } from './mstp-camera';
 import type { CameraWorkerEvent, CameraWorkerRequest } from './mstp-protocol';
 
 class FakeTrack {
@@ -78,7 +79,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function make(opts: { throwOnAttach?: boolean; firstFrameTimeoutMs?: number; attachTimeoutMs?: number } = {}) {
+function make(opts: { throwOnAttach?: boolean; firstFrameTimeoutMs?: number; attachTimeoutMs?: number } & MstpFrameSourceOptions = {}) {
   const cam = new FakeCamera();
   const worker = new FakeWorker();
   worker.throwOnAttach = !!opts.throwOnAttach;
@@ -87,9 +88,12 @@ function make(opts: { throwOnAttach?: boolean; firstFrameTimeoutMs?: number; att
     createWorker: () => worker,
     timeOrigin: 1000, // worker timeOrigin 1010 ⇒ worker times are 10 ms later on the main timeline
     now: () => now,
+    grabTimeoutMs: 100,
+    stallMs: 60_000,
+    isHidden: () => false,
+    ...opts,
     attachTimeoutMs: opts.attachTimeoutMs ?? 200,
     firstFrameTimeoutMs: opts.firstFrameTimeoutMs ?? 200,
-    grabTimeoutMs: 100,
   });
   return { cam, worker, src, setNow: (t: number) => (now = t) };
 }
@@ -126,8 +130,8 @@ describe('MstpFrameSource', () => {
     worker.emit(frame(att.gen, 3, 50_066_000, 175));
     expect(seen[1].t).toBeCloseTo(50_066 + (138 - 50_033), 6);
     worker.emit({ type: 'grabbed', id: (worker.sent.at(-1)!.msg as { id: number }).id, error: 'stale' });
-    await expect(seen[1].grab).rejects.toThrow(/stale/);
-    expect(src.stats).toMatchObject({ frames: 3, dispatched: 2, grabs: 2, staleGrabs: 1, codedWidth: 1920, format: 'NV12' });
+    await expect(seen[1].grab).rejects.toBeInstanceOf(StaleFrameError);
+    expect(src.stats).toMatchObject({ frames: 3, dispatched: 2, grabs: 2, staleGrabs: 1, codedWidth: 1920, format: 'NV12', transport: 'track' });
 
     src.stop();
     expect(worker.terminated).toBe(true);
@@ -237,5 +241,179 @@ describe('FrameClock', () => {
     // a clock jump (offset 1.5 s larger than the minimum suggests) restarts the estimate
     expect(c.map(70_000, 2_000)).toEqual({ t: 2_000, source: 'frameTimestamp' });
     expect(c.offsetMs).toBe(1930);
+  });
+});
+
+describe('MstpFrameSource (review fixes)', () => {
+  async function running(opts: MstpFrameSourceOptions = {}) {
+    const m = make(opts);
+    const started = m.src.start();
+    const g = m.worker.lastAttach().gen;
+    m.worker.emit({ type: 'attached', gen: g, timeOrigin: 1000 });
+    m.worker.emit(frame(g, 1, 1_000_000, 5));
+    expect(await started).toBe('mstp');
+    return m;
+  }
+
+  it('transfers a main-thread processor stream where tracks are not transferable, and stops that clone', async () => {
+    const g = globalThis as { MediaStreamTrackProcessor?: unknown };
+    const streams: object[] = [];
+    g.MediaStreamTrackProcessor = class {
+      readable = {};
+      constructor() {
+        streams.push(this.readable);
+      }
+    };
+    try {
+      const { cam, worker, src } = make();
+      // only the track transfer fails (Chromium)
+      const post = worker.postMessage.bind(worker);
+      worker.postMessage = (msg, transfer) => {
+        if (msg.type === 'attach' && msg.track) throw new DOMException('not transferable', 'DataCloneError');
+        post(msg, transfer);
+      };
+      const started = src.start();
+      const att = worker.lastAttach();
+      expect(att.track).toBeUndefined();
+      expect(att.readable).toBe(streams[0]);
+      expect(worker.sent.at(-1)!.transfer).toEqual([streams[0]]);
+      worker.emit(frame(att.gen, 1, 1000, 1));
+      expect(await started).toBe('mstp');
+      expect(src.stats.transport).toBe('stream');
+      const clone = cam.track!.clones[0];
+      expect(clone.stopped).toBe(false);
+      src.stop();
+      expect(clone.stopped).toBe(true);
+    } finally {
+      delete g.MediaStreamTrackProcessor;
+    }
+  });
+
+  it('stop() while pending resolves fallback; start() while pending returns the same promise', async () => {
+    const { src } = make();
+    const a = src.start();
+    expect(src.start()).toBe(a);
+    src.stop();
+    expect(await a).toBe('fallback');
+    expect(src.mode).toBe('idle');
+  });
+
+  it('a worker script error before the first frame falls back', async () => {
+    const { worker, src } = make();
+    const started = src.start();
+    worker.onerror?.({ message: 'boom', preventDefault() {} } as unknown as ErrorEvent);
+    expect(await started).toBe('fallback');
+    expect(src.fallbackReason).toMatch(/boom/);
+  });
+
+  it('a camera restart while pending waits for the new track instead of falling back', async () => {
+    const { cam, worker, src } = make();
+    const started = src.start();
+    cam.setState('restarting');
+    expect(src.mode).toBe('pending');
+    cam.track = new FakeTrack();
+    cam.setState('running');
+    const g = worker.lastAttach().gen;
+    expect(worker.lastAttach().track).toBe(cam.track.clones[0]);
+    worker.emit(frame(g, 1, 1000, 1));
+    expect(await started).toBe('mstp');
+  });
+
+  it('rejects in-flight grabs on detach and closes a bitmap that arrives afterwards', async () => {
+    const { cam, worker, src } = await running();
+    let p: Promise<unknown> | null = null;
+    src.onFrame(() => (p = src.grabFrame().catch((e: Error) => e)));
+    const g = worker.lastAttach().gen;
+    worker.emit(frame(g, 2, 1_033_000, 40));
+    const grab = worker.sent.at(-1)!.msg as { id: number };
+    cam.setState('restarting');
+    expect(String(await p)).toMatch(/detached/);
+    let closed = false;
+    worker.emit({ type: 'grabbed', id: grab.id, bitmap: { close: () => (closed = true) } as unknown as ImageBitmap });
+    expect(closed).toBe(true);
+    src.stop();
+  });
+
+  it('does not dispatch frames while the camera is not running (no stale segment after an interruption)', async () => {
+    const { cam, worker, src } = await running();
+    const segs: number[] = [];
+    src.onFrame((_t, m) => segs.push(m.segment));
+    const g = worker.lastAttach().gen;
+    cam.setState('interrupted');
+    worker.emit(frame(g, 2, 2_000_000, 1000)); // clone unmuted before CameraCapture saw it
+    expect(segs).toEqual([]);
+    cam.segment = 1;
+    cam.setState('running');
+    worker.emit(frame(g, 3, 2_033_000, 1033));
+    expect(segs).toEqual([1]);
+    src.stop();
+  });
+
+  it('keeps the clock offset across interruptions (no late bias right after a resume)', async () => {
+    const { cam, worker, src } = await running();
+    const ts: number[] = [];
+    src.onFrame((t) => ts.push(t));
+    const g = worker.lastAttach().gen;
+    worker.emit(frame(g, 2, 1_033_000, 25)); // offset 25 − 1033 = −1008: the new minimum ⇒ t = 25
+    cam.segment = 1;
+    cam.setState('interrupted');
+    cam.setState('running');
+    worker.emit(frame(g, 3, 5_000_000, 4150)); // warm-up latency after the resume: still mapped with −1008
+    expect(ts).toEqual([25, 3992]);
+    src.stop();
+  });
+
+  it('an ended worker track without a live camera track does not use up the re-attach budget', async () => {
+    const { cam, worker, src } = await running();
+    const attaches = worker.sent.filter((s) => s.msg.type === 'attach').length;
+    cam.track!.readyState = 'ended';
+    worker.emit({ type: 'ended', gen: worker.lastAttach().gen });
+    expect(worker.sent.filter((s) => s.msg.type === 'attach').length).toBe(attaches);
+    expect(src.stats.reattaches).toBe(0);
+    cam.track = new FakeTrack();
+    cam.setState('restarting');
+    cam.setState('running');
+    expect(src.stats.reattaches).toBe(1);
+    src.stop();
+  });
+
+  it('the watchdog re-attaches a stalled clone and reports the stall until frames flow again', async () => {
+    const stalls: boolean[] = [];
+    let now = 0;
+    const { worker, src } = await running({ stallMs: 60, now: () => now, onStall: (s) => stalls.push(s) });
+    const g1 = worker.lastAttach().gen;
+    now = 100;
+    await sleep(80);
+    expect(stalls).toEqual([true]);
+    const g2 = worker.lastAttach().gen;
+    expect(g2).toBeGreaterThan(g1);
+    expect(src.stats.reattaches).toBe(1);
+    worker.emit(frame(g2, 1, 2_000_000, 100));
+    expect(stalls).toEqual([true, false]);
+    src.stop();
+  });
+});
+
+describe('MstpFrameSource late announcements', () => {
+  it('skips announcements a busy main thread reads late, but never starves', async () => {
+    let now = 0;
+    const m = make({ now: () => now });
+    const started = m.src.start();
+    const g = m.worker.lastAttach().gen;
+    m.worker.emit({ type: 'attached', gen: g, timeOrigin: 1000 }); // same origin as the main thread
+    m.worker.emit(frame(g, 1, 1_000_000, 0));
+    await started;
+    const seqs: number[] = [];
+    m.src.onFrame(() => seqs.push((m.src as unknown as { dispatchSeq: number }).dispatchSeq));
+    now = 1000;
+    m.worker.emit(frame(g, 2, 2_000_000, 999)); // 1 ms old: dispatched
+    now = 1100;
+    m.worker.emit(frame(g, 3, 2_033_000, 1033)); // read 67 ms late (backlog): skipped
+    m.worker.emit(frame(g, 4, 2_066_000, 1095)); // fresh: dispatched
+    now = 1300;
+    m.worker.emit(frame(g, 5, 2_099_000, 1130)); // late, but nothing dispatched for 200 ms: dispatched
+    expect(seqs).toEqual([2, 4, 5]);
+    expect(m.src.stats.lateFrames).toBe(1);
+    m.src.stop();
   });
 });

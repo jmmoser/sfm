@@ -16,7 +16,8 @@ import { canonicalRotation, snapScreenAngle, type ScreenAngle } from '../sensors
  *    delivery the landscape bitmaps of a landscape UI are raw too (upright for 90 also at θ = 270);
  *  - a portrait bitmap in a landscape UI is a transient mis-rotation the engine drops: no overlay;
  *  - frames within `settleMs` of a UI rotation are ignored for the delivery decision (as the engine
- *    drops them before classifying).
+ *    drops them before classifying);
+ *  - a frame declared raw (`raw`, FrameInput.rawBuffer) is upright for θ = 90 in every UI rotation.
  * The preview shown at θ_display needs `canonicalRotation(θ_display, θ_upright)` CLOCKWISE quarter
  * turns of the frame (θ = 90 raw buffer in a portrait UI: 1 turn).
  */
@@ -32,12 +33,18 @@ export class FrameOrientationTracker {
    * Observe a submitted frame (call for EVERY frame, in submission order) and return the θ its
    * pixels are upright for, or null when the engine drops such a frame (no overlay).
    */
-  observe(f: { width: number; height: number; screenAngle: number; t?: number }): ScreenAngle | null {
+  observe(f: { width: number; height: number; screenAngle: number; t?: number; raw?: boolean }): ScreenAngle | null {
     const ui = snapScreenAngle(f.screenAngle);
     const t = f.t ?? NaN;
     if (this.lastUI !== null && ui !== this.lastUI) this.changeT = t;
     this.lastUI = ui;
     const settling = Number.isFinite(t) && t - this.changeT < this.settleMs;
+    if (f.raw) {
+      // declared raw buffer (FrameInput.rawBuffer): the engine's rule, upright for θ = 90
+      if (settling || f.height > f.width) return null;
+      this.rawDelivery = true;
+      return 90;
+    }
     return this.uprightTheta(f.width, f.height, ui, !settling);
   }
 

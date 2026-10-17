@@ -113,6 +113,11 @@ export interface FrameInput {
   /** MotionSensor calibration version the IMU samples were normalised with (-1: no motion). */
   imuCalibrationVersion?: number;
   timeSource?: 'captureTime' | 'presentationTime' | 'callback' | 'frameTimestamp';
+  /**
+   * The bitmap is a raw sensor-orientation buffer (MediaStreamTrackProcessor path): upright for
+   * θ = 90 in every UI rotation (src/engine/frame-ingest.ts OrientationTracker).
+   */
+  rawBuffer?: boolean;
 }
 
 export type KeyframeDecision = 'keyframe' | 'skip' | 'reject_blur' | 'reject_motion';

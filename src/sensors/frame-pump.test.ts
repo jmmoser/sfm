@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { ImuSample } from '../core/types';
 import type { FrameCallback, FrameMeta } from './camera';
 import { ScreenAngleTracker, type ScreenAngle } from './frame-orientation';
-import { FramePump, type PumpFrame } from './frame-pump';
+import { FramePump, StaleFrameError, type PumpFrame } from './frame-pump';
 
 class FakeBitmap {
   closed = false;
@@ -183,6 +183,43 @@ describe('FramePump', () => {
       [640, 480, 180],
     ]);
     expect(pump.stats.skippedAspect).toBe(0);
+    expect(frames.every((f) => f.rawBuffer)).toBe(true);
+    // a portrait bitmap from a raw path (the source rotated after all) is dropped
+    cam.w = 480;
+    cam.h = 640;
+    cam.emit(4);
+    await sleep(0);
+    expect(frames).toHaveLength(3);
+    expect(pump.stats.skippedAspect).toBe(1);
+    pump.stop();
+  });
+
+  it('a stale grab is skipped quietly and gives the rate-limit slot back', async () => {
+    const cam = new FakeCamera();
+    let stale = true;
+    const grab = cam.grabFrame.bind(cam);
+    cam.grabFrame = () => (stale ? Promise.reject(new StaleFrameError('replaced')) : grab());
+    const errors: unknown[] = [];
+    const frames: PumpFrame[] = [];
+    const pump = new FramePump({
+      camera: cam,
+      angleTracker: new ScreenAngleTracker({ read: () => 0 as ScreenAngle }),
+      targetHz: 10,
+      isHidden: () => false,
+      onError: (e) => errors.push(e),
+      consumer: (f) => void frames.push(f),
+    });
+    pump.start();
+    cam.emit(0);
+    await sleep(0);
+    expect(pump.stats.skippedStale).toBe(1);
+    stale = false;
+    cam.emit(33); // the very next frame is tried (not rate-limited for 100 ms)
+    await sleep(0);
+    expect(frames.map((f) => f.t)).toEqual([33]);
+    expect(frames[0].rawBuffer).toBe(false);
+    expect(errors).toEqual([]);
+    expect(pump.stats.errors).toBe(0);
     pump.stop();
   });
 

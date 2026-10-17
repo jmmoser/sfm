@@ -72,6 +72,8 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   let pump: FramePump | null = null;
   /** `?camera=mstp`: frames from MediaStreamTrackProcessor in a worker (falls back to `camera`). */
   let frameSource: MstpFrameSource | null = null;
+  /** frameSource.start(), awaited only right before the pump is created. */
+  let frameSourceReady: Promise<unknown> | null = null;
   let camRes: CameraStartResult | null = null;
   let phase: Phase = 'starting';
   let closed = false;
@@ -496,8 +498,9 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       attitude: f.attitude ? { t: f.attitude.t, R_world_device: f.attitude.R_world_device, absolute: f.attitude.absolute, yawAccuracyDeg: f.attitude.yawAccuracyDeg } : null,
       imuCalibrationVersion: f.imuCalibrationVersion,
       timeSource: f.timeSource,
+      rawBuffer: f.rawBuffer,
     };
-    const upright = orientation.observe({ width: f.width, height: f.height, screenAngle: f.screenAngle, t: f.t });
+    const upright = orientation.observe({ width: f.width, height: f.height, screenAngle: f.screenAngle, t: f.t, raw: f.rawBuffer });
     inFlight = { width: f.width, height: f.height, screenAngle: f.screenAngle, upright };
     try {
       await app.engine.processFrame(input);
@@ -657,13 +660,17 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     }
     d.add(camera.onStateChange(onCameraState));
     if (app.cameraPath === 'mstp' && !frameSource && MstpFrameSource.isSupported()) {
-      frameSource = new MstpFrameSource(camera);
-      const mode = await frameSource.start();
-      if (closed) return;
-      if (mode === 'fallback') toast('Worker camera capture is unavailable here: using the standard camera path.', { tone: 'warn' });
+      frameSource = new MstpFrameSource(camera, {
+        onStall: (stalled) => {
+          if (stalled && !closed && phase === 'running') toast('Camera frames stopped — reconnecting…', { tone: 'warn' });
+        },
+      });
+      // runs while the rest of the setup (torch, white balance, location, session) continues
+      frameSourceReady = frameSource.start().then((mode) => {
+        if (mode === 'fallback' && !closed) toast('Worker camera capture is unavailable here: using the standard camera path.', { tone: 'warn' });
+      });
     }
-    const path = !frameSource ? 'video' : frameSource.mode === 'mstp' ? 'mstp' : `video (MSTP fallback: ${frameSource.fallbackReason ?? 'stopped'})`;
-    debugOverlay?.setCamera({ width: camRes.width, height: camRes.height, frameRate: camRes.frameRate, label: camRes.label, frameMaxSide: camRes.frameMaxSide, path });
+    showCameraInfo();
     torchBtn.disabled = !camRes.torchAvailable;
     if (cfg.torch && camRes.torchAvailable) void toggleTorch(true);
     // Lock white balance after auto-WB settled (iOS supports manual WB only).
@@ -699,6 +706,18 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     await initEngine();
   }
 
+  function showCameraInfo(): void {
+    if (!camRes) return;
+    const path = !frameSource
+      ? 'video'
+      : frameSource.mode === 'mstp'
+        ? `mstp (${frameSource.stats.transport ?? '…'})`
+        : frameSource.mode === 'pending'
+          ? 'mstp (starting)'
+          : `video (MSTP fallback: ${frameSource.fallbackReason ?? 'stopped'})`;
+    debugOverlay?.setCamera({ width: camRes.width, height: camRes.height, frameRate: camRes.frameRate, label: camRes.label, frameMaxSide: camRes.frameMaxSide, path });
+  }
+
   async function initEngine(): Promise<void> {
     showCard(infoCard({ spinner: true, title: 'Preparing 3D engine…', text: 'Compiling GPU programs. This takes a moment the first time.' }));
     try {
@@ -722,6 +741,11 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       return;
     }
     if (closed) return;
+    if (frameSourceReady) {
+      await frameSourceReady; // the pump needs to know which path delivers the frames
+      if (closed) return;
+      showCameraInfo();
+    }
     showCard(null);
     pump = new FramePump({
       camera: frameSource ?? camera,

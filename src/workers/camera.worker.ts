@@ -23,7 +23,7 @@ const core = new CameraWorkerCore({
   },
   toBitmap: videoFrameToBitmap,
   now: () => performance.now(),
-  timeOrigin: performance.timeOrigin,
+  timeOrigin: () => performance.timeOrigin,
 });
 
 scope.onmessage = (e: MessageEvent<CameraWorkerRequest>) => core.handle(e.data);

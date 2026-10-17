@@ -3,10 +3,15 @@
  * MediaStreamTrack with MediaStreamTrackProcessor (DedicatedWorker-only in WebKit, Safari 18+)
  * and converts frames to ImageBitmaps on request.
  *
- *  - Every frame is announced to the main thread (`frame` event, a few numbers) and kept open
- *    until the next one arrives, so the main thread can ask for exactly the frame whose timestamp
- *    it paired with the IMU (`grab` with that `seq`). A frame being converted is closed only when
- *    its conversion finished. Older frames are closed at once: the capture buffer pool is small.
+ *  - Every frame is announced to the main thread (`frame` event, a few numbers) and the last
+ *    `KEEP_FRAMES` stay open, so the main thread can ask for exactly the frame whose timestamp it
+ *    paired with the IMU (`grab` with that `seq`). A frame being converted is closed only when its
+ *    conversion finished. Older frames are closed at once: the capture buffer pool is small —
+ *    keeping 2 open (next to the `<video>` preview's) stalled Chromium's fake camera after 3
+ *    frames, so 1 it is; the main thread skips announcements that are already old instead.
+ *  - WebKit ignores `resizeQuality` for `createImageBitmap(VideoFrame)` (ImageBitmap.cpp draws
+ *    with the default filter), so downscaled grabs may be filtered differently than on the
+ *    `<video>` path.
  *  - Frames keep the sensor orientation on iOS (raw sensor-landscape buffers, no
  *    `VideoFrame.rotation`); the engine's OrientationTracker handles that (frame-ingest.ts).
  *  - Environment access is injected (`CameraWorkerEnv`) so the logic runs in Node tests.
@@ -23,13 +28,17 @@ export interface FrameLike {
   close(): void;
 }
 
+/** Frames kept open for grabs (more starve the capture buffer pool, see above). */
+export const KEEP_FRAMES = 1;
+
 export interface CameraWorkerEnv {
   post(msg: CameraWorkerEvent, transfer?: Transferable[]): void;
   /** null = MediaStreamTrackProcessor is not available. */
   createReader(track: MediaStreamTrack, maxBufferSize: number): ReadableStreamDefaultReader<FrameLike> | null;
   toBitmap(frame: FrameLike, opts: { maxSide?: number; resizeQuality?: ResizeQuality }): Promise<ImageBitmap>;
   now(): number;
-  readonly timeOrigin: number;
+  /** performance.timeOrigin, read when called (WebKit converts it to wall time at each read). */
+  timeOrigin(): number;
 }
 
 interface Current {
@@ -41,7 +50,8 @@ export class CameraWorkerCore {
   private gen = -1;
   private track: MediaStreamTrack | null = null;
   private reader: ReadableStreamDefaultReader<FrameLike> | null = null;
-  private cur: Current | null = null;
+  /** Open frames, oldest first; the last one is the current frame. */
+  private frames: Current[] = [];
   private seq = 0;
   /** Frames being converted (pin count); closed when the last conversion finished, unless current. */
   private readonly pinned = new Map<FrameLike, number>();
@@ -80,7 +90,7 @@ export class CameraWorkerCore {
       return;
     }
     this.reader = reader;
-    this.env.post({ type: 'attached', gen, timeOrigin: this.env.timeOrigin });
+    this.env.post({ type: 'attached', gen, timeOrigin: this.env.timeOrigin() });
     void this.readLoop(gen, reader);
   }
 
@@ -98,11 +108,11 @@ export class CameraWorkerCore {
           value.close();
           break;
         }
-        this.setCurrent(value);
+        const seq = this.setCurrent(value);
         this.env.post({
           type: 'frame',
           gen,
-          seq: this.cur!.seq,
+          seq,
           timestampUs: value.timestamp,
           receivedMs: this.env.now(),
           width: value.displayWidth,
@@ -124,21 +134,22 @@ export class CameraWorkerCore {
     }
   }
 
-  private setCurrent(frame: FrameLike): void {
-    const prev = this.cur;
-    this.cur = { frame, seq: ++this.seq };
-    if (prev) this.release(prev.frame);
+  private setCurrent(frame: FrameLike): number {
+    const seq = ++this.seq;
+    this.frames.push({ frame, seq });
+    while (this.frames.length > KEEP_FRAMES) this.release(this.frames.shift()!.frame);
+    return seq;
   }
 
   private dropCurrent(): void {
-    const prev = this.cur;
-    this.cur = null;
-    if (prev) this.release(prev.frame);
+    const old = this.frames;
+    this.frames = [];
+    for (const f of old) this.release(f.frame);
   }
 
-  /** Close a frame that is no longer current, unless a conversion still uses it. */
+  /** Close a frame that is no longer kept, unless a conversion still uses it. */
   private release(frame: FrameLike): void {
-    if (this.pinned.has(frame) || this.cur?.frame === frame) return;
+    if (this.pinned.has(frame) || this.frames.some((f) => f.frame === frame)) return;
     try {
       frame.close();
     } catch {
@@ -147,9 +158,10 @@ export class CameraWorkerCore {
   }
 
   private async grab(msg: Extract<CameraWorkerRequest, { type: 'grab' }>): Promise<void> {
-    const cur = this.cur;
-    if (msg.gen !== this.gen || !cur || cur.seq !== msg.seq) {
-      this.env.post({ type: 'grabbed', id: msg.id, error: cur && msg.gen === this.gen ? 'stale' : 'no frame' });
+    const cur = msg.gen === this.gen ? this.frames.find((f) => f.seq === msg.seq) : undefined;
+    if (!cur) {
+      const stale = msg.gen === this.gen && this.frames.length > 0 && msg.seq < this.frames[0].seq;
+      this.env.post({ type: 'grabbed', id: msg.id, error: stale ? 'stale' : 'no frame' });
       return;
     }
     const frame = cur.frame;

@@ -18,7 +18,7 @@ export type CameraWorkerRequest =
   | { type: 'detach' };
 
 export type CameraWorkerEvent =
-  /** The processor is reading; `timeOrigin` = the worker's performance.timeOrigin. */
+  /** The processor is reading; `timeOrigin` = the worker's performance.timeOrigin, read now. */
   | { type: 'attached'; gen: number; timeOrigin: number }
   | {
       type: 'frame';
