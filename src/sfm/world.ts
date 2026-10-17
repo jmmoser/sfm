@@ -8,7 +8,11 @@
  * Decision logic:
  *  - time offset: gyro rotations (`estimateTimeOffset`); if unobservable (little angular
  *    acceleration), linear acceleration (`estimateTimeOffsetFromAcceleration`); else default;
- *  - gravity: IMU specific force (`estimateGravity`), else per-keyframe `gravityCam`;
+ *  - gravity: IMU specific force (`estimateGravity`), else per-keyframe `gravityCam`. When the
+ *    two point to opposite hemispheres the accelerometer samples carry the wrong sign (the
+ *    platform sign self-check decided late or wrongly; `gravityCam` comes from the
+ *    DeviceOrientation attitude, which does not depend on that sign): the specific force is
+ *    negated for everything that uses it (gravity, acceleration time offset, metric scale);
  *  - north: compass headings flagged MAGNETIC (`WorldKeyframe.headingNorth`) are turned into
  *    true-north headings with the WMM2025 declination (`sensors/wmm.ts`) at the first GPS fix
  *    whose accuracy is ≤ 50 km (an "approximate" iOS fix is plenty), else at the optional
@@ -188,6 +192,8 @@ export interface WorldAlignment {
     /** Where `offsetMs` comes from: gyro rotation, linear acceleration, or the default. */
     offsetSource: 'gyro' | 'accel' | 'default';
     gravity: GravityResult | null;
+    /** The accelerometer samples were negated: their gravity contradicted the keyframes' `gravityCam`. */
+    accelSignCorrected: boolean;
     imuScale: MetricScaleResult | null;
     gps: GpsAlignment | null;
     /** Compass yaw (true north when `north` is 'true' or a GPS yaw exists, else magnetic). */
@@ -225,6 +231,15 @@ export interface DeclinationEstimate {
   blackoutZone: boolean;
   /** Keyframe headings converted from magnetic to true north. */
   numConverted: number;
+}
+
+/** Samples with the specific force (`accelG`) and linear acceleration (`accel`) negated. */
+function negateAccelerometer(imu: readonly ImuSample[]): ImuSample[] {
+  return imu.map((s) => ({
+    ...s,
+    accel: s.accel ? [-s.accel[0], -s.accel[1], -s.accel[2]] : s.accel,
+    accelG: s.accelG ? [-s.accelG[0], -s.accelG[1], -s.accelG[2]] : s.accelG,
+  }));
 }
 
 /**
@@ -279,7 +294,7 @@ export function computeWorldAlignment(input: WorldAlignmentInput, options: Parti
   }
 
   // ---- inertial
-  const imu = input.imu ?? [];
+  let imu = input.imu ?? [];
   let timeOffset: TimeOffsetResult | null = null;
   let accelTimeOffset: AccelTimeOffsetResult | null = null;
   let offsetMs = o.timeOffsetMs;
@@ -294,6 +309,19 @@ export function computeWorldAlignment(input: WorldAlignmentInput, options: Parti
     }
   }
   let gravity: GravityResult | null = n > 0 ? estimateGravity(ikf, imu, { gyroBias, ...o.gravity, offsetMs }) : null;
+  // An accelerometer with the wrong sign yields gravity pointing UP (a model upside down) that
+  // still looks reliable; the orientation-based gravityCam is independent of that sign and goes
+  // through the same R_cam_device, so a disagreement beyond 90° can only be the sign.
+  let accelSignCorrected = false;
+  if (gravity && gravity.source === 'accelG') {
+    const gc = estimateGravity(ikf, [], o.gravity);
+    if (gc && gc.numSamples >= 3 && gc.down[0] * gravity.down[0] + gc.down[1] * gravity.down[1] + gc.down[2] * gravity.down[2] < 0) {
+      imu = negateAccelerometer(imu);
+      gravity = estimateGravity(ikf, imu, { gyroBias, ...o.gravity, offsetMs });
+      accelSignCorrected = true;
+      warnings.push('accelerometer gravity opposite to the orientation sensor: accelerometer sign corrected');
+    }
+  }
   if (gravity && !gravity.reliable) {
     warnings.push(`gravity estimate unreliable (σ ${((gravity.stdRad * 180) / Math.PI).toFixed(1)}°)`);
     // try the per-keyframe fallback if the IMU path was used
@@ -557,6 +585,7 @@ export function computeWorldAlignment(input: WorldAlignmentInput, options: Parti
       offsetMs,
       offsetSource,
       gravity,
+      accelSignCorrected,
       imuScale,
       gps,
       compass,

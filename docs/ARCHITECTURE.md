@@ -948,7 +948,11 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   (≥ 2 s of votes); B″ measures the sign of `acceleration` relative to the gravity-including field;
   D estimates the gyro signed permutation + units from orientation-derived body rates. The ring
   buffer stores RAW values, so a calibration change re-signs everything still buffered
-  (`calibration.version` increments; drained samples are not revisited). First (replayed) event
+  (`calibration.version` increments; drained samples are not revisited — the worker keeps them
+  with the old sign, so `computeWorldAlignment` re-checks the sign: an accelerometer gravity in
+  the opposite hemisphere from the keyframes' orientation-based `gravityCam` is negated before
+  gravity / time offset / scale, `details.accelSignCorrected`; before this the model came out
+  upside down after refine although the live preview was upright). First (replayed) event
   after attaching and bit-identical duplicates (only for unquantised data) are dropped.
 * **Timing**: `ImuSample.t` = `event.timeStamp` except for bursts after a main-thread stall
   (arrival gaps < 0.35 × nominal): the run is re-spaced at the nominal interval ending at the
