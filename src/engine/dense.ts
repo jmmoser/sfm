@@ -272,7 +272,17 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   if (!pm && deps.holder.reason) deps.log('info', `dense: CPU PatchMatch (${deps.holder.reason})`);
   let maxSize = Math.max(32, Math.round(opts.maxImageSize ?? (pm ? preset.maxImageSize : Math.min(preset.maxImageSize, preset.cpuMaxImageSize))));
   const maxViews = Math.max(2, Math.round(opts.maxViews ?? preset.maxViews));
-  const images = spreadSubset(model.images, maxViews);
+  // A keyframe whose photo never reached storage (failed JPEG encode / write during capture) is
+  // left out: it would fail every densify (and every "Try again") at the same view.
+  const storedIds = new Set((await deps.store.getFrameRecords()).map((r) => r.id));
+  const withImage = model.images.filter((im) => storedIds.has(im.id));
+  if (withImage.length < model.images.length) {
+    const missing = model.images.filter((im) => !storedIds.has(im.id)).map((im) => im.id);
+    deps.log('warn', `dense: ${missing.length} registered keyframe(s) without a stored image, skipped (${missing.join(', ')})`);
+    stats.denseMissingImages = missing.length;
+  }
+  if (withImage.length < 2) throw new Error(`densify needs at least 2 registered images with stored photos (${withImage.length} of ${model.images.length} available)`);
+  const images = spreadSubset(withImage, maxViews);
   stats.denseViews = images.length;
   stats.patchMatch = pm ? 'gpu' : 'cpu';
 

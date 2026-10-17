@@ -205,6 +205,21 @@ describe('engine: synthetic orbit, CPU path', () => {
   }, 300_000);
 
   it('densifies (CPU PatchMatch) into a world-frame cloud that matches the scene, then meshes', async () => {
+    {
+      // a keyframe whose photo never reached storage is skipped, not a hard failure
+      const missing = res.cameras[0].id; // the first registered view is always in the dense subset
+      const getRecords = store.getFrameRecords.bind(store),
+        getImage = store.getFrameImage.bind(store);
+      store.getFrameRecords = async () => (await getRecords()).filter((r) => r.id !== missing);
+      store.getFrameImage = async (id) => (id === missing ? null : getImage(id));
+      try {
+        const pc = await engine.densify({ maxImageSize: 96, maxViews: 8 });
+        expect(pc.count).toBeGreaterThan(500);
+      } finally {
+        store.getFrameRecords = getRecords;
+        store.getFrameImage = getImage;
+      }
+    }
     const pc = await engine.densify({ maxImageSize: 96, maxViews: 8 });
     expect(pc.count).toBeGreaterThan(1500);
     // GT depth of frame 0 vs the dense points mapped into the GT frame
