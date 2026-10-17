@@ -485,7 +485,9 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
         minAutocorrelation: cfg.perImageFocalMinAutocorrelation,
         timeOrder: order,
         rounds: cfg.perImageFocalRounds,
-        refinePrincipalPoint: ppOn ? (r) => refinePrincipalPoint(r, st.db, st.graph, mo, cancel) : undefined,
+        ppPriorSigmaPx: cfg.perImageFocalPPSigmaPx,
+        ppPriorAnchor: cfg.perImageFocalPPAnchor,
+        refinePrincipalPoint: ppOn ? (r, priors) => refinePrincipalPoint(r, st.db, st.graph, priors ? { ...mo, principalPointPriors: priors } : mo, cancel) : undefined,
         cancel,
       });
       if (pf.accepted) chosen = pf.rec;
@@ -537,6 +539,13 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
       gravityCam: k.rec.info.gravityCam,
       heading: k.rec.info.heading,
       headingAccuracy: k.rec.headingAccuracy,
+      // Absent `headingNorth` = 'true': the FrameInfo.heading / HeadingSample contract (true north
+      // unless flagged 'magnetic'; callers without a north reference, e.g. tests and the harness'
+      // true-north replays, send none). Since the WMM change the app flags every heading it sends
+      // (capture.ts: 'magnetic' until CompassSensor knows the declination). App builds before that
+      // change sent unflagged MAGNETIC headings, so their keyframes would be read as true north here
+      // (yaw off by the local declination) — the app was never released, so no such stored session
+      // exists; a released app would need a session-version check to read them as 'magnetic'.
       headingNorth: k.rec.headingNorth ?? 'true',
       geo: k.rec.info.geo,
     }));

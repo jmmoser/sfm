@@ -8,8 +8,10 @@
  *              the UI stays responsive while it runs, layout audit at 393 px and 375 px
  *   cancel     Cancel while running → "Cancelled" state, Run is available again
  *   no-webgpu  the page has no WebGPU → CPU-only results, nothing crashes
+ *   loaded     a scan is open in the engine → Run asks first ("Free memory and run" releases the
+ *              engine, then runs; "Run anyway"); the scan opens again afterwards
  * Prints the text report of the run. Screenshots: e2e/out/ui/bench-*.png.
- * Usage: node e2e/ui/bench.mjs [run|cancel|no-webgpu ...] [--scale small|full] [--verbose]
+ * Usage: node e2e/ui/bench.mjs [run|cancel|no-webgpu|loaded ...] [--scale small|full] [--verbose]
  */
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -116,6 +118,8 @@ await scenario('run', async () => {
   // Leaving and re-opening Diagnostics keeps the results.
   await by(page, 'back').tap();
   await by(page, 'open-diagnostics').tap();
+  // the previous Diagnostics screen fades out for 180 ms (still in the DOM, with its own verdict)
+  await page.waitForFunction(() => document.querySelectorAll('[data-screen="diagnostics"]').length === 1, null, { timeout: 5000 });
   await by(page, 'bench-verdict').waitFor({ timeout: 10000 });
   const again = await page.$$eval('.bench-row[data-status]', (els) => els.map((e) => e.getAttribute('data-status')));
   check(again.length === 4 && again.every((s) => s === 'pass'), `results kept after re-opening Diagnostics (${again.join(', ')})`);
@@ -161,6 +165,58 @@ await scenario('no-webgpu', async () => {
   check(/No WebGPU — CPU results only/.test(verdictText ?? ''), 'the verdict says the results are CPU-only');
   await page.evaluate(() => document.querySelector('.diagnostics')?.scrollTo(0, 0));
   await auditShot(page, 'bench-no-webgpu');
+  await context.close();
+});
+
+await scenario('loaded', async () => {
+  const { page, context } = await newPage();
+  await page.goto(`${base}?mock=1&benchScale=${scale}`);
+  await by(page, 'new-scan').waitFor();
+  await page.evaluate(async () => {
+    const { SessionStore } = await import('/src/io/storage.ts');
+    const s = await SessionStore.open();
+    await s.createSession({ id: 'seed-bench', name: 'Loaded vase', mode: 'object', status: 'meshed', stats: { quality: 'fast', keyframes: 20 } });
+  });
+  await page.reload();
+  // open the scan: the engine now holds it
+  await by(page, 'session-item').first().tap();
+  await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  await by(page, 'viewer-back').tap();
+  await by(page, 'open-diagnostics').tap();
+  await by(page, 'bench-run').waitFor({ timeout: 30000 });
+  // "Run anyway" asks first, then runs with the scan loaded
+  await by(page, 'bench-run').tap();
+  await by(page, 'bench-run-anyway').waitFor({ timeout: 5000 });
+  check(await by(page, 'bench-release-run').isVisible(), 'a loaded scan: Run asks first (free memory / run anyway)');
+  await auditShot(page, 'bench-loaded-ask');
+  await by(page, 'bench-run-anyway').tap();
+  await by(page, 'bench-cancel').waitFor({ timeout: 10000 });
+  check((await page.evaluate(() => globalThis.__sfmApp.engine.status.state)) === 'ready', '"Run anyway" keeps the scan loaded');
+  await by(page, 'bench-cancel').tap();
+  await waitReport(page);
+  await by(page, 'bench-run').waitFor({ timeout: 10000 });
+  // "Free memory and run": the engine is released before the benchmark starts
+  await page.evaluate(() => (globalThis.__sfmApp.debug.benchReport = undefined));
+  await by(page, 'bench-run').tap();
+  await by(page, 'bench-release-run').tap();
+  await by(page, 'bench-cancel').waitFor({ timeout: 10000 });
+  const st = await page.evaluate(() => ({ state: globalThis.__sfmApp.engine.status.state, loaded: globalThis.__sfmApp.loadedSessionId }));
+  check(st.state === 'idle' && st.loaded === null, `"Free memory and run" released the engine (${JSON.stringify(st)})`);
+  await by(page, 'bench-cancel').tap();
+  await waitReport(page);
+  // released and nothing loaded: Run starts right away (no question)
+  await by(page, 'bench-run').waitFor({ timeout: 10000 });
+  await page.evaluate(() => (globalThis.__sfmApp.debug.benchReport = undefined));
+  await by(page, 'bench-run').tap();
+  await by(page, 'bench-cancel').waitFor({ timeout: 10000 });
+  check((await page.locator('[data-testid="bench-run-anyway"]').count()) === 0, 'no question once nothing is loaded');
+  await by(page, 'bench-cancel').tap();
+  await waitReport(page);
+  // the scan opens again (loaded from storage)
+  await by(page, 'back').tap();
+  await by(page, 'session-item').first().tap();
+  await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  check(/Loaded vase/.test((await page.locator('.viewer-title').textContent()) ?? ''), 'the scan opens again after the release');
   await context.close();
 });
 

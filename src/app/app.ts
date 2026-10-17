@@ -393,6 +393,26 @@ export class App {
   }
 
   /**
+   * True while the engine holds a scan in memory: a capture or an opened scan (`loadedSessionId`),
+   * or any initialised engine (its capture state, models and GPU pipelines stay until released).
+   */
+  engineHoldsData(): boolean {
+    const st = this.engine.status.state;
+    return this.loadedSessionId !== null || st === 'ready' || st === 'starting' || st === 'respawning';
+  }
+
+  /**
+   * Free the engine's memory (EngineLike.release: the worker and everything in it) and the models
+   * the page holds, e.g. before the on-device benchmark. Stored scans stay on the device and are
+   * loaded again when opened.
+   */
+  async releaseEngine(): Promise<void> {
+    await this.engine.release();
+    this.loadedSessionId = null;
+    this.results = App.emptyResults(this.config);
+  }
+
+  /**
    * Make the engine hold `sessionId` (loadSession when it holds another one) and copy the
    * stored models into `results`. Returns false when it failed (a toast explains).
    */

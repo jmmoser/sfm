@@ -173,44 +173,60 @@ export function spatialPairs(
  * Union of pair lists: normalised to [min, max], self-pairs and duplicates removed, pairs
  * with `exclude(a, b)` true dropped (e.g. `(a, b) => db.hasPair(a, b)`; called once per
  * distinct pair), sorted by (a, b). Pairs with a non-finite id are dropped.
- * Ids that are integers in [0, 2^26) take a fast path (typed-array sort of numeric keys,
- * ≈ 10× faster than sorting pair objects); other ids fall back to a generic merge.
+ * Ids that are integers in [0, 2^26) take a fast path (one pass to numeric keys, typed-array
+ * sort; Uint32 keys when every id is < 2^16, as image ids are; ≈ 3–4× faster than sorting pair
+ * objects on Node 22); other ids fall back to a generic merge.
  */
 export function mergePairs(lists: Iterable<readonly (readonly [number, number])[]>, exclude?: (a: number, b: number) => boolean): ImagePair[] {
   let total = 0;
-  let small = true;
   const arr: (readonly (readonly [number, number])[])[] = [];
   for (const list of lists) {
     arr.push(list);
     total += list.length;
-    if (small)
-      for (const p of list) {
-        const a = p[0],
-          b = p[1];
-        if (!(a >= 0 && a < KEY_BASE && b >= 0 && b < KEY_BASE && Number.isInteger(a) && Number.isInteger(b))) {
-          if (Number.isFinite(a) && Number.isFinite(b)) small = false;
-        }
-      }
   }
-  if (!small) return mergePairsGeneric(arr, exclude);
   const keys = new Float64Array(total);
   let n = 0;
-  for (const list of arr)
-    for (const p of list) {
-      const a = p[0],
-        b = p[1];
-      if (a === b || !Number.isFinite(a) || !Number.isFinite(b)) continue;
-      keys[n++] = a < b ? a * KEY_BASE + b : b * KEY_BASE + a;
+  let maxId = 0;
+  for (let li = 0; li < arr.length; li++) {
+    const list = arr[li];
+    for (let i = 0; i < list.length; i++) {
+      const a = list[i][0],
+        b = list[i][1];
+      if (a >= 0 && a < KEY_BASE && b >= 0 && b < KEY_BASE && Number.isInteger(a) && Number.isInteger(b)) {
+        if (a === b) continue;
+        if (a < b) {
+          keys[n++] = a * KEY_BASE + b;
+          if (b > maxId) maxId = b;
+        } else {
+          keys[n++] = b * KEY_BASE + a;
+          if (a > maxId) maxId = a;
+        }
+      } else if (Number.isFinite(a) && Number.isFinite(b)) return mergePairsGeneric(arr, exclude);
+      // a non-finite id: dropped
     }
-  const ks = keys.subarray(0, n).sort();
+  }
+  let ks: Float64Array | Uint32Array = keys.subarray(0, n);
+  let base = KEY_BASE;
+  if (maxId < 65536) {
+    // (a, b) < 2^16 ⇒ a·2^16 + b fits a Uint32 key, which sorts ≈ 1.5× faster than a Float64 key
+    const u = new Uint32Array(n);
+    for (let i = 0; i < n; i++) {
+      const k = keys[i],
+        b = k % KEY_BASE;
+      u[i] = ((k - b) / KEY_BASE) * 65536 + b;
+    }
+    ks = u;
+    base = 65536;
+  }
+  ks.sort();
   const out: ImagePair[] = [];
   let prev = -1;
   for (let i = 0; i < n; i++) {
     const k = ks[i];
     if (k === prev) continue;
     prev = k;
-    const b = k % KEY_BASE,
-      a = (k - b) / KEY_BASE;
+    const b = k % base,
+      a = (k - b) / base;
     if (exclude && exclude(a, b)) continue;
     out.push([a, b]);
   }

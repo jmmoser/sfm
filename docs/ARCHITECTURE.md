@@ -54,7 +54,7 @@ Shared types live in `src/core/types.ts` (do not duplicate them).
 ### 2.1 WebGPU rules for iOS Safari (from docs/research/ios-webgpu.md)
 
 * At most ONE heavy command buffer in flight: submit, then `await device.queue.onSubmittedWorkDone()`
-  (`submitAndWait` in `src/gpu/device.ts`) before the next. Size command buffers to ~2–30 ms of GPU
+  (`BudgetEncoder` in `src/features/gpu-common.ts`, the band loop of `PatchMatchGPU`) before the next. Size command buffers to ~2–30 ms of GPU
   work (tile large images / batch pairs); never ~100 ms+.
 * Create all pipelines up front (pipeline compilation blocks the queue on Safari 26/27) — e.g. in a
   `create()`/warm-up step, not lazily in the middle of the capture loop.
@@ -102,7 +102,7 @@ src/
   engine/                PhotogrammetryEngine (pipeline orchestration, runs in a worker)
   workers/               engine.worker.ts + typed message protocol
   app/                   mobile UI (vanilla TS + CSS), screens, state machine
-  harness/               test harness page logic (feeds synthetic datasets to the engine)
+  harness/               test harness pages: synthetic dataset generator, engine e2e, dense GT
   main.ts                app entry
 e2e/                     synthetic dataset generator, end-to-end runner, metrics
 docs/                    this file, research notes
@@ -279,6 +279,8 @@ interface BAProblem {
   obsWeight?: Float32Array;                       // optional per-observation weight (1/σ)
   centerPriors?: { pose: number; center: Vec3; sigma: number }[];          // e.g. GPS, same world frame
   relRotationPriors?: { i: number; j: number; R_ji: Mat3; sigma: number }[]; // R_j ≈ R_ji R_i (gyro)
+  focalPriors?: { camera: number; f: number; sigma: number }[];            // (f − f₀)/σ, only when f is refined
+  principalPointPriors?: { camera: number; cx: number; cy: number; sigma: number }[]; // (c − c₀)/σ, only when c is refined
 }
 interface BAOptions {
   loss?: 'trivial' | 'huber' | 'cauchy' | 'soft_l1';   // default 'cauchy'
@@ -504,6 +506,26 @@ class Viewer {
   resize(): void; dispose(): void; screenshot(): Promise<Blob>
 }
 ```
+
+### 4.10 Contract deviations
+
+Where the code legitimately differs from the contracts above. Optional parameters, extra fields
+and extra methods that keep the documented call working are not listed.
+
+* **File lists.** There are more files than listed. `src/ba` also has `camera-model.ts`, `linear.ts`
+  and `priors.ts`, plus `synthetic.ts` for tests and the benchmark. `src/features` also has
+  `sift-common.ts`, `gpu-common.ts`, `sift-gpu-host.ts`, `match-gpu-host.ts`, `simd.ts` (WASM
+  SIMD kernels) and `testdata.ts`. `src/geometry` also has `eigen.ts` and `internal.ts`. WGSL
+  lives in `.ts` modules (`features/shaders/*.ts`, `dense/patchmatch-wgsl.ts`), never in `.wgsl`
+  files.
+* **`src/features/index.ts`** re-exports only the CPU modules. `sift-gpu.ts` and `match-gpu.ts`
+  read `GPUBufferUsage` at module load, which throws where WebGPU does not exist, so import them
+  and `extractor.ts` directly. The engine loads `extractor.ts` lazily.
+* **`saveFile`** can also resolve `'cancelled'`, when the user dismisses the share sheet.
+  Callers must not report that as a saved file.
+* **`tsdfMesh` `truncation`** is in voxels (default 4), not in world units like `voxelSize`.
+* **`BAOptions.linearSolver: 'auto'`** also picks the dense Schur solver above 2400 reduced
+  parameters when the Cholesky envelope is small, as it is for sequential captures.
 
 ## 5. Pipeline
 
@@ -1759,7 +1781,8 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   skipped (could commit a NaN keyframe time); NaN `numInliersToLastKF` = "not measured" (no lost / overlap
   trigger). `rotationCompensatedParallax` skips NaN distances (non-finite / out-of-range keypoints).
 * **mergePairs** (also behind `sequentialPairs` / `retrievalPairs` / `spatialPairs`): typed-array sort of numeric
-  keys for integer ids in [0, 2²⁶) — 400 k pairs ≈ 0.1 s (was ≈ 1.5 s); other ids (≥ 2²⁶, negative) use a
+  keys for integer ids in [0, 2²⁶), Uint32 keys when every id is < 2¹⁶ — 400 k pairs ≈ 50 ms warm vs
+  ≈ 150–250 ms for the Set + pair-object sort it replaced (Node 22, 4-core VM); other ids (≥ 2²⁶, negative) use a
   collision-free generic path (pairId would collide); non-finite ids dropped.
 * Verified correct (no change): R_wd = R_wc·R_cam_device, gyro right-multiplication and the Magnus sign
   (h²/12 ωa×ωb), Forster bias Jacobian sign, offset sign (τ = t_cam + offset), specific-force gravity sign,
@@ -1805,8 +1828,9 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   `resume: true` or last `loadSession`; pending requests reject with `EngineCrashedError`) on:
   module load failure, fatal error event, init timeout, 2 consecutive frame timeouts. Cap 3 per
   60 s → state `dead`; after 2 GPU-related failures the replay uses `preferGPU: false`.
-  `src/workers/engine.worker.ts` is a PLACEHOLDER (every request → `NotImplementedError` "engine
-  not implemented yet"); the app shows that clearly and suggests `?mock=1`.
+  A worker that answers every request with `NotImplementedError` (a build without the engine; the
+  original placeholder `engine.worker.ts`, now the real engine) gets an "engine unavailable" card
+  that suggests `?mock=1` (e2e/ui/states.mjs `engine-missing`).
 * **MockEngine** (`mock-engine.ts`, `mock-scene.ts`; `?mock=1`, `mockSpeed=<x>`,
   `mockFail=<method>[:msg]`): procedural object-on-table / backyard scenes; keyframes every 10° of
   an orbit driven by frame timestamps; overlays are projections of the scene into the moving
@@ -1993,8 +2017,8 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   'auto' reference). **Deviation**: when the IMU scale is rejected only for low excitation but the fit is
   excellent (R² ≥ 0.9, σ ≤ 3 %, excitation ≥ 0.03 m/s²) it is accepted with σ = max(2σ, 2 %) and a warning
   (e2e `object` orbit with GT poses: 0.3 % scale error at 0.06 m/s², rejected by the 0.08 floor).
-* **Dense**: preset table of ENGINE.md (+ `DENSE_PRESETS` of src/dense when exported, read defensively by
-  field name; `removeDepthHalos` applied to the final maps when exported) → evenly spread view subset →
+* **Dense**: preset table of ENGINE.md (engine table ← `DENSE_PRESETS` of src/dense, merged by field
+  name; `removeDepthHalos` applied to the final maps) → evenly spread view subset →
   JPEG decode at the dense size + `undistortImage` through an LRU (15 % of the memory budget) → selectSourceViews
   → PatchMatchGPU (self-tested once; CPU at ≤ 320–480 px otherwise; device loss ⇒ recreate once, else
   'gpu-lost') photometric + geometric passes → fusion (min views 3 object / 2 scene, colour thumbnails within
@@ -2300,7 +2324,7 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   488 k triangles, ATE 2.06e-4 — same as before the changes (0.9997 / 0.996 / 0.998, 1.31 M points).
 * **Checked, unchanged**: every FrameInput bitmap is closed on all paths (busy, not initialised, hidden, settle
   drop, prepare failure, disposed while waiting for the GPU lock); one GPU command stream (engine `gpu()` chain +
-  submitAndWait inside the modules), feature pipelines compiled at init, PatchMatch at densify start; frames are
+  submit-and-wait inside the modules), feature pipelines compiled at init, PatchMatch at densify start; frames are
   skipped while hidden and dense waits for visibility before each view; quota errors surface on the next frame
   (app: "Storage is full") or reject densify (resumable).
 * **Remaining risks (devices)**: all budgets are estimates — no on-device memory profile (no
@@ -2451,9 +2475,10 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   declination at one GPS fix; yaw recovered to 1e-6°). Fixed: under the `'ui-top'` heading model (selected when the
   platform heading follows the UI top across rotations) `CompassSensor.headingAt` returned the raw UI-top heading, which
   the world alignment reads as the device-top azimuth (±90° in landscape); it now reports the device-top / camera
-  reference from the ψ-corrected attitude (orientation.test.ts). Open: persisted keyframes from before this change carry
-  no `headingNorth` and are read as true north although the old app sent magnetic headings (`refine.ts`
-  `k.rec.headingNorth ?? 'true'`; `'magnetic'` would be right for app sessions).
+  reference from the ψ-corrected attitude (orientation.test.ts). Persisted keyframes without `headingNorth` are read as
+  TRUE north (`refine.ts` `k.rec.headingNorth ?? 'true'`, the FrameInfo.heading contract; documented there). App builds
+  from before this change sent unflagged magnetic headings, but the app was never released, so no such session exists;
+  a released app would need a session-version check to read them as `'magnetic'`.
 
 ### `src/app` — capture / viewer gaps + on-device benchmark (amends the `src/app` notes above)
 
@@ -2480,6 +2505,13 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   Review fix: overlapping `abortLongOperation` calls for the same request (finishing card Cancel, then X → Discard
   within the grace period) share one outcome — the second used to report `'cancelled'` although the worker was
   restarted (`engine-client.gpu.test.ts`, one restart, both `'restarted'`).
+  Discard during a stuck finish (fixed): the session used to be deleted at once while the abort's restart (4 s later)
+  replayed `init` with `resume` and re-created it, and a new scan's `init` sent within those 4 s was rejected by the
+  restart. Now `abortLongOperation({ reinit: false })` restarts without a replay (also when an earlier abort of the same
+  request asked for one); `abandon` deletes the session only after the abort settled ("Discarding scan…" card when it
+  takes > 0.3 s); an `init` / `loadSession` issued while an abort is pending waits for it and the restart replays nothing
+  (the new setup supersedes it). Tests: `engine-client.gpu.test.ts` (no replay, new init not rejected and the old session
+  not replayed), `mock-engine.test.ts`, UI `states.mjs finish-stuck-discard`.
 * **Capture memory cap** (`error` event reason `'out-of-memory'` / `CaptureMemoryLimitError`, or
   `LiveUpdate.timings.memoryLimited`): asked once — pause + card "Memory limit reached — finish scan now?" with
   **Finish scan** / **Continue (tracking only)** (fewer than 5 keyframes: Continue / Back to home), like the storage-full
@@ -2488,10 +2520,15 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   `denseInterrupted`) ⇒ viewer HUD "Dense cloud interrupted · Resume" and a "Resume dense reconstruction" item in the
   Build sheet (another quality says it starts over — the resume key includes the settings); Processing headline
   "Resuming dense cloud"; markers cleared by a finished densify or a refine. Pure helpers in `model-info.ts`.
+  The resume uses the quality of the INTERRUPTED run, not the scan's: the engine stores it in `dense/progress` and
+  reports `stats.denseResumableQuality` (loadSession); the app's marker carries `denseInterruptedQuality`
+  (`denseResumeQuality`). The HUD names it and resumes with it, the Build sheet preselects it; unknown (older records) ⇒
+  the item says it continues only if the maps were made at the selected quality (UI `states.mjs dense-resume-quality`).
 * **Info sheet**: North row from `stats.north` / `yawSource` / `declinationDeg` / `declinationSource` / `yawStdDeg` of the
   world alignment ("True north — from the GPS track / compass corrected by the declination / combined", or "Magnetic
   north" with the declination note when the compass had no location; sessions without `stats.north`: compass ⇒
-  magnetic unless a declination is reported). Memory section: `memoryMB`, `denseMemPeakMB`, `denseMaxSize` (+ requested
+  magnetic unless a declination is reported — also with `northAligned` false, the world alignment's flag for an applied
+  magnetic-only yaw, which showed "Unknown" before). Memory section: `memoryMB`, `denseMemPeakMB`, `denseMaxSize` (+ requested
   when reduced), `fusionStep` > 1.
 * **On-device benchmark & self-test** (Diagnostics, top; `src/app/bench/`): `bench.ts` runs `runner.ts` in a dedicated
   module worker (`bench.worker.ts`; UI stays responsive — 61 rAF/s in the e2e run). Tests: (1) WebGPU SIFT on a
@@ -2511,6 +2548,10 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   1024² GPU ≈ 1 s (CPU ≈ 30 ms), PatchMatch 160×120 × 4 sources ≈ 0.5–0.65 s per iteration (CPU 2 iterations 1.5 s),
   parity 100 % / cosine 1.000 / 99.1 % depth agreement / 100 % identical pairs, BA 30 images ≈ 20–30 ms per iteration —
   SwiftShader timings say nothing about Apple GPUs; the estimate coefficients are unverified on devices.
+  While the engine holds a scan (`App.engineHoldsData`: an opened / captured session or an initialised engine), "Run
+  benchmark" asks first: **Free memory and run** (`App.releaseEngine` → `EngineLike.release()`: the worker is terminated
+  without a replay, the page's models dropped; the scan reloads from storage when opened) or **Run anyway** (UI
+  `bench.mjs loaded`).
 * **MockEngine** knobs: `?mockStall=finishCapture[,refine|densify|mesh]` (hangs, ignores cancel; ends by
   `abortLongOperation` = simulated restart), `?mockMemoryLimit=<n>` (cap after n keyframes, one `out-of-memory` event,
   `timings.memoryLimited`), interrupted densify ⇒ `denseResumablePass` (also read from seeded session stats); mock stats
@@ -2659,9 +2700,11 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
 
   * At 90° the sky still reaches the top row at one corner, so part of it is found. At 180° (upside down) nothing is.
     With `skyUp`, both rotations reproduce the upright result exactly.
-  * **For the engine owner** (src/engine is not changed here): `runDensify` calls `halo(dm, ref.image, ref.cam)`.
-    When the model is gravity-aligned, it should pass `{ skyUp: worldUpInCamera(image.pose.R) }`, or the frame's
-    −`gravityCam` (canonical camera axes). Without it, the sky test works only on upright frames.
+  * **Engine** (done): `runDensify` passes each view's `skyUp` to `removeDepthHalos` (`denseSkyUp`, src/engine/dense.ts):
+    `worldUpInCamera(pose.R)` when the sparse model is gravity-aligned (`MetricInfo.gravityAligned`), else −`gravityCam`
+    of the keyframe (canonical camera axes; `PhotogrammetryEngine.denseSkyInputs` takes it from the live session, or after
+    a reload from the stored keyframe records re-rotated with the stored camera←device mapping), else nothing (top row).
+    `stats.haloSkyUp` names the source, which is part of the dense resume key. Test: `src/engine/dense-sky.test.ts`.
 * **Phone-realistic captures** (`yard-real` / `object-real`: JPEG 0.85, motion blur, white-balance drift, focus breathing,
   rolling shutter; e2e/README "Real-capture artefacts"). These are mini subsets with GT poses: yard 15 views and object
   12 views, stride 8, balanced, 480 px. Maps were saved, then re-fused with the sky test off and on. The low absolute
@@ -2704,7 +2747,10 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   the best candidate of the window (`candidateScore` = sharpness / (1 + |ω| / 2 rad/s)) is HELD (`decision.hold`); when the
   window ends without a sharp enough frame, the held frame becomes the keyframe if it scores better than the current one
   (`decision.useHeld`) instead of whichever frame arrives at the deadline. The engine keeps at most ONE held frame (its
-  prepared image, features, tracking geometry; released on drop / segment change / finishCapture / dispose). A keyframe made
+  prepared image, features, tracking geometry; released on drop / segment change / dispose). At the end of the capture
+  (`finishCapture`, or a `refine` without it) a frame still held is COMMITTED as the keyframe its window would have produced
+  (`KeyframeSelector.commitHeld`, `LiveSession.commitHeldKeyframe`: persisted and mapped by the flush; memory cap respected)
+  instead of being dropped (`held-keyframes.test.ts`). A keyframe made
   from a held frame is answered on the LATER frame's LiveUpdate: `timings.keyframeFrameIndex` names the frame it came from
   (SparseCameraEx.frameIndex is always right; the harness's live-trajectory mapping uses it, `keyframeSourceIndex` — it
   used the later frame before).
@@ -2809,10 +2855,88 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   image centre against −1.0 px GT: pp error 1.46 px, rotation 0.118° (6 rounds: 0.87 px, 0.077°); abl-object-breath
   extrapolates to ≈ +0.5 px. The fixed point is biased along the orbit's weak pitch ↔ c_y mode (the 0.5 % prior keeps
   part of the breathing in the shared camera), so the cap acts as an early-stopping regulariser tuned on these two
-  datasets (a principal-point prior or a joint shared-intrinsics BA would make it principled); the camera–IMU offset the
+  datasets. A weak principal-point prior in the shared re-refinements (`BAProblem.principalPointPriors`,
+  `MapperOptions.principalPointPriors`, `EngineConfig.perImageFocalPPSigmaPx` / `perImageFocalPPAnchor`; OFF by default)
+  was measured and does NOT make the alternation converge (e2e/README "Principal-point prior"): at σ 2.5 px the per-round
+  contraction of the c_y steps is unchanged (object-real 0.78 → 0.76, abl-object-breath 0.84 → 0.81), only the extrapolated
+  fixed point moves (object-real +1.2 → +0.6 px, GT −1.0) — the run still ends by a stopping rule (cap or 0.25 px
+  tolerance), and with the 6-round cap it helps object-real (pp 0.90 → 0.59 px, rotation 0.078 → 0.055°) but hurts
+  abl-object-breath (0.92 → 1.27 px, 0.078 → 0.105°); anchored at the image centre it is worse (object-real 1.45 px /
+  0.116°); a stronger prior (σ 1 px: contraction 0.67) makes the anchor — the breathing-biased input pp — set the fixed
+  point and doubles the focal error (0.09 → 0.20 %, pp 0.91 px). So the 6-round cap stays; a joint BA with intrinsics shared ACROSS
+  cameras remains the principled fix. The camera–IMU offset the
   readout passes query ω with comes from the DISTORTED live model and is biased by where the features sit in the frame
   (yard-real −30.5 / abl-yard-rs −27.9 ms, truth −25 — the alignment later finds −25.1 on the corrected model);
   re-calibrating before the second pass gives −25.1 / −24.9 ms but measured neutral, and worse on yard-real (pp 0.4 →
   1.3 px, e2e/README "Adversarial review"), so it is not done; no live RS estimation
   during capture (only a configured readout is applied live). Memory: `rsOriginal` (a copy of the keypoints of every
   corrected keyframe, ≈ 11 % of the features) and the best-of-window held frame are counted in `captureMemory`.
+
+### iOS Safari 26 compatibility audit (2026-10; amends §2.1 and the `src/features` / `src/gpu` notes above)
+
+Every web platform API, JS built-in, CSS feature, WGSL construct and WebAssembly feature used by `src/**` (tests and
+`src/harness` excluded) was checked against Safari 26.0 (ios-webgpu.md, ios-platform.md, ios-camera.md, MDN BCD).
+* **JS / build**: the es2022 Vite output needs no lowering for Safari 16.4 (checked with oxc: identical output for targets
+  `esnext` and `safari16.4`); no ES2023+ built-ins are used except three.js's guarded `Float16Array` (`getOrInsert` in the
+  bundle is our own `dense-util` hash map). `requestIdleCallback`, `scheduler.yield`, `navigator.userAgentData` /
+  `deviceMemory` (all absent in Safari) are feature-detected with fallbacks.
+* **CSS**: every `backdrop-filter` / `user-select` carries its `-webkit-` twin (kept by the minifier), `100dvh` has a
+  `100vh` fallback, `env(safe-area-inset-*)` with `viewport-fit=cover`; no `:has()`, `color-mix()`, container queries,
+  `@layer`, nesting, `text-wrap` or popover. Modals are `role=dialog` + `inert` (15.5), not `<dialog>`.
+* **WebGPU / WGSL**: optional features only when the adapter has them, numeric limits only; no `enable f16`, subgroups,
+  storage textures, pointers, `vec3` in buffers or struct-by-value; `r32float` is only `textureLoad`ed
+  (`unfilterable-float`), linear filtering only on `r8unorm` / `rgba8unorm`; `uncapturederror` re-armed (26.x one-shot).
+* **Fixes of this audit**: (1) `features/simd.ts` runs a known-answer self-test of the v128 kernels (dot4, blurH, blurV,
+  grad; repeated rounds so tier-up / OSR thunks run with live v128 locals) before first use and falls back to plain JS on
+  any mismatch — guard for the Safari 26.x JSC "v128 corruption in SIMD thunks" regression (fixed in 27.0); the passing
+  instance is handed to the first `createSimdKernels()` (no extra Wasm memory); `simdStatus()` / diagnostics
+  `features.wasmSimdKernels` report it. (2) `getGPU()` retries `requestDevice` with default limits on a FRESH adapter (an
+  adapter makes one device; WebKit returns a lost device on the second request). (3) `compilePipeline` (SIFT / matcher)
+  races `createComputePipelineAsync` against a 30 s timeout and then compiles synchronously, as PatchMatchGPU already did.
+  (4) `SiftGPU.extractFromBitmap(ImageData)` uploads with `writeTexture` (ImageData is not a Safari
+  `copyExternalImageToTexture` source per BCD). MSTP is worker-only in Safari: `features.mediaStreamTrackProcessor` is
+  false on the main thread there (unused by the capture path).
+
+### Security & privacy review (2026-10; amends the `src/app`, `src/io`, `src/engine` notes and `public/sw.js`)
+
+* **Service worker** (`public/sw.js`, registered by `src/app/pwa.ts`): versioned per deploy — the page registers
+  `sw.js?v=<entry chunk file name>` (content-hashed by Vite; it changes with any JS chunk), caches are named
+  `sfm:<scope path>:<version>`. The old worker kept ONE cache forever (every deployed chunk accumulated in the quota the
+  scans need), cached EVERY navigation response under its full URL (502 / 404 pages and redirects were served offline;
+  each query string added an entry), and its `activate` deleted every cache of the ORIGIN not named `sfm-v1` (on GitHub
+  Pages user sites all projects share one origin). Now: install precaches the shell and every hashed asset reachable from
+  it (HTML → entry → lazy chunks / worker scripts named in the JS; the engine worker used to be fetched only at the first
+  scan, so an install-then-offline scan failed); navigations are network first and only a 200, non-redirected app shell
+  is stored, under the scope URL; `assets/` and `icons/` cache first (200 only, no `.map`); other files network first;
+  activate keeps the current and the previous version of its own scope only (a page still running the old version loads
+  its lazy chunks), cross-origin / out-of-scope / range / non-GET requests are not intercepted. Tests:
+  `src/app/service-worker.test.ts` (sw.js in a simulated worker scope); verified on a production build in Chromium over
+  HTTPS (precache list, offline reload + engine worker start + viewer chunk, deploy → previous version kept, no CSP
+  violation).
+* **CSP** (`index.html` meta): `default-src 'self'`, `script-src 'self' 'wasm-unsafe-eval'` (no eval, no inline script),
+  `style-src 'self' 'unsafe-inline'` (Vite dev injects `<style>`), `img-src 'self' blob: data:`, `connect-src 'self'`
+  (also the HMR WebSocket), `worker-src 'self'`, `object-src 'none'`, `base-uri 'self'`, `form-action 'none'`. Same-origin
+  workers carry no document CSP (WASM in workers unaffected). `frame-ancestors` would need an HTTP header. All UI flows
+  (`e2e/ui/*`) run with it (they fail on any console error, i.e. any refusal); `npm run dev` with HMR checked.
+* **Production build** contains only `index.html`: `harness.html` (exposes `window.runPipeline`, fetches
+  `/e2e/data/<?dataset>` paths, writes sessions into the app's IndexedDB and runs the GPU engine on load) was deployed.
+* **URL parameters** are validated in `src/app/boot-params.ts`; the `mockFail` custom message (text shown in the app's
+  UI) is a dev-build hook only — production shows "Simulated failure", so a crafted link cannot inject wording.
+* **IndexedDB robustness**: `normalizeSessionMeta` (applied by `getSession` / `listSessions`) coerces records of older
+  versions / damaged records (non-string name, NaN counts, unknown mode / status, junk stats, non-Blob thumbnails); the
+  engine's `loadResults` treats an undecodable sparse model / dense cloud / mesh as missing (warning logged, the scan
+  opens as 'captured' and can be processed again — it used to be unopenable with "unpackArrays: bad container"), and
+  `unpackArrays` checks every length against the buffer ("Stored data is damaged (…)"); invalid `engine/state` mode /
+  quality / FOV values are ignored.
+* **Privacy**: exports (PLY / GLB / COLMAP) contain NO location — the engine's export path has no geo input, coordinates
+  are local (ENU metres), keyframe JPEGs are canvas re-encodes (no EXIF); the GPS origin is only shown in Model info and
+  GPS is used only when the "GPS" switch is on (on by default for Large area). The Diagnostics "Copy" JSON redacts camera
+  `deviceId` / `groupId` and any lat / lon / alt (`diagnosticsReportJSON`). Clipboard writes, permission prompts (motion,
+  camera, location, benchmark) only follow taps; launch-time `storage.persist()` is skipped where the Permissions API
+  reports 'prompt' (Firefox would show a prompt). No third-party request anywhere (fonts are system fonts).
+* **DOM**: HTML sinks only for static markup (`icons.ts`, the Home illustration); `iconSvg` reads own keys only and a
+  numeric size; `h()` refuses string `on*` props. Guarded by `src/app/security.test.ts`.
+* **Not changed / deployment notes**: build `sourcemap: true` publishes the full sources next to the bundle (config not
+  changed; use `'hidden'` if that matters); `npm run dev` binds all interfaces (phone testing) and serves the repository
+  to the LAN; on a shared origin (`<user>.github.io/<repo>/`) every other project of that user can read this app's
+  IndexedDB (scans, photos, GPS fixes) and caches — deploy on a dedicated origin (custom domain) for real use.

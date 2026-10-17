@@ -100,6 +100,50 @@ interface BufferedBlob {
   type: string;
 }
 
+const SESSION_MODES: readonly string[] = ['object', 'scene', 'auto'] satisfies SessionMode[];
+const SESSION_STATUSES: readonly string[] = ['capturing', 'captured', 'sparse', 'dense', 'meshed'] satisfies SessionStatus[];
+
+function finiteOr(v: unknown, fallback: number): number {
+  return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+}
+
+/**
+ * A stored session record with every field of its declared type, so records written by older
+ * versions or damaged ones cannot break the session list, file names or routing: name → string,
+ * timestamps → finite numbers, numFrames → integer ≥ 0, unknown mode → 'auto', unknown status →
+ * 'capturing' (opens like an interrupted capture), stats → only finite-number / string values,
+ * thumbnail → a Blob or dropped. null when the value is not a session record at all (no object,
+ * or its id is neither a string nor a number). The stored record itself is not modified.
+ */
+export function normalizeSessionMeta(raw: unknown): SessionMeta | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const id = r.id;
+  if (!(typeof id === 'string' || (typeof id === 'number' && Number.isFinite(id)))) return null;
+  const updatedAt = finiteOr(r.updatedAt, finiteOr(r.createdAt, 0));
+  const createdAt = finiteOr(r.createdAt, updatedAt);
+  const nf = finiteOr(r.numFrames, 0);
+  const meta: SessionMeta = {
+    id: id as string, // numeric keys stay numbers (the record must stay addressable for delete / update)
+    name: typeof r.name === 'string' ? r.name : r.name === undefined || r.name === null ? '' : String(r.name),
+    createdAt,
+    updatedAt,
+    mode: SESSION_MODES.includes(r.mode as string) ? (r.mode as SessionMode) : 'auto',
+    status: SESSION_STATUSES.includes(r.status as string) ? (r.status as SessionStatus) : 'capturing',
+    numFrames: nf > 0 ? Math.floor(nf) : 0,
+  };
+  if (!meta.name.trim()) meta.name = 'Untitled scan';
+  if (r.stats && typeof r.stats === 'object' && !Array.isArray(r.stats)) {
+    const stats: Record<string, number | string> = {};
+    for (const [k, v] of Object.entries(r.stats as Record<string, unknown>)) {
+      if (typeof v === 'string' || (typeof v === 'number' && Number.isFinite(v))) stats[k] = v;
+    }
+    meta.stats = stats;
+  }
+  if (typeof Blob !== 'undefined' && r.thumbnail instanceof Blob) meta.thumbnail = r.thumbnail;
+  return meta;
+}
+
 function isBufferedBlob(v: unknown): v is BufferedBlob {
   return !!v && typeof v === 'object' && (v as BufferedBlob).$blobBuffer instanceof ArrayBuffer;
 }
@@ -426,17 +470,22 @@ export class SessionStore {
     });
   }
 
+  /** The session record, normalised (`normalizeSessionMeta`); null if missing or unusable. */
   getSession(id: string): Promise<SessionMeta | null> {
     return this.tx<SessionMeta | null>([S_SESSIONS], 'readonly', 'reading a session', (tx, set, fail) => {
-      SessionStore.on(tx.objectStore(S_SESSIONS).get(id), fail, (v: SessionMeta | undefined) => set(v ?? null));
+      SessionStore.on(tx.objectStore(S_SESSIONS).get(id), fail, (v: unknown) => set(normalizeSessionMeta(v)));
     });
   }
 
-  /** All sessions, newest first (by createdAt, or updatedAt when requested). */
+  /**
+   * All sessions, newest first (by createdAt, or updatedAt when requested), normalised
+   * (`normalizeSessionMeta`: records of older versions or damaged ones never break the list).
+   */
   listSessions(opts: { orderBy?: 'createdAt' | 'updatedAt' } = {}): Promise<SessionMeta[]> {
     const key = opts.orderBy ?? 'createdAt';
     return this.tx<SessionMeta[]>([S_SESSIONS], 'readonly', 'listing sessions', (tx, set, fail) => {
-      SessionStore.on(tx.objectStore(S_SESSIONS).getAll(), fail, (all: SessionMeta[]) => {
+      SessionStore.on(tx.objectStore(S_SESSIONS).getAll(), fail, (raw: unknown[]) => {
+        const all = raw.map(normalizeSessionMeta).filter((m): m is SessionMeta => m !== null);
         all.sort((a, b) => b[key] - a[key] || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
         set(all);
       });

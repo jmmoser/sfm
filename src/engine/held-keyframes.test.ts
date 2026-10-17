@@ -62,4 +62,43 @@ describe('best-of-window keyframes in the engine', () => {
     expect(updates[updates.length - 1].numRegistered).toBeGreaterThanOrEqual(0.8 * live().state.order.length);
     engine.dispose();
   }, 300_000);
+
+  it('finishCapture keeps a frame still held when the capture ends (it is mapped like any keyframe)', async () => {
+    const store = new MemoryEngineStore('held-end');
+    const engine = new PhotogrammetryEngine(
+      { mode: 'object', quality: 'fast', persist: false, sessionId: 'held-end', hfovPriorDeg: 60 },
+      { pipeline, mapping: 'background', store, keyframe: { deferSharpnessRatio: 10, maxDeferMs: 150, hardOverlap: 0 } },
+    );
+    await engine.init();
+    const live = () => engine.liveSession!;
+    let heldIndex = -1;
+    const frames = frameInputs(cap);
+    for (let i = 0; i < frames.length; i++) {
+      await engine.processFrame(frames[i]);
+      // stop the capture right after a frame was held, once the live model is going
+      if (live().selector.heldTime === cap.frames[i].t && live().state.order.length >= 6) {
+        heldIndex = i;
+        break;
+      }
+    }
+    expect(heldIndex).toBeGreaterThan(0);
+    const nBefore = live().state.order.length;
+    const heldBefore = live().stats.heldKeyframes;
+    await engine.finishCapture();
+    const st = live().state;
+    expect(st.order.length).toBe(nBefore + 1);
+    const rec = st.records.get(st.order[st.order.length - 1])!;
+    expect(rec.frameIndex).toBe(heldIndex);
+    expect(rec.t).toBe(cap.frames[heldIndex].t);
+    expect(live().stats.heldKeyframes).toBe(heldBefore + 1);
+    expect(live().selector.heldTime).toBeNull();
+    expect(live().pendingMapping).toBe(0);
+    // mapped by the flush of finishCapture: registered in the live model
+    expect(live().mapper.reconstruction.images.get(rec.id)?.registered).toBe(true);
+    // the keyframe's image and record are stored
+    await engine.flush();
+    const stored = await store.getFrameRecords();
+    expect(stored.some((r) => r.id === rec.id && r.frameIndex === heldIndex)).toBe(true);
+    engine.dispose();
+  }, 300_000);
 });

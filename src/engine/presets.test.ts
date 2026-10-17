@@ -1,6 +1,6 @@
 /**
  * Dense preset resolution: the engine table ← `DENSE_PRESETS` of src/dense (tuned by the dense
- * owner, read defensively) ← EngineConfig.dense overrides; the option blocks of the tuned presets
+ * owner) ← EngineConfig.dense overrides; the option blocks of the tuned presets
  * reach the dense module.
  */
 import { describe, expect, it } from 'vitest';

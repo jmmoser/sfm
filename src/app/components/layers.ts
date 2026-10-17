@@ -21,11 +21,6 @@ export function overlayLayer(): HTMLDivElement {
   return layer;
 }
 
-export interface ModalHandle {
-  el: HTMLElement;
-  close: () => void;
-}
-
 /**
  * Register a modal element (already in the overlay layer). Returns a release function that
  * restores focus / inertness. `onEscape` is called for the Escape key on the topmost modal.

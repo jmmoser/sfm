@@ -26,6 +26,7 @@ import {
   type LiveUpdate,
   type LogMessage,
   type MeshOptions,
+  type QualityPreset,
   type SessionSummary,
   type SparseCamera,
   type SparseResult,
@@ -81,6 +82,8 @@ export class MockEngine implements EngineLike {
   private releaseStall: (() => void) | null = null;
   /** A densify was interrupted: the next one resumes (reported as stats.denseResumablePass). */
   private denseResumablePass: number | null = null;
+  /** Quality of the interrupted densify (a resume needs the same one; another starts over). */
+  private denseResumableQuality: QualityPreset | null = null;
   private readonly sessionsSrc: () => Promise<SessionStore | null>;
   private st: EngineStatus = { state: 'idle', respawns: 0 };
   private options: EngineOptions | null = null;
@@ -188,6 +191,7 @@ export class MockEngine implements EngineLike {
     this.cancelled = false;
     this.memoryLimitHit = false;
     this.denseResumablePass = null;
+    this.denseResumableQuality = null;
   }
 
   async init(options: EngineOptions): Promise<InitResult> {
@@ -473,6 +477,7 @@ export class MockEngine implements EngineLike {
       this.sparse = this.buildSparse(this.keyframes.length, t);
       this.captureDone = true;
       this.denseResumablePass = null; // refine invalidates stored depth maps
+      this.denseResumableQuality = null;
       return this.sparse;
     });
   }
@@ -485,7 +490,7 @@ export class MockEngine implements EngineLike {
       const q = options?.quality ?? this.options?.quality ?? 'balanced';
       const f = q === 'fast' ? 0.6 : q === 'max' ? 1.6 : 1;
       const t0 = performance.now();
-      const resumed = this.denseResumablePass;
+      const resumed = this.denseResumablePass !== null && (this.denseResumableQuality ?? q) === q ? this.denseResumablePass : null;
       let t1 = t0;
       try {
         await this.stage('depth_maps', 2600 * f * (resumed !== null ? 0.4 : 1), onProgress, `${this.sparse.cameras.length} views`);
@@ -493,10 +498,14 @@ export class MockEngine implements EngineLike {
         await this.stage('fusion', 1100 * f, onProgress);
       } catch (e) {
         // Like the real engine: stored depth maps make an interrupted densify resumable.
-        if ((e as { name?: string })?.name === ENGINE_ERRORS.cancelled) this.denseResumablePass = 1;
+        if ((e as { name?: string })?.name === ENGINE_ERRORS.cancelled) {
+          this.denseResumablePass = 1;
+          this.denseResumableQuality = q;
+        }
         throw e;
       }
       this.denseResumablePass = null;
+      this.denseResumableQuality = null;
       const n = Math.round(this.sizes.dense * (q === 'fast' ? 0.6 : q === 'max' ? 1.5 : 1));
       this.denseCloud = scene.dense(n);
       const size = q === 'fast' ? 800 : q === 'max' ? 1600 : 1280;
@@ -652,6 +661,8 @@ export class MockEngine implements EngineLike {
         if (st === 'meshed') this.meshModel = scene.mesh();
         const rp = meta.stats?.denseResumablePass;
         if (typeof rp === 'number' && this.sparse && !this.denseCloud) this.denseResumablePass = rp;
+        const rq = meta.stats?.denseResumableQuality;
+        if (rq === 'fast' || rq === 'balanced' || rq === 'max') this.denseResumableQuality = rq;
         this.sessionName = meta.name;
       }
       this.setState('ready');
@@ -668,7 +679,11 @@ export class MockEngine implements EngineLike {
         sparse: this.sparse,
         dense: this.denseCloud,
         mesh: this.meshModel,
-        stats: { ...(this.sparse?.stats ?? {}), ...(this.denseResumablePass !== null ? { denseResumablePass: this.denseResumablePass } : {}) },
+        stats: {
+          ...(this.sparse?.stats ?? {}),
+          ...(this.denseResumablePass !== null ? { denseResumablePass: this.denseResumablePass } : {}),
+          ...(this.denseResumablePass !== null && this.denseResumableQuality ? { denseResumableQuality: this.denseResumableQuality } : {}),
+        },
       };
     } catch (e) {
       this.setState('idle', (e as Error).message);
@@ -685,20 +700,51 @@ export class MockEngine implements EngineLike {
     if (this.longOp) this.cancelled = true;
   }
 
-  async abortLongOperation(opts: { graceMs?: number } = {}): Promise<AbortOutcome> {
+  async abortLongOperation(opts: { graceMs?: number; reinit?: boolean } = {}): Promise<AbortOutcome> {
     if (!this.longOp) return 'none';
     this.cancel();
     const graceMs = Math.max(0, opts.graceMs ?? 5000);
     const t0 = performance.now();
     while (this.longOp && performance.now() - t0 < graceMs) await sleep(40);
     if (!this.longOp) return 'cancelled';
-    // Stuck: end it here and "restart" (the in-memory session survives, like a resume from IndexedDB).
+    // Stuck: end it here and "restart" (the in-memory session survives, like a resume from
+    // IndexedDB — unless `reinit: false`: then nothing is re-opened, like EngineClient).
     this.abortCurrent?.(namedError(ENGINE_ERRORS.cancelled, 'The operation did not stop — the engine was restarted'));
     this.releaseStall?.();
     this.setState('respawning', `${ABORT_REASON_PREFIX}the operation did not respond to cancel`);
     await sleep(250 / this.speed);
-    if (!this.disposed) this.setState('ready', 'recovered after an abort');
+    if (this.disposed) return 'restarted';
+    if (opts.reinit === false) {
+      this.forgetSession();
+      this.setState('idle', 'restarted without re-opening the session');
+    } else this.setState('ready', 'recovered after an abort');
     return 'restarted';
+  }
+
+  /** Forget the session (EngineClient.release: a fresh worker). A running operation is rejected. */
+  async release(): Promise<void> {
+    if (this.disposed) throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');
+    if (this.longOp) {
+      this.cancelled = true;
+      this.abortCurrent?.(namedError(ENGINE_ERRORS.cancelled, 'The engine was released'));
+      this.releaseStall?.();
+    }
+    this.forgetSession();
+    this.setState('idle', 'released');
+  }
+
+  private forgetSession(): void {
+    this.options = null;
+    this.sessionId = null;
+    this.scene = null;
+    this.samples = null;
+    this.keyframes = [];
+    this.captureDone = false;
+    this.sparse = null;
+    this.denseCloud = null;
+    this.meshModel = null;
+    this.denseResumablePass = null;
+    this.denseResumableQuality = null;
   }
 
   setHidden(hidden: boolean): void {

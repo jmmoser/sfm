@@ -15,9 +15,10 @@ import { STATUS_LABEL, estimateLine, formatMs, qualityName, reportClipboardText,
 import { describeTest } from '../bench/scales';
 import { BENCH_TESTS, type BenchReport, type BenchScale, type BenchStatus, type BenchTestId, type BenchTestResult } from '../bench/types';
 import { MotionSensor } from '../../sensors/motion';
-import { collectDiagnostics, type SensorDiagnostics } from '../../sensors/diagnostics';
+import { collectDiagnostics, diagnosticsReportJSON, type SensorDiagnostics } from '../../sensors/diagnostics';
 import type { App, Screen } from '../app';
 import { banner, button, chip, group, iconButton, kvRow, section, spinner } from '../components/controls';
+import { actionSheet } from '../components/sheet';
 import { toast } from '../components/toast';
 import { Disposer, h, replaceChildren } from '../dom';
 import { icon } from '../icons';
@@ -91,8 +92,8 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
   }
 
   async function copy(): Promise<void> {
-    const text = JSON.stringify(report(), (_k, v) => (v instanceof Float64Array || v instanceof Float32Array ? Array.from(v) : v), 2);
-    await copyText(text, 'Diagnostics copied');
+    // camera device ids and any location are redacted (diagnosticsReportJSON)
+    await copyText(diagnosticsReportJSON(report()), 'Diagnostics copied');
   }
 
   // ---- benchmark ---------------------------------------------------------------------------------
@@ -146,6 +147,49 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
       }
     });
     renderBench();
+  }
+
+  /**
+   * Run the benchmark — after asking when the processing engine still holds a scan: the benchmark
+   * allocates hundreds of MB (GPU buffers, a second WebGPU device) and, together with a loaded scan,
+   * can exceed the iPhone tab's memory limit (iOS then closes the app without warning).
+   */
+  function requestBench(): void {
+    if (benchRun) return;
+    if (!app.engineHoldsData()) {
+      runBench();
+      return;
+    }
+    actionSheet(
+      'A scan is loaded in memory',
+      [
+        {
+          label: 'Free memory and run',
+          icon: 'activity',
+          description: 'Unloads the scan from the processing engine first. It stays saved on this device.',
+          testId: 'bench-release-run',
+          onSelect: () => void releaseAndRun(),
+        },
+        {
+          label: 'Run anyway',
+          icon: 'warning',
+          description: 'iOS may close the app if memory runs out.',
+          testId: 'bench-run-anyway',
+          onSelect: () => runBench(),
+        },
+      ],
+      'The benchmark needs a lot of memory. With a scan loaded as well, iOS may close the app.',
+    );
+  }
+
+  async function releaseAndRun(): Promise<void> {
+    try {
+      await app.releaseEngine();
+    } catch (e) {
+      toast(`Could not unload the scan: ${(e as Error)?.message ?? e}`, { tone: 'bad' });
+      return;
+    }
+    if (!closed) runBench();
   }
 
   function cancelBench(reason?: string): void {
@@ -271,7 +315,7 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
       renderBenchClock();
     } else {
       benchClock = null;
-      actions.push(button({ label: rep ? 'Run again' : 'Run benchmark', icon: 'activity', variant: 'primary', size: 'md', block: true, testId: 'bench-run', onClick: () => runBench() }));
+      actions.push(button({ label: rep ? 'Run again' : 'Run benchmark', icon: 'activity', variant: 'primary', size: 'md', block: true, testId: 'bench-run', onClick: () => requestBench() }));
       if (rep)
         actions.push(
           button({ label: 'Copy report', icon: 'copy', variant: 'secondary', size: 'md', block: true, testId: 'bench-copy', onClick: () => void copyText(reportClipboardText(rep), 'Benchmark report copied') }),

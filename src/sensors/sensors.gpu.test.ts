@@ -218,6 +218,7 @@ describe('misc browser glue', () => {
     expect(d.features.requestVideoFrameCallback).toBe(true);
     expect(d.features.deviceMotion).toBe(true);
     expect(d.features.motionPermissionApi).toBe(false);
+    expect(d.features.wasmSimdKernels).toBe(true); // compiled + passed the runtime self-test
     expect(d.appleMobileWebKit).toBe(false);
     expect(d.cameras!.length).toBeGreaterThan(0);
     expect(d.gpu?.available).toBe(true);

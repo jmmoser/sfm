@@ -1,7 +1,7 @@
 /**
- * Dense reconstruction (ARCHITECTURE §4.6): PatchMatch MVS (WebGPU + CPU) and the
- * synthetic test-data generator. Undistortion, view selection, fusion and TSDF
- * files are added alongside and re-exported here.
+ * Dense reconstruction (ARCHITECTURE §4.6): PatchMatch MVS (WebGPU + CPU), undistortion,
+ * view selection, fusion, halo / sky filter, TSDF + marching cubes, simplification, point-cloud
+ * filters, tuned presets, and the synthetic test-data generator (`synthetic` namespace).
  */
 export * from './types';
 export { patchMatchCPU, lastPatchMatchCPUStats, type PatchMatchCPUStats } from './patchmatch-cpu';

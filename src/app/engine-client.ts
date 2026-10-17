@@ -23,6 +23,7 @@
 import type { PointCloud, ProgressCallback, ProgressEvent, TriangleMesh } from '../core/types';
 import {
   ENGINE_ERRORS,
+  LONG_RUNNING_METHODS,
   collectTransferables,
   deserializeError,
   isEngineEvent,
@@ -96,8 +97,17 @@ export interface EngineLike {
    * respawned and the last init / loadSession replayed with `resume`, so the persisted capture
    * comes back and later calls do not queue behind the stuck one). Resolves with what happened:
    * 'none' (nothing running), 'cancelled' (the engine stopped it), 'restarted'.
+   * `reinit: false`: such a restart does NOT replay the last init / loadSession — the session is
+   * being discarded, and a replay with `resume` would re-open (re-create) it.
    */
-  abortLongOperation(opts?: { graceMs?: number }): Promise<AbortOutcome>;
+  abortLongOperation(opts?: { graceMs?: number; reinit?: boolean }): Promise<AbortOutcome>;
+  /**
+   * Free everything the engine holds in memory (capture state, models, GPU device / pipelines),
+   * e.g. before the on-device benchmark. EngineClient terminates the worker WITHOUT replaying the
+   * last init / loadSession (the next init / loadSession starts a fresh one); a request still
+   * running is rejected with CancelledError.
+   */
+  release(): Promise<void>;
   /** Page visibility (EngineClient forwards it automatically; MockEngine pauses timers). */
   setHidden(hidden: boolean): void;
   /** Every LiveUpdate: frame responses AND unsolicited `live` events. */
@@ -181,7 +191,7 @@ type Setup = { kind: 'init'; options: EngineOptions } | { kind: 'load'; id: stri
  * Long operations: `cancel()` targets the running one, progress resets their inactivity timer.
  * finishCapture is one (it drains the keyframe mapping queue; the worker gives it a cancel token).
  */
-const LONG: ReadonlySet<EngineMethod> = new Set<EngineMethod>(['finishCapture', 'refine', 'densify', 'mesh', 'export', 'loadSession']);
+const LONG: ReadonlySet<EngineMethod> = new Set<EngineMethod>(LONG_RUNNING_METHODS);
 const FIRE_AND_FORGET: ReadonlySet<EngineMethod> = new Set<EngineMethod>(['cancel', 'visibility', 'dispose']);
 
 function defaultWorker(): Worker {
@@ -220,6 +230,10 @@ export class EngineClient implements EngineLike {
   private readonly settleWaiters = new Map<number, (() => void)[]>();
   /** abortLongOperation in progress per request id (a second abort of the same request shares it). */
   private readonly aborts = new Map<number, Promise<AbortOutcome>>();
+  /** Requests whose abort must not replay the setup when it restarts the worker (`reinit: false`). */
+  private readonly abortsWithoutReplay = new Set<number>();
+  /** > 0 while a new init / loadSession waits for aborts: a restart then replays nothing (it is superseded). */
+  private superseding = 0;
   private readonly live = new Emitter<LiveUpdate>();
   private readonly progressE = new Emitter<ProgressEvent>();
   private readonly logE = new Emitter<LogMessage>();
@@ -277,6 +291,8 @@ export class EngineClient implements EngineLike {
 
   async init(options: EngineOptions): Promise<InitResult> {
     this.assertUsable();
+    await this.settleAborts();
+    this.assertUsable();
     this.setup = { kind: 'init', options: { ...options } };
     this.gpuFailures = 0;
     this.setState('starting');
@@ -328,6 +344,8 @@ export class EngineClient implements EngineLike {
 
   async loadSession(id: string, options?: Partial<EngineOptions>): Promise<SessionSummary> {
     this.assertUsable();
+    await this.settleAborts();
+    this.assertUsable();
     this.setup = { kind: 'load', id, options };
     this.setState('starting');
     try {
@@ -346,15 +364,20 @@ export class EngineClient implements EngineLike {
     void this.call('cancel', { target }, { timeoutMs: this.opts.callTimeoutMs }).catch(() => undefined);
   }
 
-  abortLongOperation(opts: { graceMs?: number } = {}): Promise<AbortOutcome> {
+  abortLongOperation(opts: { graceMs?: number; reinit?: boolean } = {}): Promise<AbortOutcome> {
     const id = this.longOp;
     const p = id !== null ? this.pending.get(id) : undefined;
     if (id === null || !p) return Promise.resolve('none');
+    // (an overlapping abort that asks for no replay applies to the shared one as well)
+    if (opts.reinit === false) this.abortsWithoutReplay.add(id);
     // Overlapping aborts of the same request (capture: Cancel, then Discard) share one outcome:
     // otherwise the first one's restart settles the request and the second reports 'cancelled'.
     let run = this.aborts.get(id);
     if (!run) {
-      run = this.abortRequest(id, p, opts).finally(() => this.aborts.delete(id));
+      run = this.abortRequest(id, p, opts).finally(() => {
+        this.aborts.delete(id);
+        this.abortsWithoutReplay.delete(id);
+      });
       this.aborts.set(id, run);
     }
     return run;
@@ -378,8 +401,39 @@ export class EngineClient implements EngineLike {
     // replays the last init / loadSession with `resume` (the capture is persisted per keyframe).
     const stuck = this.settle(id);
     stuck?.reject(namedError(ENGINE_ERRORS.cancelled, `'${p.method}' did not stop within ${Math.round(graceMs / 1000)} s — the engine was restarted`));
+    // a discarded session must not be re-opened by the replay (`resume` would re-create it)
+    if (this.abortsWithoutReplay.has(id)) this.setup = null;
     this.respawn(`${ABORT_REASON_PREFIX}'${p.method}' did not respond to cancel`, false, true);
     return 'restarted';
+  }
+
+  /**
+   * A new init / loadSession while an abort of a stuck request is pending (e.g. a new scan right
+   * after leaving one whose finishCapture hung): wait for that abort first (≤ its grace period) —
+   * its worker restart would otherwise reject the new request — and let the restart replay nothing:
+   * the new setup replaces the old one.
+   */
+  private async settleAborts(): Promise<void> {
+    if (!this.aborts.size) return;
+    this.superseding++;
+    try {
+      await Promise.allSettled([...this.aborts.values()]);
+    } finally {
+      this.superseding--;
+    }
+  }
+
+  async release(): Promise<void> {
+    this.assertUsable();
+    this.setup = null;
+    if (this.worker) {
+      this.rejectAll(namedError(ENGINE_ERRORS.cancelled, 'The engine was released'));
+      this.frameBusy = false;
+      this.killWorker();
+    }
+    // a replay of an earlier restart (if any) ended with the worker: later calls do not wait for it
+    this.gate = Promise.resolve();
+    if (this.st.state !== 'dead') this.setState('idle', 'released');
   }
 
   setHidden(hidden: boolean): void {
@@ -660,7 +714,7 @@ export class EngineClient implements EngineLike {
     }
     this.st = { ...this.st, respawns: this.st.respawns + 1 };
     const setup = this.setup;
-    if (!setup || !this.opts.autoReinit) {
+    if (!setup || !this.opts.autoReinit || this.superseding > 0) {
       this.setState('idle', reason);
       return;
     }

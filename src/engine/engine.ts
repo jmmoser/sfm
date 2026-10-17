@@ -39,7 +39,7 @@ import {
 import { EngineDepthStore } from './depth-store';
 import { PatchMatchHolder, rebuildColourViews, runDensify, runMesh, type DenseOutput } from './dense';
 import { buildExport } from './export';
-import { closeSource } from './frame-ingest';
+import { closeSource, rotateVec } from './frame-ingest';
 import { LiveSession } from './live';
 import { modelKeypoints, originalKeypoints } from './refine-camera';
 import {
@@ -55,7 +55,8 @@ import {
 import { MB, deviceMemoryBudgetMB, formatBreakdown, sumBreakdown, type GpuMemoryHints, type MemoryBreakdown } from './memory';
 import { ENGINE_DEFAULTS, QUALITY_PRESETS, type QualityPresetConfig, type ResolvedMode } from './presets';
 import { modelPointCloud, runRefine } from './refine';
-import type { EngineConfig, EngineEvents, SparseModel, SparseResultEx } from './types';
+import type { EngineConfig, EngineEvents, KeyframeRecord, SparseModel, SparseResultEx } from './types';
+import { cameraFromDevice } from '../sensors/frame-orientation';
 
 /** Bytes of a plain-array sparse model. */
 function sparseModelBytes(m: SparseModel): number {
@@ -599,6 +600,8 @@ export class PhotogrammetryEngine {
     return this.longRun('finishCapture', async () => {
       const live = this.assertLive();
       live.state.captureFinished = true;
+      // a best-of-window frame still held would have become a keyframe: keep it (mapped by the flush)
+      live.commitHeldKeyframe();
       const pending = live.pendingMapping;
       progress?.({ stage: 'matching', progress: 0, message: pending ? `mapping ${pending} keyframes` : 'finishing capture' });
       const timer = setInterval(() => {
@@ -643,6 +646,8 @@ export class PhotogrammetryEngine {
     return this.longRun('refine', async () => {
       const live = await this.ensureLiveForRefine();
       await this.ensurePipeline();
+      // refine without finishCapture: the held best-of-window frame is kept as in finishCapture
+      if (!live.state.captureFinished) live.commitHeldKeyframe();
       live.state.captureFinished = true;
       await live.flush();
       const t0 = now();
@@ -748,6 +753,8 @@ export class PhotogrammetryEngine {
       const model = await this.ensureModel();
       if (!this.store) throw namedError(ENGINE_ERRORS.notInitialized, 'No session');
       await this.ensureDeviceBudget();
+      // up direction of the views for the sky test (read before the capture state is released)
+      const sky = await this.denseSkyInputs();
       // the dense stage needs the memory more than the capture state does
       this.releaseCaptureMemory();
       const resident = sumBreakdown(this.memoryReport().parts);
@@ -772,6 +779,8 @@ export class PhotogrammetryEngine {
           log: (l, m, d) => this.log(l, m, d),
           memoryBudgetMB: this.memoryBudgetMB,
           residentBytes: resident,
+          gravityAligned: sky.gravityAligned,
+          gravityCam: sky.gravityCam,
         },
         opts ?? {},
         progress,
@@ -796,6 +805,32 @@ export class PhotogrammetryEngine {
       out.stats.memoryMB = this.logMemory('densify');
       return out.cloud;
     });
+  }
+
+  /**
+   * What the dense sky test needs to orient each view (`DenseDeps.gravityAligned` / `gravityCam`):
+   * whether the sparse model is gravity-aligned (then each pose gives the up direction), else the
+   * keyframes' gravity in the canonical camera frame — from the live session (current camera←device
+   * mapping) or, after a reload, the stored keyframe records re-rotated with the stored mapping
+   * (records keep the mapping of their creation time).
+   */
+  private async denseSkyInputs(): Promise<{ gravityAligned: boolean; gravityCam: Map<number, ArrayLike<number>> }> {
+    const gravityCam = new Map<number, ArrayLike<number>>();
+    let metric = this.sparse?.metric ?? null;
+    if (!metric && this.store) metric = (await this.store.getValue<SparseMetaRecord>('sparse/meta').catch(() => null))?.metric ?? null;
+    if (metric?.gravityAligned) return { gravityAligned: true, gravityCam };
+    if (this.live) {
+      for (const r of this.live.state.records.values()) if (r.info.gravityCam) gravityCam.set(r.id, r.info.gravityCam);
+    } else if (this.store) {
+      const st = await this.store.getValue<EngineStateRecord>('engine/state').catch(() => null);
+      const theta = st ? (st.cameraTheta ?? st.thetaSession) : null;
+      const Rcd = theta === 0 || theta === 90 || theta === 180 || theta === 270 ? cameraFromDevice(theta) : null;
+      for (const r of await this.store.getFrameRecords().catch(() => [] as KeyframeRecord[])) {
+        const g = Rcd && r.gravityDevice ? rotateVec(Rcd, r.gravityDevice) : r.info?.gravityCam;
+        if (g) gravityCam.set(r.id, g);
+      }
+    }
+    return { gravityAligned: false, gravityCam };
   }
 
   /**
@@ -948,34 +983,54 @@ export class PhotogrammetryEngine {
   /** Load stored results (sparse / dense / mesh) of the current store. */
   private async loadResults(st: EngineStateRecord | null): Promise<void> {
     const store = this.store!;
+    // A damaged / unreadable stored result is treated as missing (logged): the scan still opens
+    // and can be processed again from its photos, instead of becoming unopenable.
+    const decode = <T>(what: string, f: () => T): T | null => {
+      try {
+        return f();
+      } catch (e) {
+        this.log('warn', `stored ${what} is damaged and was ignored: ${(e as Error)?.message ?? e}`);
+        return null;
+      }
+    };
     const mb = await store.getBinary('sparse/model').catch(() => null);
     const meta = await store.getValue<SparseMetaRecord>('sparse/meta').catch(() => null);
-    if (mb && meta) {
-      this.model = unpackSparseModel(mb);
-      this.model.rollingShutter = meta.rollingShutter ?? null;
-      this.sparse = {
-        points: modelPointCloud(this.model),
-        cameras: meta.cameras.map((c) => ({
-          id: c.id,
-          pose: { R: Float64Array.from(c.pose.R), t: Float64Array.from(c.pose.t) },
-          intrinsics: c.intrinsics,
-          t: c.t,
-          frameIndex: c.frameIndex,
-        })),
-        metric: meta.metric,
-        stats: meta.stats,
-      };
-      this.stats = { ...meta.stats };
+    const loaded =
+      mb && meta
+        ? decode('sparse model', () => {
+            const model = unpackSparseModel(mb);
+            model.rollingShutter = meta.rollingShutter ?? null;
+            const sparse: SparseResultEx = {
+              points: modelPointCloud(model),
+              cameras: meta.cameras.map((c) => ({
+                id: c.id,
+                pose: { R: Float64Array.from(c.pose.R), t: Float64Array.from(c.pose.t) },
+                intrinsics: c.intrinsics,
+                t: c.t,
+                frameIndex: c.frameIndex,
+              })),
+              metric: meta.metric,
+              stats: meta.stats,
+            };
+            return { model, sparse };
+          })
+        : null;
+    if (loaded) {
+      this.model = loaded.model;
+      this.sparse = loaded.sparse;
+      this.stats = { ...meta!.stats };
     }
     const db = await store.getBinary('dense/points').catch(() => null);
-    if (db && this.model) {
-      this.denseCloud = deserializePointCloud(db);
+    const dense = db && this.model ? decode('dense point cloud', () => deserializePointCloud(db)) : null;
+    if (dense) {
+      this.denseCloud = dense;
       this.denseMeta = await store.getValue<DenseMetaRecord>('dense/meta').catch(() => null);
       this.hasDense = true;
     }
     const mb2 = await store.getBinary('mesh').catch(() => null);
-    if (mb2 && this.model) {
-      this.meshModel = deserializeTriangleMesh(mb2);
+    const mesh = mb2 && this.model ? decode('mesh', () => deserializeTriangleMesh(mb2)) : null;
+    if (mesh) {
+      this.meshModel = mesh;
       this.hasMesh = true;
     }
     void st;
@@ -1015,10 +1070,11 @@ export class PhotogrammetryEngine {
     if (!meta) throw namedError('SessionNotFoundError', `Session not found: ${id}`);
     const st = await this.store!.getValue<EngineStateRecord>('engine/state').catch(() => null);
     if (st) {
-      if (!options.mode) this.options.mode = st.mode;
-      if (!options.quality) this.options.quality = st.quality;
-      if (this.options.hfovPriorDeg === undefined && st.hfovPriorDeg !== null) this.options.hfovPriorDeg = st.hfovPriorDeg;
-      this.loadedMode = st.resolvedMode;
+      // values of a damaged / foreign record are ignored (defaults stay)
+      if (!options.mode && (st.mode === 'object' || st.mode === 'scene' || st.mode === 'auto')) this.options.mode = st.mode;
+      if (!options.quality && (st.quality === 'fast' || st.quality === 'balanced' || st.quality === 'max')) this.options.quality = st.quality;
+      if (this.options.hfovPriorDeg === undefined && typeof st.hfovPriorDeg === 'number' && st.hfovPriorDeg > 0 && st.hfovPriorDeg < 180) this.options.hfovPriorDeg = st.hfovPriorDeg;
+      this.loadedMode = st.resolvedMode === 'object' || st.resolvedMode === 'scene' ? st.resolvedMode : null;
       if (!this.live) this.savedState = st;
     } else {
       if (!options.mode) this.options.mode = meta.mode;
@@ -1030,9 +1086,13 @@ export class PhotogrammetryEngine {
     else await this.reloadResults();
     const status = this.hasMesh ? 'meshed' : this.hasDense ? 'dense' : this.sparse ? 'sparse' : st?.captureFinished ? 'captured' : meta.status;
     // a densify interrupted by a kill / cancel can resume from its stored depth maps
-    const prog = this.store!.persistent ? await this.store!.getValue<{ pass?: number }>('dense/progress').catch(() => null) : null;
-    const extra: Record<string, number> = {};
-    if (prog && typeof prog.pass === 'number') extra.denseResumablePass = prog.pass;
+    const prog = this.store!.persistent ? await this.store!.getValue<{ pass?: number; quality?: string }>('dense/progress').catch(() => null) : null;
+    const extra: Record<string, number | string> = {};
+    if (prog && typeof prog.pass === 'number') {
+      extra.denseResumablePass = prog.pass;
+      // the interrupted run's preset: resuming needs the same one (another one starts over)
+      if (prog.quality === 'fast' || prog.quality === 'balanced' || prog.quality === 'max') extra.denseResumableQuality = prog.quality;
+    }
     return {
       id,
       name: meta.name,

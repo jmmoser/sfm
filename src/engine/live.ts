@@ -761,11 +761,11 @@ export class LiveSession {
         // the keyframe is an EARLIER frame than the one this update answers (for consumers that map
         // keyframes to frames by the 'keyframe' decision, e.g. the e2e live-trajectory metric)
         timings.keyframeFrameIndex = src.frameIndex;
-      } else if (decision.hold) {
+      } else if (decision.hold && !st.captureFinished && !this.disposed) {
         this.releaseHeld();
         this.held = src;
         handedOff = true;
-      } else if (this.selector.heldTime === null) this.releaseHeld();
+      } else if (this.selector.heldTime === null || st.captureFinished) this.releaseHeld();
       let mapped: Promise<void> | null = null;
       if (decision.decision === 'keyframe') {
         const tk = now();
@@ -1074,6 +1074,30 @@ export class LiveSession {
   /** Number of keyframes waiting for mapping. */
   get pendingMapping(): number {
     return this.queued;
+  }
+
+  /**
+   * End of capture: the frame held by best-of-window keyframing would have become a keyframe once its
+   * deferral window ended (`KeyframeSelector.commitHeld`), but no later frame will end it — make it
+   * the keyframe now (persisted and mapped like any other) instead of dropping it. Call before
+   * `flush` (which releases a held frame once the capture is finished). Returns the new keyframe id,
+   * or null (nothing held, disposed, capture memory cap reached).
+   */
+  commitHeldKeyframe(): number | null {
+    const src = this.held;
+    if (!src) return null;
+    this.held = null;
+    if (this.disposed || this.selector.heldTime !== src.f.t || this.captureMemoryFull()) {
+      src.prep.release();
+      return null;
+    }
+    this.selector.commitHeld();
+    this.stats.heldKeyframes++;
+    const id = this.createKeyframe(src.f, src.frameIndex, src.prep, src.fs, src.k);
+    this.ref = { id, fs: src.fs, t: src.f.t, width: src.width, height: src.height };
+    void this.enqueue({ id, tracking: src.refId !== null && src.trackGeom ? { other: src.refId, geom: src.trackGeom } : null });
+    this.deps.log('info', `the held best-of-window frame ${src.frameIndex} became keyframe ${id} at the end of the capture`);
+    return id;
   }
 
   /** Resolves when the mapping queue is empty and all writes are done. */

@@ -1,7 +1,8 @@
 /**
- * Feature extraction and matching. CPU reference implementations live here; the
- * WebGPU implementations (sift-gpu.ts, match-gpu.ts) and the CPU/GPU-selecting
- * pipeline (extractor.ts) are added alongside.
+ * Feature extraction and matching: the CPU reference implementations. The WebGPU modules
+ * (sift-gpu.ts, match-gpu.ts) and the CPU/GPU-selecting pipeline (extractor.ts) are NOT
+ * re-exported: sift-gpu / match-gpu read `GPUBufferUsage` at module load, which throws where
+ * WebGPU does not exist — import them directly (the engine loads extractor.ts lazily).
  * Test helpers (testdata.ts) are intentionally not re-exported.
  */
 export * from './image';

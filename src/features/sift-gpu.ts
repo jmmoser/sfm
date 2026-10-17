@@ -595,7 +595,15 @@ export class SiftGPU {
     let direct = false;
     if (input.kind === 'rgba') {
       try {
-        device.queue.copyExternalImageToTexture({ source: input.bitmap! }, { texture: inp.tex! }, [input.width, input.height]);
+        const src = input.bitmap!;
+        if (typeof ImageData !== 'undefined' && src instanceof ImageData) {
+          // Raw RGBA bytes: writeTexture (identical result for sRGB ImageData). MDN lists ImageData
+          // as an unsupported copyExternalImageToTexture source in Safari, and WebKit 26.x/27.0
+          // routes that call through a CPU readback anyway (docs/research/ios-webgpu.md §4.5).
+          device.queue.writeTexture({ texture: inp.tex! }, src.data, { bytesPerRow: 4 * input.width, rowsPerImage: input.height }, [input.width, input.height]);
+        } else {
+          device.queue.copyExternalImageToTexture({ source: src }, { texture: inp.tex! }, [input.width, input.height]);
+        }
       } catch (e) {
         // Synchronous exceptions concern the source (closed / detached / not origin-clean);
         // GPU-side validation errors go to the error scope instead.

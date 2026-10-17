@@ -344,11 +344,6 @@ export function closeSource(source: FrameSource | null | undefined): void {
   }
 }
 
-/** Size of a frame source as submitted. */
-export function sourceSize(source: FrameSource): { width: number; height: number } {
-  return { width: source.width, height: source.height };
-}
-
 // ---------------------------------------------------------------------------------------------
 // Per-feature data
 // ---------------------------------------------------------------------------------------------

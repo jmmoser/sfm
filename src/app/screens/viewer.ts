@@ -22,7 +22,7 @@ import { Disposer, h, replaceChildren } from '../dom';
 import { exportFilename, formatBytes, formatCount, formatDuration, modeLabel, qualityLabel } from '../format';
 import { icon, type IconName } from '../icons';
 import type { ProcessingStep, Route } from '../router';
-import { denseResumable, memoryStatRows, northInfo } from '../model-info';
+import { clearDenseResume, denseResumable, denseResumeQuality, memoryStatRows, northInfo } from '../model-info';
 
 interface DisplayState {
   points: boolean;
@@ -87,18 +87,24 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   const exportTool = tool('share', 'Export', () => openExport(), 'tool-export');
   const toolbar = h('nav', { class: 'viewer-toolbar', 'aria-label': 'Model tools' }, viewTool, measureTool, buildTool, exportTool);
 
+  const resumeSub = h('span', { class: 'viewer-resume-sub', text: 'Resume from the saved depth maps.' });
   const resumeHud = h(
     'div',
     { class: 'viewer-resume', hidden: true, role: 'status', 'data-testid': 'dense-resume' },
     h('span', { class: 'viewer-resume-icon' }, icon('points', { size: 20 })),
-    h('div', { class: 'viewer-resume-text' }, h('span', { class: 'viewer-resume-title', text: 'Dense cloud interrupted' }), h('span', { class: 'viewer-resume-sub', text: 'Resume from the saved depth maps.' })),
+    h('div', { class: 'viewer-resume-text' }, h('span', { class: 'viewer-resume-title', text: 'Dense cloud interrupted' }), resumeSub),
     button({ label: 'Resume', variant: 'primary', size: 'sm', testId: 'dense-resume-button', onClick: () => resumeDense() }),
   );
 
   const el = h('div', { class: 'viewer-screen' }, canvasHost, loading, top, resumeHud, measureHud, toolbar);
 
-  /** Resume (re-run) the interrupted densify with the scan's quality: the engine skips the stored maps. */
+  /**
+   * Resume (re-run) the interrupted densify with the quality of the INTERRUPTED run (the engine skips
+   * the stored maps only for the same settings), not the scan's current one.
+   */
   function resumeDense(): void {
+    const rq = denseResumeQuality(app.results);
+    if (rq) app.results.quality = rq;
     app.navigate({ type: 'BUILD', steps: ['densify'] });
   }
 
@@ -114,6 +120,8 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     subEl.textContent = parts.join(' · ');
     buildTool.classList.toggle('has-badge', !r.dense || !r.mesh);
     resumeHud.hidden = !denseResumable(r);
+    const rq = denseResumeQuality(r);
+    resumeSub.textContent = rq ? `Resume from the saved depth maps (${qualityLabel(rq)} quality).` : 'Resume from the saved depth maps.';
     if (!viewer) return;
     const metric = r.sparse?.metric;
     viewer.setWorldUp(metric?.gravityAligned ? 'z' : 'auto');
@@ -186,8 +194,10 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
 
   function openBuild(): void {
     const r = app.results;
-    let q: QualityPreset = app.results.quality;
     const resumable = denseResumable(r);
+    // the interrupted run's preset (null: unknown — older records)
+    const resumeQ = resumable ? denseResumeQuality(r) : null;
+    let q: QualityPreset = resumeQ ?? app.results.quality;
     // Resuming needs the interrupted run's settings: another quality starts over.
     let syncResume = (): void => undefined;
     const quality = segmented<QualityPreset>(
@@ -251,7 +261,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     const sheet = openSheet({ title: 'Build', subtitle: 'Higher quality takes longer and needs more memory.', content, testId: 'sheet-build' });
 
     function resumeItem(): HTMLElement {
-      const quality0 = r.quality;
+      const quality0 = resumeQ ?? r.quality;
       const sub = h('span', { class: 'build-sub' });
       const btn = button({
         label: 'Resume',
@@ -260,10 +270,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
         testId: 'build-dense',
         onClick: () => {
           // Another quality starts over (the engine discards the stored maps of the other settings).
-          if (q !== quality0) {
-            delete app.results.stats.denseResumablePass;
-            delete app.results.stats.denseInterrupted;
-          }
+          if (q !== quality0) clearDenseResume(app.results.stats);
           build(['densify']);
         },
       });
@@ -271,7 +278,11 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       syncResume = () => {
         const same = q === quality0;
         title.textContent = same ? 'Resume dense reconstruction' : 'Dense point cloud';
-        sub.textContent = same ? 'Interrupted — continues from the saved depth maps.' : `Starts over at ${qualityLabel(q)} quality (the interrupted run used ${qualityLabel(quality0)}).`;
+        sub.textContent = !same
+          ? `Starts over at ${qualityLabel(q)} quality (the interrupted run used ${qualityLabel(quality0)}).`
+          : resumeQ
+            ? 'Interrupted — continues from the saved depth maps.'
+            : 'Interrupted — continues from the saved depth maps if they were made at this quality, otherwise starts over.';
         setButtonLabel(btn, same ? 'Resume' : 'Build');
       };
       syncResume();

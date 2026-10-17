@@ -9,8 +9,8 @@
  * GPU scheduling (one command buffer in flight, retries of dropped work) is done inside
  * PatchMatchGPU; between views the engine waits while the page is hidden.
  */
-import type { CameraIntrinsics, CancelToken, PointCloud, ProgressCallback, RGBAImage, TriangleMesh } from '../core/types';
-import * as denseModule from '../dense';
+import type { CameraIntrinsics, CancelToken, PointCloud, Pose, ProgressCallback, RGBAImage, TriangleMesh } from '../core/types';
+import { removeDepthHalos, worldUpInCamera } from '../dense/depth-filter';
 import { fuseDepthMaps } from '../dense/fusion';
 import { patchMatchCPU } from '../dense/patchmatch-cpu';
 import { PatchMatchGPU } from '../dense/patchmatch-gpu';
@@ -110,6 +110,32 @@ export interface DenseDeps {
   memoryBudgetMB: number;
   /** Engine data resident during the dense stage (bytes; capture state if kept, sparse model). */
   residentBytes?: number;
+  /**
+   * Up direction of each view for the halo filter's sky test (`denseSkyUp`): the model is
+   * gravity-aligned (`MetricInfo.gravityAligned`: world +Z is up), else the keyframes' gravity
+   * (`FrameInfo.gravityCam`, DOWN in the canonical camera frame, by keyframe id). Neither ⇒ the
+   * sky test assumes upright images (top row), which is wrong for frames that are not upright.
+   */
+  gravityAligned?: boolean;
+  gravityCam?: ReadonlyMap<number, ArrayLike<number> | null>;
+}
+
+/**
+ * Up direction (opposite gravity) in a view's camera frame for the halo filter's sky test
+ * (`HaloFilterOptions.skyUp`): world +Z through the pose when the model is gravity-aligned, else
+ * −gravityCam when known, else null (the filter then takes the image as upright).
+ */
+export function denseSkyUp(pose: Pose, gravityAligned: boolean, gravityCam?: ArrayLike<number> | null): [number, number, number] | null {
+  if (gravityAligned) {
+    const up = worldUpInCamera(pose.R);
+    if (up.every(Number.isFinite)) return up;
+  }
+  if (gravityCam && gravityCam.length >= 3) {
+    const up: [number, number, number] = [-gravityCam[0], -gravityCam[1], -gravityCam[2]];
+    const n = Math.hypot(up[0], up[1], up[2]);
+    if (n > 0 && n < Infinity) return [up[0] / n, up[1] / n, up[2] / n];
+  }
+  return null;
 }
 
 /** Persisted dense progress (`dense/progress` in the depth backend): resume after a kill / cancel. */
@@ -118,6 +144,11 @@ interface DenseProgress {
   key: string;
   /** Pass in progress (0 = photometric), or = number of passes when fusing. */
   pass: number;
+  /**
+   * Quality preset of the run (the key covers its settings): a resume must use the same one — the
+   * engine reports it after a reload (`stats.denseResumableQuality`). Absent in older records.
+   */
+  quality?: QualityPreset;
 }
 
 const PROGRESS_KEY = 'dense/progress';
@@ -133,7 +164,11 @@ function fnv1a(s: string): string {
 }
 
 /** Identity of a dense run: model (poses, cameras, points) + reference views + settings. */
-function denseKey(model: SparseModel, refs: number[], settings: { maxSize: number; passes: number; mode: string; preset: DensePresetConfig; halo: boolean }): string {
+function denseKey(
+  model: SparseModel,
+  refs: number[],
+  settings: { maxSize: number; passes: number; mode: string; preset: DensePresetConfig; halo: boolean; sky?: string },
+): string {
   const r6 = (v: number): number => Math.round(v * 1e6) / 1e6;
   const poses = model.images.map((im) => [im.id, im.cameraId, ...Array.from(im.pose.R, r6), ...Array.from(im.pose.t, r6)]);
   const p = settings.preset;
@@ -148,6 +183,7 @@ function denseKey(model: SparseModel, refs: number[], settings: { maxSize: numbe
       passes: settings.passes,
       mode: settings.mode,
       halo: settings.halo,
+      sky: settings.sky ?? null,
       rs: model.rollingShutter ? [model.rollingShutter.axis, model.rollingShutter.readoutMs, !!model.rollingShutter.nu] : null,
       pm: [p.iterations, p.geometricIterations, p.numSources, p.patchMatch ?? {}, p.viewSelection ?? {}],
     }),
@@ -207,14 +243,6 @@ export function spreadSubset<T>(items: readonly T[], n: number): T[] {
   return out;
 }
 
-type HaloFilter = (dm: DepthMap, image: RGBAImage, cam: CameraIntrinsics, options?: Record<string, unknown>) => DepthMap;
-
-/** `removeDepthHalos` of src/dense when that module exports it (colour-guided halo clean-up before fusion). */
-function haloFilter(): HaloFilter | null {
-  const f = (denseModule as unknown as Record<string, unknown>)[['remove', 'DepthHalos'].join('')];
-  return typeof f === 'function' ? (f as HaloFilter) : null;
-}
-
 function emptyDepth(): DepthMap {
   return { width: 0, height: 0, depth: new Float32Array(0), normal: new Float32Array(0), cost: new Float32Array(0) };
 }
@@ -251,8 +279,15 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   // ---- memory plan (iPhone tab budget): cache sizes, fusion neighbours / pixel step / point cap;
   // the image size is lowered (× 0.85 steps, not below 480 px) when even that does not fit
   const passes = 1 + Math.max(0, Math.round(preset.geometricPasses));
-  const halo = preset.haloFilter === false ? null : haloFilter();
+  // colour-guided halo / sky clean-up of the final depth maps before fusion
+  const halo = preset.haloFilter === false ? null : removeDepthHalos;
   if (halo) stats.haloFilter = 1;
+  // sky test orientation per view (frames are not always upright: canonical orientation, portrait lock)
+  const skyUpOf = (id: number, pose: Pose): [number, number, number] | null => denseSkyUp(pose, !!deps.gravityAligned, deps.gravityCam?.get(id));
+  let skySource = 'top row';
+  if (deps.gravityAligned) skySource = 'gravity-aligned model';
+  else if (images.some((im) => denseSkyUp(im.pose, false, deps.gravityCam?.get(im.id)))) skySource = 'keyframe gravity';
+  if (halo) stats.haloSkyUp = skySource;
   const presetStep = Number((preset.fusion as { step?: unknown } | undefined)?.step);
   const largest = (size: number): { width: number; height: number } => {
     let best = { width: 1, height: 1 };
@@ -359,7 +394,7 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   const backend = deps.depthBackend;
   const persistent = !!backend?.persistent;
   // resume after a kill / cancel: same model + settings ⇒ keep the maps already computed
-  const planKey = denseKey(model, ordered.map((g) => g.id), { maxSize, passes, mode: deps.mode, preset, halo: !!halo });
+  const planKey = denseKey(model, ordered.map((g) => g.id), { maxSize, passes, mode: deps.mode, preset, halo: !!halo, sky: halo ? skySource : undefined });
   let resumePass = 0;
   if (persistent) {
     const prog = await backend!.getValue<DenseProgress>(PROGRESS_KEY).catch(() => null);
@@ -371,7 +406,7 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   stats.denseResumedPass = resumePass;
   const setProgress = async (pass: number | null): Promise<void> => {
     if (!persistent) return;
-    await backend!.putValue(PROGRESS_KEY, pass === null ? null : ({ key: planKey, pass } satisfies DenseProgress));
+    await backend!.putValue(PROGRESS_KEY, pass === null ? null : ({ key: planKey, pass, quality } satisfies DenseProgress));
   };
   const srcDepth = new LruCache<number, DepthMap>(plan.sourceDepthCacheBytes, (d) => d.depth.byteLength);
   let prev: EngineDepthStore | null = resumePass > 0 ? new EngineDepthStore(backend, `pm${resumePass - 1}`, 0) : null;
@@ -457,7 +492,8 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
       geometric = undefined;
       if (halo && pass === passes - 1) {
         try {
-          dm = halo(dm, ref.image, ref.cam);
+          const skyUp = skyUpOf(g.id, g.pose);
+          dm = skyUp ? halo(dm, ref.image, ref.cam, { skyUp }) : halo(dm, ref.image, ref.cam);
         } catch (e) {
           deps.log('warn', `depth halo filter failed: ${(e as Error)?.message ?? e}`);
         }

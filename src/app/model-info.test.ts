@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { SparseResult } from '../workers/protocol';
-import { denseResumable, memoryStatRows, northInfo } from './model-info';
+import { clearDenseResume, denseResumable, denseResumeQuality, memoryStatRows, northInfo } from './model-info';
 
 const sparse = { points: { count: 0, positions: new Float32Array(0), colors: new Uint8Array(0) }, cameras: [], stats: {} } as unknown as SparseResult;
 const cloud = { count: 1, positions: new Float32Array(3), colors: new Uint8Array(3) };
@@ -15,6 +15,20 @@ describe('denseResumable', () => {
   it('never with a dense cloud or without a sparse model', () => {
     expect(denseResumable({ sparse, dense: cloud, stats: { denseResumablePass: 1 } })).toBe(false);
     expect(denseResumable({ sparse: null, dense: null, stats: { denseResumablePass: 1 } })).toBe(false);
+  });
+});
+
+describe('denseResumeQuality', () => {
+  it('the interrupted run’s preset: the app marker first (newest), else the engine’s; null when unknown', () => {
+    expect(denseResumeQuality({ stats: { denseResumablePass: 1, denseResumableQuality: 'max' } })).toBe('max');
+    expect(denseResumeQuality({ stats: { denseInterrupted: 1, denseInterruptedQuality: 'fast', denseResumableQuality: 'max' } })).toBe('fast');
+    expect(denseResumeQuality({ stats: { denseResumablePass: 1 } })).toBeNull();
+    expect(denseResumeQuality({ stats: { denseResumableQuality: 'ultra' } })).toBeNull();
+  });
+  it('clearDenseResume drops every marker', () => {
+    const st: Record<string, number | string> = { denseResumablePass: 1, denseResumableQuality: 'max', denseInterrupted: 1, denseInterruptedQuality: 'fast', keyframes: 9 };
+    clearDenseResume(st);
+    expect(st).toEqual({ keyframes: 9 });
   });
 });
 
@@ -38,7 +52,11 @@ describe('northInfo', () => {
     expect(northInfo(true, { yawSource: 'compass' })).toMatchObject({ label: 'Magnetic north', tone: 'warn', note: expect.stringContaining('declination') });
     expect(northInfo(true, { yawSource: 'compass', declinationDeg: 2 }).label).toBe('True north');
     expect(northInfo(true, { yawSource: 'compass', northReference: 'true' }).label).toBe('True north');
-    expect(northInfo(false, { yawSource: 'compass' })).toEqual({ label: 'Unknown', note: null, tone: 'neutral' });
+    // a compass yaw reported with northAligned false is the magnetic-only yaw (applied, +Y ≈ magnetic north)
+    expect(northInfo(false, { yawSource: 'compass' })).toMatchObject({ label: 'Magnetic north', tone: 'warn' });
+    expect(northInfo(false, { yawSource: 'compass', declinationDeg: 3 }).label).toBe('Magnetic north');
+    expect(northInfo(false, { yawSource: 'none' })).toEqual({ label: 'Unknown', note: null, tone: 'neutral' });
+    expect(northInfo(false, {})).toEqual({ label: 'Unknown', note: null, tone: 'neutral' });
     expect(northInfo(undefined, {})).toMatchObject({ label: 'Unknown' });
     expect(northInfo(true, {})).toMatchObject({ label: 'True north', note: null });
   });

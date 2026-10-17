@@ -21,7 +21,7 @@ beforeAll(async () => {
   ctx = await getGPU();
   if (!ctx) throw new Error('WebGPU unavailable in the test browser');
   pm = await PatchMatchGPU.create(ctx);
-});
+}, 600_000); // pipeline compilation on SwiftShader can exceed the 30 s default hook timeout while other GPU files run
 
 afterAll(() => {
   pm?.destroy();

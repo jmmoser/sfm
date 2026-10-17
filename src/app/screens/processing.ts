@@ -18,7 +18,7 @@ import { icon } from '../icons';
 import type { ProcessingStep, Route } from '../router';
 import { STAGES, estimateRemainingMs, stageIdFor, stageWeights, type StageId, type StageState } from '../stages';
 import { decimate } from './capture';
-import { denseResumable } from '../model-info';
+import { clearDenseResume as clearResumeMarkers, denseResumable } from '../model-info';
 
 interface StageRow {
   el: HTMLElement;
@@ -58,8 +58,7 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
 
   /** The dense cloud was (re)built, or refine invalidated the stored depth maps: nothing to resume. */
   function clearDenseResume(): void {
-    delete app.results.stats.denseResumablePass;
-    delete app.results.stats.denseInterrupted;
+    clearResumeMarkers(app.results.stats);
   }
 
   // ---- DOM ---------------------------------------------------------------------------------------
@@ -317,7 +316,8 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
       running = false;
       // An interrupted densify of a stored scan continues from its saved depth maps next time
       // (the viewer offers "Resume dense reconstruction").
-      if (step === 'densify' && route.sessionId && !app.results.dense) app.results.stats = { ...app.results.stats, denseInterrupted: 1 };
+      // The run's preset is kept with the marker: a resume must use it (another one starts over).
+      if (step === 'densify' && route.sessionId && !app.results.dense) app.results.stats = { ...app.results.stats, denseInterrupted: 1, denseInterruptedQuality: quality };
       if (closed) return;
       if (step) failStep(step);
       if (isCancelledError(e) || cancelling) {

@@ -103,6 +103,7 @@ export function cloneBAProblem(p: BAProblem): BAProblem {
     centerPriors: p.centerPriors?.map((c) => ({ pose: c.pose, center: Float64Array.from(c.center), sigma: c.sigma })),
     relRotationPriors: p.relRotationPriors?.map((r) => ({ i: r.i, j: r.j, R_ji: Float64Array.from(r.R_ji), sigma: r.sigma })),
     focalPriors: p.focalPriors?.map((f) => ({ ...f })),
+    principalPointPriors: p.principalPointPriors?.map((c) => ({ ...c })),
   };
 }
 

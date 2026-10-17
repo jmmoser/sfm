@@ -140,12 +140,3 @@ export async function decodeStoredImage(img: StoredImage, w?: number, h?: number
     bmp.close();
   }
 }
-
-/** Natural size of a stored image (decodes the JPEG header via createImageBitmap). */
-export async function storedImageSize(img: StoredImage): Promise<{ width: number; height: number }> {
-  if (isRGBAImage(img)) return { width: img.width, height: img.height };
-  const bmp = await createImageBitmap(img);
-  const s = { width: bmp.width, height: bmp.height };
-  bmp.close();
-  return s;
-}

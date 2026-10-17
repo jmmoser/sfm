@@ -11,7 +11,7 @@
  *  - Point j: world XYZ, additive updates.
  *
  * Cost (Ceres convention): `½ Σ_obs ρ(‖w (π(X) − uv)‖²) + ½ Σ_priors ‖r_prior‖²`
- * (priors: camera centres, relative rotations, focal lengths)
+ * (priors: camera centres, relative rotations, focal lengths, principal points)
  * where `w = obsWeight[o]` (1/σ, default 1) and ρ is the robust loss with scale
  * `lossScalePx` applied to the WEIGHTED residual (i.e. in units of σ when weights
  * are 1/σ). Priors use the trivial loss.
@@ -53,6 +53,18 @@ export interface BAFocalPrior {
   sigma: number;
 }
 
+/**
+ * Principal-point prior of a camera: residual `((cx_c − cx)/sigma, (cy_c − cy)/sigma)` (pixels /
+ * pixels). Only acts when the camera's principal point is refined. E.g. a weak pull towards the
+ * image centre or an earlier estimate, to damp a weakly observable principal-point mode.
+ */
+export interface BAPrincipalPointPrior {
+  camera: number;
+  cx: number;
+  cy: number;
+  sigma: number;
+}
+
 export interface BAProblem {
   /** Intrinsics per camera; refined in place. */
   cameras: CameraIntrinsics[];
@@ -81,6 +93,7 @@ export interface BAProblem {
   centerPriors?: BACenterPrior[];
   relRotationPriors?: BARelRotationPrior[];
   focalPriors?: BAFocalPrior[];
+  principalPointPriors?: BAPrincipalPointPrior[];
 }
 
 export type BALossType = 'trivial' | 'huber' | 'cauchy' | 'soft_l1';
@@ -261,6 +274,12 @@ export function validateBAProblem(p: BAProblem): void {
     for (const fp of p.focalPriors) {
       if (!(fp.camera >= 0 && fp.camera < nC) || (fp.camera | 0) !== fp.camera) throw new RangeError(`BA: focalPrior camera ${fp.camera} out of range`);
       if (!(fp.sigma > 0) || !Number.isFinite(fp.f)) throw new RangeError('BA: focalPrior needs a finite f and sigma > 0');
+    }
+  }
+  if (p.principalPointPriors) {
+    for (const pp of p.principalPointPriors) {
+      if (!(pp.camera >= 0 && pp.camera < nC) || (pp.camera | 0) !== pp.camera) throw new RangeError(`BA: principalPointPrior camera ${pp.camera} out of range`);
+      if (!(pp.sigma > 0) || !Number.isFinite(pp.cx) || !Number.isFinite(pp.cy)) throw new RangeError('BA: principalPointPrior needs a finite cx, cy and sigma > 0');
     }
   }
   if (p.relRotationPriors) {

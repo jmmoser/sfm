@@ -336,13 +336,6 @@ export function growU32(a: Uint32Array<ArrayBuffer>, minLength: number): Uint32A
   return b;
 }
 
-export function growI32(a: Int32Array<ArrayBuffer>, minLength: number): Int32Array<ArrayBuffer> {
-  if (a.length >= minLength) return a;
-  const b = new Int32Array(Math.max(minLength, a.length * 2, 64));
-  b.set(a);
-  return b;
-}
-
 /**
  * RGB (3 bytes / px) of `image` resampled to the depth-map grid w × h (box filter when
  * shrinking, nearest when the sizes match / enlarging). Used to colour fused points

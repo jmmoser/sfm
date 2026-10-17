@@ -22,10 +22,14 @@
  *   finish-stuck     finishCapture hangs and ignores cancel → Cancel aborts it (engine restart),
  *                    "Process now" reconstructs the scan
  *   finish-stuck-home  same, "Back to home" keeps the scan (status captured)
+ *   finish-stuck-discard  finishCapture hangs, X (keyboard) → Discard: the scan is deleted only after the
+ *                    engine let go of it (no re-opening restart), a new scan starts right away
  *   memory-limit     the engine's capture memory cap → "Memory limit reached — finish scan now?",
  *                    Continue (tracking only) adds no keyframes, Finish works
  *   dense-resume     an interrupted densify (loadSession stats.denseResumablePass) → "Resume dense
  *                    reconstruction" in the viewer + Build sheet; a densify cancelled here too
+ *   dense-resume-quality  the interrupted run used another preset than the scan (stats
+ *                    denseResumableQuality): the resume uses that preset
  *   info-sheet       Model info: magnetic-north note for compass yaw, engine memory section
  * Usage: node e2e/ui/states.mjs [name ...] [--verbose]
  */
@@ -434,6 +438,36 @@ await scenario('finish-stuck-home', async () => {
   await context.close();
 });
 
+await scenario('finish-stuck-discard', async () => {
+  const { page, context } = await newPage();
+  await startCapture(page, `${base}?mock=1&mockSpeed=3&mockStall=finishCapture`);
+  await page.waitForFunction(() => Number(document.querySelector('[data-testid="kf-count"]')?.textContent) >= 6, null, { timeout: 90000 });
+  await by(page, 'finish').tap();
+  await by(page, 'capture-finishing').waitFor({ timeout: 10000 });
+  await sleep(500);
+  // the finishing card covers the X for touch; keyboard / VoiceOver still reach it
+  await by(page, 'capture-cancel').evaluate((el) => el.click());
+  await by(page, 'dialog-confirm').tap();
+  // the stuck step is aborted first (≤ 4 s grace): the deletion waits, the card says so
+  await by(page, 'capture-discarding').waitFor({ timeout: 5000 });
+  await shot(page, 'state-finish-stuck-discard');
+  await by(page, 'new-scan').waitFor({ timeout: 15000 });
+  const list = async () =>
+    page.evaluate(async () => {
+      const { SessionStore } = await import('/src/io/storage.ts');
+      return (await (await SessionStore.open()).listSessions()).map((m) => m.id);
+    });
+  check((await list()).length === 0, 'the discarded scan is deleted');
+  check((await page.evaluate(() => globalThis.__sfmApp.engine.status.state)) === 'idle', 'the restart did not re-open the discarded session');
+  // a new scan right away works (no rejected init)
+  await by(page, 'new-scan').tap();
+  await by(page, 'start-capture').tap();
+  await page.waitForFunction(() => Number(document.querySelector('[data-testid="kf-count"]')?.textContent) >= 2, null, { timeout: 60000 });
+  check(true, 'a new scan starts right after the discard');
+  check((await list()).length === 1, 'only the new scan is stored');
+  await context.close();
+});
+
 async function memoryLimit(page, name) {
   await startCapture(page, `${base}?mock=1&mockSpeed=3&mockMemoryLimit=6`);
   await by(page, 'capture-memory-limit').waitFor({ timeout: 90000 });
@@ -514,6 +548,38 @@ await scenario('dense-resume', async () => {
   await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
   await sleep(500);
   check(await by(page, 'dense-resume').isHidden(), 'no resume offer once the dense cloud exists');
+  await context.close();
+});
+
+await scenario('dense-resume-quality', async () => {
+  const { page, context } = await newPage();
+  await page.goto(`${base}?mock=1&mockSpeed=2`);
+  await by(page, 'new-scan').waitFor();
+  await page.evaluate(async () => {
+    const { SessionStore } = await import('/src/io/storage.ts');
+    const s = await SessionStore.open();
+    // captured at Balanced; the densify that was interrupted ran at Max
+    await s.createSession({ id: 'seed-resume-q', name: 'Fence', mode: 'scene', status: 'sparse', stats: { quality: 'balanced', keyframes: 30, denseResumablePass: 1, denseResumableQuality: 'max' } });
+  });
+  await page.reload();
+  await by(page, 'session-item').first().tap();
+  await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  await by(page, 'dense-resume').waitFor({ state: 'visible', timeout: 5000 });
+  check(/Max quality/.test((await by(page, 'dense-resume').textContent()) ?? ''), 'the resume offer names the interrupted run’s quality');
+  await by(page, 'tool-build').tap();
+  await by(page, 'build-dense-resume').waitFor({ timeout: 5000 });
+  const item = await by(page, 'build-dense-resume').textContent();
+  check(/Resume dense reconstruction/.test(item ?? '') && /continues from the saved depth maps/.test(item ?? ''), 'Build sheet: resume at the interrupted quality');
+  check((await page.locator('.segment[aria-checked="true"]').first().getAttribute('data-value')) === 'max', 'the quality selector starts at the interrupted run’s Max');
+  await page.locator('.segment[data-value="balanced"]').tap();
+  check(/Starts over at Balanced quality \(the interrupted run used Max\)/.test((await by(page, 'build-dense-resume').textContent()) ?? ''), 'the scan’s own quality starts over');
+  await page.keyboard.press('Escape');
+  await sleep(300);
+  await by(page, 'dense-resume-button').tap();
+  await page.waitForSelector('.processing', { timeout: 20000 });
+  check((await page.locator('.proc-title').textContent()) === 'Resuming dense cloud', 'processing says it resumes');
+  check(/Max quality/.test((await page.locator('.processing').textContent()) ?? ''), 'the resume runs at Max quality');
+  await page.waitForSelector('.viewer-screen', { timeout: 120000 });
   await context.close();
 });
 

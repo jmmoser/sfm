@@ -16,7 +16,7 @@ beforeAll(async () => {
   const t0 = performance.now();
   pm = await PatchMatchGPU.create(ctx);
   log(`adapter ${ctx.info.vendor}/${ctx.info.architecture} software=${ctx.isSoftware}; create (pipeline compile) ${(performance.now() - t0).toFixed(0)} ms`);
-});
+}, 600_000); // pipeline compilation on SwiftShader can exceed the 30 s default hook timeout while other GPU files run
 
 afterAll(() => {
   pm?.destroy();

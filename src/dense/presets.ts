@@ -1,8 +1,8 @@
 /**
  * Recommended dense-reconstruction settings per quality preset (`fast` / `balanced` / `max`),
  * tuned on the GT-pose dense harness (e2e/run-dense-gt.mjs; ARCHITECTURE §6 "Dense tuning
- * results"). Flat fields use the engine's names (src/engine/presets.ts reads them
- * defensively); the nested blocks hold the full option sets for direct users of src/dense:
+ * results"). Flat fields use the engine's names (src/engine/presets.ts merges them over its base
+ * table); the nested blocks hold the full option sets for direct users of src/dense:
  *
  *   selectSourceViews(views, sparse, { numSources, ...viewSelection })
  *   PatchMatch photometric: { ...patchMatch, iterations }      (multiScale: see below)

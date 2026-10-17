@@ -151,6 +151,29 @@ describe('MockEngine', () => {
     expect((await stuck.refine()).cameras.length).toBeGreaterThan(0);
   });
 
+  it('abort with reinit: false restarts without re-opening the session; release() forgets it', async () => {
+    const stuck = new MockEngine({ speed: 20, stallOn: { finishCapture: true }, sessions: async () => null });
+    await stuck.init({ mode: 'object', quality: 'fast', sessionId: 'gone' });
+    const q = stuck.finishCapture().catch((err: Error) => err);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(await stuck.abortLongOperation({ graceMs: 100, reinit: false })).toBe('restarted');
+    expect(await q).toMatchObject({ name: 'CancelledError' });
+    expect(stuck.status.state).toBe('idle');
+    await expect(stuck.refine()).rejects.toMatchObject({ name: 'EngineNotInitializedError' });
+
+    const e = new MockEngine({ speed: 50, sessions: async () => null });
+    await e.init({ mode: 'object', quality: 'fast' });
+    for (let i = 0; i < 20; i++) await e.processFrame(frame(100 + i * 400));
+    const r = e.refine().catch((err: Error) => err);
+    await e.release();
+    expect(await r).toMatchObject({ name: 'CancelledError' });
+    expect(e.status).toMatchObject({ state: 'idle', reason: 'released' });
+    await expect(e.refine()).rejects.toMatchObject({ name: 'EngineNotInitializedError' });
+    // a new init works as before
+    await e.init({ mode: 'object', quality: 'fast' });
+    expect(e.status.state).toBe('ready');
+  });
+
   it('memoryLimitKeyframes: one out-of-memory event, then tracking only (no new keyframes)', async () => {
     const e = new MockEngine({ speed: 60, memoryLimitKeyframes: 3, sessions: async () => null });
     await e.init({ mode: 'object', quality: 'fast' });
@@ -172,7 +195,7 @@ describe('MockEngine', () => {
     const d = e.densify();
     setTimeout(() => e.cancel(), 100);
     await expect(d).rejects.toMatchObject({ name: 'CancelledError' });
-    expect((await e.loadSession('r1')).stats.denseResumablePass).toBe(1);
+    expect((await e.loadSession('r1')).stats).toMatchObject({ denseResumablePass: 1, denseResumableQuality: 'fast' });
     const pc = await e.densify();
     expect(pc.count).toBeGreaterThan(0);
     const sum = await e.loadSession('r1');

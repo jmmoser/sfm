@@ -460,11 +460,25 @@ export async function refinePerImageFocal(
     minImprovement?: number;
     minAutocorrelation?: number;
     timeOrder?: readonly number[];
-    refinePrincipalPoint?: (rec: Reconstruction) => Promise<{ rec: Reconstruction; accepted: boolean; reason: string }>;
+    /**
+     * Shared (f, c, k) refinement of the rescaled model; `priors` (shared camera id → weak principal-
+     * point prior, `ppPriorSigmaPx`) are to be passed to its BA (`MapperOptions.principalPointPriors`).
+     */
+    refinePrincipalPoint?: (
+      rec: Reconstruction,
+      priors?: ReadonlyMap<number, { cx: number; cy: number; sigma: number }>,
+    ) => Promise<{ rec: Reconstruction; accepted: boolean; reason: string }>;
     /** Maximum alternations of the shared re-refinement and the per-image focal lengths (default 6). */
     rounds?: number;
     /** Stop alternating once the shared principal point moves less than this (px; default 0.25) and f̄ < 0.02 %. */
     ppTolerancePx?: number;
+    /**
+     * Weak prior σ (px) on the shared principal point in every shared re-refinement of the
+     * alternation (0 / absent = none), anchored at the shared principal point of the input model
+     * (`ppPriorAnchor` 'input', default) or the image centre ('centre').
+     */
+    ppPriorSigmaPx?: number;
+    ppPriorAnchor?: 'input' | 'centre';
     cancel?: CancelToken;
   } = {},
 ): Promise<PerImageFocalResult> {
@@ -515,6 +529,17 @@ export async function refinePerImageFocal(
     for (const sid of new Set(sharedOf.values())) shared.set(sid, { ...rec.cameras.get(sid)! });
     const rounds = Math.max(1, o.rounds ?? 6);
     const notes: string[] = [];
+    // weak principal-point prior: damps the slow drift along the weakly observable c ↔ pitch mode
+    let ppPriors: Map<number, { cx: number; cy: number; sigma: number }> | undefined;
+    const ppSigma = o.ppPriorSigmaPx ?? 0;
+    if (ppSigma > 0) {
+      ppPriors = new Map();
+      for (const [sid, c] of shared) {
+        const centre = o.ppPriorAnchor === 'centre';
+        ppPriors.set(sid, { cx: centre ? (c.width - 1) / 2 : c.cx, cy: centre ? (c.height - 1) / 2 : c.cy, sigma: ppSigma });
+      }
+    }
+    let stop = `stopped at the ${rounds}-round cap`;
     for (let round = 0; round < rounds; round++) {
       const before0 = [...shared.values()][0];
       const prevF = before0.f,
@@ -547,12 +572,13 @@ export async function refinePerImageFocal(
       for (const cid of [...rescaled.cameras.keys()]) if (!shared.has(cid) && ![...rescaled.images.values()].some((im) => im.cameraId === cid)) rescaled.cameras.delete(cid);
       let pp: { rec: Reconstruction; accepted: boolean; reason: string } | null = null;
       try {
-        pp = await o.refinePrincipalPoint(rescaled);
+        pp = await o.refinePrincipalPoint(rescaled, ppPriors);
       } finally {
         for (const [id, kp] of saved) out.images.get(id)!.keypoints!.set(kp);
       }
       if (!pp || !pp.accepted) {
         if (pp) notes.push(`round ${round + 1}: shared camera kept (${pp.reason})`);
+        stop = `stopped in round ${round + 1}`;
         break;
       }
       // per-image cameras around the new shared camera, then polish the focal lengths
@@ -575,9 +601,15 @@ export async function refinePerImageFocal(
       const c0 = [...shared.values()][0];
       notes.push(`round ${round + 1}: f̄ ${c0.f.toFixed(1)} px, principal point offset (${(c0.cx - (c0.width - 1) / 2).toFixed(2)}, ${(c0.cy - (c0.height - 1) / 2).toFixed(2)}) px`);
       // converged: the shared camera hardly moves any more (the alternation converges linearly)
-      if (Math.hypot(c0.cx - prevCx, c0.cy - prevCy) < (o.ppTolerancePx ?? 0.25) && Math.abs(c0.f / prevF - 1) < 2e-4) break;
+      if (Math.hypot(c0.cx - prevCx, c0.cy - prevCy) < (o.ppTolerancePx ?? 0.25) && Math.abs(c0.f / prevF - 1) < 2e-4) {
+        stop = `converged in ${round + 1} rounds`;
+        break;
+      }
     }
-    if (notes.length) ppNote = `; shared camera re-refined without the breathing: ${notes.join('; ')}`;
+    if (notes.length) {
+      const prior = ppPriors ? `, principal-point prior σ ${ppSigma} px (${o.ppPriorAnchor === 'centre' ? 'image centre' : 'input'})` : '';
+      ppNote = `; shared camera re-refined without the breathing (${stop}${prior}): ${notes.join('; ')}`;
+    }
   }
   // drop the now unused shared cameras
   const used = new Set<number>();

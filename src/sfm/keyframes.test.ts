@@ -199,6 +199,28 @@ describe('KeyframeSelector', () => {
     expect(off.evaluate(cand(300, { medianParallaxPx: thr + 5, sharpness: 70 })).hold).toBeUndefined();
   });
 
+  it('end of capture: a held frame is committed as the keyframe its window would have produced', () => {
+    const s = warmed();
+    const thr = s.parallaxThresholdPx(W);
+    expect(s.commitHeld()).toBeNull(); // nothing held
+    expect(s.evaluate(cand(300, { medianParallaxPx: thr + 5, sharpness: 70 })).hold).toBe(true);
+    expect(s.evaluate(cand(400, { medianParallaxPx: thr + 6, sharpness: 82 })).hold).toBe(true);
+    expect(s.evaluate(cand(450, { medianParallaxPx: thr + 7, sharpness: 74 })).hold).toBeUndefined();
+    // rejected frames after it do not change what the window would produce
+    expect(s.evaluate(cand(470, { sharpness: 20 })).decision).toBe('reject_blur');
+    const n = s.numKeyframes;
+    expect(s.commitHeld()).toBe(400);
+    expect(s.numKeyframes).toBe(n + 1);
+    expect(s.lastKeyframeTime).toBe(400);
+    expect(s.heldTime).toBeNull();
+    expect(s.commitHeld()).toBeNull();
+    // the trigger went away: the held frame was dropped, nothing to commit
+    expect(s.evaluate(cand(1100, { medianParallaxPx: 2 * thr, sharpness: 70 })).hold).toBe(true);
+    s.evaluate(cand(1150, { medianParallaxPx: 1 }));
+    expect(s.commitHeld()).toBeNull();
+    expect(s.lastKeyframeTime).toBe(400);
+  });
+
   it('revert / reset', () => {
     const s = warmed();
     s.evaluate(cand(500, { medianParallaxPx: 500 }));

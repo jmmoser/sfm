@@ -32,6 +32,7 @@ interface EngineOptions {
   persist?: boolean;           // default true in the app, false in tests
   preferGPU?: boolean;         // default true
   hfovPriorDeg?: number;       // from CameraCapture (lens + aspect)
+  resume?: boolean;            // re-open sessionId's persisted state (EngineClient after a worker respawn)
 }
 
 interface FrameInput {
@@ -40,7 +41,9 @@ interface FrameInput {
   screenAngle: 0 | 90 | 180 | 270;  // θ of ARCHITECTURE §2 when the frame was captured
   imu: ImuSample[];                 // samples since the previous frame
   geo?: GeoFix | null;
-  heading?: { heading: number; accuracy: number } | null;
+  heading?: { heading: number; accuracy: number; north?: 'true' | 'magnetic' } | null;
+  // + optional FramePump metadata: index, segment, gravityDevice, attitude,
+  //   imuCalibrationVersion, timeSource (src/workers/protocol.ts)
 }
 
 interface LiveUpdate {
@@ -60,26 +63,28 @@ interface LiveUpdate {
 }
 
 class PhotogrammetryEngine {
-  constructor(opts: EngineOptions)
-  init(): Promise<{ gpu: boolean; adapter?: string }>
+  constructor(opts: EngineOptions, config?: EngineConfig)   // EngineConfig: tuning knobs (harness / tests)
+  init(): Promise<{ gpu: boolean; adapter?: string; fallbackReason?: string }>
   processFrame(f: FrameInput): Promise<LiveUpdate>
-  finishCapture(): Promise<void>
+  finishCapture(progress?, cancel?): Promise<void>
   refine(progress?, cancel?): Promise<SparseResult>
   densify(opts?, progress?, cancel?): Promise<PointCloud>
   mesh(opts?, progress?, cancel?): Promise<TriangleMesh>
   exportModel(format: 'ply-points' | 'ply-mesh' | 'glb' | 'colmap-zip'): Promise<Blob>
-  loadSession(id: string): Promise<SessionSummary>
+  loadSession(id: string, options?: Partial<EngineOptions>): Promise<SessionSummary>
   dispose(): void
+  // worker / harness hooks: setHidden, flush, recoverGPU, memoryReport, releaseResultMemory
 }
 ```
 
-Quality presets (initial values; tuned by e2e results):
+Quality presets (effective values: `QUALITY_PRESETS` of `src/engine/presets.ts`, dense part from the
+tuned `DENSE_PRESETS` of `src/dense/presets.ts`):
 
-| preset | feature max side | max features | dense max side | PM iterations | geom passes |
-|---|---|---|---|---|---|
-| fast | 1024 | 2048 | 800 | 4 | 0 |
-| balanced | 1600 | 4096 | 1280 | 6 | 1 |
-| max | 2048 | 8192 | 1600 | 8 | 2 |
+| preset | feature max side | max features | dense max side | views | sources | PM iterations | geometric passes × iterations |
+|---|---|---|---|---|---|---|---|
+| fast | 1024 | 2048 | 800 | 40 | 5 | 4 | 1 × 2 |
+| balanced | 1600 | 4096 | 1280 | 80 | 8 | 6 | 1 × 3 |
+| max | 2048 | 8192 | 1600 | 150 | 8 | 6 | 1 × 3 |
 
 Mode affects keyframe thresholds, TSDF voxel size and depth-range margins; `auto`
 picks object vs scene after initialisation from the scene depth / baseline.
@@ -87,11 +92,11 @@ picks object vs scene after initialisation from the scene depth / baseline.
 ### Frame flow (live)
 1. Rotate to the session's canonical orientation (first frame's θ) when needed;
    `R_cam_device` for the session follows from θ₀.
-2. Small gray copy (≤ 320 px) → sharpness; IMU angular speed + gyro rotation since the
+2. Small RGBA copy (≤ 640 px) → sharpness; IMU angular speed + gyro rotation since the
    last keyframe → blur/motion gate (`KeyframeSelector.gate`; relaxed when the hard
    rotation limit forces a keyframe through a fast pan).
 3. Features at the preset's working resolution (GPU path takes the ImageBitmap
-   directly). Per-feature colours sampled from a ≤ 640 px RGBA copy.
+   directly). Per-feature colours sampled from the small copy.
 4. Match to the last keyframe, guided by the gyro rotation homography
    `H = K R_c K⁻¹` with `R_c = R_cam_device · R_{d(t)←d(t_kf)} · R_cam_deviceᵀ`;
    verify with two-view geometry; compute rotation-compensated parallax.
@@ -117,14 +122,15 @@ per-image focal lengths (focus breathing; kept only if they help) → world alig
 ### Dense / mesh
 Views stream from IndexedDB through an LRU image cache; depth maps go through a
 `DepthMapStore` with an LRU memory cache backed by IndexedDB to bound memory on
-phones (Safari tabs get killed above ~1.5–3 GB).
+phones: the memory planner (`src/engine/memory.ts`) budgets 1.2 GB (600 / 850 MB on 4 / 6 GB
+iPhones); iOS kills a tab at ~1.5 GB (soft) / 2 GB (hard), docs/research/ios-platform.md.
 
 ## 3. Worker protocol (`src/workers/protocol.ts`)
 
 Request/response RPC with ids, plus unsolicited events:
 
 * requests: `init`, `frame`, `finishCapture`, `refine`, `densify`, `mesh`,
-  `export`, `loadSession`, `cancel`, `dispose`
+  `export`, `loadSession`, `cancel`, `visibility` (page hidden / visible: pause GPU work), `dispose`
 * events: `progress` (ProgressEvent), `live` (LiveUpdate), `log`, `error`
 * large typed arrays and ImageBitmaps are transferred, never copied.
 

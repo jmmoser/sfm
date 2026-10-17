@@ -958,12 +958,21 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     stopSensors();
     void app.wakeLock.release();
     // Cancel what the engine is still doing for this capture (a finishCapture that ignores the
-    // cancel is aborted and the worker restarted, so the next scan does not queue behind it).
-    void app.engine.abortLongOperation({ graceMs: FINISH_ABORT_GRACE_MS });
+    // cancel is aborted and the worker restarted, so the next scan does not queue behind it; a new
+    // scan's init waits for that abort — EngineClient). A session that is deleted must not be
+    // re-opened by the restart (its replayed init with `resume` would re-create it): no replay, and
+    // the deletion waits until the engine has let go of the session (only a stuck step takes long:
+    // ≤ the grace period).
+    const discard = !!sessionId && deleteSession;
+    const aborted = app.engine.abortLongOperation({ graceMs: FINISH_ABORT_GRACE_MS, reinit: !discard }).catch(() => 'none' as const);
     if (sessionId) {
       await sessionCreated;
-      if (deleteSession) await app.deleteSession(sessionId);
-      else await app.updateSession(sessionId, { stats: { keyframes: numKeyframes, points: last?.numPoints ?? 0, quality: cfg.quality } });
+      if (deleteSession) {
+        const slow = setTimeout(() => showCard(infoCard({ spinner: true, title: 'Discarding scan…', text: 'Stopping the engine.', testId: 'capture-discarding' })), 300);
+        await aborted;
+        clearTimeout(slow);
+        await app.deleteSession(sessionId);
+      } else await app.updateSession(sessionId, { stats: { keyframes: numKeyframes, points: last?.numPoints ?? 0, quality: cfg.quality } });
     }
     app.loadedSessionId = null;
     app.navigate({ type: 'CANCEL' });

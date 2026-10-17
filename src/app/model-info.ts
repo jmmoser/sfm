@@ -2,6 +2,7 @@
  * Pure helpers for the Viewer / Processing screens (unit-tested in model-info.test.ts):
  * dense-resume detection, north reference of the model, engine memory statistics.
  */
+import type { QualityPreset } from '../workers/protocol';
 import type { Results } from './app';
 
 type Stats = Record<string, number | string>;
@@ -15,6 +16,28 @@ type Stats = Record<string, number | string>;
 export function denseResumable(r: Pick<Results, 'sparse' | 'dense' | 'stats'>): boolean {
   if (!r.sparse || r.dense) return false;
   return typeof r.stats.denseResumablePass === 'number' || !!r.stats.denseInterrupted;
+}
+
+/**
+ * Quality preset of the interrupted densify, which a resume must use (the engine's resume key
+ * covers the settings: another preset starts over): the app's marker of a run it interrupted
+ * (`denseInterruptedQuality`, newest), else the engine's (`denseResumableQuality`, loadSession, from
+ * the stored dense progress). null = unknown (older records).
+ */
+export function denseResumeQuality(r: Pick<Results, 'stats'>): QualityPreset | null {
+  for (const k of ['denseInterruptedQuality', 'denseResumableQuality']) {
+    const v = r.stats[k];
+    if (v === 'fast' || v === 'balanced' || v === 'max') return v;
+  }
+  return null;
+}
+
+/** Drop the dense-resume markers (a densify finished, or refine invalidated the stored depth maps). */
+export function clearDenseResume(stats: Stats): void {
+  delete stats.denseResumablePass;
+  delete stats.denseResumableQuality;
+  delete stats.denseInterrupted;
+  delete stats.denseInterruptedQuality;
 }
 
 export interface NorthInfo {
@@ -43,9 +66,11 @@ export function northInfo(northAligned: boolean | undefined, stats: Stats): Nort
   const magneticNote = `From the compass, which measures magnetic north${sigma}. True north differs by the local declination (up to ±20°, e.g. ≈ 15° in Seattle) — no location was known to correct it; enable GPS for the scan.`;
   let north = stats.north === 'true' || stats.north === 'magnetic' || stats.north === 'none' ? stats.north : null;
   if (north === null) {
-    // older sessions: infer from northAligned + yawSource
-    if (!northAligned) north = 'none';
-    else if (src === 'compass') north = decl !== null || stats.northReference === 'true' ? 'true' : 'magnetic';
+    // older sessions: infer from northAligned + yawSource. A compass yaw without a declination is
+    // MAGNETIC — also with northAligned false, which is how the world alignment reports a
+    // magnetic-only yaw (it is applied: +Y ≈ magnetic north), so it is not "unknown".
+    if (src === 'compass') north = northAligned && (decl !== null || stats.northReference === 'true') ? 'true' : 'magnetic';
+    else if (!northAligned) north = 'none';
     else north = 'true';
   }
   if (north === 'none') return { label: 'Unknown', note: null, tone: 'neutral' };

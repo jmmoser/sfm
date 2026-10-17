@@ -6,7 +6,8 @@
  *   'fatal'      answers `init`, then posts a fatal GPU-lost error event
  *   'slow-frame' never answers `frame`
  *   'slow-finish'  `finishCapture` runs (progress every 30 ms) until cancelled
- *   'stuck-finish' `finishCapture` never answers and ignores `cancel` (progress keeps coming)
+ *   'stuck-finish' `finishCapture` never answers and ignores `cancel` (progress keeps coming); an
+ *                  `init` while it hangs takes 1 s (the real worker builds a new engine meanwhile)
  */
 import {
   ENGINE_ERRORS,
@@ -31,6 +32,8 @@ const mode = scope.name || 'ok';
 let hidden = false;
 let initOptions: unknown = null;
 let frames = 0;
+let inits = 0;
+let finishing = false;
 const longOps = new Map<number, () => void>();
 
 function ok(id: number, result: unknown): void {
@@ -50,7 +53,9 @@ async function handle(req: EngineRequest): Promise<void> {
   switch (req.method) {
     case 'init': {
       initOptions = req.params;
+      inits++;
       if (mode === 'hang-init') return;
+      if (mode === 'stuck-finish' && finishing) await new Promise((r) => setTimeout(r, 1000));
       const p = req.params as { resume?: boolean; preferGPU?: boolean };
       ok(req.id, { gpu: p.preferGPU !== false, adapter: `fixture:${mode}:resume=${!!p.resume}:gpu=${p.preferGPU !== false}` });
       if (mode === 'fatal') {
@@ -138,7 +143,7 @@ async function handle(req: EngineRequest): Promise<void> {
         sparse: null,
         dense: null,
         mesh: null,
-        stats: { hidden: String(hidden), init: JSON.stringify(initOptions) },
+        stats: { hidden: String(hidden), init: JSON.stringify(initOptions), inits },
       });
       return;
     case 'cancel': {
@@ -156,6 +161,7 @@ async function handle(req: EngineRequest): Promise<void> {
         ok(req.id, undefined);
         return;
       }
+      finishing = true;
       await new Promise<void>((resolve) => {
         const timer = setInterval(() => scope.postMessage({ type: 'progress', requestId: req.id, stage: 'matching', progress: -1, message: 'mapping 3 keyframes' }), 30);
         // A stuck worker never registers a cancel hook: the request hangs for good.

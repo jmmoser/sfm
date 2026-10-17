@@ -47,6 +47,10 @@ function richProblem(seed = 5): SyntheticBA {
     { i: 5, j: 2, R_ji: Rji(5, 2, [-0.1, 0.04, 0.0]), sigma: 0.02 }, // row block > col block
     { i: 0, j: 4, R_ji: Rji(0, 4, [0.02, 0.02, -0.01]), sigma: 0.03 }, // involves the fixed pose
   ];
+  p.principalPointPriors = [
+    { camera: 0, cx: p.cameras[0].cx + 3, cy: p.cameras[0].cy - 2, sigma: 1.5 },
+    { camera: 1, cx: p.cameras[1].cx - 1, cy: p.cameras[1].cy + 4, sigma: 2 }, // principal point fixed: constant cost
+  ];
   perturbBA(s, { rotSigma: 0.01, centreSigma: 0.05, pointSigma: 0.05, focalScale: 0.03, k1Delta: 0.02 });
   return s;
 }
@@ -449,6 +453,67 @@ describe('bundleAdjust: focal priors', () => {
     expect(p.cameras[1].f).toBe(f1);
     expect(() => bundleAdjust({ ...p, focalPriors: [{ camera: 9, f: 1, sigma: 1 }] })).toThrow(RangeError);
     expect(() => bundleAdjust({ ...p, focalPriors: [{ camera: 0, f: 1, sigma: 0 }] })).toThrow(RangeError);
+  });
+});
+
+describe('bundleAdjust: principal-point priors', () => {
+  const setup = () => {
+    const s = makeSyntheticBA({ numPoses: 12, numPoints: 600, layout: 'orbit', trackWindow: 3, noisePx: 0.2, seed: 62, numCameras: 2 });
+    const p = s.problem;
+    fixGaugeTwoPoses(p);
+    for (let c = 0; c < p.cameras.length; c++) p.cameraRefine[c] = { focal: true, principalPoint: true, distortion: false };
+    return { s, p };
+  };
+
+  it('a weak prior lets the data decide; a tight one holds the principal point at the prior', () => {
+    const { s, p } = setup();
+    const gt = s.gtCameras.map((c) => ({ cx: c.cx, cy: c.cy }));
+    // weak prior 6 px away from the truth, start 4 px off
+    p.principalPointPriors = p.cameras.map((c, k) => ({ camera: k, cx: gt[k].cx + 6, cy: gt[k].cy - 6, sigma: 1e4 }));
+    for (const c of p.cameras) {
+      c.cx += 4;
+      c.cy -= 4;
+    }
+    perturbBA(s, { rotSigma: 0.002, centreSigma: 0.01 });
+    const r = bundleAdjust(p, { loss: 'trivial', maxIterations: 100 });
+    expect(r.success).toBe(true);
+    for (let c = 0; c < 2; c++) expect(Math.hypot(p.cameras[c].cx - gt[c].cx, p.cameras[c].cy - gt[c].cy)).toBeLessThan(0.5);
+
+    const t = setup();
+    const target = { cx: t.s.gtCameras[1].cx + 5, cy: t.s.gtCameras[1].cy + 3 };
+    t.p.principalPointPriors = [{ camera: 1, cx: target.cx, cy: target.cy, sigma: 1e-3 }];
+    const r2 = bundleAdjust(t.p, { loss: 'trivial', maxIterations: 100 });
+    expect(r2.success).toBe(true);
+    expect(Math.hypot(t.p.cameras[1].cx - target.cx, t.p.cameras[1].cy - target.cy)).toBeLessThan(0.02);
+  });
+
+  it('a prior of moderate σ pulls the estimate part of the way (between the data and the prior)', () => {
+    const free = setup();
+    bundleAdjust(free.p, { loss: 'trivial', maxIterations: 100 });
+    const est = { cx: free.p.cameras[0].cx, cy: free.p.cameras[0].cy };
+    const { p, s } = setup();
+    const anchor = { cx: s.gtCameras[0].cx + 20, cy: s.gtCameras[0].cy };
+    p.principalPointPriors = [{ camera: 0, cx: anchor.cx, cy: anchor.cy, sigma: 0.5 }];
+    bundleAdjust(p, { loss: 'trivial', maxIterations: 100 });
+    const moved = p.cameras[0].cx - est.cx;
+    expect(moved).toBeGreaterThan(0.05);
+    expect(moved).toBeLessThan(anchor.cx - est.cx - 0.05);
+  });
+
+  it('the prior enters the cost; a prior on a camera without principal-point refinement is inert; validation', () => {
+    const { s, p } = setup();
+    const base = evaluateBACost(cloneBAProblem(p)).cost;
+    p.principalPointPriors = [{ camera: 1, cx: s.gtCameras[1].cx + 6, cy: s.gtCameras[1].cy - 8, sigma: 2 }];
+    expect(evaluateBACost(p).cost).toBeCloseTo(base + 0.5 * (9 + 16), 6);
+    expect(evaluateBACost(cloneBAProblem(p)).cost).toBeCloseTo(base + 0.5 * 25, 6); // the clone keeps it
+    p.cameraRefine[1] = { focal: true, principalPoint: false, distortion: false };
+    const c1 = { cx: p.cameras[1].cx, cy: p.cameras[1].cy };
+    bundleAdjust(p, { loss: 'trivial', maxIterations: 10 });
+    expect(p.cameras[1].cx).toBe(c1.cx);
+    expect(p.cameras[1].cy).toBe(c1.cy);
+    expect(() => bundleAdjust({ ...p, principalPointPriors: [{ camera: 5, cx: 1, cy: 1, sigma: 1 }] })).toThrow(RangeError);
+    expect(() => bundleAdjust({ ...p, principalPointPriors: [{ camera: 0, cx: 1, cy: 1, sigma: 0 }] })).toThrow(RangeError);
+    expect(() => bundleAdjust({ ...p, principalPointPriors: [{ camera: 0, cx: NaN, cy: 1, sigma: 1 }] })).toThrow(RangeError);
   });
 });
 

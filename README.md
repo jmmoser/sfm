@@ -26,7 +26,8 @@ geo-referenced point cloud and mesh that you can measure and export.
 * **Exports**: PLY (points and mesh), GLB, and a COLMAP text model with images in a ZIP. Exports go
   through the iOS share sheet.
 * **Robust on iPhone**:
-  * Memory planner for the tab's ~1.2 GB limit, with resume after the tab is killed.
+  * Memory planner that keeps the tab within ≤ 1.2 GB (iOS kills it at ~1.5–2 GB), with resume
+    after the tab is killed.
   * One GPU command buffer in flight at a time, GPU-loss recovery, and CPU fallbacks.
   * Sessions persist in IndexedDB.
   * On-device benchmark and diagnostics.
@@ -72,6 +73,11 @@ To test on a phone you need HTTPS. Either:
   workflow in `.github/workflows/pages.yml` deploys `dist/`, or
 * run `npm run dev` behind any HTTPS tunnel.
 
+Scans (photos, models, GPS fixes) live in the origin's IndexedDB. On a shared origin such as
+`<user>.github.io/<repo>/`, every other project of that user can read them, so give a real deployment its
+own origin (custom domain). The production build ships only the app (the e2e harness pages are dev-server
+only), with a Content-Security-Policy and a versioned service worker (offline after the first visit).
+
 CI (`.github/workflows/ci.yml`) runs typecheck, unit tests and the build.
 
 ### End-to-end evaluation with ground truth
@@ -82,25 +88,35 @@ phone-realistic variants with rolling shutter, focus breathing, hand shake, expo
 JPEG compression.
 
 ```sh
-npm run synth -- all                 # render e2e/data/{object,yard} (+ object-real, yard-real presets)
+npm run synth -- all                 # render e2e/data/{object,yard}; `-- real`: object-real + yard-real
 npm run e2e -- object --engine worker # replay through the real engine worker, score vs ground truth
 npm run e2e:dense-gt -- all          # dense MVS alone, with ground-truth poses
 npm run ui:smoke                     # full UI flow with the mock engine at iPhone size
+node e2e/ui/states.mjs               # UI edge states; also e2e/ui/layouts.mjs (sizes), bench.mjs
 ```
 
 See [`e2e/README.md`](e2e/README.md) for options, dataset layout, metrics and recorded results.
 
-Results with the real engine worker on the clean synthetic datasets (SwiftShader, 480 px dense):
+Results with the real engine worker: fast preset, all sensors, 480 px dense images
+(`--dense-size 480`), and CPU features on SwiftShader (`--set 'engineConfig={"featureBackend":"cpu"}'`;
+the WebGPU kernels give the same features but take 25 s per frame there). Final verification runs
+(2026-10-17; sparse rows: `--no-dense`, tag `verify`; *-real* dense: tag `verify-dense480`; † clean
+dense: the earlier `final` runs in e2e/README.md). Every `e2e/thresholds.json` check passes. The
+*-real* datasets add rolling shutter, focus breathing, hand shake with fast pans, exposure /
+white-balance drift and JPEG 0.85:
 
-| | object (0.5 m orbit, 200 frames) | backyard (40 m walk, 240 frames) |
-|---|---|---|
-| registered keyframes | 100 % | 100 % |
-| camera position error (ATE) | 0.29 mm (2e-4 of scene) | 8 mm (2e-4 of scene) |
-| rotation error | 0.05° | 0.06° |
-| focal length error | 0.03 % | 0.07 % |
-| metric scale error | 0.4 % (IMU) | 0.01 % (IMU + GPS) |
-| gravity / north error | 0.01° / 0.4° | 0.01° / 0.6° |
-| dense F-score | 0.998 (τ = 13.6 mm) | 0.55 (τ = 0.1 m; far field limited by resolution) |
+| | object (0.5 m orbit, 200 frames) | backyard (40 m walk, 240 frames) | object-real | yard-real |
+|---|---|---|---|---|
+| registered keyframes | 92 / 92 | 80 / 80 | 89 / 89 | 81 / 81 |
+| camera position error (ATE / scene extent) | 2.1e-4 (0.29 mm) | 2.2e-4 (8.5 mm) | 2.8e-4 (0.39 mm) | 3.2e-4 (12 mm) |
+| rotation error (median) | 0.08° | 0.05° | 0.08° | 0.09° |
+| focal length error | +0.04 % | +0.07 % | +0.09 % | +0.16 % |
+| metric scale error (source) | +0.3 % (IMU) | +0.1 % (IMU + GPS) | −0.9 % (IMU) | +1.6 % (IMU + GPS) |
+| gravity / north error | 0.01° / −0.8° | 0.01° / −0.6° | 0.02° / −0.5° | 0.06° / −0.9° |
+| dense precision / completeness (τ) | 0.9997 / 0.996 (13.6 mm)† | 0.964 / 0.379 (0.1 m)† | 0.9995 / 0.994 (13.6 mm) | 0.961 / 0.351 (0.1 m) |
+| dense F-score / median accuracy | 0.998 / 0.24 mm† | 0.55 / 6.7 mm† | 0.997 / 0.31 mm | 0.51 / 8.8 mm |
+
+Backyard completeness is limited by image resolution in the far field (0.23–0.34 even with exact poses).
 
 ## How it works
 
@@ -130,11 +146,13 @@ UI ◀──────── progress / results ──────────
 | `src/math`, `src/geometry` | linear algebra, minimal solvers (5-pt, 7/8-pt, homography, P3P/EPnP), LO-MSAC, two-view geometry |
 | `src/ba` | Levenberg–Marquardt bundle adjustment with Schur complement, dense/PCG solvers, robust losses, priors |
 | `src/features` | SIFT (CPU + WASM SIMD reference, WebGPU), GPU/CPU matching, guided matching |
-| `src/sfm` | feature database, correspondence graph, incremental + live mapper, keyframing, retrieval, inertial / GPS / world alignment |
+| `src/sfm` | feature database, correspondence graph, incremental + live mapper, keyframing, retrieval, gyro checks, rolling shutter, inertial / GPS / world alignment |
 | `src/dense` | PatchMatch MVS (WebGPU + CPU), view selection, fusion, halo/sky filters, TSDF, marching cubes, simplification |
 | `src/sensors` | camera capture, IMU normalisation (iOS sign fixes), compass + WMM2025, GPS, frame pump, permissions |
 | `src/engine`, `src/workers` | the photogrammetry engine, memory planner, persistence, worker RPC |
-| `src/app`, `src/viewer`, `src/io` | mobile UI, three.js viewer, storage and exports |
+| `src/core`, `src/gpu` | shared types, WebGPU device acquisition |
+| `src/app`, `src/viewer`, `src/io` | mobile UI (incl. on-device benchmark), three.js viewer, storage and exports |
+| `public`, `tools` | service worker, web manifest, icons (and their generator) |
 | `src/harness`, `e2e` | synthetic dataset generator, harnesses, metrics, UI flows |
 
 ## Limitations

@@ -279,6 +279,19 @@ export class KeyframeSelector {
     return c.sharpness / (1 + w / Math.max(1e-6, this.options.scoreAngularSpeed));
   }
 
+  /**
+   * End of capture: no later frame will close the deferral window, so the HELD frame — the best
+   * candidate of a window whose (soft) keyframe trigger still holds; a frame without a trigger drops
+   * it — is what the window would have produced: commit it as the keyframe. Returns its time, or
+   * null when nothing is held.
+   */
+  commitHeld(): number | null {
+    const t = this.heldT;
+    if (t === null) return null;
+    this.commitKeyframe(t);
+    return t;
+  }
+
   /** Make the frame at time t the reference keyframe. */
   commitKeyframe(t: number): void {
     if (this.lastKfT !== null) {

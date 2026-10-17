@@ -72,18 +72,6 @@ export function confirmDialog(o: ConfirmOptions): Promise<boolean> {
   );
 }
 
-export function alertDialog(title: string, message?: string, okLabel = 'OK'): Promise<void> {
-  return openDialog<void>(
-    (done) => {
-      const ok = h('button', { type: 'button', class: 'btn btn-primary btn-md', text: okLabel, autofocus: '' });
-      ok.addEventListener('click', () => done());
-      return { body: message ? [h('p', { class: 'dialog-message', text: message })] : [], actions: [ok] };
-    },
-    title,
-    undefined,
-  );
-}
-
 export function promptDialog(o: { title: string; message?: string; value?: string; placeholder?: string; confirmLabel?: string; maxLength?: number }): Promise<string | null> {
   return openDialog<string | null>(
     (done) => {

@@ -271,6 +271,15 @@ class BAEngine {
         prior += 0.5 * r * r;
       }
     }
+    const pps = p.principalPointPriors;
+    if (pps) {
+      for (let k = 0; k < pps.length; k++) {
+        const pp = pps[k];
+        const rx = (K[5 * pp.camera + 1] - pp.cx) / pp.sigma,
+          ry = (K[5 * pp.camera + 2] - pp.cy) / pp.sigma;
+        prior += 0.5 * (rx * rx + ry * ry);
+      }
+    }
     const total = cost + comp + prior;
     return { cost: total === total ? total : Infinity, sqErr: sq };
   }
@@ -856,6 +865,26 @@ class BAEngine {
         const r = (this.K[5 * fp.camera] - fp.f) * is;
         gY[bStart[cb]] += is * r;
         U[diagOff[cb]] += is * is;
+      }
+    }
+
+    // principal-point priors: r = ((cx − cx₀)/σ, (cy − cy₀)/σ); cx, cy follow the focal in a camera block
+    const pps = p.principalPointPriors;
+    if (pps) {
+      const bs = this.S.blockSize;
+      for (let k = 0; k < pps.length; k++) {
+        const pp = pps[k];
+        const cb = this.camBlock[pp.camera];
+        if (cb < 0) continue;
+        const n = bs[cb];
+        const is = 1 / pp.sigma;
+        for (let q = 0; q < n; q++) {
+          const param = this.camIdx[5 * pp.camera + q];
+          if (param !== 1 && param !== 2) continue;
+          const r = (this.K[5 * pp.camera + param] - (param === 1 ? pp.cx : pp.cy)) * is;
+          gY[bStart[cb] + q] += is * r;
+          U[diagOff[cb] + q * n + q] += is * is;
+        }
       }
     }
 

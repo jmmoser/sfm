@@ -36,6 +36,8 @@ export function applyProps(el: HTMLElement, props: Props): void {
       }
     } else if (k === 'dataset') Object.assign(el.dataset, v as Record<string, string>);
     else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2), v as EventListener);
+    // never an inline event-handler attribute from a string (the CSP would refuse it anyway)
+    else if (/^on/i.test(k)) throw new TypeError(`h(): '${k}' must be a function`);
     else if (k in el && typeof v !== 'string' && k !== 'role') (el as unknown as Record<string, unknown>)[k] = v;
     else el.setAttribute(k, v === true ? '' : String(v));
   }
@@ -106,17 +108,4 @@ export function reducedMotion(): boolean {
   } catch {
     return false;
   }
-}
-
-/** Run `fn` on the next animation frame at most once per frame (coalescing). */
-export function rafThrottle(fn: () => void): () => void {
-  let pending = false;
-  return () => {
-    if (pending) return;
-    pending = true;
-    requestAnimationFrame(() => {
-      pending = false;
-      fn();
-    });
-  };
 }

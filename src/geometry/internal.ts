@@ -63,26 +63,6 @@ export function smallestEigenvector(A: Float64Array, n: number, out: Float64Arra
   for (let r = 0; r < n; r++) out[r] = vectors[r * n];
 }
 
-/** out = a * b for polynomials in DESCENDING powers (lengths na, nb → na + nb − 1). */
-export function polyMulInto(
-  a: Float64Array,
-  ao: number,
-  na: number,
-  b: Float64Array,
-  bo: number,
-  nb: number,
-  out: Float64Array,
-  oo: number,
-): void {
-  const no = na + nb - 1;
-  for (let i = 0; i < no; i++) out[oo + i] = 0;
-  for (let i = 0; i < na; i++) {
-    const ai = a[ao + i];
-    if (ai === 0) continue;
-    for (let j = 0; j < nb; j++) out[oo + i + j] += ai * b[bo + j];
-  }
-}
-
 /** Determinant of a row-major 3×3 stored at offset o. */
 export function det3(m: ArrayLike<number>, o = 0): number {
   return (

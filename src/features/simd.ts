@@ -441,6 +441,15 @@ export interface SimdKernels {
 }
 
 let compiled: WebAssembly.Module | null | undefined;
+/** Name of the kernel that failed the runtime self-test in this realm (null: passed / not run). */
+let selfTestFailure: string | null = null;
+type KernelExports = Pick<SimdKernels, 'blurV' | 'blurH' | 'dot4' | 'grad' | 'desc'>;
+/**
+ * The passing self-test's instance, zeroed and handed out by the next createSimdKernels(): no
+ * extra Wasm memory (JSC reserves 4 GiB of address space per "fast" memory and allows only a
+ * few of them, docs/research/ios-platform.md §1.3).
+ */
+let spare: { memory: WebAssembly.Memory; ex: KernelExports } | null = null;
 
 function getModule(): WebAssembly.Module | null {
   if (compiled !== undefined) return compiled;
@@ -450,11 +459,172 @@ function getModule(): WebAssembly.Module | null {
     if (g.SFM_DISABLE_SIMD || typeof g.WebAssembly === 'undefined') return null;
     const bytes = buildModule();
     if (!WebAssembly.validate(bytes)) return null;
-    compiled = new WebAssembly.Module(bytes);
+    const mod = new WebAssembly.Module(bytes);
+    selfTestFailure = runSelfTest(mod, true);
+    if (selfTestFailure) {
+      console.warn(`[simd] WASM SIMD self-test failed (${selfTestFailure}); using the plain JS kernels`);
+      return null;
+    }
+    compiled = mod;
   } catch {
     compiled = null;
   }
   return compiled;
+}
+
+// ---------------------------------------------------------------------------
+// Runtime self-test
+// ---------------------------------------------------------------------------
+
+/**
+ * Known-answer test of the v128 kernels against scalar JS references, run once per realm before
+ * the module is first used. Safari 26.x shipped a JavaScriptCore regression ("RegisterSet::
+ * normalizeWidths() lost vector-width information, causing v128 argument corruption in
+ * WebAssembly SIMD thunks", fixed in Safari 27.0; the affected 26.x builds are unknown —
+ * docs/research/ios-webgpu.md §6). Our exports take no v128 arguments and make no calls, but
+ * tier-up / OSR-entry thunks still run while v128 locals are live, so every kernel is run for
+ * several rounds (thousands of loop back-edges, across the tier-up thresholds) and checked after
+ * each round. Any mismatch (or trap) disables SIMD for the realm: every caller has a plain-JS
+ * path. `desc` is scalar f32 code (no v128) and is covered by the SIFT parity tests instead.
+ * Returns the name of the failing kernel, or null. Cost: ≈ 10 ms once per realm (Node); the
+ * 128 KiB instance is kept as `spare` when `keep` is set and the test passed.
+ */
+function runSelfTest(mod: WebAssembly.Module, keep = false): string | null {
+  let stage = 'instantiate';
+  try {
+    const memory = new WebAssembly.Memory({ initial: 2 });
+    const ex = new WebAssembly.Instance(mod, { e: { m: memory } }).exports as unknown as KernelExports;
+    const mem = memory.buffer;
+    // deterministic LCG (no Math.random: the result must not depend on the run)
+    let seed = 0x2545f491;
+    const rnd = (): number => {
+      seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+      return seed / 4294967296;
+    };
+    const f = Math.fround;
+
+    // --- dot4: exact i32 sums of i16 products (signed values exercise i32x4.dot_i16x8_s) ----
+    stage = 'dot4';
+    const NB = 128;
+    const aOff = 0;
+    const bOff = 1024;
+    const oOff = bOff + NB * 256;
+    const A = new Int16Array(mem, aOff, 4 * 128);
+    const B = new Int16Array(mem, bOff, NB * 128);
+    for (let i = 0; i < A.length; i++) A[i] = Math.floor(rnd() * 601) - 300;
+    for (let i = 0; i < B.length; i++) B[i] = Math.floor(rnd() * 601) - 300;
+    const dref = new Int32Array(4 * NB);
+    for (let j = 0; j < NB; j++)
+      for (let q = 0; q < 4; q++) {
+        let s = 0;
+        for (let t = 0; t < 128; t++) s += A[q * 128 + t] * B[j * 128 + t];
+        dref[4 * j + q] = s;
+      }
+    const dout = new Int32Array(mem, oOff, 4 * NB);
+    for (let round = 0; round < 32; round++) {
+      dout.fill(0x55555555);
+      ex.dot4(aOff, bOff, NB, oOff);
+      for (let i = 0; i < dref.length; i++) if (dout[i] !== dref[i]) return 'dot4';
+    }
+
+    // --- planes: blurH / blurV (f32x4 mul/add, replicated borders) and grad ------------------
+    const W = 64;
+    const H = 24;
+    const n = W * H;
+    const PLANE = 8192; // 6 KiB plane + slack for the 16-byte block overrun
+    const sOff = 36864;
+    const tOff = sOff + PLANE;
+    const dOff = tOff + PLANE;
+    const mOff = dOff + PLANE;
+    const angOff = mOff + PLANE;
+    const padOff = angOff + PLANE;
+    const kvOff = padOff + 1024;
+    const kern = [0.3989423, 0.2419707, 0.05399097, 0.004431848, 0.0001338302];
+    const R = kern.length - 1;
+    const src = new Float32Array(mem, sOff, n);
+    for (let i = 0; i < n; i++) src[i] = rnd();
+    for (let x = 0; x < W; x++) src[7 * W + x] = 0.5; // a flat row: gx = 0 (angles ±π/2 exactly)
+    new Float32Array(mem, kvOff, kern.length).set(kern);
+    const k32 = Float32Array.from(kern);
+    const S = Float32Array.from(src);
+    const tmp = new Float32Array(mem, tOff, n);
+    const dst = new Float32Array(mem, dOff, n);
+    // scalar references in the kernels' exact operation order (f32 rounding at every step)
+    const href = new Float32Array(n);
+    const vref = new Float32Array(n);
+    for (let y = 0; y < H; y++)
+      for (let x = 0; x < W; x++) {
+        let acc = f(k32[0] * S[y * W + x]);
+        for (let j = 1; j <= R; j++) acc = f(acc + f(k32[j] * f(S[y * W + Math.max(x - j, 0)] + S[y * W + Math.min(x + j, W - 1)])));
+        href[y * W + x] = acc;
+      }
+    for (let y = 0; y < H; y++)
+      for (let x = 0; x < W; x++) {
+        let acc = f(k32[0] * href[y * W + x]);
+        for (let j = 1; j <= R; j++) acc = f(acc + f(k32[j] * f(href[Math.max(y - j, 0) * W + x] + href[Math.min(y + j, H - 1) * W + x])));
+        vref[y * W + x] = acc;
+      }
+    const near = (a: number, b: number): boolean => Math.abs(a - b) <= 1e-6 * (1 + Math.abs(b));
+    const mag = new Float32Array(mem, mOff, n);
+    const ang = new Float32Array(mem, angOff, n);
+    for (let round = 0; round < 8; round++) {
+      stage = 'blurH';
+      tmp.fill(NaN);
+      ex.blurH(sOff, tOff, W, H, kvOff, R, padOff);
+      for (let i = 0; i < n; i++) if (!near(tmp[i], href[i])) return 'blurH';
+      stage = 'blurV';
+      dst.fill(NaN);
+      ex.blurV(tOff, dOff, W, H, kvOff, R);
+      for (let i = 0; i < n; i++) if (!near(dst[i], vref[i])) return 'blurV';
+      stage = 'grad';
+      mag.fill(NaN);
+      ang.fill(NaN);
+      ex.grad(sOff, mOff, angOff, W, H);
+      for (let y = 1; y < H - 1; y++)
+        for (let x = 1; x < W - 1; x++) {
+          const i = y * W + x;
+          const gx = f(0.5 * f(S[i + 1] - S[i - 1]));
+          const gy = f(0.5 * f(S[i + W] - S[i - W]));
+          if (!near(mag[i], f(Math.sqrt(f(f(gx * gx) + f(gy * gy)))))) return 'grad';
+          const a = ang[i];
+          if (!(a >= 0 && a < 2 * Math.PI)) return 'grad';
+          if (gx === 0 && gy === 0) continue;
+          let e = Math.atan2(gy, gx);
+          if (e < 0) e += 2 * Math.PI;
+          const d = Math.abs(a - e);
+          if (Math.min(d, 2 * Math.PI - d) > 1e-4) return 'grad';
+        }
+    }
+    if (keep) spare = { memory, ex };
+    return null;
+  } catch (e) {
+    return `${stage}: ${(e as Error)?.message ?? e}`;
+  }
+}
+
+/**
+ * State of the WASM SIMD kernels in this realm (diagnostics): 'ok', 'disabled'
+ * (SFM_DISABLE_SIMD), 'unsupported' (no WebAssembly / SIMD) or 'self-test-failed: <kernel>'.
+ * Compiles (and self-tests) the module on first use.
+ */
+export function simdStatus(): string {
+  const g = globalThis as { SFM_DISABLE_SIMD?: boolean };
+  if (g.SFM_DISABLE_SIMD) return 'disabled';
+  if (getModule()) return 'ok';
+  return selfTestFailure ? `self-test-failed: ${selfTestFailure}` : 'unsupported';
+}
+
+/**
+ * Run the known-answer self-test on `bytes` (default: this module) in a fresh instance; returns
+ * the failing kernel (or 'compile' when the bytes do not validate) or null. Tests / diagnostics.
+ */
+export function simdSelfTest(bytes: Uint8Array<ArrayBuffer> = buildModule()): string | null {
+  try {
+    if (typeof WebAssembly === 'undefined' || !WebAssembly.validate(bytes)) return 'compile';
+    return runSelfTest(new WebAssembly.Module(bytes));
+  } catch {
+    return 'compile';
+  }
 }
 
 /** True when the WASM SIMD kernels can be used in this realm. */
@@ -470,15 +640,19 @@ export function createSimdKernels(initialBytes = 1 << 16): SimdKernels | null {
   if (!mod) return null;
   try {
     const pages = Math.max(1, Math.ceil(initialBytes / 65536));
-    const memory = new WebAssembly.Memory({ initial: pages });
-    const inst = new WebAssembly.Instance(mod, { e: { m: memory } });
-    const ex = inst.exports as unknown as {
-      blurV: SimdKernels['blurV'];
-      blurH: SimdKernels['blurH'];
-      dot4: SimdKernels['dot4'];
-      grad: SimdKernels['grad'];
-      desc: SimdKernels['desc'];
-    };
+    let memory: WebAssembly.Memory;
+    let ex: KernelExports;
+    if (spare) {
+      // the self-test's instance: zeroed, so it is indistinguishable from a fresh one
+      ({ memory, ex } = spare);
+      spare = null;
+      new Uint8Array(memory.buffer).fill(0);
+      const have = memory.buffer.byteLength / 65536;
+      if (pages > have) memory.grow(pages - have);
+    } else {
+      memory = new WebAssembly.Memory({ initial: pages });
+      ex = new WebAssembly.Instance(mod, { e: { m: memory } }).exports as unknown as KernelExports;
+    }
     return {
       memory,
       blurV: ex.blurV,

@@ -153,6 +153,15 @@ export interface EngineConfig {
   /** Maximum alternations of the shared-camera re-refinement without the breathing and the per-image focal BA (default 6; stops early once the principal point moves < 0.25 px). */
   perImageFocalRounds?: number;
   /**
+   * Weak prior on the shared principal point during those rounds (σ in px; default 0 = off). Anchor
+   * `perImageFocalPPAnchor`: 'input' = the shared principal point before the per-image focal
+   * refinement (default), 'centre' = the image centre. Measured on object-real / abl-object-breath
+   * (e2e/README "Principal-point prior"): it does not make the alternation converge (the per-round
+   * contraction is unchanged), it only shifts where the round cap stops it — hence off.
+   */
+  perImageFocalPPSigmaPx?: number;
+  perImageFocalPPAnchor?: 'input' | 'centre';
+  /**
    * Back-pressure of 'background' mapping: a keyframe frame's response waits until at most this
    * many keyframes are queued or being mapped (default 2; -1 = never wait). Without it the live
    * model falls arbitrarily far behind when mapping is slower than the keyframe rate (CPU tier,

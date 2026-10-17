@@ -6,6 +6,7 @@
  * WebGPU device of THIS realm (call it from the diagnostics screen, not during capture, when the
  * engine owns the device in its worker); `'adapter'` only requests an adapter.
  */
+import { simdAvailable, simdStatus } from '../features/simd';
 import { getGPU } from '../gpu/device';
 import { CameraCapture, isAppleMobileWebKit, type CameraInfo } from './camera';
 import { screenAngle } from './frame-orientation';
@@ -108,6 +109,8 @@ export async function collectDiagnostics(opts: DiagnosticsOptions = {}): Promise
     webgpu: !!nav?.gpu,
     getUserMedia: !!nav?.mediaDevices?.getUserMedia,
     requestVideoFrameCallback: typeof HTMLVideoElement !== 'undefined' && has(HTMLVideoElement.prototype, 'requestVideoFrameCallback'),
+    // Safari exposes MSTP in dedicated workers only: false on this (main) thread is expected on
+    // iOS. The capture path does not use it (rVFC + createImageBitmap).
     mediaStreamTrackProcessor: has(g, 'MediaStreamTrackProcessor'),
     videoFrame: has(g, 'VideoFrame'),
     imageCapture: has(g, 'ImageCapture'),
@@ -135,7 +138,12 @@ export async function collectDiagnostics(opts: DiagnosticsOptions = {}): Promise
         return false;
       }
     })(),
+    // our SIMD kernels compiled AND passed the runtime known-answer self-test (Safari 26.x
+    // v128 regression guard, features/simd.ts); false = plain-JS CPU kernels
+    wasmSimdKernels: simdAvailable(),
   };
+  const simd = simdStatus();
+  if (simd.startsWith('self-test-failed')) errors.push(`wasm simd: ${simd}`);
 
   let gpu: GpuDiagnostics | null = null;
   const gpuMode = opts.gpu ?? 'device';
@@ -248,4 +256,27 @@ export async function collectDiagnostics(opts: DiagnosticsOptions = {}): Promise
     lockdownSuspected: !features.webgpu && !features.getUserMedia && !features.indexedDB,
     errors,
   };
+}
+
+/**
+ * Keys that identify the device or the user's location. Not needed to debug the app, so never
+ * part of a copied report: camera `deviceId` / `groupId` are stable per-origin identifiers, and
+ * GPS fixes / WMM inputs (when a caller passes `geo` / `compass`) are the user's position.
+ */
+const PRIVATE_KEYS = new Set(['deviceId', 'groupId', 'lat', 'lon', 'alt', 'latDeg', 'lonDeg', 'altM', 'latitude', 'longitude', 'altitude', 'originLatLonAlt']);
+
+/**
+ * JSON text of a diagnostics report for the clipboard / bug reports: typed arrays become plain
+ * arrays, and the values of PRIVATE_KEYS are replaced by `"[redacted]"` (empty values stay as
+ * they are, so "no label / no id" remains visible).
+ */
+export function diagnosticsReportJSON(report: unknown): string {
+  return JSON.stringify(
+    report,
+    (k, v: unknown) => {
+      if (PRIVATE_KEYS.has(k) && v !== null && v !== undefined && v !== '') return '[redacted]';
+      return ArrayBuffer.isView(v) && !(v instanceof DataView) ? Array.from(v as unknown as ArrayLike<number>) : v;
+    },
+    2,
+  );
 }

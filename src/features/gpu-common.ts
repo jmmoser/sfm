@@ -159,6 +159,15 @@ export class Staging {
   }
 }
 
+/**
+ * Upper bound (ms) for one `createComputePipelineAsync`. On Safari 26.x/27.0 the async variant
+ * compiles synchronously in the GPU process, and Safari Technology Preview fixed async creations
+ * that stalled or never settled (docs/research/ios-webgpu.md §4.6). After this long, a device that
+ * is still alive compiles the pipeline with the synchronous `createComputePipeline` instead (as
+ * PatchMatchGPU does). Mutable for tests.
+ */
+export const pipelineCompileLimits = { timeoutMs: 30_000 };
+
 /** Compiles a compute pipeline asynchronously; rejects with GPUFeatureError on errors / device loss. */
 export async function compilePipeline(
   device: GPUDevice,
@@ -177,12 +186,26 @@ export async function compilePipeline(
   const desc: GPUComputePipelineDescriptor = { layout: 'auto', compute: { module, entryPoint }, label };
   let pipeline: GPUComputePipeline | null = null;
   let failure: unknown = null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const r = await Promise.race([device.createComputePipelineAsync(desc), lost.then(() => 'lost' as const)]);
+    const timeout = new Promise<'timeout'>((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), pipelineCompileLimits.timeoutMs);
+    });
+    const r = await Promise.race([device.createComputePipelineAsync(desc), lost.then(() => 'lost' as const), timeout]);
     if (r === 'lost') failure = new GPUFeatureError(`device lost while compiling ${label}`);
-    else pipeline = r;
+    else if (r === 'timeout') {
+      console.warn(`[gpu] async compilation of ${label} timed out; compiling synchronously`);
+      // push / create / pop with no await in between: the scope is this call's own
+      device.pushErrorScope('validation');
+      const p = device.createComputePipeline(desc);
+      const e = await device.popErrorScope();
+      if (e) failure = new GPUFeatureError(e.message);
+      else pipeline = p;
+    } else pipeline = r;
   } catch (e) {
     failure = e;
+  } finally {
+    clearTimeout(timer);
   }
   let err: GPUError | null = null;
   try {

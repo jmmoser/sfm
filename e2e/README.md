@@ -244,10 +244,11 @@ Typed helpers for tests live in `e2e/lib/*.mjs` + `*.d.mts`.
 poses and intrinsics, so every error it reports comes from MVS or fusion, not from SfM.
 
 ```sh
-node e2e/run-dense-gt.mjs [object|yard|all ...] [--max-size 480] [--views N] [--stride N] [--frames i,j,...]
-     [--preset fast|balanced|max] [--sources 8] [--iterations 6] [--geom-iterations 3] [--geom-passes 1]
-     [--no-geometric] [--multiscale] [--tsdf] [--save-maps] [--load-maps RUN] [--fusion-input geo|photo]
-     [--oracle] [--tag NAME] [--set key=json ...] [--no-render] [--no-metrics] [--no-consistency]
+node e2e/run-dense-gt.mjs [object|yard|all|<dataset> ...] [--max-size 480] [--views N] [--stride N] [--first N]
+     [--frames i,j,...] [--preset fast|balanced|max] [--sources 8] [--iterations 6] [--geom-iterations 3]
+     [--geom-passes 1] [--no-geometric] [--multiscale] [--tsdf] [--debug-views N] [--sparse N]
+     [--save-maps] [--load-maps RUN] [--fusion-input geo|photo] [--oracle] [--tag NAME] [--out DIR]
+     [--set key=json ...] [--no-render] [--no-metrics] [--no-consistency] [--verbose]
 
 node e2e/run-dense-gt.mjs all --tsdf --save-maps            # reference run (~1.5 h on SwiftShader)
 node e2e/run-dense-gt.mjs object --load-maps object --tag mv2 --set fusion.minViews=2   # fusion only, seconds
@@ -478,7 +479,7 @@ The exit code is 0 when every pipeline finished without errors and every enforce
 
 Open `harness.html?dataset=object&engine=mock&maxFrames=40&densify=1` on the dev server
 (`npm run dev`). It runs on load and shows the result. The query keys are `engine`, `quality`, `mode`, `stride`,
-`maxFrames`, `start`, `fps`, `imu`, `gps`, `heading`, `densify`, `mesh`, `exports` and `mockSpeed`.
+`maxFrames`, `start`, `fps`, `imu`, `gps`, `heading`, `headingNorth`, `densify`, `mesh`, `exports` and `mockSpeed`.
 From the console, `await runPipeline({...})` returns the same `HarnessResult`. When `window.__e2eWrite`
 is missing, the dense cloud is embedded as base64 in `densePoints`.
 
@@ -730,3 +731,45 @@ Measured, not adopted:
   abl-yard-rs −27.9 ms; truth −25) and becomes −25.1 / −24.9 ms with the true bias, but accuracy was neutral
   (object-real 2.79e-4 / 0.071°, abl-yard-rs 2.50e-4 / 0.06°, abl-object-rs 2.27e-4 / 0.04°) and worse on yard-real
   (same live model: pp 0.4 → 1.3 px, rotation 0.10 → 0.13°).
+
+#### Principal-point prior in the per-image focal rounds (2026-10, measured, not adopted)
+
+Weak prior on the shared principal point in every shared re-refinement of the per-image focal alternation
+(`engineConfig.perImageFocalPPSigmaPx` / `perImageFocalPPAnchor`, BA `principalPointPriors`; off by default). Same command
+as above (`--no-dense --no-mesh`, CPU features, worker), tags `ppbase` (current code, no prior) and `pp*`; GT principal
+point (+1.50, −1.00) px from the centre on both datasets. "stop" = the 6-round cap or the 0.25 px tolerance; c_y offset
+of the shared camera per round.
+
+| dataset, variant | stop | c_y per round (px) | pp px | rot° p50 | ATE / extent | focal % |
+|---|---|---|---|---|---|---|
+| object-real, no prior (`ppbase`) | cap 6 | −3.52 −2.48 −1.67 −1.03 −0.53 −0.15 | 0.90 | 0.078 | 2.84e-4 | +0.09 |
+| object-real, σ 2.5 px at the input pp, cap 6 (`pp25in-r6`) | cap 6 | −3.54 −2.57 −1.82 −1.25 −0.80 −0.48 | 0.59 | 0.055 | 2.81e-4 | +0.11 |
+| object-real, σ 2.5 px at the input pp, ≤ 20 rounds (`pp25in-r20`) | tolerance, round 7 | … −0.44 −0.19 | 0.86 | 0.074 | 2.84e-4 | +0.09 |
+| object-real, σ 2.5 px at the image centre, ≤ 20 rounds (`pp25c-r20`) | tolerance, round 8 | … −0.06 +0.21 +0.42 | 1.45 | 0.116 | 2.92e-4 | +0.05 |
+| object-real, σ 1 px at the input pp, ≤ 20 rounds (`pp10in-r20`) | tolerance, round 5 | −3.70 −2.94 −2.43 −2.09 −1.86 | 0.91 | 0.079 | 2.79e-4 | +0.20 |
+| abl-object-breath, no prior (`ppbase`) | cap 6 | −5.58 −4.55 −3.70 −2.98 −2.38 −1.86 | 0.92 | 0.078 | 2.65e-4 | −0.06 |
+| abl-object-breath, σ 2.5 px at the input pp, cap 6 (`pp25in-r6`) | cap 6 | −5.62 −4.64 −3.85 −3.20 −2.67 −2.24 | 1.27 | 0.105 | 2.67e-4 | −0.04 |
+| abl-object-breath, σ 2.5 px at the input pp, ≤ 20 rounds (`pp25in-r20`) | tolerance, round 9 | … −2.26 −1.92 −1.64 −1.41 | 0.52 | 0.052 | 2.60e-4 | −0.09 |
+
+The prior does not make the alternation converge: the c_y steps still shrink geometrically by almost the same factor per
+round (object-real 0.78 → 0.76 at σ 2.5 px, abl-object-breath 0.84 → 0.81), so every run still ends by a stopping rule.
+Extrapolated fixed points (last c_y + last step · ρ/(1 − ρ)): object-real +1.2 → +0.6 px, abl-object-breath ≈ +0.9 →
+−0.4 px, against −1.0 px GT. With the 6-round cap the prior helps object-real and hurts abl-object-breath (it slows a
+drift that is still short of the truth there). With ≤ 20 rounds both improve, but only because the 0.25 px tolerance is
+crossed at a better place (rounds 7 / 9) — another early-stopping rule tuned on the same two datasets. Anchored at the
+image centre it is worse. σ 1 px contracts faster (factor 0.67; fixed point ≈ −1.4 px, set by the anchor — the input pp,
+which the breathing biases by a dataset-dependent amount) but still stops by the tolerance (−1.86 px: pp 0.91 px) and
+doubles the focal error. Kept: the 6-round cap without a prior (ARCHITECTURE "Real-capture robustness", Limits).
+
+#### Final verification (2026-10-17, worker engine, CPU features, fast preset)
+
+Sparse: `node e2e/run-e2e.mjs <dataset> --engine worker --no-dense --tag verify --set 'engineConfig={"featureBackend":"cpu"}'`;
+dense: the same with `--dense-size 480 --tag verify-dense480` (instead of `--no-dense`), run one after another. Every
+`thresholds.json` check passes; the sparse part of the dense runs matches the sparse runs (yard-real ATE 3.18e-4 vs 3.17e-4).
+
+| dataset | kf reg (model) | ATE / extent | rot° p50 | focal % | pp px | scale % (source) | grav° | head° | Δt ms | rolling shutter | dense P / C / F | dense acc p50 / p90 | wall s (refine / densify) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| object | 92/92 (live) | 2.10e-4 | 0.08 | +0.04 | 0.8 | +0.3 (imu) | 0.01 | −0.83 | −24.9 | none | – | – | 133 (59 / –) |
+| yard | 80/80 (live) | 2.19e-4 | 0.05 | +0.07 | 0.4 | +0.1 (imu+gps) | 0.01 | −0.64 | −24.9 | none | – | – | 140 (56 / –) |
+| object-real | 89/89 (live) | 2.84e-4 | 0.08 | +0.09 | 0.9 | −0.9 (imu) | 0.02 | −0.54 | −25.1 | cols −21.6 ms | 0.9995 / 0.9941 / 0.9968 | 0.31 / 1.06 mm | 943 (86 / 775) |
+| yard-real | 81/81 (live) | 3.17e-4 | 0.09 | +0.16 | 0.4 | +1.6 (imu+gps) | 0.06 | −0.93 | −25.1 | rows 22.0 ms | 0.961 / 0.351 / 0.515 | 8.8 / 47 mm | 843 (69 / 684) |

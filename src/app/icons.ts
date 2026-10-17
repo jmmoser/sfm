@@ -58,8 +58,11 @@ const P = {
 export type IconName = keyof typeof P;
 
 export function iconSvg(name: IconName, size = 24): string {
-  const body: string = P[name] ?? '';
-  return `<svg class="icon" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${body}</svg>`;
+  // innerHTML sink (icon()): only the static markup above, never a value from outside (own
+  // properties only — no `constructor` / `__proto__` lookups — and a numeric size).
+  const body: string = hasIcon(name) ? P[name] : '';
+  const px = Number.isFinite(size) && size > 0 ? Math.round(size * 100) / 100 : 24;
+  return `<svg class="icon" width="${px}" height="${px}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${body}</svg>`;
 }
 
 /** An icon element (span wrapper). */

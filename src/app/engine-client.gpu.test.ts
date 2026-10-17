@@ -201,6 +201,61 @@ describe('EngineClient', () => {
     expect(c.status.state).toBe('ready');
   });
 
+  it('abortLongOperation with reinit: false restarts a stuck worker WITHOUT re-opening the session (it is being discarded)', async () => {
+    const { c, spawned } = client(['stuck-finish', 'ok']);
+    await c.init({ mode: 'object', quality: 'fast', sessionId: 's1' });
+    let progress = 0;
+    c.onProgress(() => progress++);
+    const settled = c.finishCapture().catch((e: Error) => e);
+    await waitFor(() => progress >= 2);
+    expect(await c.abortLongOperation({ graceMs: 300, reinit: false })).toBe('restarted');
+    expect(await settled).toMatchObject({ name: 'CancelledError' });
+    await new Promise((r) => setTimeout(r, 200)); // a replay would spawn a worker here
+    expect(spawned).toEqual(['stuck-finish']);
+    expect(c.status.state).toBe('idle');
+    expect(c.pendingCount).toBe(0);
+    // the next scan starts a fresh worker, without resume
+    expect((await c.init({ mode: 'object', quality: 'fast', sessionId: 's2' })).adapter).toBe('fixture:ok:resume=false:gpu=true');
+    expect(spawned).toEqual(['stuck-finish', 'ok']);
+  });
+
+  it('a new init while an abort of a stuck request is pending waits for it: not rejected by the restart, the old session not replayed', async () => {
+    // capture: finishing hangs, "Back to home", then a new scan right away (within the grace period)
+    const { c, spawned } = client(['stuck-finish', 'ok']);
+    await c.init({ mode: 'object', quality: 'fast', sessionId: 's1' });
+    let progress = 0;
+    c.onProgress(() => progress++);
+    const settled = c.finishCapture().catch((e: Error) => e);
+    await waitFor(() => progress >= 2);
+    const aborted = c.abortLongOperation({ graceMs: 400 });
+    const res = await c.init({ mode: 'object', quality: 'fast', sessionId: 's2' });
+    expect(await aborted).toBe('restarted');
+    expect(await settled).toMatchObject({ name: 'CancelledError' });
+    expect(res.adapter).toBe('fixture:ok:resume=false:gpu=true');
+    expect(c.status.state).toBe('ready');
+    expect(spawned).toEqual(['stuck-finish', 'ok']);
+    // the new worker saw ONE init: the new scan's (no replay of s1 with resume)
+    const sum = await c.loadSession('s2');
+    expect(sum.stats.inits).toBe(1);
+    expect(JSON.parse(String(sum.stats.init))).toMatchObject({ sessionId: 's2' });
+    expect(JSON.parse(String(sum.stats.init)).resume).toBeUndefined();
+  });
+
+  it('release(): ends the running request, terminates the worker without a replay; the next init starts a fresh one', async () => {
+    const { c, spawned } = client('ok');
+    await c.init({ mode: 'object', quality: 'fast', sessionId: 's1' });
+    const d = c.densify().catch((e: Error) => e);
+    await new Promise((r) => setTimeout(r, 60));
+    await c.release();
+    expect(await d).toMatchObject({ name: 'CancelledError' });
+    expect(c.status).toMatchObject({ state: 'idle', reason: 'released', respawns: 0 });
+    await new Promise((r) => setTimeout(r, 150));
+    expect(spawned).toEqual(['ok']);
+    expect((await c.init({ mode: 'object', quality: 'fast', sessionId: 's2' })).adapter).toBe('fixture:ok:resume=false:gpu=true');
+    expect(spawned).toEqual(['ok', 'ok']);
+    expect(c.status.respawns).toBe(0);
+  });
+
   it('init timeout respawns the worker and replays init with resume', async () => {
     const { c, spawned } = client(['hang-init', 'ok'], { initTimeoutMs: 300 });
     const statuses: EngineStatus[] = [];

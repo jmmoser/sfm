@@ -145,7 +145,7 @@ beforeAll(async () => {
   const t0 = performance.now();
   sift = await SiftGPU.create(ctx);
   log(`adapter ${ctx.info.vendor}/${ctx.info.architecture} software=${ctx.isSoftware}; create ${(performance.now() - t0).toFixed(0)} ms`);
-});
+}, 600_000); // pipeline compilation on SwiftShader can exceed the 30 s default hook timeout while other GPU files run
 
 afterAll(() => sift?.destroy());
 
@@ -348,9 +348,11 @@ describe('SiftGPU.extractFromBitmap', () => {
       checkContract(g, 4096, 1280, 960);
       expect(p.posFrac).toBeGreaterThanOrEqual(0.97);
       expect(p.medianCos).toBeGreaterThanOrEqual(0.995);
-      // ImageData is accepted directly too.
+      // ImageData is accepted directly too (uploaded with writeTexture: the same bytes, so the
+      // same features as through copyExternalImageToTexture of the ImageBitmap).
       const g2 = await ex.extractFromBitmap(id, 1280, 960);
       expect(parity(g, g2).posFrac).toBeGreaterThan(0.99);
+      expect(g2.count).toBe(g.count);
       bmp.close();
     } finally {
       ex.destroy();

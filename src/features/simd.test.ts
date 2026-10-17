@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { blurFloat32, gaussianHalfKernel } from './image';
 import { matchCPU, matchUsesSIMD } from './match';
 import { extractSiftCPU, lastSiftCPUTimings } from './sift-cpu';
-import { createSimdKernels, simdAvailable } from './simd';
+import { createSimdKernels, simdAvailable, simdModuleBytes, simdSelfTest, simdStatus } from './simd';
 import { TestRng, makeTexturedImage, makeWarpedPair, similarityAboutCenter } from './testdata';
 
 const g = globalThis as { SFM_DISABLE_SIMD?: boolean };
@@ -147,5 +147,57 @@ describe('SIMD and JS paths agree', () => {
     expect(same).toBeGreaterThan(0.97 * n);
     expect(maxDiff).toBeLessThanOrEqual(2);
     expect(diffBytes).toBeLessThan(0.01 * same * 128);
+  });
+});
+
+describe('SIMD runtime self-test (Safari 26.x v128 thunk regression guard)', () => {
+  /** Copy of `bytes` with occurrence #`nth` of opcode `from` replaced by `to` (same length). */
+  function patch(bytes: Uint8Array<ArrayBuffer>, from: number[], to: number[], nth = 0): Uint8Array<ArrayBuffer> {
+    const out = bytes.slice();
+    for (let i = 0, seen = 0; i + from.length <= out.length; i++) {
+      if (from.every((b, k) => out[i + k] === b) && seen++ === nth) {
+        out.set(to, i);
+        return out;
+      }
+    }
+    throw new Error('opcode not found');
+  }
+  const F32X4_ADD = [0xfd, 228, 1];
+  const F32X4_SUB = [0xfd, 229, 1];
+
+  it('passes for the shipped module and gates simdAvailable()', () => {
+    expect(simdSelfTest()).toBeNull();
+    expect(simdAvailable()).toBe(true);
+    expect(simdStatus()).toBe('ok');
+    g.SFM_DISABLE_SIMD = true;
+    expect(simdStatus()).toBe('disabled');
+  });
+
+  it('detects a miscompiled kernel and names it', () => {
+    const bytes = simdModuleBytes();
+    // i32x4.add -> i32x4.sub (only dot4 uses it)
+    expect(simdSelfTest(patch(bytes, [0xfd, 174, 1], [0xfd, 177, 1]))).toBe('dot4');
+    // f32x4.sqrt -> f32x4.abs (only grad uses it)
+    expect(simdSelfTest(patch(bytes, [0xfd, 227, 1], [0xfd, 224, 1]))).toBe('grad');
+    // code section order is blurV, blurH, dot4, grad: f32x4.add #0/#1 are blurV's tap
+    // accumulation, #2/#3 blurH's
+    expect(simdSelfTest(patch(bytes, F32X4_ADD, F32X4_SUB, 0))).toBe('blurV');
+    expect(simdSelfTest(patch(bytes, F32X4_ADD, F32X4_SUB, 2))).toBe('blurH');
+  });
+
+  it('hands out the self-test instance zeroed (no extra Wasm memory), then fresh ones', async () => {
+    vi.resetModules();
+    const m = await import('./simd');
+    const k1 = m.createSimdKernels(1 << 18)!;
+    const k2 = m.createSimdKernels(1 << 16)!;
+    for (const k of [k1, k2]) expect(new Uint8Array(k.memory.buffer).every((b) => b === 0)).toBe(true);
+    expect(k1.memory.buffer.byteLength).toBe(1 << 18);
+    expect(k2.memory.buffer.byteLength).toBe(1 << 16);
+    expect(k1.memory).not.toBe(k2.memory);
+  });
+
+  it('reports invalid bytes as a compile failure', () => {
+    const bytes = simdModuleBytes();
+    expect(simdSelfTest(bytes.slice(0, bytes.length - 3))).toBe('compile');
   });
 });

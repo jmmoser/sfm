@@ -431,18 +431,35 @@ export function packArrays(header: unknown, arrays: PackedArray[]): ArrayBuffer 
   return buf;
 }
 
+/** Thrown for a stored container that cannot be decoded (damaged, truncated, foreign format). */
+function damaged(what: string): Error {
+  return new Error(`Stored data is damaged (${what})`);
+}
+
+/** Every size is checked against the buffer before it is used (a damaged record never allocates). */
 export function unpackArrays<H>(buf: ArrayBuffer): { header: H; arrays: PackedArray[] } {
+  if (!buf || !(buf.byteLength >= 8)) throw damaged('container too short');
   const dv = new DataView(buf);
-  if (buf.byteLength < 8 || dv.getUint32(0, true) !== PACK_MAGIC) throw new Error('unpackArrays: bad container');
+  if (dv.getUint32(0, true) !== PACK_MAGIC) throw damaged('not an array container');
   const hl = dv.getUint32(4, true);
-  const parsed = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 8, hl))) as { header: H; n: number };
+  if (hl > buf.byteLength - 8) throw damaged('header length');
+  let parsed: { header: H; n: number };
+  try {
+    parsed = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 8, hl))) as { header: H; n: number };
+  } catch {
+    throw damaged('header');
+  }
+  if (!parsed || typeof parsed !== 'object' || !Number.isInteger(parsed.n) || parsed.n < 0) throw damaged('header');
   const pad8 = (n: number): number => (n + 7) & ~7;
   let off = pad8(8 + hl);
   const arrays: PackedArray[] = [];
   for (let i = 0; i < parsed.n; i++) {
+    if (off + 8 > buf.byteLength) throw damaged('truncated');
     const dt = DTYPES[dv.getUint32(off, true)];
+    if (!dt) throw damaged('array type');
     const count = dv.getUint32(off + 4, true);
     off += 8;
+    if (count * dt.bytes > buf.byteLength - off) throw damaged('array length');
     // copy into its own buffer (transferable on its own)
     const bytes = new Uint8Array(buf, off, count * dt.bytes).slice();
     arrays.push(new dt.ctor(bytes.buffer, 0, count));
@@ -468,6 +485,22 @@ export function packSparseModel(m: SparseModel): ArrayBuffer {
 
 export function unpackSparseModel(buf: ArrayBuffer): SparseModel {
   const { header, arrays } = unpackArrays<SparseModelHeader>(buf);
+  // shapes the rest of the engine indexes without checks
+  const n = header?.numPoints;
+  const ok =
+    Array.isArray(header?.cameras) &&
+    Array.isArray(header?.images) &&
+    header.images.every((im) => im && Array.isArray(im.R) && im.R.length === 9 && Array.isArray(im.t) && im.t.length === 3) &&
+    Number.isInteger(n) &&
+    n >= 0 &&
+    arrays.length >= 6 &&
+    arrays[0].length === 3 * n &&
+    arrays[1].length === 3 * n &&
+    arrays[2].length === n &&
+    arrays[3].length === n + 1 &&
+    arrays[4].length === arrays[5].length &&
+    arrays[3][n] === arrays[4].length;
+  if (!ok) throw damaged('sparse model');
   return {
     cameras: new Map(header.cameras),
     images: header.images.map((im) => ({ id: im.id, cameraId: im.cameraId, pose: { R: Float64Array.from(im.R), t: Float64Array.from(im.t) } })),

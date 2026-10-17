@@ -156,9 +156,15 @@ describe('pairs (review)', () => {
     const rng = new Rng(1);
     const big: [number, number][] = [];
     for (let i = 0; i < 200000; i++) big.push([rng.int(3000), rng.int(3000)]);
-    const t0 = performance.now();
-    const r = mergePairs([big, big]);
-    const ms = performance.now() - t0;
+    // Best of 3 calls on each side: the first call of either includes JIT warm-up, and the minimum
+    // is the noise-robust estimate under machine load (single cold calls measured 0.35–0.7×).
+    let r: ReturnType<typeof mergePairs> = [];
+    let ms = Infinity;
+    for (let rep = 0; rep < 3; rep++) {
+      const t0 = performance.now();
+      r = mergePairs([big, big]);
+      ms = Math.min(ms, performance.now() - t0);
+    }
     const ref = new Set<string>();
     for (const [a, b] of big) if (a !== b) ref.add(`${Math.min(a, b)},${Math.max(a, b)}`);
     expect(r.length).toBe(ref.size);
@@ -167,22 +173,26 @@ describe('pairs (review)', () => {
     expect(sorted).toBe(true);
     for (let i = 0; i < r.length; i += 997) expect(ref.has(`${r[i][0]},${r[i][1]}`)).toBe(true);
     // Relative to the pre-review algorithm (Set<number> + sort of pair objects) on the same data, so
-    // the check is robust to machine load: ≈ 0.1 s vs ≈ 1.5 s.
-    const t1 = performance.now();
-    const seen = new Set<number>();
-    const old: [number, number][] = [];
-    for (const list of [big, big])
-      for (const [x, y] of list) {
-        const a = Math.min(x, y),
-          b = Math.max(x, y);
-        if (a === b) continue;
-        const key = a * 67108864 + b;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        old.push([a, b]);
-      }
-    old.sort((x, y) => x[0] - y[0] || x[1] - y[1]);
-    const oldMs = performance.now() - t1;
+    // the check is robust to machine load: ≈ 50 ms vs ≈ 150–250 ms (Node 22, 4-core VM).
+    let old: [number, number][] = [];
+    let oldMs = Infinity;
+    for (let rep = 0; rep < 3; rep++) {
+      const t1 = performance.now();
+      const seen = new Set<number>();
+      old = [];
+      for (const list of [big, big])
+        for (const [x, y] of list) {
+          const a = Math.min(x, y),
+            b = Math.max(x, y);
+          if (a === b) continue;
+          const key = a * 67108864 + b;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          old.push([a, b]);
+        }
+      old.sort((x, y) => x[0] - y[0] || x[1] - y[1]);
+      oldMs = Math.min(oldMs, performance.now() - t1);
+    }
     expect(old).toEqual(r);
     expect(ms).toBeLessThan(0.5 * oldMs * perfSlack());
     // ids beyond the 2^26 key range and negative ids: no key collisions
@@ -202,6 +212,35 @@ describe('pairs (review)', () => {
       [-5, 3],
       [0, L + 1],
       [1, L],
+    ]);
+    // ids ≥ 2^16 (Float64 keys) and the 2^16 boundary of the Uint32 keys; NaN / Infinity dropped
+    expect(
+      mergePairs([
+        [
+          [70000, 5],
+          [5, 70000],
+          [L - 1, 65536],
+          [Infinity, 1],
+          [3, 2],
+        ],
+      ]),
+    ).toEqual([
+      [2, 3],
+      [5, 70000],
+      [65536, L - 1],
+    ]);
+    expect(
+      mergePairs([
+        [
+          [65535, 0],
+          [65534, 65535],
+          [0, 65535],
+          [1, NaN],
+        ],
+      ]),
+    ).toEqual([
+      [0, 65535],
+      [65534, 65535],
     ]);
     // exclude is called once per distinct pair
     let calls = 0;

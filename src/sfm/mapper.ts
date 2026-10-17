@@ -128,6 +128,12 @@ export interface MapperOptions {
   refineFocal: boolean;
   refineDistortion: boolean;
   refinePrincipalPoint: boolean;
+  /**
+   * Optional weak prior on the principal point per camera id (BA `principalPointPriors`, residual
+   * (c − c₀)/σ in px): acts in every BA of this mapper that refines that camera's principal point.
+   * Absent = none (default).
+   */
+  principalPointPriors?: ReadonlyMap<number, { cx: number; cy: number; sigma: number }>;
   /** Intrinsics are refined (global BA) only once this many images are registered. */
   minImagesForIntrinsics: number;
   // ---- filtering
@@ -1162,6 +1168,13 @@ export class IncrementalMapper {
       for (const [cid, fp] of cfg.focalPriors) {
         const ci = camIndex.get(cid);
         if (ci !== undefined) problem.focalPriors.push({ camera: ci, f: fp.f, sigma: fp.sigma });
+      }
+    }
+    const ppp = this.opts.principalPointPriors;
+    if (ppp && ppp.size) {
+      for (const [cid, pp] of ppp) {
+        const ci = camIndex.get(cid);
+        if (ci !== undefined && cameraRefine[ci].principalPoint) (problem.principalPointPriors ??= []).push({ camera: ci, cx: pp.cx, cy: pp.cy, sigma: pp.sigma });
       }
     }
     const result = bundleAdjust(problem, {

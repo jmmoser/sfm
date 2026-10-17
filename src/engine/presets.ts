@@ -1,17 +1,10 @@
 /**
- * Quality presets (docs/ENGINE.md §2 table) and capture-mode parameters.
- *
- * | preset   | feature max side | max features | dense max side | PM iterations | geom passes |
- * |----------|------------------|--------------|----------------|---------------|-------------|
- * | fast     | 1024             | 2048         | 800            | 4             | 0           |
- * | balanced | 1600             | 4096         | 1280           | 6             | 1           |
- * | max      | 2048             | 8192         | 1600           | 8             | 2           |
- *
- * When `src/dense` exports `DENSE_PRESETS` (tuned from the e2e results by the dense owner),
- * its values override the dense part of this table (read defensively: only known numeric /
- * boolean fields are taken, under either the engine's or a few common alternative names).
+ * Quality presets and capture-mode parameters. `QUALITY_PRESETS` below holds the feature settings
+ * and the engine's base dense table; the tuned `DENSE_PRESETS` of src/dense/presets.ts override
+ * its dense part (only known numeric / boolean fields are taken, under the engine's or a few
+ * alternative names). Effective values: docs/ENGINE.md §2 "Quality presets".
  */
-import * as denseModule from '../dense';
+import { DENSE_PRESETS } from '../dense/presets';
 import type { KeyframeSelectorOptions } from '../sfm/keyframes';
 import type { CaptureMode, QualityPreset } from '../workers/protocol';
 
@@ -171,12 +164,9 @@ const DENSE_ALIASES: Record<string, keyof DensePresetConfig> = {
   maxPoints: 'maxPoints',
 };
 
-/** Numeric fields of a `DENSE_PRESETS[quality]` entry (if src/dense exports one), mapped to our names. */
+/** Fields of the tuned `DENSE_PRESETS[quality]` entry (src/dense/presets.ts), mapped to our names. */
 export function externalDensePreset(quality: QualityPreset): Partial<DensePresetConfig> {
-  // computed key: the export may not exist (yet); a literal would make the bundler warn
-  const ext = (denseModule as unknown as Record<string, unknown>)[['DENSE', 'PRESETS'].join('_')];
-  if (!ext || typeof ext !== 'object') return {};
-  return parseDensePresetEntry((ext as Record<string, unknown>)[quality]);
+  return parseDensePresetEntry(DENSE_PRESETS[quality]);
 }
 
 /**
@@ -225,7 +215,7 @@ export function parseDensePresetEntry(entry: unknown): Partial<DensePresetConfig
   return out;
 }
 
-/** The dense preset: engine table ← DENSE_PRESETS (if exported) ← explicit overrides. */
+/** The dense preset: engine table ← DENSE_PRESETS ← explicit overrides. */
 export function resolveDensePreset(quality: QualityPreset, overrides: Partial<DensePresetConfig> = {}): DensePresetConfig {
   return { ...QUALITY_PRESETS[quality].dense, ...externalDensePreset(quality), ...stripUndefined(overrides) };
 }

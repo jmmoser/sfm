@@ -58,9 +58,14 @@ describe('engine on a persistent store', () => {
     // the live session was released for the dense stage; the stored capture state is intact
     expect(e.liveSession).toBeNull();
     expect(logs.some((l) => l.includes('capture state released for the dense stage'))).toBe(true);
-    expect(await store.getValue('dense/progress')).toMatchObject({ pass: 1 });
+    expect(await store.getValue('dense/progress')).toMatchObject({ pass: 1, quality: 'fast' });
     const pm1 = await store.listBinaryKeys('pm1/');
     expect(pm1.length).toBeGreaterThan(0);
+    // after a reload the app learns the interrupted run's preset (a resume needs the same one)
+    const other = new PhotogrammetryEngine({ mode: 'auto', quality: 'max' }, { pipeline, store });
+    const sum = await other.loadSession('p');
+    expect(sum.stats).toMatchObject({ denseResumablePass: 1, denseResumableQuality: 'fast' });
+    other.dispose();
 
     // a new densify resumes: the maps of pass 1 that exist are not recomputed
     const pc = await e.densify(dense);
