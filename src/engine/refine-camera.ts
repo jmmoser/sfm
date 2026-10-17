@@ -463,6 +463,7 @@ export async function refinePerImageFocal(
     /**
      * Shared (f, c, k) refinement of the rescaled model; `priors` (shared camera id → weak principal-
      * point prior, `ppPriorSigmaPx`) are to be passed to its BA (`MapperOptions.principalPointPriors`).
+     * `rec` is a throwaway copy owned by the callee (it may be refined in place).
      */
     refinePrincipalPoint?: (
       rec: Reconstruction,

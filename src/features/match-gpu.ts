@@ -15,9 +15,10 @@
  * whole tiles using spatially sorted features ('positions', 'H' -> predicted
  * positions, 'F' -> epipolar band).
  *
- * Descriptor buffers (packed 4 bytes per u32) and inverse norms are cached per
- * FeatureSet (WeakMap + LRU byte budget + FinalizationRegistry); a content hash is
- * verified on every call, so descriptor arrays refilled in place are re-uploaded.
+ * Descriptor buffers (packed 4 bytes per u32) and inverse norms (GPU f32 and host f64)
+ * are cached per FeatureSet (WeakMap + LRU byte budget + FinalizationRegistry); a cheap
+ * content hash is verified on every call, so descriptor arrays refilled in place are
+ * re-uploaded and their norms recomputed.
  */
 
 import type { FeatureSet, MatchPairs } from '../core/types';
@@ -39,8 +40,8 @@ import {
 } from './gpu-common';
 import { matchCPU, matchGuidedCPU } from './match';
 import type { MatchGuide, MatchOptions } from './match';
-import { descriptorStats, emitMatches, packDescriptorWords, planChunks, prepareGuide, reduceTop2, validateFeatureSet } from './match-gpu-host';
-import type { DescriptorStats, GuidePrep } from './match-gpu-host';
+import { descriptorHash, descriptorInvNorms, emitMatches, packDescriptorWords, planChunks, prepareGuide, reduceTop2, validateFeatureSet } from './match-gpu-host';
+import type { GuidePrep } from './match-gpu-host';
 import { MATCH_TILE, matchShader } from './shaders/match-wgsl';
 import type { MatchKernelMode } from './shaders/match-wgsl';
 
@@ -84,6 +85,8 @@ export interface MatcherGPUTimings {
 interface CacheEntry {
   count: number;
   hash: number;
+  /** f64 inverse norms (host re-rank), kept so a cache hit skips recomputing them. */
+  invNorm: Float64Array;
   desc: GPUBuffer;
   inv: GPUBuffer;
   bytes: number;
@@ -299,9 +302,9 @@ export class MatcherGPU {
   }
 
   /** GPU buffers of a FeatureSet's descriptors, uploaded on first use or content change. */
-  private entry(fs: FeatureSet, st: DescriptorStats, T: MatcherGPUTimings): CacheEntry {
+  private entry(fs: FeatureSet, hash: number, T: MatcherGPUTimings): CacheEntry {
     let e = this.cache.get(fs);
-    if (e && e.alive && e.count === fs.count && e.hash === st.hash) {
+    if (e && e.alive && e.count === fs.count && e.hash === hash) {
       this.lru.delete(e);
       this.lru.add(e);
       return e;
@@ -313,11 +316,12 @@ export class MatcherGPU {
     const invBytes = Math.max(16, Math.ceil((n * 4) / 16) * 16);
     const desc = device.createBuffer({ size: descBytes, usage: STORAGE | COPY_DST, label: 'match-desc' });
     device.queue.writeBuffer(desc, 0, packDescriptorWords(fs));
+    const invNorm = descriptorInvNorms(fs);
     const inv32 = new Float32Array(n);
-    for (let i = 0; i < n; i++) inv32[i] = st.invNorm[i];
+    for (let i = 0; i < n; i++) inv32[i] = invNorm[i];
     const inv = device.createBuffer({ size: invBytes, usage: STORAGE | COPY_DST, label: 'match-inv' });
     device.queue.writeBuffer(inv, 0, inv32);
-    e = { count: n, hash: st.hash, desc, inv, bytes: descBytes + invBytes, alive: true };
+    e = { count: n, hash, invNorm, desc, inv, bytes: descBytes + invBytes, alive: true };
     this.cache.set(fs, e);
     this.lru.add(e);
     this.cacheUsed += e.bytes;
@@ -375,10 +379,8 @@ export class MatcherGPU {
     const na = a.count;
     const nb = b.count;
     const mutual = opts?.mutual ?? true;
-    const sa = descriptorStats(a);
-    const sb = a === b ? sa : descriptorStats(b);
-    const ea = this.entry(a, sa, T);
-    const eb = a === b ? ea : this.entry(b, sb, T);
+    const ea = this.entry(a, descriptorHash(a), T);
+    const eb = a === b ? ea : this.entry(b, descriptorHash(b), T);
     this.trimCache([ea, eb]);
 
     const fwd = planChunks(na, nb, this.targetWG);
@@ -460,11 +462,11 @@ export class MatcherGPU {
     const bestJ = new Int32Array(na);
     const bestDot = new Float64Array(na);
     const secondDot = new Float64Array(na);
-    reduceTop2(out, 0, na, fwd.nChunks, sa.invNorm, sb.invNorm, true, bestJ, bestDot, secondDot);
+    reduceTop2(out, 0, na, fwd.nChunks, ea.invNorm, eb.invNorm, true, bestJ, bestDot, secondDot);
     let colBestI: Int32Array | null = null;
     if (rev) {
       colBestI = new Int32Array(nb);
-      reduceTop2(out, 4 * fwdEntries, nb, rev.nChunks, sb.invNorm, sa.invNorm, false, colBestI, new Float64Array(nb), new Float64Array(nb));
+      reduceTop2(out, 4 * fwdEntries, nb, rev.nChunks, eb.invNorm, ea.invNorm, false, colBestI, new Float64Array(nb), new Float64Array(nb));
     }
     const pairs = emitMatches(na, bestJ, bestDot, secondDot, colBestI, opts);
     T.finalizeMs = performance.now() - t2;

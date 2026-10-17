@@ -175,7 +175,7 @@ export class PhotogrammetryEngine {
     this.options = { persist: false, preferGPU: true, ...options };
     this.config = config;
     this.pipelineCfgKey = pipelineKey(this.options.quality, this.options.preferGPU !== false, config);
-    this.holder = new PatchMatchHolder(this.options.preferGPU !== false);
+    this.holder = new PatchMatchHolder(this.options.preferGPU !== false, config.dense ?? {});
   }
 
   // ------------------------------------------------------------------------------------------

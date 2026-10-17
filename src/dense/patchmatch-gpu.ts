@@ -171,14 +171,17 @@ export class PatchMatchGPU {
   }
 
   /**
-   * Create the matcher and compile all pipelines for the (patchRadius, patchStep)
-   * of `opts` (all source-count buckets 4/8/12/16) up front.
+   * Create the matcher and compile the pipelines for the (patchRadius, patchStep) of
+   * `opts` up front: the source-count buckets (4/8/12/16) up to the one holding
+   * `maxSources` (default all). Larger buckets compile lazily on first use; Safari's
+   * shader compile is slow, so callers that know their source count should pass it.
    */
-  static async create(ctx: GPUContext, opts?: Partial<PatchMatchOptions>): Promise<PatchMatchGPU> {
+  static async create(ctx: GPUContext, opts?: Partial<PatchMatchOptions>, maxSources = MAX_PATCHMATCH_SOURCES): Promise<PatchMatchGPU> {
     const pm = new PatchMatchGPU(ctx, opts ?? {});
     const o = resolvePatchMatchOptions(opts);
+    const top = SOURCE_BUCKETS.find((b) => b >= maxSources) ?? MAX_PATCHMATCH_SOURCES;
     try {
-      for (const b of SOURCE_BUCKETS) await pm.getPipelines(b, o.patchRadius, o.patchStep);
+      for (const b of SOURCE_BUCKETS) if (b <= top) await pm.getPipelines(b, o.patchRadius, o.patchStep);
     } catch (e) {
       pm.destroy();
       throw e;

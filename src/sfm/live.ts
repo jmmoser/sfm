@@ -44,6 +44,11 @@ export interface LiveMapperOptions extends MapperOptions {
   globalBATimeMs: number;
   /** Pending keyframes retried after a successful registration (default 4). */
   retryPendingPerKeyframe: number;
+  /**
+   * `addKeyframe` reports the model's mean reprojection error (default true). It reprojects
+   * every observation per keyframe; the engine never reads it and turns it off (NaN then).
+   */
+  reportReprojError: boolean;
 }
 
 export const DEFAULT_LIVE_OPTIONS: Readonly<
@@ -59,6 +64,7 @@ export const DEFAULT_LIVE_OPTIONS: Readonly<
     | 'globalBAEvery'
     | 'globalBATimeMs'
     | 'retryPendingPerKeyframe'
+    | 'reportReprojError'
   >
 > = Object.freeze({
   initWindow: 30,
@@ -71,13 +77,14 @@ export const DEFAULT_LIVE_OPTIONS: Readonly<
   globalBAEvery: 15,
   globalBATimeMs: 800,
   retryPendingPerKeyframe: 4,
+  reportReprojError: true,
 });
 
 export interface LiveKeyframeResult {
   registered: boolean;
   initialized: boolean;
   numPoints: number;
-  /** Mean reprojection error (px) of the model (0 before initialisation). */
+  /** Mean reprojection error (px) of the model (0 before initialisation; NaN when not reported). */
   reprojError: number;
 }
 
@@ -161,7 +168,7 @@ export class LiveMapper {
       registered: this.rec.images.get(id)!.registered,
       initialized: this.isInit,
       numPoints: this.rec.numPoints,
-      reprojError: this.isInit ? this.rec.meanReprojectionError() : 0,
+      reprojError: !this.isInit ? 0 : this.opts.reportReprojError ? this.rec.meanReprojectionError() : NaN,
     };
   }
 

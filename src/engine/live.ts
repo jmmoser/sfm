@@ -15,7 +15,7 @@
  * `LiveMapper.addKeyframe`, vocabulary training / indexing, the R_cam_device hand-eye check,
  * 'auto' mode resolution, persistence and a `live` event with the decimated model.
  */
-import type { CameraIntrinsics, FeatureSet, FrameInfo, GeoFix, ImuSample, Mat3, MatchPairs, Pose, TwoViewGeometry } from '../core/types';
+import type { CameraIntrinsics, CancelToken, FeatureSet, FrameInfo, GeoFix, ImuSample, Mat3, MatchPairs, Pose, TwoViewGeometry } from '../core/types';
 import type { FeaturePipeline } from '../features/extractor';
 import { deserializeFeatureSet, serializeFeatureSet } from '../io/serialize';
 import { estimateTwoViewGeometry } from '../geometry/twoview';
@@ -33,7 +33,7 @@ import { LiveMapper } from '../sfm/live';
 import { rsModelFromDevice, type RollingShutterModel } from '../sfm/rolling-shutter';
 import { intrinsicsFromFov, type MapperOptions } from '../sfm/mapper';
 import type { Reconstruction } from '../sfm/reconstruction';
-import { VocabularyIndex } from '../sfm/vocab';
+import { VocabularyIndex, type BowVector } from '../sfm/vocab';
 import type { CaptureMode, FrameInput, Guidance, LiveCamera, LiveDebug, LiveUpdate, QualityPreset, TrackingState } from '../workers/protocol';
 import {
   OrientationTracker,
@@ -429,6 +429,7 @@ export class LiveSession {
     this.mapper = new LiveMapper(this.state.db, this.state.graph, {
       hfovPriorDeg: deps.hfovPriorDeg ?? 69,
       rotationCheck: this.rotationCheck(),
+      reportReprojError: false, // never read here; a full reprojection per keyframe
       ...(deps.config.live ?? {}),
     });
   }
@@ -1185,14 +1186,34 @@ export class LiveSession {
 
   /** Matching + verification of a keyframe pair (a < b in capture order). */
   async matchPair(a: number, b: number, opts: { maxIterations?: number } = {}): Promise<TwoViewGeometry | null> {
+    const m = await this.putativeMatches(a, b);
+    return m ? this.verifyPair(a, b, m, opts) : null;
+  }
+
+  /**
+   * GPU half of `matchPair`: putative matches of a keyframe pair, null when a set is missing or
+   * too small. Split from `verifyPair` so a caller can match the next pair while it verifies this
+   * one (refine): still one GPU job at a time, queued on the engine's GPU chain. A job that
+   * reaches the GPU after `cancel` is set does no work and returns null.
+   */
+  async putativeMatches(a: number, b: number, cancel?: CancelToken): Promise<MatchPairs | null> {
+    const st = this.state;
+    const fa = st.db.features.get(a);
+    const fb = st.db.features.get(b);
+    if (!fa || !fb || !st.records.has(a) || !st.records.has(b) || fa.count < 8 || fb.count < 8) return null;
+    // the pipeline is read when the job runs: a GPU-loss recovery queued ahead of a prefetched
+    // job has replaced it by then
+    return this.deps.gpu(async () => (cancel?.cancelled ? null : this.deps.pipeline().match(fa, fb)));
+  }
+
+  /** CPU half of `matchPair`: two-view verification of putative matches and the gyro gate. */
+  verifyPair(a: number, b: number, m: MatchPairs, opts: { maxIterations?: number } = {}): TwoViewGeometry | null {
     const st = this.state;
     const fa = st.db.features.get(a);
     const fb = st.db.features.get(b);
     const ra = st.records.get(a);
     const rb = st.records.get(b);
-    if (!fa || !fb || !ra || !rb || fa.count < 8 || fb.count < 8) return null;
-    const pipeline = this.deps.pipeline();
-    const m = await this.deps.gpu(() => pipeline.match(fa, fb));
+    if (!fa || !fb || !ra || !rb) return null;
     if (m.length >> 1 < this.minPairInliers) return null;
     const ca = this.intrinsics(ra.width, ra.height);
     const cb = this.intrinsics(rb.width, rb.height);
@@ -1228,9 +1249,11 @@ export class LiveSession {
       cands.push({ other: o, speculative: false });
       chosen.add(o);
     }
-    // vocabulary retrieval
-    if (st.vocab && nRet > 0) {
-      const res = st.vocab.query(fs, nRet + 4, (x: number) => chosen.has(x));
+    // vocabulary retrieval (the BoW is kept for indexing this keyframe below: quantised once)
+    let bow: { vocab: VocabularyIndex; bow: BowVector } | null = null;
+    if (st.vocab && st.vocab.size > 0 && nRet > 0) {
+      bow = { vocab: st.vocab, bow: st.vocab.computeBow(fs) };
+      const res = st.vocab.query(bow.bow, nRet + 4, (x: number) => chosen.has(x));
       let k = 0;
       for (const r of res) {
         if (k >= nRet || !(r.score > 0)) break;
@@ -1273,7 +1296,7 @@ export class LiveSession {
     this.consecutiveUnregistered = res.registered ? 0 : this.consecutiveUnregistered + 1;
     this.modelVersion++;
     // vocabulary: train once enough keyframes exist, then index incrementally
-    this.updateVocabulary(id);
+    this.updateVocabulary(id, bow);
     this.maybeVerifyCameraFromDevice();
     this.maybeCalibrateGyro();
     this.maybeResolveMode();
@@ -1348,7 +1371,8 @@ export class LiveSession {
     return d;
   }
 
-  private updateVocabulary(id: number): void {
+  /** `bow`: the keyframe's BoW from retrieval, reused when computed with the current vocabulary. */
+  private updateVocabulary(id: number, bow: { vocab: VocabularyIndex; bow: BowVector } | null = null): void {
     const st = this.state;
     const vc = this.deps.config.vocabulary ?? {};
     const trainAfter = vc.trainAfter ?? ENGINE_DEFAULTS.vocabularyTrainAfter;
@@ -1363,7 +1387,10 @@ export class LiveSession {
         st.vocabTrainedOn = ids;
         this.track(this.deps.store.putBinary('vocab', st.vocab.exportCodebook()));
         this.deps.log('info', `vocabulary trained on ${ids.length} keyframes (${st.vocab.numWords} words, ${Math.round(now() - t0)} ms)`);
-      } else if (!st.vocab.has(id)) st.vocab.add(id, st.db.features.get(id)!);
+      } else if (!st.vocab.has(id)) {
+        if (bow && bow.vocab === st.vocab) st.vocab.addBow(id, bow.bow);
+        else st.vocab.add(id, st.db.features.get(id)!);
+      }
     } catch (e) {
       this.deps.log('warn', `vocabulary update failed: ${(e as Error)?.message ?? e}`);
     }
