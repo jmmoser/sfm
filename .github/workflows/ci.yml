@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'claude/**']
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Typecheck
+        run: npx tsc --noEmit -p tsconfig.json
+      - name: Unit tests (Node)
+        # Timing assertions in perf tests are relaxed on shared CI runners.
+        env:
+          PERF_SLACK: '4'
+        run: npx vitest run --project unit
+      - name: Build
+        run: npx vite build

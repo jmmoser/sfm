@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Engine harness</title>
+    <style>
+      :root { color-scheme: dark; }
+      body { margin: 0; padding: 16px; font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background: #111; color: #ddd; }
+      h1 { font: 600 15px/1.3 system-ui, sans-serif; margin: 0 0 8px; }
+      #status { color: #9cf; margin-bottom: 8px; white-space: pre-wrap; }
+      pre { white-space: pre-wrap; word-break: break-word; margin: 0 0 12px; }
+      #log { max-height: 50vh; overflow: auto; color: #aaa; }
+    </style>
+  </head>
+  <body>
+    <h1>Engine harness</h1>
+    <!-- window.runPipeline(config): see src/harness/engine/main.ts; driven by e2e/run-e2e.mjs.
+         Manual: harness.html?dataset=object&engine=mock&maxFrames=40&densify=1 -->
+    <div id="status">loading…</div>
+    <pre id="log"></pre>
+    <pre id="result"></pre>
+    <script type="module" src="/src/harness/engine/main.ts"></script>
+  </body>
+</html>

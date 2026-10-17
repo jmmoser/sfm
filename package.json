@@ -9,12 +9,15 @@
     "build": "tsc --noEmit -p tsconfig.json && vite build",
     "preview": "vite preview --host",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "test:gpu": "node e2e/run-gpu-tests.mjs",
-    "e2e": "node e2e/run-e2e.mjs"
+    "test": "vitest run --project unit",
+    "test:gpu": "vitest run --project gpu",
+    "test:all": "vitest run",
+    "test:watch": "vitest --project unit",
+    "synth": "node e2e/generate-synth.mjs",
+    "e2e": "node e2e/run-e2e.mjs",
+    "e2e:dense-gt": "node e2e/run-dense-gt.mjs",
+    "ui:smoke": "node e2e/ui/smoke.mjs"
   },
-  "license": "MIT",
   "dependencies": {
     "three": "^0.186.1"
   },

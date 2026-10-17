@@ -1,0 +1,611 @@
+#!/usr/bin/env node
+/**
+ * UI edge states at iPhone size, each in a fresh context (isolated storage), with screenshots in
+ * e2e/out/ui/state-*.png:
+ *   engine-missing   real EngineClient + a stub worker that answers NotImplementedError (a build
+ *                    without the engine) → clear "engine unavailable" card
+ *   install-hint     iOS Safari UA, not standalone → "Install to Home Screen" card
+ *   cpu-mode         no WebGPU → "CPU mode — slower" banner
+ *   lockdown         no WebGPU, camera, IndexedDB → Lockdown Mode explanation, New scan disabled
+ *   camera-denied    getUserMedia NotAllowedError → recovery card
+ *   landscape        capture UI in landscape (852×393)
+ *   interrupted      page hidden during capture → paused, resume needs a tap
+ *   processing-error refine fails → error banner with retry
+ *   storage-full-start   IndexedDB quota exceeded → the scan is blocked with an explanation
+ *   storage-full-capture keyframes cannot be stored → capture pauses, "Finish scan" works
+ *   engine-dead      EngineClient gave up (respawn cap) → error card, no toast storm
+ *   export-reopen    export finishes while its sheet is closed → the reopened sheet shows Save
+ *   open-other-session processing a stored scan after viewing another: no stale name / stages
+ *   focus            keyboard navigation moves focus to the new screen's heading
+ *   raw-overlay      a RAW sensor buffer (landscape bitmap in the portrait UI: the headless fake
+ *                    camera) gets its keypoint overlay turned onto the upright preview
+ *   finish-stuck     finishCapture hangs and ignores cancel → Cancel aborts it (engine restart),
+ *                    "Process now" reconstructs the scan
+ *   finish-stuck-home  same, "Back to home" keeps the scan (status captured)
+ *   finish-stuck-discard  finishCapture hangs, X (keyboard) → Discard: the scan is deleted only after the
+ *                    engine let go of it (no re-opening restart), a new scan starts right away
+ *   memory-limit     the engine's capture memory cap → "Memory limit reached — finish scan now?",
+ *                    Continue (tracking only) adds no keyframes, Finish works
+ *   dense-resume     an interrupted densify (loadSession stats.denseResumablePass) → "Resume dense
+ *                    reconstruction" in the viewer + Build sheet; a densify cancelled here too
+ *   dense-resume-quality  the interrupted run used another preset than the scan (stats
+ *                    denseResumableQuality): the resume uses that preset
+ *   info-sheet       Model info: magnetic-north note for compass yaw, engine memory section
+ * Usage: node e2e/ui/states.mjs [name ...] [--verbose]
+ */
+import { launch, layoutAudit, shot, sleep } from './lib.mjs';
+
+const args = process.argv.slice(2).filter((a) => !a.startsWith('--'));
+const want = (n) => !args.length || args.includes(n);
+const { newPage, close, consoleErrors, base } = await launch({ verbose: process.argv.includes('--verbose') });
+const failures = [];
+const check = (cond, msg) => {
+  if (!cond) {
+    failures.push(msg);
+    console.error(`[states] FAIL: ${msg}`);
+  } else console.log(`[states] ok: ${msg}`);
+};
+const by = (page, id) => page.locator(`[data-testid="${id}"]`);
+
+async function startCapture(page, url) {
+  await page.goto(url);
+  await by(page, 'new-scan').tap();
+  await by(page, 'start-capture').tap();
+  await page.waitForSelector('.capture');
+}
+
+async function holdShot(page, name) {
+  await page.evaluate(() => globalThis.__sfmApp?.debug.holdFrames?.(true));
+  await sleep(600);
+  await shot(page, name);
+  await page.evaluate(() => globalThis.__sfmApp?.debug.holdFrames?.(false));
+}
+
+async function scenario(name, fn) {
+  if (!want(name)) return;
+  console.log(`[states] — ${name}`);
+  try {
+    await fn();
+  } catch (e) {
+    failures.push(`${name}: ${e?.message ?? e}`);
+    console.error(e);
+  }
+}
+
+await scenario('engine-missing', async () => {
+  const { page, context } = await newPage();
+  // The real engine worker exists now: serve a stub module in its place that answers every
+  // request like the old placeholder did (NotImplementedError).
+  await context.route(/engine\.worker\.ts/, (route) =>
+    route.fulfill({
+      contentType: 'text/javascript',
+      body: `self.onmessage = (ev) => { const r = ev.data; if (r && typeof r.id === 'number') self.postMessage({ id: r.id, ok: false, error: { name: 'NotImplementedError', message: 'engine not implemented yet' } }); };`,
+    }),
+  );
+  await startCapture(page, base);
+  await page.waitForSelector('[data-testid="capture-error"]', { timeout: 60000 });
+  const text = await page.locator('[data-testid="capture-error"]').textContent();
+  check(/engine not implemented yet/i.test(text ?? ''), 'placeholder worker error is shown');
+  await shot(page, 'state-engine-missing');
+  await by(page, 'capture-back').tap();
+  await by(page, 'new-scan').waitFor();
+  check(true, 'back to home from the error card');
+  await context.close();
+  // The stub worker answers with an error: expected console noise is none.
+});
+
+await scenario('install-hint', async () => {
+  const { page, context } = await newPage({ iphoneUA: true });
+  await page.goto(`${base}?mock=1`);
+  await by(page, 'install-hint').waitFor({ timeout: 10000 });
+  await sleep(400);
+  await page.evaluate(() => document.querySelector('.home')?.scrollTo(0, 2000));
+  await sleep(300);
+  await shot(page, 'state-install-hint');
+  check(true, 'install hint visible on iOS Safari (not standalone)');
+  await context.close();
+});
+
+await scenario('cpu-mode', async () => {
+  const { page, context } = await newPage({ initScript: () => Object.defineProperty(Navigator.prototype, 'gpu', { get: () => undefined, configurable: true }) });
+  await page.goto(`${base}?mock=1`);
+  await by(page, 'env-webgpu').waitFor({ timeout: 10000 });
+  check(!(await by(page, 'new-scan').isDisabled()), 'scanning still allowed in CPU mode');
+  await sleep(300);
+  await shot(page, 'state-cpu-mode');
+  await context.close();
+});
+
+await scenario('lockdown', async () => {
+  const { page, context } = await newPage({
+    initScript: () => {
+      Object.defineProperty(Navigator.prototype, 'gpu', { get: () => undefined, configurable: true });
+      Object.defineProperty(Navigator.prototype, 'mediaDevices', { get: () => undefined, configurable: true });
+      Object.defineProperty(globalThis, 'indexedDB', { get: () => undefined, configurable: true });
+    },
+  });
+  await page.goto(`${base}?mock=1`);
+  await by(page, 'env-lockdown').waitFor({ timeout: 10000 });
+  check(await by(page, 'new-scan').isDisabled(), 'New scan disabled under Lockdown Mode');
+  await sleep(300);
+  await shot(page, 'state-lockdown');
+  await context.close();
+});
+
+await scenario('camera-denied', async () => {
+  const { page, context } = await newPage({
+    initScript: () => {
+      const md = navigator.mediaDevices;
+      if (md) md.getUserMedia = () => Promise.reject(new DOMException('Permission denied', 'NotAllowedError'));
+    },
+  });
+  await startCapture(page, `${base}?mock=1`);
+  await page.waitForSelector('[data-testid="capture-error"]', { timeout: 30000 });
+  const text = await page.locator('[data-testid="capture-error"]').textContent();
+  check(/Camera access is off/.test(text ?? ''), 'denied camera explains how to allow it');
+  await shot(page, 'state-camera-denied');
+  await context.close();
+});
+
+await scenario('landscape', async () => {
+  const { page, context } = await newPage({ contextOptions: { viewport: { width: 852, height: 393 } } });
+  await startCapture(page, `${base}?mock=1&mockSpeed=3`);
+  await page.waitForFunction(() => Number(document.querySelector('[data-testid="kf-count"]')?.textContent) >= 6, null, { timeout: 90000 });
+  await holdShot(page, 'state-landscape');
+  const box = await by(page, 'finish').boundingBox();
+  check(!!box && box.x > 852 - 150, 'controls move to the right edge in landscape');
+  await context.close();
+});
+
+await scenario('interrupted', async () => {
+  const { page, context } = await newPage();
+  await startCapture(page, `${base}?mock=1&mockSpeed=3`);
+  await page.waitForFunction(() => document.querySelector('.capture')?.getAttribute('data-phase') === 'running', null, { timeout: 45000 });
+  const setHidden = (hidden) =>
+    page.evaluate((h) => {
+      Object.defineProperty(document, 'hidden', { value: h, configurable: true });
+      Object.defineProperty(document, 'visibilityState', { value: h ? 'hidden' : 'visible', configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+    }, hidden);
+  await setHidden(true);
+  await page.waitForFunction(() => document.querySelector('.capture')?.getAttribute('data-phase') === 'interrupted');
+  await setHidden(false);
+  await by(page, 'resume').waitFor({ timeout: 10000 });
+  await page.evaluate(() => document.querySelector('video')?.pause());
+  await sleep(300);
+  await shot(page, 'state-interrupted');
+  await by(page, 'resume').tap();
+  await page.waitForFunction(() => document.querySelector('.capture')?.getAttribute('data-phase') === 'running', null, { timeout: 15000 });
+  check(true, 'resume from the tap after an interruption');
+  await context.close();
+});
+
+await scenario('processing-error', async () => {
+  const { page, context } = await newPage();
+  await startCapture(page, `${base}?mock=1&mockSpeed=3&mockFail=refine:Not enough overlap between photos`);
+  await page.waitForFunction(() => Number(document.querySelector('[data-testid="kf-count"]')?.textContent) >= 6, null, { timeout: 90000 });
+  await by(page, 'finish').tap();
+  await by(page, 'processing-error').waitFor({ timeout: 30000 });
+  const text = await by(page, 'processing-error').textContent();
+  check(/Not enough overlap/.test(text ?? ''), 'processing error message shown');
+  await sleep(400);
+  await shot(page, 'state-processing-error');
+  await context.close();
+});
+
+/** Seed a finished (meshed) scan into IndexedDB so the Viewer opens without a capture. */
+async function seedMeshed(page, name = 'Seeded vase') {
+  await page.evaluate(async (n) => {
+    const { SessionStore } = await import('/src/io/storage.ts');
+    const s = await SessionStore.open();
+    await s.createSession({ id: 'seed-meshed', name: n, mode: 'object', status: 'meshed', stats: { quality: 'fast', keyframes: 20 } });
+  }, name);
+  await page.reload();
+}
+
+await scenario('storage-full-start', async () => {
+  const { page, context } = await newPage();
+  await page.goto(`${base}?mock=1&mockSpeed=3`);
+  await by(page, 'new-scan').waitFor();
+  // From now on every IndexedDB write fails like a full origin quota.
+  await page.evaluate(() => {
+    IDBObjectStore.prototype.add = function () {
+      throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
+    };
+    IDBObjectStore.prototype.put = IDBObjectStore.prototype.add;
+  });
+  await by(page, 'new-scan').tap();
+  await by(page, 'start-capture').tap();
+  await page.waitForSelector('[data-testid="capture-error"]', { timeout: 30000 });
+  const text = await page.locator('[data-testid="capture-error"]').textContent();
+  check(/Storage is full/.test(text ?? ''), 'a full storage blocks the scan at the start with an explanation');
+  check((await page.locator('.capture').getAttribute('data-phase')) === 'error', 'no frames are processed when the scan cannot be saved');
+  await shot(page, 'state-storage-full-start');
+  await by(page, 'capture-back').tap();
+  await by(page, 'new-scan').waitFor();
+  await context.close();
+});
+
+await scenario('storage-full-capture', async () => {
+  const { page, context } = await newPage();
+  await startCapture(page, `${base}?mock=1&mockSpeed=3`);
+  await page.waitForFunction(() => Number(document.querySelector('[data-testid="kf-count"]')?.textContent) >= 6, null, { timeout: 90000 });
+  // The engine can no longer store keyframes.
+  await page.evaluate(() => {
+    const e = globalThis.__sfmApp.engine;
+    e.processFrame = async (f) => {
+      f.bitmap.close?.();
+      const err = new Error('Storage quota exceeded while storing a keyframe');
+      err.name = 'StorageQuotaError';
+      throw err;
+    };
+  });
+  await by(page, 'capture-storage-full').waitFor({ timeout: 15000 });
+  check((await page.locator('.capture').getAttribute('data-phase')) === 'paused', 'capture pauses when keyframes cannot be stored');
+  await holdShot(page, 'state-storage-full-capture');
+  await page.locator('[data-testid="capture-storage-full"] button', { hasText: 'Finish scan' }).tap();
+  await page.waitForSelector('.processing', { timeout: 20000 });
+  check(true, 'the scan can be finished with the keyframes captured so far');
+  await context.close();
+});
+
+await scenario('engine-dead', async () => {
+  const { page, context } = await newPage();
+  await startCapture(page, `${base}?mock=1&mockSpeed=3`);
+  await page.waitForFunction(() => Number(document.querySelector('[data-testid="kf-count"]')?.textContent) >= 2, null, { timeout: 90000 });
+  // EngineClient after the respawn cap: state 'dead', every call rejects with EngineCrashedError.
+  await page.evaluate(() => {
+    const e = globalThis.__sfmApp.engine;
+    Object.defineProperty(e, 'status', { get: () => ({ state: 'dead', respawns: 3, reason: 'gpu-lost' }), configurable: true });
+    e.processFrame = async (f) => {
+      f.bitmap.close?.();
+      const err = new Error('Engine stopped after repeated failures (gpu-lost)');
+      err.name = 'EngineCrashedError';
+      throw err;
+    };
+  });
+  await page.waitForSelector('[data-testid="capture-error"]', { timeout: 15000 });
+  const text = await page.locator('[data-testid="capture-error"]').textContent();
+  check(/Processing engine stopped/.test(text ?? ''), 'a dead engine stops the capture with an error card');
+  const toasts = await page.locator('.toast').count();
+  check(toasts <= 1, `no toast storm from failing frames (${toasts} toasts)`);
+  await shot(page, 'state-engine-dead');
+  await context.close();
+});
+
+await scenario('export-reopen', async () => {
+  const { page, context } = await newPage();
+  await page.goto(`${base}?mock=1`);
+  await by(page, 'new-scan').waitFor();
+  await seedMeshed(page);
+  await by(page, 'session-item').first().tap();
+  await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  // A slow export (big model): close the sheet while it is being built, then open it again.
+  await page.evaluate(() => {
+    const e = globalThis.__sfmApp.engine;
+    const orig = e.exportModel.bind(e);
+    e.exportModel = async (f) => {
+      await new Promise((r) => setTimeout(r, 1500));
+      return orig(f);
+    };
+  });
+  await by(page, 'tool-export').tap();
+  await by(page, 'export-prepare-glb').tap();
+  await page.locator('.sheet-close').last().tap();
+  await page.waitForFunction(() => !document.querySelector('.sheet-wrap'), null, { timeout: 5000 });
+  await by(page, 'tool-export').tap();
+  await by(page, 'sheet-export').waitFor();
+  await by(page, 'export-save-glb').waitFor({ timeout: 10000 });
+  check(true, 'an export finished while the sheet was closed shows its Save button in the reopened sheet');
+  await context.close();
+});
+
+await scenario('open-other-session', async () => {
+  const { page, context } = await newPage();
+  await page.goto(`${base}?mock=1&mockSpeed=4`);
+  await by(page, 'new-scan').waitFor();
+  await page.evaluate(async () => {
+    const { SessionStore } = await import('/src/io/storage.ts');
+    const s = await SessionStore.open();
+    await s.createSession({ id: 'a-meshed', name: 'Alpha vase', mode: 'object', status: 'meshed', stats: { quality: 'max', keyframes: 20 } });
+    await s.createSession({ id: 'b-captured', name: 'Beta yard', mode: 'scene', status: 'captured', stats: { quality: 'fast', keyframes: 20 } });
+  });
+  await page.reload();
+  await page.locator('[data-testid="session-item"]', { hasText: 'Alpha vase' }).tap();
+  await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  await by(page, 'viewer-back').tap();
+  // Process the other (captured) scan: the screen must not show Alpha's name / built stages.
+  await page.locator('[data-testid="session-item"]', { hasText: 'Beta yard' }).tap();
+  await page.waitForSelector('.processing');
+  const early = await page.evaluate(() => document.querySelector('.processing .topbar-title')?.textContent);
+  check(early !== 'Alpha vase', `processing never shows the previous scan's name (got "${early}")`);
+  await page.waitForFunction(() => document.querySelector('.processing .topbar-title')?.textContent === 'Beta yard', null, { timeout: 15000 });
+  const st = await page.evaluate(() => ({
+    depth: document.querySelector('[data-testid="stage-depth_maps"]')?.getAttribute('data-status'),
+    sub: document.querySelector('.processing .topbar-sub')?.textContent,
+  }));
+  check(st.depth === 'skipped', `stages of the other scan are not shown as built (depth maps: ${st.depth})`);
+  check(st.sub === 'Fast quality', `quality of the opened scan (got "${st.sub}")`);
+  await context.close();
+});
+
+await scenario('focus', async () => {
+  const { page, context } = await newPage();
+  await page.goto(`${base}?mock=1`);
+  await by(page, 'new-scan').focus();
+  await page.keyboard.press('Enter');
+  await by(page, 'start-capture').waitFor();
+  const active = await page.evaluate(() => ({ tag: document.activeElement?.tagName, text: document.activeElement?.textContent, inOld: !!document.activeElement?.closest('.screen-exit') }));
+  check(active.tag === 'H1' && active.text === 'New scan' && !active.inOld, `focus moves to the new screen's heading (got ${active.tag} "${active.text}")`);
+  const exiting = await page.evaluate(() => [...document.querySelectorAll('.screen-exit')].every((el) => el.inert));
+  check(exiting, 'the exiting screen is inert');
+  await context.close();
+});
+
+async function audit(page, name) {
+  const problems = await page.evaluate(layoutAudit);
+  for (const p of problems) check(false, `${name}: ${p}`);
+}
+
+const kf = (page) => page.evaluate(() => Number(document.querySelector('[data-testid="kf-count"]')?.textContent));
+
+await scenario('raw-overlay', async () => {
+  const { page, context } = await newPage();
+  await startCapture(page, `${base}?mock=1&mockSpeed=3`);
+  await page.waitForFunction(() => document.querySelector('.capture')?.getAttribute('data-phase') === 'running', null, { timeout: 45000 });
+  // Every LiveUpdate gets two keypoints at known raw-buffer positions: (0.9, 0.5) and (0.1, 0.5).
+  await page.evaluate(() => {
+    const em = globalThis.__sfmApp.engine.live;
+    const orig = em.emit.bind(em);
+    em.emit = (u) => orig({ ...u, overlay: new Float32Array([0.9, 0.5, 0.1, 0.5]) });
+  });
+  const info = await page.evaluate(() => {
+    const v = document.querySelector('video');
+    return { w: v.videoWidth, h: v.videoHeight, angle: screen.orientation?.angle ?? 0, vw: innerWidth, vh: innerHeight };
+  });
+  check(info.w > info.h && info.angle === 0, `fake camera delivers landscape frames in the portrait UI (${info.w}×${info.h}, θ ${info.angle}) — raw buffers`);
+  // Raw buffers are upright for θ = 90: one clockwise turn onto the portrait preview →
+  // (0.9, 0.5) → (0.5, 0.9) and (0.1, 0.5) → (0.5, 0.1): bottom-centre and top-centre.
+  // Unrotated (the old mapping) both would lie outside the cropped preview.
+  const found = await page.waitForFunction(
+    ({ vw, vh }) => {
+      const c = document.querySelector('.capture-overlay');
+      if (!c || !c.width) return false;
+      const ctx = c.getContext('2d');
+      const s = c.width / vw;
+      const hit = (x, y) => {
+        const d = ctx.getImageData(Math.round(x * s) - 3, Math.round(y * s) - 3, 7, 7).data;
+        for (let i = 3; i < d.length; i += 4) if (d[i] > 0) return true;
+        return false;
+      };
+      return hit(vw / 2, 0.9 * vh) && hit(vw / 2, 0.1 * vh) ? true : false;
+    },
+    { vw: info.vw, vh: info.vh },
+    { timeout: 20000, polling: 100 },
+  ).then(() => true, () => false);
+  check(found, 'raw-buffer keypoints are drawn at their rotated positions (bottom-centre, top-centre)');
+  await holdShot(page, 'state-raw-overlay');
+  await context.close();
+});
+
+async function stuckFinish(page) {
+  await startCapture(page, `${base}?mock=1&mockSpeed=3&mockStall=finishCapture`);
+  await page.waitForFunction(() => Number(document.querySelector('[data-testid="kf-count"]')?.textContent) >= 6, null, { timeout: 90000 });
+  await by(page, 'finish').tap();
+  await by(page, 'capture-finishing').waitFor({ timeout: 10000 });
+  check(await by(page, 'finish-cancel').isHidden(), 'no Cancel during a normal-length finish');
+  await by(page, 'finish-cancel').waitFor({ state: 'visible', timeout: 10000 });
+  await sleep(1200); // a progress message arrives (the stalled engine keeps reporting)
+  const text = await by(page, 'capture-finishing').textContent();
+  check(/mapping 2 keyframes|Still mapping/i.test(text ?? ''), `finishing card explains the wait ("${text?.replace(/\s+/g, ' ').trim()}")`);
+  await shot(page, 'state-finish-stuck');
+  await audit(page, 'finish-stuck');
+  const t0 = Date.now();
+  await by(page, 'finish-cancel').tap();
+  await by(page, 'capture-finish-stopped').waitFor({ timeout: 15000 });
+  const dt = Date.now() - t0;
+  check(dt < 9000, `a stuck finishCapture is aborted within the grace period (${(dt / 1000).toFixed(1)} s)`);
+  const card = await by(page, 'capture-finish-stopped').textContent();
+  check(/Engine restarted/.test(card ?? ''), 'the abort restarted the engine (it ignored the cancel)');
+  const toasts = await page.locator('.toast', { hasText: 'restarted after an error' }).count();
+  check(toasts === 0, 'no "restarted after an error" toast for a user abort');
+  await shot(page, 'state-finish-stopped');
+  await audit(page, 'finish-stopped');
+}
+
+await scenario('finish-stuck', async () => {
+  const { page, context } = await newPage();
+  await stuckFinish(page);
+  await by(page, 'finish-process').tap();
+  await page.waitForSelector('.processing', { timeout: 20000 });
+  await page.waitForSelector('.viewer-screen', { timeout: 120000 });
+  check(true, '"Process now" after an aborted finish reconstructs the scan');
+  await context.close();
+});
+
+await scenario('finish-stuck-home', async () => {
+  const { page, context } = await newPage();
+  await stuckFinish(page);
+  await by(page, 'finish-home').tap();
+  await by(page, 'session-item').first().waitFor({ timeout: 15000 });
+  const status = await page.evaluate(async () => {
+    const { SessionStore } = await import('/src/io/storage.ts');
+    const s = await SessionStore.open();
+    const list = await s.listSessions();
+    return list.map((m) => m.status);
+  });
+  check(status.length === 1 && status[0] === 'captured', `the scan is kept as captured (got ${JSON.stringify(status)})`);
+  await context.close();
+});
+
+await scenario('finish-stuck-discard', async () => {
+  const { page, context } = await newPage();
+  await startCapture(page, `${base}?mock=1&mockSpeed=3&mockStall=finishCapture`);
+  await page.waitForFunction(() => Number(document.querySelector('[data-testid="kf-count"]')?.textContent) >= 6, null, { timeout: 90000 });
+  await by(page, 'finish').tap();
+  await by(page, 'capture-finishing').waitFor({ timeout: 10000 });
+  await sleep(500);
+  // the finishing card covers the X for touch; keyboard / VoiceOver still reach it
+  await by(page, 'capture-cancel').evaluate((el) => el.click());
+  await by(page, 'dialog-confirm').tap();
+  // the stuck step is aborted first (≤ 4 s grace): the deletion waits, the card says so
+  await by(page, 'capture-discarding').waitFor({ timeout: 5000 });
+  await shot(page, 'state-finish-stuck-discard');
+  await by(page, 'new-scan').waitFor({ timeout: 15000 });
+  const list = async () =>
+    page.evaluate(async () => {
+      const { SessionStore } = await import('/src/io/storage.ts');
+      return (await (await SessionStore.open()).listSessions()).map((m) => m.id);
+    });
+  check((await list()).length === 0, 'the discarded scan is deleted');
+  check((await page.evaluate(() => globalThis.__sfmApp.engine.status.state)) === 'idle', 'the restart did not re-open the discarded session');
+  // a new scan right away works (no rejected init)
+  await by(page, 'new-scan').tap();
+  await by(page, 'start-capture').tap();
+  await page.waitForFunction(() => Number(document.querySelector('[data-testid="kf-count"]')?.textContent) >= 2, null, { timeout: 60000 });
+  check(true, 'a new scan starts right after the discard');
+  check((await list()).length === 1, 'only the new scan is stored');
+  await context.close();
+});
+
+async function memoryLimit(page, name) {
+  await startCapture(page, `${base}?mock=1&mockSpeed=3&mockMemoryLimit=6`);
+  await by(page, 'capture-memory-limit').waitFor({ timeout: 90000 });
+  check((await page.locator('.capture').getAttribute('data-phase')) === 'paused', `${name}: the capture pauses at the memory limit`);
+  const text = await by(page, 'capture-memory-limit').textContent();
+  check(/Memory limit reached — finish scan now\?/.test(text ?? ''), `${name}: the prompt asks to finish now`);
+  await holdShot(page, `state-${name}`);
+  await audit(page, name);
+}
+
+await scenario('memory-limit', async () => {
+  const { page, context } = await newPage();
+  await memoryLimit(page, 'memory-limit');
+  await by(page, 'memory-continue').tap();
+  await page.waitForFunction(() => document.querySelector('.capture')?.getAttribute('data-phase') === 'running', null, { timeout: 10000 });
+  check(await by(page, 'memory-limited').isVisible(), '"Tracking only" chip after Continue');
+  const before = await kf(page);
+  await sleep(5000);
+  const after = await kf(page);
+  check(before === 6 && after === 6, `no new keyframes while tracking only (${before} → ${after})`);
+  check((await page.locator('[data-testid="capture-memory-limit"]').count()) === 0, 'the prompt is shown once');
+  await holdShot(page, 'state-memory-limit-tracking');
+  await by(page, 'finish').tap();
+  await page.waitForSelector('.processing', { timeout: 20000 });
+  check(true, 'Finish works after continuing with tracking only');
+  await context.close();
+  // Landscape: the prompt fits and its "Finish scan" leads to processing.
+  const l = await newPage({ contextOptions: { viewport: { width: 852, height: 393 } } });
+  await memoryLimit(l.page, 'memory-limit-landscape');
+  await by(l.page, 'memory-finish').tap();
+  await l.page.waitForSelector('.processing', { timeout: 20000 });
+  check(true, '"Finish scan" from the memory prompt');
+  await l.context.close();
+});
+
+await scenario('dense-resume', async () => {
+  const { page, context } = await newPage();
+  // Slow stages: the resumed densify must still be running when Cancel is tapped.
+  await page.goto(`${base}?mock=1&mockSpeed=0.3`);
+  await by(page, 'new-scan').waitFor();
+  await page.evaluate(async () => {
+    const { SessionStore } = await import('/src/io/storage.ts');
+    const s = await SessionStore.open();
+    await s.createSession({ id: 'seed-resume', name: 'Garden wall', mode: 'scene', status: 'sparse', stats: { quality: 'balanced', keyframes: 30, denseResumablePass: 1 } });
+  });
+  await page.reload();
+  await by(page, 'session-item').first().tap();
+  await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  await by(page, 'dense-resume').waitFor({ state: 'visible', timeout: 5000 });
+  await sleep(800);
+  await shot(page, 'state-dense-resume');
+  await audit(page, 'dense-resume viewer');
+  await by(page, 'tool-build').tap();
+  await by(page, 'build-dense-resume').waitFor({ timeout: 5000 });
+  const item = await by(page, 'build-dense-resume').textContent();
+  check(/Resume dense reconstruction/.test(item ?? ''), 'Build sheet offers "Resume dense reconstruction"');
+  await sleep(400);
+  await shot(page, 'state-dense-resume-build');
+  await audit(page, 'dense-resume build sheet');
+  // Another quality starts over: the item says so.
+  await page.locator('.segment[data-value="fast"]').tap();
+  const changed = await by(page, 'build-dense-resume').textContent();
+  check(/Starts over at Fast quality/.test(changed ?? ''), 'another quality explains that it starts over');
+  await page.locator('.segment[data-value="balanced"]').tap();
+  await by(page, 'build-dense').tap();
+  await page.waitForSelector('.processing', { timeout: 20000 });
+  check((await page.locator('.proc-title').textContent()) === 'Resuming dense cloud', 'processing says it resumes');
+  // Cancel the resumed densify: the viewer offers to resume again.
+  await page.waitForSelector('[data-testid="stage-depth_maps"][data-status="active"]', { timeout: 20000 });
+  await by(page, 'processing-cancel').tap();
+  await by(page, 'dialog-confirm').tap();
+  await page.waitForSelector('.viewer-screen', { timeout: 20000 });
+  await by(page, 'dense-resume').waitFor({ state: 'visible', timeout: 10000 });
+  check(true, 'a densify cancelled in Processing is resumable from the viewer');
+  await by(page, 'dense-resume-button').tap();
+  await page.waitForSelector('.processing', { timeout: 20000 });
+  await page.waitForSelector('.viewer-screen', { timeout: 120000 });
+  await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  await sleep(500);
+  check(await by(page, 'dense-resume').isHidden(), 'no resume offer once the dense cloud exists');
+  await context.close();
+});
+
+await scenario('dense-resume-quality', async () => {
+  const { page, context } = await newPage();
+  await page.goto(`${base}?mock=1&mockSpeed=2`);
+  await by(page, 'new-scan').waitFor();
+  await page.evaluate(async () => {
+    const { SessionStore } = await import('/src/io/storage.ts');
+    const s = await SessionStore.open();
+    // captured at Balanced; the densify that was interrupted ran at Max
+    await s.createSession({ id: 'seed-resume-q', name: 'Fence', mode: 'scene', status: 'sparse', stats: { quality: 'balanced', keyframes: 30, denseResumablePass: 1, denseResumableQuality: 'max' } });
+  });
+  await page.reload();
+  await by(page, 'session-item').first().tap();
+  await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  await by(page, 'dense-resume').waitFor({ state: 'visible', timeout: 5000 });
+  check(/Max quality/.test((await by(page, 'dense-resume').textContent()) ?? ''), 'the resume offer names the interrupted run’s quality');
+  await by(page, 'tool-build').tap();
+  await by(page, 'build-dense-resume').waitFor({ timeout: 5000 });
+  const item = await by(page, 'build-dense-resume').textContent();
+  check(/Resume dense reconstruction/.test(item ?? '') && /continues from the saved depth maps/.test(item ?? ''), 'Build sheet: resume at the interrupted quality');
+  check((await page.locator('.segment[aria-checked="true"]').first().getAttribute('data-value')) === 'max', 'the quality selector starts at the interrupted run’s Max');
+  await page.locator('.segment[data-value="balanced"]').tap();
+  check(/Starts over at Balanced quality \(the interrupted run used Max\)/.test((await by(page, 'build-dense-resume').textContent()) ?? ''), 'the scan’s own quality starts over');
+  await page.keyboard.press('Escape');
+  await sleep(300);
+  await by(page, 'dense-resume-button').tap();
+  await page.waitForSelector('.processing', { timeout: 20000 });
+  check((await page.locator('.proc-title').textContent()) === 'Resuming dense cloud', 'processing says it resumes');
+  check(/Max quality/.test((await page.locator('.processing').textContent()) ?? ''), 'the resume runs at Max quality');
+  await page.waitForSelector('.viewer-screen', { timeout: 120000 });
+  await context.close();
+});
+
+await scenario('info-sheet', async () => {
+  const { page, context } = await newPage();
+  await page.goto(`${base}?mock=1`);
+  await by(page, 'new-scan').waitFor();
+  await seedMeshed(page);
+  await by(page, 'session-item').first().tap();
+  await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  await by(page, 'viewer-info').tap();
+  await by(page, 'sheet-info').waitFor();
+  const t = await by(page, 'sheet-info').textContent();
+  check(/Magnetic north/.test(t ?? '') && /declination/.test(t ?? ''), 'compass yaw is labelled magnetic north with the declination note');
+  check(/Engine memory \(last step\)/.test(t ?? ''), 'engine memory (stats.memoryMB) shown');
+  await sleep(400);
+  await shot(page, 'state-info-sheet');
+  await audit(page, 'info-sheet');
+  await page.locator('.section-title', { hasText: 'Memory' }).scrollIntoViewIfNeeded();
+  await sleep(300);
+  await shot(page, 'state-info-sheet-memory');
+  await context.close();
+});
+
+const errs = consoleErrors.filter((e) => !/favicon/i.test(e));
+check(errs.length === 0, `no console errors (got ${errs.length}: ${errs.slice(0, 5).join(' | ')})`);
+console.log(failures.length ? `[states] FAILED (${failures.length})` : '[states] OK');
+await close();
+process.exit(failures.length ? 1 : 0);
