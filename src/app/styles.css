@@ -1448,6 +1448,41 @@ h3 {
   color: var(--warn);
 }
 
+/* Capture debug overlay (setup option "Debug overlay"). */
+.debug-overlay {
+  position: absolute;
+  top: calc(var(--safe-t) + 176px);
+  left: max(12px, var(--safe-l));
+  z-index: 3;
+  max-width: min(calc(100vw - 24px), 440px);
+  padding: 8px 10px;
+  border-radius: var(--radius-s);
+  background: rgba(0, 0, 0, 0.7);
+  color: var(--text);
+  font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-wrap: anywhere;
+  pointer-events: auto;
+}
+
+.debug-overlay.collapsed .debug-overlay-body > :not(:nth-child(-n + 3)) {
+  display: none;
+}
+
+.debug-overlay-bad {
+  color: var(--warn);
+}
+
+.debug-overlay-copy {
+  float: right;
+  margin: 0 0 4px 8px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+}
+
 .guidance {
   position: absolute;
   top: calc(var(--safe-t) + 104px);

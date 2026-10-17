@@ -40,6 +40,8 @@ export interface CaptureConfig {
   torch: boolean;
   /** Build the dense cloud right after capture. */
   autoDense: boolean;
+  /** Show the engine diagnostics panel while capturing. */
+  debugOverlay: boolean;
 }
 
 /** Large data shared between screens (kept out of the reactive store). */
@@ -72,7 +74,7 @@ export interface AppOptions {
 
 const CONFIG_KEY = 'sfm.captureConfig.v1';
 
-const DEFAULT_CONFIG: CaptureConfig = { mode: 'object', quality: 'balanced', useGps: false, torch: false, autoDense: true };
+const DEFAULT_CONFIG: CaptureConfig = { mode: 'object', quality: 'balanced', useGps: false, torch: false, autoDense: true, debugOverlay: false };
 
 function loadConfig(): CaptureConfig {
   try {
@@ -85,6 +87,7 @@ function loadConfig(): CaptureConfig {
         useGps: typeof c.useGps === 'boolean' ? c.useGps : DEFAULT_CONFIG.useGps,
         torch: false, // never start with the torch on
         autoDense: typeof c.autoDense === 'boolean' ? c.autoDense : DEFAULT_CONFIG.autoDense,
+        debugOverlay: typeof c.debugOverlay === 'boolean' ? c.debugOverlay : DEFAULT_CONFIG.debugOverlay,
       };
     }
   } catch {

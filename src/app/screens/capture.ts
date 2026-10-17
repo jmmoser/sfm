@@ -36,6 +36,7 @@ import { defaultSessionName, formatAccuracy, formatBytes, formatClock, formatCou
 import { icon, type IconName } from '../icons';
 import { frameErrorAction, overlayMatchesView } from '../capture-policy';
 import { FrameOrientationTracker, mapOverlay } from '../overlay-map';
+import { createDebugOverlay } from '../debug-overlay';
 import { MIN_KEYFRAMES, type Route } from '../router';
 
 type Phase = 'starting' | 'running' | 'paused' | 'interrupted' | 'error' | 'finishing' | 'closed';
@@ -138,6 +139,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   const finishHint = h('div', { class: 'finish-hint', 'aria-live': 'polite', text: `Capture ${MIN_KEYFRAMES} keyframes to finish` });
   const controls = h('div', { class: 'capture-controls' }, finishHint, h('div', { class: 'capture-controls-row' }, torchBtn, pauseBtn, finishBtn));
 
+  const debugOverlay = cfg.debugOverlay ? createDebugOverlay() : null;
   const card = h('div', { class: 'capture-card-host' });
   const pausedLabel = h('div', { class: 'paused-label', hidden: true, text: 'Paused' });
 
@@ -153,6 +155,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     guidance,
     pausedLabel,
     mini,
+    debugOverlay?.el ?? null,
     controls,
     card,
   );
@@ -380,6 +383,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     if (closed) return;
     const meta = inFlight;
     last = u;
+    debugOverlay?.onLive(u);
     const prevKf = numKeyframes;
     numKeyframes = u.numKeyframes;
     kfCount.textContent = String(u.numKeyframes);
@@ -644,6 +648,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       return;
     }
     d.add(camera.onStateChange(onCameraState));
+    debugOverlay?.setCamera({ width: camRes.width, height: camRes.height, frameRate: camRes.frameRate, label: camRes.label, frameMaxSide: camRes.frameMaxSide });
     torchBtn.disabled = !camRes.torchAvailable;
     if (cfg.torch && camRes.torchAvailable) void toggleTorch(true);
     // Lock white balance after auto-WB settled (iOS supports manual WB only).
@@ -996,6 +1001,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       d.listen(document, 'visibilitychange', onVisibility);
       d.add(app.engine.onLive(onLive));
       d.add(app.engine.onError(onEngineError));
+      if (debugOverlay) d.add(app.engine.onLog((l) => debugOverlay.onLog(l)));
       d.interval(() => {
         timeLabel.textContent = formatClock(elapsed());
       }, 500);

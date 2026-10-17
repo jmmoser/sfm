@@ -34,12 +34,13 @@ import { rsModelFromDevice, type RollingShutterModel } from '../sfm/rolling-shut
 import { intrinsicsFromFov, type MapperOptions } from '../sfm/mapper';
 import type { Reconstruction } from '../sfm/reconstruction';
 import { VocabularyIndex } from '../sfm/vocab';
-import type { CaptureMode, FrameInput, Guidance, LiveCamera, LiveUpdate, QualityPreset, TrackingState } from '../workers/protocol';
+import type { CaptureMode, FrameInput, Guidance, LiveCamera, LiveDebug, LiveUpdate, QualityPreset, TrackingState } from '../workers/protocol';
 import {
   OrientationTracker,
   closeSource,
   gravityDown,
   overlayPoints,
+  lumaStats,
   prepareFrame,
   rotateVec,
   sampleFeatureColors,
@@ -636,8 +637,10 @@ export class LiveSession {
     st.imu.append(f.imu);
     if (f.geo && Number.isFinite(f.geo.lat) && Number.isFinite(f.geo.lon)) st.geo = mergeGeoFixes(st.geo, [f.geo]);
     const timings: Record<string, number> = {};
+    const dbg = this.newDebug();
     const finish = (u: LiveUpdate): LiveUpdate => {
       timings.total = now() - t0;
+      u.debug = dbg;
       this.lastDecision = u.decision;
       this.lastGuidance = u.guidance;
       return u;
@@ -655,7 +658,10 @@ export class LiveSession {
     }
     this.segment = seg;
     const verdict = this.orientation.classify({ width: f.bitmap.width, height: f.bitmap.height, screenAngle: f.screenAngle, t: f.t });
+    dbg.srcWidth = f.bitmap.width;
+    dbg.srcHeight = f.bitmap.height;
     if (!verdict.ok) {
+      dbg.reason = `dropped: ${verdict.reason}`;
       closeSource(f.bitmap);
       this.deps.log('debug', `frame ${frameIndex} dropped: ${verdict.reason}`);
       return finish(this.baseUpdate(frameIndex, 'skip', this.lastGuidance, timings));
@@ -683,6 +689,12 @@ export class LiveSession {
       const kOut = (4 - verdict.k) % 4;
       const W = prep.width,
         H = prep.height;
+      dbg.width = W;
+      dbg.height = H;
+      dbg.sharpness = prep.sharpness;
+      const lm = lumaStats(prep.small);
+      dbg.lumaMean = lm.mean;
+      dbg.lumaStd = lm.std;
       const angSpeed = angularSpeedAt(st.imu.samples, f.t + (st.timeOffsetMs ?? 0));
       // gyro rotation since the last keyframe (hard rotation limit: fast pans force keyframes)
       const Rk = this.ref ? this.gyroRotation(this.ref.t, f.t) : null;
@@ -699,8 +711,12 @@ export class LiveSession {
       };
       // pre-gate: blurry / fast-rotating frames are rejected without feature extraction (the
       // selector's own gate, relaxed for frames the hard rotation limit forces)
-      if (this.selector.gate(cand).reject) {
+      const gate = this.selector.gate(cand);
+      dbg.sharpnessRef = gate.reference;
+      dbg.angularSpeed = angSpeed;
+      if (gate.reject) {
         const d = this.selector.evaluate(cand);
+        dbg.reason = `${d.decision}: ${d.reason}`;
         return finish(this.baseUpdate(frameIndex, d.decision, this.mapGuidance(d.guidance), timings));
       }
       // features
@@ -727,6 +743,8 @@ export class LiveSession {
       timings.features = now() - tf;
       this.stats.featureMs += timings.features;
       cand.numFeatures = fs.count;
+      dbg.numFeatures = fs.count;
+      dbg.featureInput = fi.kind === 'bitmap' && !this.bitmapInputBroken ? 'bitmap' : 'gray';
       // tracking against the last keyframe
       let trackGeom: TwoViewGeometry | null = null;
       if (this.ref && (this.ref.width !== W || this.ref.height !== H)) {
@@ -751,6 +769,8 @@ export class LiveSession {
         this.lastFrameInliers = NaN;
       }
       let decision = this.selector.evaluate(cand);
+      dbg.inliers = cand.numInliersToLastKF;
+      dbg.reason = decision.reason;
       if (decision.decision === 'keyframe' && decision.forced) this.stats.forcedKeyframes++;
       if (decision.decision === 'keyframe' && decision.useHeld && !this.held) {
         // the engine keeps every frame the selector holds — defensive: keyframe = this frame
@@ -826,6 +846,37 @@ export class LiveSession {
     } finally {
       if (!handedOff) prep.release();
     }
+  }
+
+  /** Diagnostics of a frame before it is analysed (filled in as processing goes). */
+  private newDebug(): LiveDebug {
+    let backend: LiveDebug['backend'] = 'cpu';
+    let fallbackReason: string | null = null;
+    try {
+      const p = this.deps.pipeline();
+      backend = p.gpu ? 'webgpu' : 'cpu';
+      fallbackReason = p.fallbackReason;
+    } catch (e) {
+      fallbackReason = `no pipeline: ${(e as Error)?.message ?? e}`;
+    }
+    return {
+      backend,
+      fallbackReason,
+      featureInput: null,
+      srcWidth: 0,
+      srcHeight: 0,
+      width: 0,
+      height: 0,
+      numFeatures: null,
+      minFeatures: this.selector.options.minFeatures,
+      sharpness: NaN,
+      sharpnessRef: NaN,
+      angularSpeed: NaN,
+      lumaMean: NaN,
+      lumaStd: NaN,
+      inliers: NaN,
+      reason: 'skipped (paused / hidden / finished)',
+    };
   }
 
   private featureMaxSide(): number {
