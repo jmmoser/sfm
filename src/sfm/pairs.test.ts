@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { Pose } from '../core/types';
 import { Rng } from '../math/random';
 import { mergePairs, pairId, retrievalPairs, sequentialPairs, spatialPairs, type RetrievalSource, type SpatialCamera } from './pairs';
+import { perfSlack } from '../core/perf-slack';
 
 /** Camera at C looking along unit direction d (world), up hint +Z. */
 function lookPose(C: number[], d: number[]): Pose {
@@ -126,7 +127,7 @@ describe('pair selection', () => {
     const t0 = performance.now();
     const r = mergePairs([big, big]);
     const ms = performance.now() - t0;
-    expect(ms).toBeLessThan(1500);
+    expect(ms).toBeLessThan(1500 * perfSlack());
     let sorted = true;
     for (let i = 1; i < r.length; i++) sorted &&= r[i - 1][0] < r[i][0] || (r[i - 1][0] === r[i][0] && r[i - 1][1] < r[i][1]);
     expect(sorted).toBe(true);

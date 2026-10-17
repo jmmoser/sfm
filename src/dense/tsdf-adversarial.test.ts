@@ -11,6 +11,7 @@ import { distanceToScene, renderGtViews } from './testutil-scene';
 import { buildTsdfVolume, integrateDepthMap, tsdfMesh, TsdfVolume, type TsdfStats } from './tsdf';
 import { MemoryDepthMapStore, type DenseView, type DepthMap } from './types';
 import { Rng } from '../math/random';
+import { perfSlack } from '../core/perf-slack';
 
 const log = (...a: unknown[]): void => console.log('[tsdf-adv]', ...a);
 
@@ -177,7 +178,7 @@ describe('TSDF allocation (adversarial)', () => {
     log(`tiny user voxel: ${stats!.blocks} blocks, cap hit ${stats!.blockCapHit}, ${ms.toFixed(0)} ms, ${mesh.triangleCount} triangles`);
     expect(stats!.blocks).toBeLessThanOrEqual(300);
     expect(stats!.blockCapHit).toBe(true);
-    expect(ms).toBeLessThan(15000);
+    expect(ms).toBeLessThan(15000 * perfSlack());
   });
 });
 

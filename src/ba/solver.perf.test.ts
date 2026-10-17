@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { bundleAdjust } from './solver';
 import { fixGaugeTwoPoses, makeSyntheticBA, perturbBA, syntheticErrors } from './synthetic';
+import { perfSlack } from '../core/perf-slack';
 
 /** Run a few LM iterations and return per-iteration wall times (ms). */
 function timeIterations(
@@ -45,7 +46,7 @@ describe('bundleAdjust performance (logged)', () => {
     );
     expect(nObs).toBeGreaterThan(95000);
     expect(r.linearSolver).toBe('dense_schur');
-    expect(median).toBeLessThan(400);
+    expect(median).toBeLessThan(400 * perfSlack());
     expect(r.finalRmsPx).toBeLessThan(0.8);
   });
 
@@ -67,7 +68,7 @@ describe('bundleAdjust performance (logged)', () => {
     expect(r.success).toBe(true);
     // ≈ 50–110 ms/iter on an idle-to-loaded 4-core x86 box; the bound only catches gross
     // regressions (the unit project runs test files in parallel, timings are noisy).
-    expect(ms / Math.max(1, r.iterations)).toBeLessThan(400);
+    expect(ms / Math.max(1, r.iterations)).toBeLessThan(400 * perfSlack());
   });
 
   it('500 poses / 60k points / ~400k observations: PCG Schur at a few s per iteration', () => {
@@ -79,7 +80,7 @@ describe('bundleAdjust performance (logged)', () => {
     );
     expect(nObs).toBeGreaterThan(380000);
     expect(r.linearSolver).toBe('pcg_schur');
-    expect(median).toBeLessThan(5000);
+    expect(median).toBeLessThan(5000 * perfSlack());
     expect(r.finalCost).toBeLessThan(r.initialCost / 10);
     // 'auto' recognises the banded reduced system and solves it directly (skyline Cholesky).
     const a = timeIterations(cfg, 'auto', 4);

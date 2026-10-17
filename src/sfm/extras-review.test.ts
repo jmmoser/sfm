@@ -15,6 +15,7 @@ import { KeyframeSelector, rotationCompensatedParallax, type KeyframeCandidate }
 import { mergePairs, spatialPairs } from './pairs';
 import { quantizeDescriptors, trainVocabulary, VocabularyIndex } from './vocab';
 import { computeWorldAlignment, type WorldKeyframe } from './world';
+import { perfSlack } from '../core/perf-slack';
 
 const DEG = Math.PI / 180;
 
@@ -183,7 +184,7 @@ describe('pairs (review)', () => {
     old.sort((x, y) => x[0] - y[0] || x[1] - y[1]);
     const oldMs = performance.now() - t1;
     expect(old).toEqual(r);
-    expect(ms).toBeLessThan(0.5 * oldMs);
+    expect(ms).toBeLessThan(0.5 * oldMs * perfSlack());
     // ids beyond the 2^26 key range and negative ids: no key collisions
     const L = 2 ** 26;
     const g = mergePairs([

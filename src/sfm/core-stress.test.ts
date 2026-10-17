@@ -13,6 +13,7 @@ import { runIncrementalSfM, type MapperTimings } from './mapper';
 import type { Reconstruction } from './reconstruction';
 import { buildSyntheticDatabase, evaluateReconstruction, generateScene, type SyntheticScene, type SyntheticSceneKind } from './synthetic';
 import type { CameraIntrinsics } from '../core/types';
+import { perfSlack } from '../core/perf-slack';
 
 interface Data {
   scene: SyntheticScene;
@@ -99,7 +100,7 @@ describe('stress: 200-keyframe closed walk around a yard (loop closure)', () => 
     expect(ev.wrongObservationRate).toBeLessThan(0.01);
     expect(reconstructionInvariantErrors(rec, { graph: rec.correspondenceGraph! })).toEqual([]);
     // generous bounds (shared CI machines): ≈ 25 s / 0.7 s on an idle desktop
-    expect(ms).toBeLessThan(240_000);
+    expect(ms).toBeLessThan(240_000 * perfSlack());
     expect(maxStall).toBeLessThan(8_000);
   }, 600_000);
 
@@ -149,7 +150,7 @@ describe('stress: long close-range object orbit', () => {
     expect(Math.abs(ev.k1 - 0.03)).toBeLessThan(0.005);
     expect(rec.meanReprojectionError()).toBeLessThan(1);
     expect(reconstructionInvariantErrors(rec, { graph: rec.correspondenceGraph! })).toEqual([]);
-    expect(ms).toBeLessThan(240_000);
+    expect(ms).toBeLessThan(240_000 * perfSlack());
 
     const t0 = performance.now();
     const { live, ms: kms, graph } = liveStream(data);

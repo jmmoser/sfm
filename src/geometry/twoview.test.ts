@@ -13,6 +13,7 @@ import {
   type TwoViewScene,
   type TwoViewSceneOptions,
 } from './testutil';
+import { perfSlack } from '../core/perf-slack';
 
 interface Problem {
   kp1: Float32Array;
@@ -275,6 +276,6 @@ describe('estimateTwoViewGeometry: timing', () => {
       expect(g.config).toBe('calibrated');
     }
     console.log(`[twoview] 2000 matches, 40 % outliers: median ${median(times).toFixed(1)} ms (min ${Math.min(...times).toFixed(1)}, max ${Math.max(...times).toFixed(1)})`);
-    expect(median(times)).toBeLessThan(200);
+    expect(median(times)).toBeLessThan(200 * perfSlack());
   });
 });
