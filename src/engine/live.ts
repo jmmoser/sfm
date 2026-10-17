@@ -407,6 +407,11 @@ export class LiveSession {
   };
   /** Frame held by best-of-window keyframing (null = none). */
   private held: HeldFrame | null = null;
+  /** Low-feature frames re-extracted from gray input to check the GPU bitmap upload. */
+  private bitmapProbes = 0;
+  private static readonly MAX_BITMAP_PROBES = 8;
+  /** The GPU bitmap upload gave far fewer features than gray input: use gray input. */
+  private bitmapInputBroken = false;
   /** Bias-aware gyro integration (camera frame) shared by tracking, gates and refine. */
   private readonly gyroRef = new GyroReference();
   private gyroCalibratedAt = 0;
@@ -701,8 +706,24 @@ export class LiveSession {
       // features
       const pipeline = this.deps.pipeline();
       const tf = now();
-      const fi = prep.featureInput(pipeline.gpu, this.featureMaxSide());
-      const fs = await this.deps.gpu(() => (fi.kind === 'bitmap' ? pipeline.extractFromBitmap(fi.source, W, H) : pipeline.extract(fi.gray, W, H)));
+      const fi = prep.featureInput(pipeline.gpu && !this.bitmapInputBroken, this.featureMaxSide());
+      let fs = await this.deps.gpu(() => (fi.kind === 'bitmap' ? pipeline.extractFromBitmap(fi.source, W, H) : pipeline.extract(fi.gray, W, H)));
+      if (fi.kind === 'bitmap' && fs.count < this.selector.options.minFeatures && this.bitmapProbes < LiveSession.MAX_BITMAP_PROBES) {
+        // The GPU bitmap upload (copyExternalImageToTexture) is not covered by the start-up
+        // self-test, and on some WebKit builds it yields a blank texture for camera frames
+        // (every frame "not enough detail"). Re-extract from the 2D-canvas gray image; if that
+        // finds clearly more, use gray input for the rest of the session.
+        this.bitmapProbes++;
+        const gi = prep.featureInput(false, this.featureMaxSide());
+        if (gi.kind === 'gray') {
+          const gfs = await this.deps.gpu(() => pipeline.extract(gi.gray, W, H));
+          if (gfs.count >= this.selector.options.minFeatures && gfs.count > 4 * fs.count) {
+            this.bitmapInputBroken = true;
+            this.deps.log('warn', `GPU bitmap input gave ${fs.count} features, gray input ${gfs.count}: using gray input for this session`);
+            fs = gfs;
+          }
+        }
+      }
       timings.features = now() - tf;
       this.stats.featureMs += timings.features;
       cand.numFeatures = fs.count;
