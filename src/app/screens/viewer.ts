@@ -4,8 +4,10 @@
  * (PLY points, PLY mesh, GLB, COLMAP + images ZIP: the first tap builds the file through the
  * engine and shows its size, a second tap "Share / Save" calls saveFile directly in the tap
  * handler — iOS allows navigator.share only within ~5 s of a user activation), Info sheet
- * (scale source and uncertainty, gravity / north alignment, counts, reprojection error,
- * timings).
+ * (scale source and uncertainty, gravity / north alignment with the yaw source — the compass
+ * gives MAGNETIC north —, counts, reprojection error, engine memory, timings). A densify that
+ * was interrupted (stats.denseResumablePass from loadSession, or cancelled / failed here) offers
+ * "Resume dense reconstruction" (HUD + Build sheet): the engine continues from its stored maps.
  */
 import { saveFile } from '../../io/download';
 import type { Viewer } from '../../viewer';
@@ -13,13 +15,14 @@ import { loadViewerModule } from '../viewer-loader';
 import { formatDistance } from '../../viewer/helpers';
 import type { ExportFormat, QualityPreset } from '../../workers/protocol';
 import type { App, Screen } from '../app';
-import { button, chip, group, iconButton, kvRow, section, segmented, spinner, switchRow } from '../components/controls';
+import { button, chip, group, iconButton, kvRow, section, segmented, setButtonLabel, spinner, switchRow } from '../components/controls';
 import { openSheet, type SheetHandle } from '../components/sheet';
 import { toast } from '../components/toast';
 import { Disposer, h, replaceChildren } from '../dom';
 import { exportFilename, formatBytes, formatCount, formatDuration, modeLabel, qualityLabel } from '../format';
 import { icon, type IconName } from '../icons';
 import type { ProcessingStep, Route } from '../router';
+import { denseResumable, memoryStatRows, northInfo } from '../model-info';
 
 interface DisplayState {
   points: boolean;
@@ -84,7 +87,20 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   const exportTool = tool('share', 'Export', () => openExport(), 'tool-export');
   const toolbar = h('nav', { class: 'viewer-toolbar', 'aria-label': 'Model tools' }, viewTool, measureTool, buildTool, exportTool);
 
-  const el = h('div', { class: 'viewer-screen' }, canvasHost, loading, top, measureHud, toolbar);
+  const resumeHud = h(
+    'div',
+    { class: 'viewer-resume', hidden: true, role: 'status', 'data-testid': 'dense-resume' },
+    h('span', { class: 'viewer-resume-icon' }, icon('points', { size: 20 })),
+    h('div', { class: 'viewer-resume-text' }, h('span', { class: 'viewer-resume-title', text: 'Dense cloud interrupted' }), h('span', { class: 'viewer-resume-sub', text: 'Resume from the saved depth maps.' })),
+    button({ label: 'Resume', variant: 'primary', size: 'sm', testId: 'dense-resume-button', onClick: () => resumeDense() }),
+  );
+
+  const el = h('div', { class: 'viewer-screen' }, canvasHost, loading, top, resumeHud, measureHud, toolbar);
+
+  /** Resume (re-run) the interrupted densify with the scan's quality: the engine skips the stored maps. */
+  function resumeDense(): void {
+    app.navigate({ type: 'BUILD', steps: ['densify'] });
+  }
 
   // ---- content -----------------------------------------------------------------------------------
   function applyContent(first: boolean): void {
@@ -97,6 +113,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     if (r.sparse) parts.push(`${r.sparse.cameras.length} photos`);
     subEl.textContent = parts.join(' · ');
     buildTool.classList.toggle('has-badge', !r.dense || !r.mesh);
+    resumeHud.hidden = !denseResumable(r);
     if (!viewer) return;
     const metric = r.sparse?.metric;
     viewer.setWorldUp(metric?.gravityAligned ? 'z' : 'auto');
@@ -170,6 +187,9 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   function openBuild(): void {
     const r = app.results;
     let q: QualityPreset = app.results.quality;
+    const resumable = denseResumable(r);
+    // Resuming needs the interrupted run's settings: another quality starts over.
+    let syncResume = (): void => undefined;
     const quality = segmented<QualityPreset>(
       'Quality',
       [
@@ -178,7 +198,10 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
         { value: 'max', label: 'Max' },
       ],
       q,
-      (v) => (q = v),
+      (v) => {
+        q = v;
+        syncResume();
+      },
     );
     const build = (steps: ProcessingStep[]): void => {
       sheet.close();
@@ -202,15 +225,17 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
         h(
           'div',
           { class: 'build-list' },
-          item({
-            icon: 'points',
-            title: 'Dense point cloud',
-            done: r.dense ? `${formatCount(r.dense.count)} points` : null,
-            desc: 'Multi-view stereo on every photo. A few minutes.',
-            steps: ['densify'],
-            testId: 'build-dense',
-            disabled: !r.sparse,
-          }),
+          resumable
+            ? resumeItem()
+            : item({
+                icon: 'points',
+                title: 'Dense point cloud',
+                done: r.dense ? `${formatCount(r.dense.count)} points` : null,
+                desc: 'Multi-view stereo on every photo. A few minutes.',
+                steps: ['densify'],
+                testId: 'build-dense',
+                disabled: !r.sparse,
+              }),
           item({
             icon: 'mesh',
             title: 'Mesh',
@@ -224,6 +249,34 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       ),
     ];
     const sheet = openSheet({ title: 'Build', subtitle: 'Higher quality takes longer and needs more memory.', content, testId: 'sheet-build' });
+
+    function resumeItem(): HTMLElement {
+      const quality0 = r.quality;
+      const sub = h('span', { class: 'build-sub' });
+      const btn = button({
+        label: 'Resume',
+        variant: 'primary',
+        size: 'sm',
+        testId: 'build-dense',
+        onClick: () => {
+          // Another quality starts over (the engine discards the stored maps of the other settings).
+          if (q !== quality0) {
+            delete app.results.stats.denseResumablePass;
+            delete app.results.stats.denseInterrupted;
+          }
+          build(['densify']);
+        },
+      });
+      const title = h('span', { class: 'build-title' });
+      syncResume = () => {
+        const same = q === quality0;
+        title.textContent = same ? 'Resume dense reconstruction' : 'Dense point cloud';
+        sub.textContent = same ? 'Interrupted — continues from the saved depth maps.' : `Starts over at ${qualityLabel(q)} quality (the interrupted run used ${qualityLabel(quality0)}).`;
+        setButtonLabel(btn, same ? 'Resume' : 'Build');
+      };
+      syncResume();
+      return h('div', { class: 'build-item build-item-resume', 'data-testid': 'build-dense-resume' }, h('span', { class: 'build-icon' }, icon('refresh', { size: 22 })), h('div', { class: 'build-text' }, title, sub), btn);
+    }
   }
 
   function exportAvailability(f: ExportFormat): { ok: boolean; sub: string } {
@@ -351,8 +404,10 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       kvRow('Scale', h('span', { text: scaleText })),
       kvRow('Scale uncertainty', h('span', { text: m?.metric && m.relativeUncertainty !== null ? `±${(m.relativeUncertainty * 100).toFixed(1)} %` : '–' })),
       kvRow('Up direction', yes(m?.gravityAligned, 'Gravity aligned', 'Not aligned')),
-      kvRow('North', yes(m?.northAligned, 'North aligned', 'Unknown')),
     ];
+    const north = northInfo(m?.northAligned, st);
+    rows.push(kvRow('North', chip(north.label, north.tone, north.tone === 'good' ? 'check' : north.tone === 'warn' ? 'compass' : undefined)));
+    if (north.note) rows.push(h('div', { class: 'row row-note', 'data-testid': 'info-north-note' }, h('span', { class: 'row-sub', text: north.note })));
     if (m?.originLatLonAlt) {
       const [lat, lon, alt] = m.originLatLonAlt;
       rows.push(kvRow('Origin', h('span', { class: 'mono', text: `${lat.toFixed(6)}, ${lon.toFixed(6)} · ${alt.toFixed(0)} m` })));
@@ -375,6 +430,8 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     if (typeof st.camera === 'string') about.push(kvRow('Camera', h('span', { text: String(st.camera) })));
     if (typeof st.resolution === 'string') about.push(kvRow('Resolution', h('span', { text: String(st.resolution) })));
     const content: HTMLElement[] = [section('Scale & orientation', group(...rows)), section('Reconstruction', group(...counts))];
+    const mem = memoryRows(st);
+    if (mem.length) content.push(section('Memory', group(...mem)));
     if (timings.length) content.push(section('Timings', group(...timings)));
     content.push(section('Capture', group(...about)));
     openSheet({ title: 'Model info', subtitle: `${modeLabel(r.mode)} scan · ${qualityLabel(r.quality)} quality`, content, testId: 'sheet-info' });
@@ -420,6 +477,11 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       d.dispose();
     },
   };
+}
+
+/** Engine memory statistics (stats.memoryMB after the last step, the dense plan's peak, size caps). */
+function memoryRows(st: Record<string, number | string>): HTMLElement[] {
+  return memoryStatRows(st).map(([k, v]) => kvRow(k, h('span', { text: v })));
 }
 
 function timingLabel(k: string): string {

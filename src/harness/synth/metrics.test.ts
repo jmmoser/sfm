@@ -200,10 +200,28 @@ describe('computeMetrics', () => {
     expect(m.trajectory!.rotErrDegMax).toBeLessThan(1e-4);
     expect(m.intrinsics!.focalErrorPct).toBeCloseTo(1, 9);
     expect(m.intrinsics!.cornerDistortionErrorPx).toBeCloseTo(0, 9);
+    expect(m.intrinsics!.perFrameFocal).toBeNull(); // no per-frame focal in a clean dataset
     expect(m.dense!.accuracyMedian).toBeLessThan(1e-5);
     expect(m.dense!.completeness).toBe(1);
     expect(m.dense!.fscore).toBe(1);
     expect(formatTable(m)).toContain('ATE RMSE');
+  });
+
+  it('focus breathing datasets: focal error vs the registered frames\' mean GT focal (informational)', () => {
+    const frames = ds.frames.map((f) => ({ ...f, f: 500 * (1 + 0.006 * Math.sin(f.index)) }));
+    const reg = frames.filter((f) => f.index < 12);
+    const regMean = reg.reduce((a, f) => a + f.f, 0) / reg.length;
+    const m = computeMetrics(
+      { ...ds, frames },
+      { intrinsics: { f: regMean * 1.01 }, images: reg.map((f) => ({ index: f.index, pose: toResult(f.pose) })), metric: { metric: false, gravityAligned: false, northAligned: false } },
+    );
+    const pf = m.intrinsics!.perFrameFocal!;
+    expect(pf.registeredMean).toBeCloseTo(regMean, 9);
+    expect(pf.focalErrorPctVsRegisteredMean).toBeCloseTo(1, 9);
+    expect(pf.max).toBeLessThanOrEqual(503 + 1e-9);
+    expect(pf.min).toBeGreaterThanOrEqual(497 - 1e-9);
+    expect(m.intrinsics!.focalErrorPct).toBeCloseTo((100 * (regMean * 1.01 - 500)) / 500, 9); // still vs meta f0
+    expect(formatTable(m)).toContain('focal error vs mean GT focal of registered');
   });
 
   it('metric + gravity + heading: detects a scale error, a tilt and a yaw', () => {

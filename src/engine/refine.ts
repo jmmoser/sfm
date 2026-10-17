@@ -388,6 +388,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
       gravityCam: k.rec.info.gravityCam,
       heading: k.rec.info.heading,
       headingAccuracy: k.rec.headingAccuracy,
+      headingNorth: k.rec.headingNorth ?? 'true',
       geo: k.rec.info.geo,
     }));
     const input = { keyframes: wk, imu: st.imu.samples, gpsFixes: st.geo };
@@ -410,6 +411,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     stats.timeOffsetSource = alignment.details.offsetSource;
     stats.scaleSource = alignment.metric.source;
     stats.yawSource = alignment.details.yawSource;
+    Object.assign(stats, alignment.details.headingStats); // north reference, declination, yaw σ / fusion
     if (alignment.metric.relativeUncertainty !== null) stats.scaleUncertainty = alignment.metric.relativeUncertainty;
     if (alignment.details.gravity) stats.gravityStdDeg = (alignment.details.gravity.stdRad * 180) / Math.PI;
     if (alignment.details.warnings.length) {

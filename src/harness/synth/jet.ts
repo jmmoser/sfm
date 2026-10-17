@@ -114,6 +114,20 @@ export function jsinusoid(t: Jet, amplitude: number, freqHz: number, phase = 0):
   return jscale(jsin(jaddc(jscale(t, w), phase)), amplitude);
 }
 
+export function jexp(a: Jet): Jet {
+  const e = Math.exp(a.v);
+  return jchain(a, e, e, e);
+}
+
+/**
+ * Gaussian bump A·exp(−(t − t0)² / (2σ²)) of the time variable t (C∞). Its largest slope
+ * is A·e^(−1/2)/σ ≈ 0.6065·A/σ, reached at t = t0 ± σ.
+ */
+export function jgaussian(t: Jet, amplitude: number, t0: number, sigma: number): Jet {
+  const x = jscale(jaddc(t, -t0), 1 / sigma);
+  return jscale(jexp(jscale(jmul(x, x), -0.5)), amplitude);
+}
+
 // ---------------------------------------------------------------------------
 // Vectors / matrices of jets
 // ---------------------------------------------------------------------------

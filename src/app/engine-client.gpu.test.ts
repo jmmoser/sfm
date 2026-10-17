@@ -126,6 +126,57 @@ describe('EngineClient', () => {
     expect(c.pendingCount).toBe(0);
   });
 
+  it('cancel reaches a running finishCapture (it is a long operation)', async () => {
+    const { c } = client('slow-finish');
+    await c.init({ mode: 'object', quality: 'fast' });
+    const msgs: string[] = [];
+    c.onProgress((p) => msgs.push(p.message ?? ''));
+    const p = c.finishCapture();
+    await waitFor(() => msgs.length >= 2);
+    expect(msgs[0]).toBe('mapping 3 keyframes');
+    c.cancel();
+    await expect(p).rejects.toMatchObject({ name: 'CancelledError' });
+    expect(c.pendingCount).toBe(0);
+  });
+
+  it('abortLongOperation: an operation that honours cancel stops without a restart', async () => {
+    const { c, spawned } = client('slow-finish');
+    await c.init({ mode: 'object', quality: 'fast', sessionId: 's1' });
+    expect(await c.abortLongOperation()).toBe('none'); // nothing running
+    const p = c.finishCapture();
+    const settled = p.catch((e: Error) => e);
+    await new Promise((r) => setTimeout(r, 80));
+    expect(await c.abortLongOperation({ graceMs: 3000 })).toBe('cancelled');
+    expect(await settled).toMatchObject({ name: 'CancelledError' });
+    expect(spawned).toEqual(['slow-finish']);
+    expect(c.status).toMatchObject({ state: 'ready', respawns: 0 });
+  });
+
+  it('abortLongOperation: a stuck finishCapture (ignores cancel) is aborted and the worker restarted with resume', async () => {
+    const { c, spawned } = client(['stuck-finish', 'ok']);
+    await c.init({ mode: 'object', quality: 'fast', sessionId: 's1' });
+    const statuses: EngineStatus[] = [];
+    c.onStatus((s) => statuses.push(s));
+    let progress = 0;
+    c.onProgress(() => progress++);
+    const p = c.finishCapture();
+    const settled = p.catch((e: Error) => e);
+    await waitFor(() => progress >= 3); // progress keeps it alive: no inactivity timeout would ever fire
+    const t0 = performance.now();
+    expect(await c.abortLongOperation({ graceMs: 300 })).toBe('restarted');
+    expect(performance.now() - t0).toBeLessThan(2000);
+    expect(await settled).toMatchObject({ name: 'CancelledError' });
+    await waitFor(() => c.status.state === 'ready');
+    expect(c.pendingCount).toBe(0); // only the replayed init was pending meanwhile
+    expect(spawned).toEqual(['stuck-finish', 'ok']);
+    // The persisted session is re-opened (resume); a user abort is not counted against the respawn cap.
+    expect(c.status.init?.adapter).toBe('fixture:ok:resume=true:gpu=true');
+    expect(statuses.find((s) => s.state === 'respawning')?.reason).toMatch(/^aborted: /);
+    // Later calls go to the new worker (they do not queue behind the stuck request).
+    const sp = await c.refine();
+    expect(sp.points.count).toBe(5000);
+  });
+
   it('init timeout respawns the worker and replays init with resume', async () => {
     const { c, spawned } = client(['hang-init', 'ok'], { initTimeoutMs: 300 });
     const statuses: EngineStatus[] = [];

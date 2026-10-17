@@ -12,6 +12,12 @@
  * the result is sRGB-encoded into the canvas (→ JPEG via canvas.toBlob).
  * Motion blur: several sub-frame renders (poses across the exposure) are averaged
  * before resampling.
+ * Rolling shutter (renderFrameBands): the output image is split into bands of pixels;
+ * each band is rendered with its own sub-frame poses into the part of the undistorted
+ * target its pixels sample (an off-axis sub-frustum + viewport, so the rasterised samples
+ * are identical to a full render) and resampled into the canvas under a scissor.
+ * Focus breathing: setFocal() changes f of the resampling (the undistorted windows are
+ * sized for the smallest focal given at construction).
  *
  * Depth frames: view-space z rendered to float targets, resampled with nearest
  * lookup through the same distortion map (GT depth aligned with the JPEG pixels), or
@@ -37,7 +43,8 @@ import {
   WebGLRenderer,
 } from 'three';
 import type { CameraIntrinsics, Pose } from '../../core/types';
-import { type NormalizedWindow, undistortedWindow } from './conventions';
+import { type NormalizedWindow, undistortedWindow, undistortNormalized } from './conventions';
+import type { PixelRect } from './realism';
 import type { WindowDepth } from './sampling';
 import type { SynthScene } from './scene-common';
 import { DEFAULT_RENDER_EFFECTS, type RenderEffects } from './render-effects';
@@ -80,6 +87,7 @@ uniform sampler2D src;
 uniform vec2 imageSize;
 uniform int ss;
 uniform float gain;
+uniform vec3 wb;
 uniform float vignette;
 uniform vec2 noiseVar;  // shot, read
 uniform uint seed;
@@ -111,6 +119,7 @@ void main() {
   vec2 dc = (pix - intr.yz) / (0.5 * length(imageSize));
   float vig = 1.0 - vignette * dot(dc, dc);
   c *= gain * vig;
+  c *= wb;
   if (noiseVar.x > 0.0 || noiseVar.y > 0.0) {
     uvec3 h1 = pcg3d(uvec3(uint(pix.x), uint(pix.y), seed));
     uvec3 h2 = pcg3d(h1 ^ uvec3(0x9e3779b9u, 0x85ebca6bu, 0xc2b2ae35u));
@@ -195,6 +204,29 @@ function gridWindow(w: NormalizedWindow, f: number, scale: number): { win: Norma
   return { win: { xmin: w.xmin, xmax: w.xmin + width * pitch, ymin: w.ymin, ymax: w.ymin + height * pitch }, width, height };
 }
 
+export interface SynthRendererOptions {
+  /**
+   * Smallest focal length (px) setFocal() will be given (focus breathing). The undistorted
+   * render windows are sized for it so that every focal ≥ minFocal is covered. Default cam.f.
+   */
+  minFocal?: number;
+}
+
+/** One band of a rolling-shutter frame: its output pixels and its sub-frame poses. */
+export interface RenderBand {
+  rect: PixelRect;
+  /** Poses averaged over the band's exposure (≥ 1). */
+  poses: readonly Pose[];
+}
+
+/** Texel rectangle [c0, c1) × [r0, r1) of a render target (GL rows, 0 = bottom). */
+interface TexelRect {
+  c0: number;
+  c1: number;
+  r0: number;
+  r1: number;
+}
+
 export class SynthRenderer {
   readonly renderer: WebGLRenderer;
   readonly canvas: HTMLCanvasElement;
@@ -214,11 +246,16 @@ export class SynthRenderer {
   private readonly accumPass: Pass;
   private readonly depthMaterial: ShaderMaterial;
   private depthBuf: Float32Array | null = null;
+  private readonly colorPitch: number;
+  private readonly baseWin: NormalizedWindow;
+  private readonly intrU: { value: number[] };
+  private focal: number;
 
   constructor(
     readonly synth: SynthScene,
     readonly cam: CameraIntrinsics,
     effects: Partial<RenderEffects> = {},
+    opts: SynthRendererOptions = {},
   ) {
     this.effects = { ...DEFAULT_RENDER_EFFECTS, ...effects };
     const ss = Math.max(1, Math.round(this.effects.supersample));
@@ -237,9 +274,13 @@ export class SynthRenderer {
     this.renderer.autoClear = true;
     this.renderer.setClearColor(0x000000, 1);
 
-    const base = undistortedWindow(cam, 3);
+    this.focal = cam.f;
+    const minF = Math.min(cam.f, opts.minFocal ?? cam.f);
+    const base = undistortedWindow({ ...cam, f: minF }, 3);
+    this.baseWin = base;
     const cg = gridWindow(base, cam.f, ss);
     this.colorWin = cg.win;
+    this.colorPitch = 1 / (cam.f * ss);
     this.sceneRT = new WebGLRenderTarget(cg.width, cg.height, {
       type: HalfFloatType,
       format: RGBAFormat,
@@ -258,6 +299,7 @@ export class SynthRenderer {
     this.depthOutRT = new WebGLRenderTarget(cam.width, cam.height, { type: FloatType, format: RGBAFormat, minFilter: NearestFilter, magFilter: NearestFilter, depthBuffer: false, generateMipmaps: false });
 
     const intr = { value: [cam.f, cam.cx, cam.cy, cam.height] };
+    this.intrU = intr;
     const kd = { value: [cam.k1, cam.k2] };
     this.colorPass = makePass(COLOR_FS, {
       src: { value: null },
@@ -267,6 +309,7 @@ export class SynthRenderer {
       imageSize: { value: [cam.width, cam.height] },
       ss: { value: ss },
       gain: { value: 1 },
+      wb: { value: [1, 1, 1] },
       vignette: { value: this.effects.vignetting },
       noiseVar: { value: [0, 0] },
       seed: { value: 0 },
@@ -285,6 +328,156 @@ export class SynthRenderer {
   /** Size of the undistorted colour render target (diagnostics). */
   get renderTargetSize(): [number, number] {
     return [this.sceneRT.width, this.sceneRT.height];
+  }
+
+  /** Current focal length (px) of the colour / depth resampling. */
+  get currentFocal(): number {
+    return this.focal;
+  }
+
+  /**
+   * Focal length (px) of the following colour and depth renders (focus breathing). The
+   * principal point and distortion stay; f must be ≥ the constructor's minFocal.
+   */
+  setFocal(f: number): void {
+    this.focal = f;
+    this.intrU.value = [f, this.cam.cx, this.cam.cy, this.cam.height];
+  }
+
+  /** Linear-light white-balance gains (r, g, b) of the following colour renders. */
+  setWhiteBalance(rgb: readonly [number, number, number]): void {
+    this.colorPass.material.uniforms.wb.value = [rgb[0], rgb[1], rgb[2]];
+  }
+
+  /**
+   * Texels of the undistorted colour target sampled by the output pixels of `rect` at the
+   * current focal (pixel extents ±0.5 px, undistorted, plus a 3-texel margin for bilinear
+   * sampling), clamped to the target.
+   */
+  private bandTexelRect(rect: PixelRect): TexelRect {
+    const { cx, cy, k1, k2 } = this.cam;
+    const f = this.focal;
+    const ua = rect.u0 - 0.5,
+      ub = rect.u1 + 0.5,
+      va = rect.v0 - 0.5,
+      vb = rect.v1 + 0.5;
+    let xmin = Infinity,
+      xmax = -Infinity,
+      ymin = Infinity,
+      ymax = -Infinity;
+    const o = new Float64Array(2);
+    const visit = (u: number, v: number) => {
+      undistortNormalized(k1, k2, (u - cx) / f, (v - cy) / f, o);
+      if (o[0] < xmin) xmin = o[0];
+      if (o[0] > xmax) xmax = o[0];
+      if (o[1] < ymin) ymin = o[1];
+      if (o[1] > ymax) ymax = o[1];
+    };
+    const n = 48;
+    for (let i = 0; i <= n; i++) {
+      const u = ua + ((ub - ua) * i) / n,
+        v = va + ((vb - va) * i) / n;
+      visit(u, va);
+      visit(u, vb);
+      visit(ua, v);
+      visit(ub, v);
+    }
+    for (let j = 1; j < 8; j++) for (let i = 1; i < 8; i++) visit(ua + ((ub - ua) * i) / 8, va + ((vb - va) * j) / 8);
+    const w = this.colorWin,
+      p = this.colorPitch,
+      W = this.sceneRT.width,
+      H = this.sceneRT.height,
+      m = 3;
+    const clamp = (x: number, hi: number) => Math.max(0, Math.min(hi, x));
+    return {
+      c0: clamp(Math.floor((xmin - w.xmin) / p) - m, W),
+      c1: clamp(Math.ceil((xmax - w.xmin) / p) + m, W),
+      r0: clamp(Math.floor((w.ymax - ymax) / p) - m, H),
+      r1: clamp(Math.ceil((w.ymax - ymin) / p) + m, H),
+    };
+  }
+
+  /** Render the scene into the texel rectangle `tr` of `target` only (sub-frustum + viewport + scissor). */
+  private renderSceneRect(pose: Pose, tr: TexelRect, target: WebGLRenderTarget): void {
+    const w = this.colorWin,
+      p = this.colorPitch;
+    applyPoseToThreeCamera(this.camera, pose);
+    const sub: NormalizedWindow = { xmin: w.xmin + tr.c0 * p, xmax: w.xmin + tr.c1 * p, ymin: w.ymax - tr.r1 * p, ymax: w.ymax - tr.r0 * p };
+    setWindowProjection(this.camera, sub, this.synth.near, this.synth.far);
+    target.viewport.set(tr.c0, tr.r0, tr.c1 - tr.c0, tr.r1 - tr.r0);
+    target.scissor.set(tr.c0, tr.r0, tr.c1 - tr.c0, tr.r1 - tr.r0);
+    target.scissorTest = true;
+    this.renderer.setRenderTarget(target);
+    this.renderer.setClearColor(0x000000, 1);
+    this.renderer.clear(true, true, true);
+    this.renderer.render(this.synth.scene, this.camera);
+  }
+
+  /**
+   * Render one colour frame band by band (rolling shutter and/or adaptive motion blur):
+   * band b's output pixels come from the average of renders at `b.poses`. The bands must
+   * partition the image. Returns the number of scene renders.
+   */
+  renderFrameBands(bands: readonly RenderBand[], gain: number, seed: number): number {
+    const r = this.renderer;
+    const u = this.colorPass.material.uniforms;
+    u.gain.value = gain;
+    u.seed.value = seed >>> 0;
+    u.noiseVar.value = this.effects.noise ? [this.effects.shotNoise, this.effects.readNoise] : [0, 0];
+    const H = this.cam.height;
+    let renders = 0;
+    const prevAutoClear = r.autoClear;
+    try {
+      for (const band of bands) {
+        if (band.poses.length === 0) throw new Error('renderFrameBands: band without poses');
+        const tr = this.bandTexelRect(band.rect);
+        if (tr.c1 <= tr.c0 || tr.r1 <= tr.r0) throw new Error('renderFrameBands: band outside the render window');
+        let src = this.sceneRT;
+        if (band.poses.length > 1) {
+          if (!this.accumRT) throw new Error('renderFrameBands: several sub-frames need effects.motionBlurSamples > 1');
+          const acc = this.accumRT;
+          acc.viewport.set(0, 0, acc.width, acc.height);
+          acc.scissor.set(tr.c0, tr.r0, tr.c1 - tr.c0, tr.r1 - tr.r0);
+          acc.scissorTest = true;
+          r.autoClear = true;
+          r.setRenderTarget(acc);
+          r.setClearColor(0x000000, 0);
+          r.clear(true, false, false);
+          this.accumPass.material.uniforms.weight.value = 1 / band.poses.length;
+          for (const p of band.poses) {
+            this.renderSceneRect(p, tr, this.sceneRT);
+            renders++;
+            r.setRenderTarget(acc);
+            r.autoClear = false;
+            r.render(this.accumPass.scene, this.ortho);
+            r.autoClear = true;
+          }
+          src = acc;
+        } else {
+          r.autoClear = true;
+          this.renderSceneRect(band.poses[0], tr, this.sceneRT);
+          renders++;
+        }
+        u.src.value = src.texture;
+        r.setRenderTarget(null);
+        r.setScissor(band.rect.u0, H - 1 - band.rect.v1, band.rect.u1 - band.rect.u0 + 1, band.rect.v1 - band.rect.v0 + 1);
+        r.setScissorTest(true);
+        r.autoClear = false;
+        r.render(this.colorPass.scene, this.ortho);
+        r.setScissorTest(false);
+      }
+    } finally {
+      for (const t of [this.sceneRT, this.accumRT]) {
+        if (!t) continue;
+        t.viewport.set(0, 0, t.width, t.height);
+        t.scissor.set(0, 0, t.width, t.height);
+        t.scissorTest = false;
+      }
+      r.setScissorTest(false);
+      r.autoClear = prevAutoClear;
+      r.setRenderTarget(null);
+    }
+    return renders;
   }
 
   private renderScene(pose: Pose, win: NormalizedWindow, target: WebGLRenderTarget): void {
@@ -392,7 +585,7 @@ export class SynthRenderer {
   /** Low-resolution undistorted depth over the colour window (for visibility tests). */
   renderWindowDepth(pose: Pose, scale = 0.25): WindowDepth {
     if (!this.visRT || !this.visWin) {
-      const g = gridWindow(undistortedWindow(this.cam, 3), this.cam.f, scale);
+      const g = gridWindow(this.baseWin, this.cam.f, scale);
       this.visWin = g.win;
       this.visRT = new WebGLRenderTarget(g.width, g.height, { type: FloatType, format: RGBAFormat, minFilter: NearestFilter, magFilter: NearestFilter, depthBuffer: true, generateMipmaps: false });
     }

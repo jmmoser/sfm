@@ -3,14 +3,25 @@
  * adapter / limits / features, cameras + capabilities, motion rate & sign self-check, storage,
  * memory hints, Lockdown suspicion) with a "Copy" button (JSON for bug reports). A "Test
  * motion sensors" button requests motion permission from the tap and samples for 3 s.
+ *
+ * "Benchmark & self-test" (top): runs src/app/bench in a dedicated worker — WebGPU SIFT,
+ * matcher, PatchMatch and bundle adjustment timings with GPU-vs-CPU parity / ground-truth
+ * checks (pass / fail chips), scan-time estimates per quality preset, Cancel, "Copy report"
+ * (text + JSON). CPU-only results without WebGPU. `?benchScale=small` = CI-sized inputs. The run
+ * is cancelled when the page is hidden (iOS drops GPU work in the background) or the screen left.
  */
+import { startBenchmark, type BenchRun } from '../bench/bench';
+import { STATUS_LABEL, estimateLine, formatMs, qualityName, reportClipboardText, verdict } from '../bench/report';
+import { describeTest } from '../bench/scales';
+import { BENCH_TESTS, type BenchReport, type BenchScale, type BenchStatus, type BenchTestId, type BenchTestResult } from '../bench/types';
 import { MotionSensor } from '../../sensors/motion';
 import { collectDiagnostics, type SensorDiagnostics } from '../../sensors/diagnostics';
 import type { App, Screen } from '../app';
-import { button, chip, group, iconButton, kvRow, section, spinner } from '../components/controls';
+import { banner, button, chip, group, iconButton, kvRow, section, spinner } from '../components/controls';
 import { toast } from '../components/toast';
 import { Disposer, h, replaceChildren } from '../dom';
-import { formatBytes } from '../format';
+import { icon } from '../icons';
+import { formatBytes, formatDuration, type Tone } from '../format';
 import type { Route } from '../router';
 
 interface MotionTest {
@@ -33,6 +44,21 @@ const KEY_LIMITS = [
 ];
 const BYTE_LIMITS = new Set(['maxBufferSize', 'maxStorageBufferBindingSize', 'maxComputeWorkgroupStorageSize']);
 
+/** The last benchmark report (kept while the app runs: leaving Diagnostics does not lose it). */
+let lastBenchReport: BenchReport | null = null;
+
+/** `?benchScale=small` (CI) — otherwise the full, device-sized inputs. */
+function benchScaleFromUrl(): BenchScale {
+  try {
+    const v = new URLSearchParams(location.search).get('benchScale');
+    return v === 'small' || v === 'tiny' ? v : 'full';
+  } catch {
+    return 'full';
+  }
+}
+
+const STATUS_TONE: Record<BenchStatus, Tone> = { pending: 'neutral', running: 'info', pass: 'good', fail: 'bad', error: 'bad', skipped: 'neutral', cancelled: 'warn' };
+
 export function createDiagnosticsScreen(app: App, _route: Extract<Route, { screen: 'diagnostics' }>): Screen {
   const d = new Disposer();
   let diag: SensorDiagnostics | null = null;
@@ -41,6 +67,7 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
   const body = h('div', { class: 'diag-body' }, h('div', { class: 'list-loading' }, spinner('md', 'Collecting diagnostics')));
   const copyBtn = button({ label: 'Copy', icon: 'copy', variant: 'ghost', size: 'sm', testId: 'diag-copy', onClick: () => void copy() });
   copyBtn.disabled = true;
+  const benchHost = h('div', { class: 'bench', 'data-testid': 'bench' });
 
   const el = h(
     'div',
@@ -52,7 +79,7 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
       h('h1', { class: 'topbar-title', text: 'Diagnostics' }),
       copyBtn,
     ),
-    h('div', { class: 'content' }, body),
+    h('div', { class: 'content' }, benchHost, body),
   );
 
   function report(): Record<string, unknown> {
@@ -65,25 +92,201 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
 
   async function copy(): Promise<void> {
     const text = JSON.stringify(report(), (_k, v) => (v instanceof Float64Array || v instanceof Float32Array ? Array.from(v) : v), 2);
-    try {
-      await navigator.clipboard.writeText(text);
-      toast('Diagnostics copied', { tone: 'good', icon: 'copy' });
-      return;
-    } catch {
-      /* fall back */
+    await copyText(text, 'Diagnostics copied');
+  }
+
+  // ---- benchmark ---------------------------------------------------------------------------------
+  const benchScale = benchScaleFromUrl();
+  let benchRun: BenchRun | null = null;
+  const benchTests = new Map<BenchTestId, BenchTestResult>();
+  const benchProgress = new Map<BenchTestId, string>();
+  let benchStarted = 0;
+  let benchTimer: ReturnType<typeof setInterval> | null = null;
+
+  function runBench(): void {
+    if (benchRun) return;
+    benchTests.clear();
+    benchProgress.clear();
+    lastBenchReport = null;
+    app.debug.benchReport = undefined;
+    benchStarted = performance.now();
+    // GPU only when this page has WebGPU (the worker checks too and falls back to the CPU).
+    const gpu = !!(navigator as Navigator & { gpu?: unknown }).gpu;
+    const run = startBenchmark({
+      scale: benchScale,
+      gpu,
+      noGpuReason: gpu ? undefined : 'WebGPU is not available in this browser (older iOS, Lockdown Mode or a disabled feature)',
+      onTest: (r) => {
+        benchTests.set(r.id, r);
+        if (r.status !== 'running') benchProgress.delete(r.id);
+        renderBench();
+      },
+      onProgress: (id, m) => {
+        benchProgress.set(id, m);
+        renderBench();
+      },
+    });
+    benchRun = run;
+    benchTimer = setInterval(() => renderBenchClock(), 1000);
+    void run.done.then((rep) => {
+      if (benchRun !== run) return;
+      benchRun = null;
+      if (benchTimer) clearInterval(benchTimer);
+      benchTimer = null;
+      lastBenchReport = rep;
+      app.debug.benchReport = rep;
+      // the final report is authoritative (a terminated worker never sent its last updates)
+      for (const t of rep.tests) benchTests.set(t.id, t);
+      benchProgress.clear();
+      if (!closed) {
+        renderBench();
+        const v = verdict(rep.tests);
+        if (rep.cancelled) toast('Benchmark cancelled', { tone: 'warn' });
+        else toast(v.fail ? `Benchmark finished: ${v.text}` : 'Benchmark finished — all checks passed', { tone: v.fail ? 'bad' : 'good' });
+      }
+    });
+    renderBench();
+  }
+
+  function cancelBench(reason?: string): void {
+    benchRun?.cancel(reason);
+    renderBench();
+  }
+
+  let benchClock: HTMLElement | null = null;
+  function renderBenchClock(): void {
+    if (benchClock && benchRun) benchClock.textContent = `Running · ${formatDuration(performance.now() - benchStarted)}`;
+  }
+
+  function benchRow(id: BenchTestId, title: string): HTMLElement {
+    const t = benchTests.get(id);
+    const idle = !benchRun && !t;
+    const status: BenchStatus = t?.status ?? 'pending';
+    const progress = benchProgress.get(id);
+    const sub =
+      status === 'running'
+        ? (progress ?? 'Starting…')
+        : t?.error
+          ? `Error: ${t.error}`
+          : t?.summary || t?.note || (idle || status === 'pending' ? describeTest(id, benchScale) : '');
+    const badge = idle
+      ? null
+      : status === 'running'
+        ? h('span', { class: 'bench-chip-running' }, spinner('sm', `${title} running`))
+        : chip(STATUS_LABEL[status], STATUS_TONE[status], status === 'pass' ? 'check' : status === 'fail' || status === 'error' ? 'warning' : undefined);
+    const details: HTMLElement[] = [];
+    if (t && (status === 'pass' || status === 'fail' || status === 'error' || status === 'cancelled')) {
+      // (the "no WebGPU — CPU fallback" note of every test is said once, in the verdict banner)
+      if (t.note && t.summary && t.backend === 'gpu') details.push(h('div', { class: 'bench-note' }, icon('info', { size: 14 }), h('span', { text: t.note })));
+      if (t.checks.length)
+        details.push(
+          h(
+            'ul',
+            { class: 'bench-checks', 'aria-label': `${title} checks` },
+            ...t.checks.map((c) => h('li', { class: c.pass ? 'ok' : 'bad' }, icon(c.pass ? 'check' : 'warning', { size: 14, label: c.pass ? 'passed' : 'failed' }), h('span', { text: `${c.name}: ${c.detail}` }))),
+          ),
+        );
+      const tm = Object.entries(t.timings);
+      if (tm.length)
+        details.push(
+          h(
+            'details',
+            { class: 'bench-timings' },
+            h('summary', { text: `Timings (${tm.length})` }),
+            h('dl', null, ...tm.flatMap(([k, v]) => [h('dt', { text: k }), h('dd', { text: formatMs(v) })])),
+          ),
+        );
     }
-    const ta = h('textarea', { class: 'offscreen', readonly: true, 'aria-hidden': 'true' });
-    ta.value = text;
-    document.body.appendChild(ta);
-    ta.select();
-    let ok = false;
-    try {
-      ok = document.execCommand('copy');
-    } catch {
-      ok = false;
+    return h(
+      'div',
+      { class: 'row bench-row', 'data-testid': `bench-${id}`, 'data-status': idle ? 'idle' : status },
+      h(
+        'div',
+        { class: 'bench-head' },
+        h(
+          'div',
+          { class: 'row-text' },
+          h('span', { class: 'row-title' }, h('span', { text: title }), t ? h('span', { class: 'bench-backend', text: t.backend.toUpperCase() }) : null),
+          sub ? h('span', { class: 'row-sub', text: sub }) : null,
+        ),
+        badge,
+      ),
+      details.length ? h('div', { class: 'bench-body' }, ...details) : null,
+    );
+  }
+
+  function renderBench(): void {
+    if (closed) return;
+    const rep = benchRun ? null : lastBenchReport;
+    const parts: HTMLElement[] = [];
+    parts.push(
+      h(
+        'p',
+        { class: 'muted bench-intro' },
+        `Measures this device on synthetic data — GPU features, matching, dense stereo and bundle adjustment — and checks the GPU results against the CPU reference. ${
+          benchScale === 'full' ? 'Takes about 1–3 minutes; keep the app open.' : `Scale “${benchScale}” (CI-sized inputs).`
+        }`,
+      ),
+    );
+    if (rep) {
+      const v = verdict(rep.tests);
+      const g = rep.device.gpu;
+      parts.push(
+        banner({
+          tone: rep.error && !rep.cancelled ? 'bad' : rep.cancelled ? 'warn' : v.fail ? 'bad' : 'good',
+          icon: rep.cancelled || v.fail ? 'warning' : 'check',
+          title: rep.cancelled ? `Cancelled — ${v.text}` : v.fail ? `${v.fail} of ${rep.tests.length} tests failed` : `All ${v.pass} tests passed`,
+          body: `${g.available ? `WebGPU: ${g.adapter}${g.isSoftware ? ' (software renderer)' : ''}` : `No WebGPU — CPU results only (${g.reason ?? 'unavailable'})`} · ${formatDuration(rep.durationMs)}${rep.error ? ` · ${rep.error}` : ''}`,
+          testId: 'bench-verdict',
+        }),
+      );
     }
-    ta.remove();
-    toast(ok ? 'Diagnostics copied' : 'Copy failed — your browser blocked the clipboard', { tone: ok ? 'good' : 'warn' });
+    parts.push(group(...BENCH_TESTS.map((t) => benchRow(t.id, t.title))));
+    if (rep?.estimates.length) {
+      const e0 = rep.estimates[0];
+      parts.push(
+        h('h3', { class: 'bench-subtitle', text: 'Estimated processing time' }),
+        group(
+          ...rep.estimates.map((e) =>
+            h(
+              'div',
+              { class: 'row bench-row', 'data-testid': `bench-estimate-${e.quality}` },
+              h('div', { class: 'row-text' }, h('span', { class: 'row-title', text: qualityName(e.quality) }), h('span', { class: 'row-sub', text: estimateLine(e) })),
+              chip(`≈ ${formatDuration(e.processingMs)}`, 'info'),
+            ),
+          ),
+        ),
+        h(
+          'p',
+          { class: 'muted bench-foot' },
+          `Rough estimate for a scan of ${e0.keyframes} keyframes, after the capture (refine + dense + mesh); features on the ${e0.features.toUpperCase()}, dense stereo on the ${e0.dense.toUpperCase()}. Extrapolated from the measurements above.`,
+        ),
+      );
+    }
+    const actions: HTMLElement[] = [];
+    if (benchRun) {
+      benchClock = h('span', { class: 'bench-clock', 'aria-live': 'off' });
+      actions.push(h('div', { class: 'bench-running' }, spinner('sm', 'Benchmark running'), benchClock));
+      actions.push(button({ label: 'Cancel', icon: 'close', variant: 'secondary', size: 'md', block: true, testId: 'bench-cancel', onClick: () => cancelBench() }));
+      renderBenchClock();
+    } else {
+      benchClock = null;
+      actions.push(button({ label: rep ? 'Run again' : 'Run benchmark', icon: 'activity', variant: 'primary', size: 'md', block: true, testId: 'bench-run', onClick: () => runBench() }));
+      if (rep)
+        actions.push(
+          button({ label: 'Copy report', icon: 'copy', variant: 'secondary', size: 'md', block: true, testId: 'bench-copy', onClick: () => void copyText(reportClipboardText(rep), 'Benchmark report copied') }),
+        );
+    }
+    parts.push(h('div', { class: 'bench-actions' }, ...actions));
+    const focused = benchHost.contains(document.activeElement) ? (document.activeElement as HTMLElement).dataset.testid : undefined;
+    // keep the open/closed state of the timing lists across re-renders
+    const open = new Set([...benchHost.querySelectorAll<HTMLDetailsElement>('details[open]')].map((d) => d.closest<HTMLElement>('[data-testid]')?.dataset.testid));
+    replaceChildren(benchHost, section('Benchmark & self-test', ...parts));
+    for (const id of open) if (id) benchHost.querySelector<HTMLDetailsElement>(`[data-testid="${id}"] details`)?.setAttribute('open', '');
+    if (focused) {
+      const next = benchHost.querySelector<HTMLElement>(`[data-testid="${focused}"]`) ?? benchHost.querySelector<HTMLElement>(benchRun ? '[data-testid="bench-cancel"]' : '[data-testid="bench-run"]');
+      next?.focus({ preventScroll: true });
+    }
   }
 
   function yesNo(v: boolean | null | undefined): HTMLElement {
@@ -258,6 +461,13 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
   return {
     el,
     enter() {
+      // Coming back to Diagnostics: show the previous run's results.
+      if (lastBenchReport) for (const t of lastBenchReport.tests) benchTests.set(t.id, t);
+      renderBench();
+      // iOS drops GPU work submitted while the page is hidden: the timings would be meaningless.
+      d.listen(document, 'visibilitychange', () => {
+        if (document.hidden && benchRun) cancelBench('the app went to the background');
+      });
       void collectDiagnostics({ gpu: 'adapter' })
         .then((r) => {
           if (closed) return;
@@ -271,9 +481,34 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
     },
     leave() {
       closed = true;
+      benchRun?.cancel('Diagnostics was closed');
+      if (benchTimer) clearInterval(benchTimer);
       d.dispose();
     },
   };
+}
+
+/** Copy text to the clipboard (Clipboard API, else a selected textarea + execCommand) with a toast. */
+async function copyText(text: string, okMessage: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(okMessage, { tone: 'good', icon: 'copy' });
+    return;
+  } catch {
+    /* fall back */
+  }
+  const ta = h('textarea', { class: 'offscreen', readonly: true, 'aria-hidden': 'true' });
+  ta.value = text;
+  document.body.appendChild(ta);
+  ta.select();
+  let ok = false;
+  try {
+    ok = document.execCommand('copy');
+  } catch {
+    ok = false;
+  }
+  ta.remove();
+  toast(ok ? okMessage : 'Copy failed — your browser blocked the clipboard', { tone: ok ? 'good' : 'warn' });
 }
 
 /** Insert zero-width break opportunities at camelCase boundaries (long WebGPU limit names). */

@@ -4,7 +4,10 @@
  * never on localhost), persistent storage in Home Screen mode.
  *
  * URL parameters (development / tests): `mock=1`, `mockSpeed=<x>` (MockEngine time scale),
- * `mockFail=<method>[:message]` (make a MockEngine method fail), `screen=diagnostics|setup`.
+ * `mockFail=<method>[:message]` (make a MockEngine method fail), `mockStall=<method>[,…]` (a
+ * MockEngine long operation hangs and ignores cancel: finishCapture | refine | densify | mesh),
+ * `mockMemoryLimit=<n>` (capture memory cap after n keyframes), `screen=diagnostics|setup`,
+ * `benchScale=small` (Diagnostics benchmark with CI-sized inputs).
  */
 import './app/styles.css';
 import { App } from './app/app';
@@ -19,9 +22,11 @@ async function boot(): Promise<void> {
   const speed = Number(params.get('mockSpeed') ?? '1');
   const fail = params.get('mockFail');
   const failOn = fail ? { [fail.split(':')[0]]: fail.split(':').slice(1).join(':') || 'Simulated failure' } : undefined;
+  const stallOn = Object.fromEntries((params.get('mockStall') ?? '').split(',').filter(Boolean).map((m) => [m, true]));
+  const memoryLimitKeyframes = Number(params.get('mockMemoryLimit') ?? '0') || undefined;
   // The MockEngine (dev / tests) is loaded on demand: it is not part of the production entry chunk.
   const engine: EngineLike = mock
-    ? new (await import('./app/mock-engine')).MockEngine({ speed: Number.isFinite(speed) && speed > 0 ? speed : 1, failOn })
+    ? new (await import('./app/mock-engine')).MockEngine({ speed: Number.isFinite(speed) && speed > 0 ? speed : 1, failOn, stallOn, memoryLimitKeyframes })
     : new EngineClient();
   const root = document.getElementById('app') ?? document.body.appendChild(document.createElement('div'));
   root.id = 'app';

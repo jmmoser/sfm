@@ -129,6 +129,59 @@ describe('MockEngine', () => {
     await expect(p).rejects.toMatchObject({ name: 'CancelledError' });
   });
 
+  it('finishCapture is a cancellable long operation; a stalled one is aborted with a simulated restart', async () => {
+    const e = new MockEngine({ speed: 1, sessions: async () => null });
+    await e.init({ mode: 'object', quality: 'fast' });
+    const p = e.finishCapture();
+    setTimeout(() => e.cancel(), 50);
+    await expect(p).rejects.toMatchObject({ name: 'CancelledError' });
+    expect(await e.abortLongOperation()).toBe('none');
+
+    const stuck = new MockEngine({ speed: 20, stallOn: { finishCapture: true }, sessions: async () => null });
+    await stuck.init({ mode: 'object', quality: 'fast' });
+    const states: string[] = [];
+    stuck.onStatus((s) => states.push(`${s.state}:${s.reason ?? ''}`));
+    const q = stuck.finishCapture().catch((err: Error) => err);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(await stuck.abortLongOperation({ graceMs: 100 })).toBe('restarted');
+    expect(await q).toMatchObject({ name: 'CancelledError' });
+    expect(states[0]).toMatch(/^respawning:aborted: /);
+    expect(stuck.status.state).toBe('ready');
+    // The session survives the "restart": processing works.
+    expect((await stuck.refine()).cameras.length).toBeGreaterThan(0);
+  });
+
+  it('memoryLimitKeyframes: one out-of-memory event, then tracking only (no new keyframes)', async () => {
+    const e = new MockEngine({ speed: 60, memoryLimitKeyframes: 3, sessions: async () => null });
+    await e.init({ mode: 'object', quality: 'fast' });
+    const errors: { reason?: string; name: string; fatal: boolean }[] = [];
+    e.onError((x) => errors.push({ reason: x.reason, name: x.error.name, fatal: x.fatal }));
+    let u: LiveUpdate | null = null;
+    for (let i = 0; i < 120; i++) u = await e.processFrame(frame(100 + i * 100));
+    expect(u!.numKeyframes).toBe(3);
+    expect(u!.timings.memoryLimited).toBe(1);
+    expect(u!.tracking).toBe('tracking');
+    expect(errors).toEqual([{ reason: 'out-of-memory', name: 'CaptureMemoryLimitError', fatal: false }]);
+  });
+
+  it('an interrupted densify is reported as resumable (stats.denseResumablePass) until it completes', async () => {
+    const e = new MockEngine({ speed: 4, sessions: async () => null });
+    await e.init({ mode: 'object', quality: 'fast', sessionId: 'r1' });
+    for (let i = 0; i < 40; i++) await e.processFrame(frame(100 + i * 400));
+    await e.refine();
+    const d = e.densify();
+    setTimeout(() => e.cancel(), 100);
+    await expect(d).rejects.toMatchObject({ name: 'CancelledError' });
+    expect((await e.loadSession('r1')).stats.denseResumablePass).toBe(1);
+    const pc = await e.densify();
+    expect(pc.count).toBeGreaterThan(0);
+    const sum = await e.loadSession('r1');
+    expect(sum.stats.denseResumablePass).toBeUndefined();
+    expect(sum.stats.denseResumedPass).toBe(1);
+    expect(typeof sum.stats.memoryMB).toBe('number');
+    expect(sum.stats.yawSource).toBe('compass');
+  });
+
   it('failOn makes a method fail (error UI)', async () => {
     const e = new MockEngine({ speed: 50, failOn: { refine: 'out of memory' }, sessions: async () => null });
     await e.init({ mode: 'object', quality: 'fast' });

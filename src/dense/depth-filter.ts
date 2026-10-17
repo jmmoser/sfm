@@ -1,6 +1,6 @@
 /**
  * Depth-map clean-up before fusion: colour-guided removal of "halos" (foreground
- * fattening) next to depth discontinuities.
+ * fattening) next to depth discontinuities, and of depths on the sky.
  *
  * Window-based matching (PatchMatch NCC over a (2r+1)² window) lets pixels of a weakly
  * textured background next to a textured foreground take the FOREGROUND's plane: a band
@@ -11,8 +11,8 @@
  * every silhouette (synthetic yard, `minViews` 2: 38 % of the points farther than τ from the
  * surface were sky-coloured).
  *
- * A halo pixel has the colour of one surface and the depth of another. For every valid
- * pixel p within `radius` pixels of a depth discontinuity (an invalid or off-plane
+ * 1. Halo vote. A halo pixel has the colour of one surface and the depth of another. For every
+ * valid pixel p within `radius` pixels of a depth discontinuity (an invalid or off-plane
  * 4-neighbour), the window samples of p's colour (mean |ΔR|,|ΔG|,|ΔB| < `segmentColor`)
  * vote: a sample is on p's plane when |d_q − z_p(q)| ≤ maxRelDepth · d_q, where z_p(q) is
  * the depth of p's plane (from its normal) on q's ray, and off-plane when invalid or
@@ -24,13 +24,30 @@
  * the same colour (a low-texture hole) is eroded where most of the window is invalid. Only
  * pixels within `radius` of a discontinuity are examined.
  *
- * Measured on the GT-pose harness (480 px, PatchMatch geometric maps; fraction of valid
- * pixels rejected with the defaults): object 66 % of the > 5 % outliers, 1.2 % of the ≤ 1 %
- * pixels; yard 81 % of the sky estimates, 68 % of the > 5 % outliers, 0.9 % of the ≤ 1 %
- * pixels. ≈ 45 ms per 480×360 map on one x86 core (5 × 5 samples per examined pixel; the
- * 9 × 9 lattice of step 2 is 2–3× slower for the same result). Apply it ONCE per map: a second
- * pass sees the removed pixels as invalid and erodes further (`removeDepthHalos` on the final
- * maps, or `FusionOptions.haloFilter`, not both).
+ * 2. Sky test (`skyMaxStd` > 0). Halos wider than the vote window survive step 1: inside a
+ * band, most same-coloured samples are band pixels on the same extended plane. The sky has
+ * no texture of its own, so every depth on it comes from propagation: (a) the texture of each
+ * pixel's colour segment (`segmentTextureSampler`: grey std of the same-coloured window
+ * samples, so a sky pixel next to a roof measures the sky, not the roof edge) marks
+ * untextured pixels; (b) untextured regions connected to the TOP image row through
+ * untextured, similar-coloured 4-neighbours (`borderComponents`; dense images are upright)
+ * are sky candidates; (c) a candidate region is sky when fewer than `skyMinCoherence` of its
+ * pixels carry a coherent depth (valid, with ≥ 3 of 4 neighbours valid and on the pixel's
+ * plane): PatchMatch fills the sky with random, locally incoherent depths (or none), while a
+ * smooth wall gets one consistent plane. All valid depths of a sky region are rejected, halo
+ * bands included. Measured (GT-pose harness, PatchMatch geometric maps, untextured = std < 2):
+ * yard sky regions have coherence 0.1–0.5 (all of their area), the object room's
+ * top-connected walls 0.5–1 (99.5 % of their area).
+ *
+ * Measured on the GT-pose harness (480 px; fraction of valid pixels rejected by step 1 with
+ * the defaults): object 66 % of the > 5 % outliers, 1.2 % of the ≤ 1 % pixels; yard 81 % of
+ * the sky estimates, 68 % of the > 5 % outliers, 0.9 % of the ≤ 1 % pixels. The sky test
+ * then removes 80–90 % of the sky-coloured points farther than τ that survive fusion on the
+ * yard (precision 0.981 → 0.985, completeness −0.03 pt) and changes nothing on the object
+ * (ARCHITECTURE §6 "Sky / low-texture halo removal"). ≈ 40 ms per 480×360 map for step 1 on
+ * one x86 core, + 5–30 ms for the sky test (proportional to the top-connected untextured
+ * area). Apply it ONCE per map: a second pass sees the removed pixels as invalid and erodes
+ * further (`removeDepthHalos` on the final maps, or `FusionOptions.haloFilter`, not both).
  */
 import type { CameraIntrinsics, RGBAImage } from '../core/types';
 import { rgbAtResolution, scaleCamera } from './dense-util';
@@ -49,6 +66,20 @@ export interface HaloFilterOptions {
   voteFraction: number;
   /** Minimum number of same-coloured samples for a decision. Default 6. */
   minSegmentSamples: number;
+  /**
+   * Sky test: grey-level std (0..255) of a pixel's colour segment (`segmentTextureSampler`) below
+   * which the pixel counts as untextured. 0 = sky test off. Default 3.
+   */
+  skyMaxStd: number;
+  /**
+   * A top-connected untextured region is sky when fewer than this fraction of its pixels carry
+   * a coherent depth (valid, ≥ 3 of 4 neighbours valid and on the pixel's plane). Default 0.5.
+   */
+  skyMinCoherence: number;
+  /** Window radius / lattice step / minimum same-coloured samples of the texture measure. Defaults 5 / 2 / 8. */
+  skyTextureRadius: number;
+  skyTextureStep: number;
+  skyTextureMinSamples: number;
 }
 
 export const DEFAULT_HALO_FILTER_OPTIONS: Readonly<HaloFilterOptions> = Object.freeze({
@@ -58,6 +89,11 @@ export const DEFAULT_HALO_FILTER_OPTIONS: Readonly<HaloFilterOptions> = Object.f
   segmentColor: 10,
   voteFraction: 0.5,
   minSegmentSamples: 6,
+  skyMaxStd: 3,
+  skyMinCoherence: 0.5,
+  skyTextureRadius: 5,
+  skyTextureStep: 2,
+  skyTextureMinSamples: 8,
 });
 
 /**
@@ -70,10 +106,11 @@ export function depthHaloMask(dm: DepthMap, image: RGBAImage, cam: CameraIntrins
   const o: HaloFilterOptions = { ...DEFAULT_HALO_FILTER_OPTIONS, ...options };
   const e = Math.max(0, Math.floor(o.radius));
   const st = Math.max(1, Math.floor(o.step));
+  const skyOn = o.skyMaxStd > 0 && o.skyMinCoherence > 0;
   const W = dm.width;
   const H = dm.height;
   const n = W * H;
-  if (e === 0 || n === 0) return null;
+  if ((e === 0 && !skyOn) || n === 0) return null;
   const depth = dm.depth;
   const normal = dm.normal;
   const c = scaleCamera(cam, W, H);
@@ -86,11 +123,13 @@ export function depthHaloMask(dm: DepthMap, image: RGBAImage, cam: CameraIntrins
   const pb = new Float32Array(n);
   const pc = new Float32Array(n);
   const pn = new Float32Array(n);
+  let anyValid = false;
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
       const i = y * W + x;
       const d = depth[i];
       if (!(d > 0 && d < Infinity)) continue;
+      anyValid = true;
       const nx = normal[3 * i];
       const ny = normal[3 * i + 1];
       const nz = normal[3 * i + 2];
@@ -106,6 +145,7 @@ export function depthHaloMask(dm: DepthMap, image: RGBAImage, cam: CameraIntrins
       pn[i] = nrp;
     }
   }
+  if (!anyValid) return null;
   /** Whether depth dq at (xq, yq) lies on pixel i's plane (within t, relative to dq). */
   const onPlane = (i: number, dq: number, xq: number, yq: number): boolean => {
     const d = depth[i];
@@ -120,7 +160,35 @@ export function depthHaloMask(dm: DepthMap, image: RGBAImage, cam: CameraIntrins
     }
     return Math.abs(dq - d) <= t * dq;
   };
+  const rgb = rgbAtResolution(image, W, H);
+  const out = new Uint32Array((n + 31) >>> 5);
+  let rejected = 0;
+  if (e > 0) rejected += haloVote(dm, rgb, o, e, st, onPlane, pa, pb, pc, pn, out);
+  if (skyOn) rejected += skyTest(dm, rgb, o, onPlane, out);
+  return rejected > 0 ? out : null;
+}
 
+type PlaneTest = (i: number, dq: number, xq: number, yq: number) => boolean;
+
+/** Step 1 (file header): same-colour plane vote near discontinuities; sets bits in `out`, returns the count. */
+function haloVote(
+  dm: DepthMap,
+  rgb: Uint8Array,
+  o: HaloFilterOptions,
+  e: number,
+  st: number,
+  onPlane: PlaneTest,
+  pa: Float32Array,
+  pb: Float32Array,
+  pc: Float32Array,
+  pn: Float32Array,
+  out: Uint32Array,
+): number {
+  const W = dm.width;
+  const H = dm.height;
+  const n = W * H;
+  const depth = dm.depth;
+  const t = o.maxRelDepth;
   // 1. discontinuity pixels: valid with an invalid or off-plane 4-neighbour
   const edge = new Uint8Array(n);
   let anyEdge = false;
@@ -142,7 +210,7 @@ export function depthHaloMask(dm: DepthMap, image: RGBAImage, cam: CameraIntrins
       }
     }
   }
-  if (!anyEdge) return null;
+  if (!anyEdge) return 0;
 
   // 2. pixels within e of a discontinuity (Chebyshev dilation, separable)
   const tmp = new Uint8Array(n);
@@ -175,10 +243,8 @@ export function depthHaloMask(dm: DepthMap, image: RGBAImage, cam: CameraIntrins
   }
 
   // 3. same-colour vote (hot loop: plane test inlined, colours packed)
-  const rgb = rgbAtResolution(image, W, H);
   const col = new Int32Array(n);
   for (let i = 0; i < n; i++) col[i] = rgb[3 * i] | (rgb[3 * i + 1] << 8) | (rgb[3 * i + 2] << 16);
-  const out = new Uint32Array((n + 31) >>> 5);
   const segC = 3 * o.segmentColor;
   const minS = Math.max(1, o.minSegmentSamples);
   const frac = o.voteFraction;
@@ -230,7 +296,58 @@ export function depthHaloMask(dm: DepthMap, image: RGBAImage, cam: CameraIntrins
       }
     }
   }
-  return rejected > 0 ? out : null;
+  return rejected;
+}
+
+/** Step 2 (file header): rejects every valid depth of the incoherent top-connected untextured regions. */
+function skyTest(dm: DepthMap, rgb: Uint8Array, o: HaloFilterOptions, onPlane: PlaneTest, out: Uint32Array): number {
+  const W = dm.width;
+  const H = dm.height;
+  const depth = dm.depth;
+  const std = segmentTextureSampler(rgb, W, H, o.skyTextureRadius, o.skyTextureStep, o.segmentColor, Math.max(1, o.skyTextureMinSamples));
+  const maxStd = o.skyMaxStd;
+  // flood fill from the top row; each pixel's texture is evaluated at most once, on the way
+  const { labels, count } = borderComponents((i) => std(i) < maxStd, rgb, W, H, o.segmentColor, 1);
+  if (count === 0) return 0;
+  const area = new Float64Array(count + 1);
+  const coherent = new Float64Array(count + 1);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      const l = labels[i];
+      if (!l) continue;
+      area[l]++;
+      const d = depth[i];
+      if (!(d > 0 && d < Infinity)) continue;
+      let agree = 0;
+      for (let k = 0; k < 4; k++) {
+        const xx = k === 0 ? x - 1 : k === 1 ? x + 1 : x;
+        const yy = k === 2 ? y - 1 : k === 3 ? y + 1 : y;
+        if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+        const dj = depth[yy * W + xx];
+        if (dj > 0 && dj < Infinity && onPlane(i, dj, xx, yy)) agree++;
+      }
+      if (agree >= 3) coherent[l]++;
+    }
+  }
+  const sky = new Uint8Array(count + 1);
+  let anySky = false;
+  for (let l = 1; l <= count; l++) {
+    if (coherent[l] < o.skyMinCoherence * area[l]) {
+      sky[l] = 1;
+      anySky = true;
+    }
+  }
+  if (!anySky) return 0;
+  let rejected = 0;
+  for (let i = 0; i < W * H; i++) {
+    if (!sky[labels[i]]) continue;
+    const d = depth[i];
+    if (!(d > 0 && d < Infinity) || (out[i >>> 5] >>> (i & 31)) & 1) continue;
+    out[i >>> 5] |= 1 << (i & 31);
+    rejected++;
+  }
+  return rejected;
 }
 
 /** Copy of `dm` with the pixels of `depthHaloMask` invalidated (depth 0, normal 0, cost 2). */
@@ -248,4 +365,115 @@ export function removeDepthHalos(dm: DepthMap, image: RGBAImage, cam: CameraIntr
     out.cost[i] = 2;
   }
   return out;
+}
+
+/**
+ * Per-pixel texture of the pixel's colour segment, evaluated on demand: `std(i)` is the
+ * grey-level standard deviation (0..255, grey = (R + 2G + B) / 4) of the window samples (radius
+ * `radius`, lattice `step` aligned with the pixel, centre included) whose colour is within
+ * `segmentColor` of the centre pixel (mean |ΔR|,|ΔG|,|ΔB|). Unlike the bilateral variance
+ * PatchMatch tests (`minVariance`), samples of other colours have NO weight, so a sky pixel next
+ * to a roof edge measures the sky's texture, not the edge's. Infinity when fewer than
+ * `minSamples` samples share the centre's colour (an isolated colour counts as texture).
+ * `rgb` = packed RGB at W × H (`rgbAtResolution`).
+ */
+export function segmentTextureSampler(rgb: Uint8Array, W: number, H: number, radius: number, step: number, segmentColor: number, minSamples: number): (i: number) => number {
+  const n = W * H;
+  const e = Math.max(1, Math.floor(radius));
+  const st = Math.max(1, Math.floor(step));
+  // 4 × grey (R + 2G + B) in 2 B/px; colours are compared on `rgb` directly (no extra copies)
+  const grey4 = new Uint16Array(n);
+  for (let i = 0; i < n; i++) grey4[i] = rgb[3 * i] + 2 * rgb[3 * i + 1] + rgb[3 * i + 2];
+  const segC = 3 * segmentColor;
+  return (i: number): number => {
+    const x = i % W;
+    const y = (i - x) / W;
+    const y0 = y - Math.floor(Math.min(e, y) / st) * st;
+    const y1 = Math.min(H - 1, y + e);
+    const x0 = x - Math.floor(Math.min(e, x) / st) * st;
+    const x1 = Math.min(W - 1, x + e);
+    const r = rgb[3 * i];
+    const g = rgb[3 * i + 1];
+    const b = rgb[3 * i + 2];
+    const g0 = grey4[i];
+    let m = 0;
+    let s1 = 0;
+    let s2 = 0;
+    for (let yy = y0; yy <= y1; yy += st) {
+      const row = yy * W;
+      for (let xx = x0; xx <= x1; xx += st) {
+        const j = row + xx;
+        const j3 = 3 * j;
+        if (Math.abs(rgb[j3] - r) + Math.abs(rgb[j3 + 1] - g) + Math.abs(rgb[j3 + 2] - b) >= segC) continue;
+        const d = grey4[j] - g0;
+        m++;
+        s1 += d;
+        s2 += d * d;
+      }
+    }
+    return m < minSamples ? Infinity : 0.25 * Math.sqrt(Math.max(0, s2 / m - (s1 / m) * (s1 / m)));
+  };
+}
+
+/** `segmentTextureSampler` evaluated at every pixel (Float32Array of W × H). */
+export function segmentTextureStd(rgb: Uint8Array, W: number, H: number, radius: number, step: number, segmentColor: number, minSamples: number): Float32Array {
+  const f = segmentTextureSampler(rgb, W, H, radius, step, segmentColor, minSamples);
+  const out = new Float32Array(W * H);
+  for (let i = 0; i < out.length; i++) out[i] = f(i);
+  return out;
+}
+
+/**
+ * Pixels of `low` (1 = low texture, or a predicate evaluated at most once per pixel on the way)
+ * connected to the image border rows/columns selected by
+ * `borders` (bit 0 top, 1 bottom, 2 left, 3 right) through 4-neighbours of `low` whose colours
+ * differ by less than `segmentColor` (mean abs RGB) — e.g. the sky region of an upright image
+ * (top border). Returns a 0/1 mask.
+ */
+export function borderConnectedMask(low: Uint8Array | ((i: number) => boolean), rgb: Uint8Array, W: number, H: number, segmentColor: number, borders = 1): Uint8Array {
+  const { labels } = borderComponents(low, rgb, W, H, segmentColor, borders);
+  return Uint8Array.from(labels, (l) => (l > 0 ? 1 : 0));
+}
+
+/**
+ * Connected components of `borderConnectedMask`: `labels[i]` = 1..count for the pixels of
+ * component k (one flood fill per unvisited border seed), 0 elsewhere.
+ */
+export function borderComponents(low: Uint8Array | ((i: number) => boolean), rgb: Uint8Array, W: number, H: number, segmentColor: number, borders = 1): { labels: Uint16Array | Int32Array; count: number } {
+  const isLow = typeof low === 'function' ? low : (i: number): boolean => low[i] === 1;
+  const n = W * H;
+  // at most one component per border seed: 16-bit labels whenever they fit (2 B/px)
+  const labels = 2 * (W + H) < 65535 ? new Uint16Array(n) : new Int32Array(n);
+  const queue = new Int32Array(n);
+  const segC = 3 * segmentColor;
+  let count = 0;
+  const fill = (s: number): void => {
+    if (labels[s] || !isLow(s)) return;
+    const lab = ++count;
+    let qh = 0;
+    let qt = 0;
+    labels[s] = lab;
+    queue[qt++] = s;
+    while (qh < qt) {
+      const i = queue[qh++];
+      const x = i % W;
+      const y = (i - x) / W;
+      for (let k = 0; k < 4; k++) {
+        const xx = k === 0 ? x - 1 : k === 1 ? x + 1 : x;
+        const yy = k === 2 ? y - 1 : k === 3 ? y + 1 : y;
+        if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+        const j = yy * W + xx;
+        if (labels[j]) continue;
+        if (Math.abs(rgb[3 * i] - rgb[3 * j]) + Math.abs(rgb[3 * i + 1] - rgb[3 * j + 1]) + Math.abs(rgb[3 * i + 2] - rgb[3 * j + 2]) >= segC) continue;
+        if (!isLow(j)) continue;
+        labels[j] = lab;
+        queue[qt++] = j;
+      }
+    }
+  };
+  if (borders & 1) for (let x = 0; x < W; x++) fill(x);
+  if (borders & 2) for (let x = 0; x < W; x++) fill((H - 1) * W + x);
+  if (borders & 4) for (let y = 0; y < H; y++) fill(y * W);
+  if (borders & 8) for (let y = 0; y < H; y++) fill(y * W + W - 1);
+  return { labels, count };
 }

@@ -9,8 +9,11 @@
  *  - page hidden ⇒ pause; on return a TAP resumes (re-acquiring the camera inside the gesture
  *    when the track did not come back — iOS reuses a camera grant without a gesture only ~1 min);
  *  - camera errors show a recovery card whose button restarts the camera from the tap;
- *  - UI rotation: the layout reflows, frames carry their screenAngle, the overlay is rotated
- *    into the current orientation.
+ *  - UI rotation: the layout reflows, frames carry their screenAngle; the overlay of a frame
+ *    captured before the rotation is dropped; a RAW sensor buffer (landscape bitmap in a portrait
+ *    UI, upright for θ = 90 — the engine's rule) is turned onto the upright preview;
+ *  - finishing can be cancelled (a stuck finishCapture is aborted, the worker restarted);
+ *  - the engine's capture memory limit ('out-of-memory' event) asks "finish scan now?".
  */
 import type { PumpFrame } from '../../sensors/frame-pump';
 import { CameraCapture, type CameraStartResult, type CameraState } from '../../sensors/camera';
@@ -18,23 +21,32 @@ import { CompassSensor } from '../../sensors/orientation';
 import { FramePump } from '../../sensors/frame-pump';
 import { GeoSensor } from '../../sensors/geolocation';
 import { MotionSensor } from '../../sensors/motion';
-import { screenAngle } from '../../sensors/frame-orientation';
+import { screenAngle, type ScreenAngle } from '../../sensors/frame-orientation';
 import type { CapturePermissionStatus } from '../../sensors/permissions';
 import type { Viewer } from '../../viewer';
 import { loadViewerModule } from '../viewer-loader';
 import { ENGINE_ERRORS, isCancelledError, type FrameInput, type LiveCamera, type LiveUpdate } from '../../workers/protocol';
 import type { App, Screen } from '../app';
-import { button, iconButton, spinner } from '../components/controls';
+import type { AbortOutcome, EngineErrorInfo } from '../engine-client';
+import { button, iconButton, setButtonLabel, spinner } from '../components/controls';
 import { confirmDialog } from '../components/dialog';
 import { toast } from '../components/toast';
 import { Disposer, h, replaceChildren } from '../dom';
 import { defaultSessionName, formatAccuracy, formatBytes, formatClock, formatCount, guidanceInfo, trackingLabel } from '../format';
 import { icon, type IconName } from '../icons';
 import { frameErrorAction, overlayMatchesView } from '../capture-policy';
-import { mapOverlay } from '../overlay-map';
+import { FrameOrientationTracker, mapOverlay } from '../overlay-map';
 import { MIN_KEYFRAMES, type Route } from '../router';
 
 type Phase = 'starting' | 'running' | 'paused' | 'interrupted' | 'error' | 'finishing' | 'closed';
+
+interface FrameMeta {
+  width: number;
+  height: number;
+  screenAngle: number;
+  /** θ the bitmap's pixels are upright for (90 for raw sensor buffers); null = dropped by the engine. */
+  upright: ScreenAngle | null;
+}
 
 const MINI_POINTS = 20_000;
 const EXPANDED_POINTS = 50_000;
@@ -70,7 +82,10 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   let thumbDone = false;
   let latestSparse: { positions: Float32Array; colors: Uint8Array } | null = null;
   let latestCameras: LiveCamera[] | null = null;
-  let inFlight: { width: number; height: number; screenAngle: number } | null = null;
+  /** Bitmap size / UI rotation of the frame being processed and the θ its pixels are upright for. */
+  let inFlight: FrameMeta | null = null;
+  /** Raw sensor buffers vs upright frames — the engine's rule, to turn overlays onto the preview. */
+  const orientation = new FrameOrientationTracker();
   let frameErrors = 0;
 
   // ---- DOM ---------------------------------------------------------------------------------------
@@ -82,6 +97,8 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   const timeLabel = h('span', { class: 'status-time', text: '0:00' });
   const statusPill = h('div', { class: 'status-pill', role: 'status', 'data-state': 'initializing', 'data-testid': 'tracking' }, dot, trackLabel, h('span', { class: 'status-sep' }), timeLabel);
   const gpsChip = h('div', { class: 'gps-chip', hidden: true, 'data-testid': 'gps' }, icon('location', { size: 14 }), h('span', { text: 'GPS…' }));
+  // Shown after the engine's capture memory cap: tracking continues, no new keyframes.
+  const memChip = h('div', { class: 'gps-chip warn capture-mem-chip', hidden: true, role: 'status', 'data-testid': 'memory-limited' }, icon('cpu', { size: 14 }), h('span', { text: 'Memory full · tracking only' }));
   const kfCount = h('strong', { text: '0', 'data-testid': 'kf-count' });
   const regCount = h('strong', { text: '0' });
   const ptCount = h('strong', { text: '0' });
@@ -98,6 +115,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     { class: 'capture-top' },
     h('div', { class: 'capture-top-row' }, closeBtn, statusPill, h('div', { class: 'capture-top-right' }, gpsChip)),
     stats,
+    memChip,
   );
   const guidanceTitle = h('span', { class: 'guidance-title' });
   const guidanceDetail = h('span', { class: 'guidance-detail' });
@@ -220,15 +238,19 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     return { w: r.width, h: r.height, dpr };
   }
 
-  function drawOverlay(pts: Float32Array | undefined, meta: { width: number; height: number; screenAngle: number }): void {
+  function drawOverlay(pts: Float32Array | undefined, meta: FrameMeta): void {
     const ctx = overlay.getContext('2d');
     if (!ctx) return;
     const { w, h: hh, dpr } = sizeOverlay();
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, overlay.width, overlay.height);
     // A frame from before a UI rotation does not match the rotated preview: drop its overlay.
-    if (!pts || pts.length < 2 || !overlayMatchesView(meta.screenAngle, screenAngle())) return;
-    const xy = mapOverlay(pts, meta.width, meta.height, w, hh, { fit: 'cover' });
+    const display = screenAngle();
+    if (!pts || pts.length < 2 || meta.upright === null || !overlayMatchesView(meta.screenAngle, display)) return;
+    // The overlay is relative to the bitmap AS SUBMITTED; a raw sensor buffer (landscape bitmap in
+    // a portrait UI, upright for θ = 90) needs a quarter turn onto the upright preview.
+    const quarterTurns = FrameOrientationTracker.overlayTurns(meta.upright, display);
+    const xy = mapOverlay(pts, meta.width, meta.height, w, hh, { fit: 'cover', quarterTurns });
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.fillStyle = 'rgba(54, 224, 166, 0.95)';
     ctx.strokeStyle = 'rgba(4, 18, 12, 0.55)';
@@ -397,7 +419,46 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       viewerDirty = true;
     }
     if (viewerDirty) scheduleViewer();
+    // The engine marks every frame after its capture memory cap (in case the event was missed).
+    if (u.timings?.memoryLimited) onMemoryLimit();
     updateFinish();
+  }
+
+  // ---- engine memory limit -----------------------------------------------------------------------
+  let memoryLimited = false;
+  function onEngineError(e: EngineErrorInfo): void {
+    if (closed || e.fatal) return;
+    if (e.reason === 'out-of-memory' || e.error?.name === 'CaptureMemoryLimitError') onMemoryLimit();
+  }
+
+  /**
+   * The engine stopped adding keyframes (capture state at its memory budget; tracking goes on).
+   * Ask once — like a full storage: pause and offer to finish now, or to continue tracking only.
+   */
+  function onMemoryLimit(): void {
+    if (memoryLimited || closed) return;
+    memoryLimited = true;
+    memChip.hidden = false;
+    el.classList.add('memory-limited');
+    if (phase !== 'running' && phase !== 'paused') return;
+    pause('user');
+    const enough = numKeyframes >= MIN_KEYFRAMES;
+    showCard(
+      infoCard({
+        icon: 'cpu',
+        tone: 'bad',
+        title: 'Memory limit reached — finish scan now?',
+        text: enough
+          ? `This device cannot hold more keyframes for this scan. Finish now to reconstruct the ${numKeyframes} keyframes captured so far, or continue with tracking only — no new keyframes are added.`
+          : 'This device cannot hold more keyframes for this scan, and there are too few to reconstruct. Continue with tracking only, or start again with a lower quality.',
+        testId: 'capture-memory-limit',
+        actions: [
+          ...(enough ? [button({ label: 'Finish scan', icon: 'check', variant: 'primary', size: 'lg', block: true, testId: 'memory-finish', onClick: () => void finish() })] : []),
+          button({ label: 'Continue (tracking only)', variant: enough ? 'secondary' : 'primary', size: 'lg', block: true, testId: 'memory-continue', onClick: () => resume() }),
+          ...(enough ? [] : [button({ label: 'Back to home', variant: 'secondary', size: 'lg', block: true, onClick: () => void abandon() })]),
+        ],
+      }),
+    );
   }
 
   async function saveThumbnail(): Promise<void> {
@@ -420,7 +481,8 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       screenAngle: f.screenAngle,
       imu: f.imu,
       geo: f.geo,
-      heading: f.heading ? { heading: f.heading.heading, accuracy: f.heading.accuracy } : null,
+      // platform headings are MAGNETIC until the compass knows the declination (setLocationFromFix)
+      heading: f.heading ? { heading: f.heading.heading, accuracy: f.heading.accuracy, north: f.heading.north ?? 'magnetic', declinationDeg: f.heading.declinationDeg ?? null } : null,
       index: f.index,
       segment: f.segment,
       gravityDevice: f.gravityDevice,
@@ -428,7 +490,8 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       imuCalibrationVersion: f.imuCalibrationVersion,
       timeSource: f.timeSource,
     };
-    inFlight = { width: f.width, height: f.height, screenAngle: f.screenAngle };
+    const upright = orientation.observe({ width: f.width, height: f.height, screenAngle: f.screenAngle, t: f.t });
+    inFlight = { width: f.width, height: f.height, screenAngle: f.screenAngle, upright };
     try {
       await app.engine.processFrame(input);
       frameErrors = 0;
@@ -588,7 +651,13 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     if (camRes.lensMaySwitch) toast('This camera may switch lenses automatically — accuracy can suffer.', { tone: 'warn' });
     if (geo) {
       geo.start(); // location prompt (after camera, never blocking it)
-      d.add(geo.onFix(() => updateGps()));
+      // true north: WMM declination at the first usable fix (CompassSensor.setLocationFromFix)
+      d.add(
+        geo.onFix((fix) => {
+          compass.setLocationFromFix(fix);
+          updateGps();
+        }),
+      );
       d.interval(updateGps, 2000);
       gpsChip.hidden = false;
     }
@@ -750,23 +819,77 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     geo?.stop();
   }
 
+  /** Show the Cancel button of the finishing card after this long (a normal finish takes < 1 s). */
+  const FINISH_CANCEL_AFTER_MS = 2000;
+  /** A cancelled finishCapture that has not stopped after this long is aborted (worker restarted). */
+  const FINISH_ABORT_GRACE_MS = 4000;
+
   async function finish(): Promise<void> {
     if (numKeyframes < MIN_KEYFRAMES || !(phase === 'running' || phase === 'paused')) return;
     setPhase('finishing');
     pump?.stop();
-    showCard(infoCard({ spinner: true, title: 'Finishing capture…' }));
+    clearOverlay();
+    // Finishing drains the engine's keyframe mapping queue. It can be cancelled: a finishCapture
+    // that ignores the cancel (stuck worker) is aborted and the worker restarted with the
+    // persisted capture (EngineLike.abortLongOperation).
+    let abortP: Promise<AbortOutcome> | null = null;
+    const detail = h('p', { class: 'capture-card-text', text: 'Mapping the last keyframes.' });
+    const cancelBtn = button({
+      label: 'Cancel',
+      variant: 'secondary',
+      size: 'lg',
+      block: true,
+      testId: 'finish-cancel',
+      onClick: () => {
+        if (abortP) return;
+        cancelBtn.disabled = true;
+        setButtonLabel(cancelBtn, 'Stopping…');
+        detail.textContent = 'Stopping…';
+        abortP = app.engine.abortLongOperation({ graceMs: FINISH_ABORT_GRACE_MS });
+      },
+    });
+    const actions = h('div', { class: 'capture-card-actions', hidden: true }, cancelBtn);
+    showCard(h('div', { class: 'capture-card', role: 'status', 'data-testid': 'capture-finishing' }, spinner('lg'), h('h2', { class: 'capture-card-title', text: 'Finishing capture…' }), detail, actions));
+    const revealCancel = setTimeout(() => {
+      actions.hidden = false;
+      if (!abortP) detail.textContent = 'Still mapping the last keyframes — this can take a while after a long scan.';
+    }, FINISH_CANCEL_AFTER_MS);
+    const unsubProgress = app.engine.onProgress((p) => {
+      if (!abortP && p.message && !actions.hidden) detail.textContent = `${capitalize(p.message)}…`;
+    });
     // Let the frame in flight complete (back-pressure: at most one).
-    for (let i = 0; i < 50 && app.engine.frameInFlight; i++) await sleep(100);
+    for (let i = 0; i < 50 && app.engine.frameInFlight && !abortP; i++) await sleep(100);
     const durationMs = elapsed();
     stopSensors();
-    try {
-      await app.engine.finishCapture();
-    } catch (e) {
-      if (!isCancelledError(e)) console.warn('[capture] finishCapture failed', e);
-    }
+    let cancelled = false;
+    if (!abortP) {
+      try {
+        await app.engine.finishCapture();
+      } catch (e) {
+        if (isCancelledError(e)) cancelled = true;
+        else console.warn('[capture] finishCapture failed', e); // refine maps what is left
+      }
+    } else cancelled = true;
+    clearTimeout(revealCancel);
+    unsubProgress();
+    const how = abortP ? await (abortP as Promise<AbortOutcome>) : null;
     if (closed) return;
+    // Finished before the cancel took effect: continue as usual.
+    if (cancelled) showFinishStopped(durationMs, how === 'restarted' ? 'restarted' : 'cancelled');
+    else await completeFinish(durationMs);
+  }
+
+  /** Session record + live preview for Processing, then navigate there. */
+  async function completeFinish(durationMs: number): Promise<void> {
     app.results.liveSparse = latestSparse;
     app.results.liveCameras = latestCameras;
+    await saveCaptured(durationMs);
+    if (closed) return;
+    closed = true;
+    app.navigate({ type: 'FINISH_CAPTURE', steps: cfg.autoDense ? ['densify'] : [] });
+  }
+
+  async function saveCaptured(durationMs: number): Promise<void> {
     await sessionCreated;
     void app.updateSession(sessionId, {
       status: 'captured',
@@ -778,8 +901,39 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
         ...(camRes ? { camera: camRes.label, resolution: `${camRes.width}×${camRes.height}` } : {}),
       },
     });
-    closed = true;
-    app.navigate({ type: 'FINISH_CAPTURE', steps: cfg.autoDense ? ['densify'] : [] });
+  }
+
+  /** finishCapture was cancelled (or aborted with a worker restart): process now, or later from Home. */
+  function showFinishStopped(durationMs: number, how: AbortOutcome): void {
+    const restarted = how === 'restarted';
+    // Without a stored session a restarted engine has nothing left to process.
+    const lost = restarted && !sessionId;
+    const kf = `${numKeyframes} keyframes`;
+    showCard(
+      infoCard({
+        icon: lost ? 'warning' : 'info',
+        tone: lost ? 'bad' : 'neutral',
+        title: restarted ? 'Engine restarted' : 'Finishing cancelled',
+        text: lost
+          ? 'The engine did not respond and was restarted. This scan was not saved on the device, so it cannot be processed.'
+          : `${restarted ? 'The engine did not respond and was restarted. ' : ''}Your ${kf} are saved. Process them now — the last keyframes are mapped during processing — or later from the home screen.`,
+        testId: 'capture-finish-stopped',
+        actions: [
+          ...(lost ? [] : [button({ label: 'Process now', icon: 'sparkles', variant: 'primary', size: 'lg', block: true, testId: 'finish-process', onClick: () => void completeFinish(durationMs) })]),
+          button({
+            label: 'Back to home',
+            variant: lost ? 'primary' : 'secondary',
+            size: 'lg',
+            block: true,
+            testId: 'finish-home',
+            onClick: () => void (async () => {
+              if (!lost) await saveCaptured(durationMs);
+              await abandon(lost);
+            })(),
+          }),
+        ],
+      }),
+    );
   }
 
   async function cancel(): Promise<void> {
@@ -803,7 +957,9 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     closed = true;
     stopSensors();
     void app.wakeLock.release();
-    app.engine.cancel();
+    // Cancel what the engine is still doing for this capture (a finishCapture that ignores the
+    // cancel is aborted and the worker restarted, so the next scan does not queue behind it).
+    void app.engine.abortLongOperation({ graceMs: FINISH_ABORT_GRACE_MS });
     if (sessionId) {
       await sessionCreated;
       if (deleteSession) await app.deleteSession(sessionId);
@@ -830,6 +986,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       });
       d.listen(document, 'visibilitychange', onVisibility);
       d.add(app.engine.onLive(onLive));
+      d.add(app.engine.onError(onEngineError));
       d.interval(() => {
         timeLabel.textContent = formatClock(elapsed());
       }, 500);

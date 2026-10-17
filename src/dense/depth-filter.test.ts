@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { CameraIntrinsics, RGBAImage } from '../core/types';
 import { Rng } from '../math/random';
-import { depthHaloMask, removeDepthHalos } from './depth-filter';
+import { borderComponents, borderConnectedMask, depthHaloMask, removeDepthHalos, segmentTextureStd } from './depth-filter';
+import { rgbAtResolution } from './dense-util';
 import { fuseDepthMaps, type FusionStats } from './fusion';
 import { makeNearScene, orbitPoses, pinholeIntrinsics } from './synthetic';
 import { renderGtViews } from './testutil-scene';
@@ -166,3 +167,167 @@ describe('depthHaloMask / removeDepthHalos', () => {
     }
   });
 });
+
+/**
+ * "Sky" scene: rows [0, SKY) are a smooth light-blue sky (±1 level, vertical gradient), rows
+ * [SKY, H) a textured dark-red wall at depth 10 facing the camera. PatchMatch-style output: the
+ * wall is valid; a band of BAND sky rows above the wall carries the wall's plane (a halo wider
+ * than the halo filter's window), the sky above it has scattered random depths (every 3rd
+ * pixel) or none. A smooth grey patch inside the wall (rows 70–85, cols 30–60) carries the
+ * wall's depth (a real untextured surface, not connected to the top).
+ */
+const SKY = 40;
+const BAND = 12;
+type SkyRegion = 'band' | 'sky' | 'wall' | 'patch';
+function skyScene(): { dm: DepthMap; image: RGBAImage; region: (x: number, y: number) => SkyRegion } {
+  const rng = new Rng(11);
+  const n = W * H;
+  const depth = new Float32Array(n);
+  const normal = new Float32Array(3 * n);
+  const cost = new Float32Array(n).fill(0.2);
+  const data = new Uint8ClampedArray(4 * n);
+  const region = (x: number, y: number): SkyRegion => (y >= SKY ? (y >= 70 && y < 86 && x >= 30 && x < 60 ? 'patch' : 'wall') : y >= SKY - BAND ? 'band' : 'sky');
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      const r = region(x, y);
+      const sky = r === 'sky' || r === 'band';
+      const t = r === 'wall' ? 25 * (2 * rng.next() - 1) : 2 * rng.next() - 1;
+      const c = sky ? [150 + 0.5 * y + t, 185 + 0.3 * y + t, 230 + t] : r === 'patch' ? [180 + t, 180 + t, 180 + t] : [150 + t, 50 + t, 40 + t];
+      data.set([c[0], c[1], c[2], 255], 4 * i);
+      if (r === 'sky') {
+        if (i % 3 === 0) {
+          depth[i] = 2 + 30 * rng.next();
+          normal[3 * i + 2] = -1;
+        }
+      } else {
+        depth[i] = 10;
+        normal[3 * i + 2] = -1;
+      }
+    }
+  }
+  return { dm: { width: W, height: H, depth, normal, cost }, image: { width: W, height: H, data }, region };
+}
+
+function rejectedFractions(mask: Uint32Array | null, dm: DepthMap, region: (x: number, y: number) => string): Record<string, number> {
+  const tot: Record<string, number> = {};
+  const rej: Record<string, number> = {};
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      if (!(dm.depth[i] > 0)) continue;
+      const r = region(x, y);
+      tot[r] = (tot[r] ?? 0) + 1;
+      if (mask && (mask[i >>> 5] >>> (i & 31)) & 1) rej[r] = (rej[r] ?? 0) + 1;
+    }
+  }
+  return Object.fromEntries(Object.keys(tot).map((k) => [k, (rej[k] ?? 0) / tot[k]]));
+}
+
+describe('sky test (untextured top-connected regions without coherent depth)', () => {
+  it('segmentTextureStd: the sky next to a strong edge measures the sky, texture is high, isolated colours are Infinity', () => {
+    const { image } = skyScene();
+    const rgb = rgbAtResolution(image, W, H);
+    for (const step of [1, 2]) {
+      const std = segmentTextureStd(rgb, W, H, 5, step, 10, 8);
+      // sky pixel directly above the wall edge, sky pixel far from it, wall pixel
+      expect(std[(SKY - 1) * W + 48]).toBeLessThan(2);
+      expect(std[10 * W + 48]).toBeLessThan(2);
+      const wall = std[(SKY + 15) * W + 10];
+      expect(wall === Infinity || wall > 3).toBe(true);
+    }
+    // a lone pixel of a unique colour
+    const solo = { width: W, height: H, data: new Uint8ClampedArray(image.data) };
+    solo.data.set([0, 255, 0, 255], 4 * (20 * W + 20));
+    expect(segmentTextureStd(rgbAtResolution(solo, W, H), W, H, 5, 1, 10, 8)[20 * W + 20]).toBe(Infinity);
+  });
+
+  it('borderConnectedMask / borderComponents keep only regions connected to the selected border through similar colours', () => {
+    const { image, region } = skyScene();
+    const rgb = rgbAtResolution(image, W, H);
+    const std = segmentTextureStd(rgb, W, H, 5, 1, 10, 8);
+    const low = Uint8Array.from(std, (v) => (v < 3 ? 1 : 0));
+    const top = borderConnectedMask(low, rgb, W, H, 10, 1);
+    const comp = borderComponents((i) => std[i] < 3, rgb, W, H, 10, 1);
+    expect(comp.count).toBe(1);
+    expect(Array.from(comp.labels, (l) => (l > 0 ? 1 : 0))).toEqual(Array.from(top));
+    let sky = 0, skyIn = 0, patch = 0, patchLow = 0, patchIn = 0;
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const i = y * W + x;
+        const r = region(x, y);
+        if (r === 'sky' || r === 'band') {
+          sky++;
+          skyIn += top[i];
+        } else if (r === 'patch') {
+          patch++;
+          patchLow += low[i];
+          patchIn += top[i];
+        }
+      }
+    }
+    expect(skyIn / sky).toBeGreaterThan(0.97);
+    expect(patchLow / patch).toBeGreaterThan(0.5);
+    expect(patchIn).toBe(0);
+    // bottom border: at most a few isolated wall pixels, never the sky
+    const bottom = borderConnectedMask(low, rgb, W, H, 10, 2);
+    expect(bottom.reduce((a, b) => a + b, 0)).toBeLessThan(0.01 * W * H);
+    for (let i = 0; i < SKY * W; i++) expect(bottom[i]).toBe(0);
+  });
+
+  it('removes a halo band wider than the halo window and the random sky depths, keeps the wall and the enclosed smooth patch', () => {
+    const { dm, image, region } = skyScene();
+    const plain = rejectedFractions(depthHaloMask(dm, image, cam, { skyMaxStd: 0 }), dm, region);
+    const sky = rejectedFractions(depthHaloMask(dm, image, cam), dm, region);
+    log(`sky scene: halo vote only ${JSON.stringify(plain)}, with the sky test ${JSON.stringify(sky)}`);
+    // the 8-px halo vote leaves the 12-px band (consistent plane extension)
+    expect(plain.band).toBeLessThan(0.5);
+    expect(sky.band).toBe(1);
+    expect(sky.sky).toBe(1);
+    expect(sky.wall).toBeLessThan(0.01);
+    expect(sky.patch).toBe(0);
+    // sky test alone (halo vote off)
+    const only = rejectedFractions(depthHaloMask(dm, image, cam, { radius: 0 }), dm, region);
+    expect(only.band).toBe(1);
+    expect(only.wall).toBe(0);
+    expect(depthHaloMask(dm, image, cam, { radius: 0, skyMaxStd: 0 })).toBeNull();
+  });
+
+  it('keeps an untextured top-connected surface with a coherent depth (a smooth wall), removes it when its depths are incoherent', () => {
+    const rng = new Rng(5);
+    const n = W * H;
+    const data = new Uint8ClampedArray(4 * n);
+    for (let i = 0; i < n; i++) {
+      const t = 2 * rng.next() - 1;
+      data.set([215 + t, 212 + t, 205 + t, 255], 4 * i);
+    }
+    const image = { width: W, height: H, data };
+    const make = (randomDepth: boolean): DepthMap => {
+      const depth = new Float32Array(n);
+      const normal = new Float32Array(3 * n);
+      for (let i = 0; i < n; i++) {
+        if (rng.next() < 0.15) continue; // 15 % holes
+        depth[i] = randomDepth ? 1 + 5 * rng.next() : 2;
+        normal[3 * i + 2] = -1;
+      }
+      return { width: W, height: H, depth, normal, cost: new Float32Array(n) };
+    };
+    const count = (m: Uint32Array | null): number => (m ? m.reduce((a, w) => a + popcount(w), 0) : 0);
+    const coherent = make(false);
+    const noisy = make(true);
+    let validNoisy = 0;
+    for (let i = 0; i < n; i++) validNoisy += noisy.depth[i] > 0 ? 1 : 0;
+    expect(count(depthHaloMask(coherent, image, cam, { radius: 0 }))).toBe(0);
+    expect(count(depthHaloMask(noisy, image, cam, { radius: 0 }))).toBe(validNoisy);
+  });
+});
+
+function popcount(v: number): number {
+  let c = 0;
+  let b = v >>> 0;
+  while (b) {
+    b &= b - 1;
+    c++;
+  }
+  return c;
+}

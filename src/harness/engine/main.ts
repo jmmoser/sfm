@@ -83,6 +83,8 @@ function configFromQuery(q: URLSearchParams): HarnessConfig | null {
   c.useImu = bool('imu');
   c.useGps = bool('gps');
   c.useHeading = bool('heading');
+  const north = q.get('headingNorth');
+  if (north === 'magnetic' || north === 'app' || north === 'true') c.headingNorth = north;
   c.densify = bool('densify');
   c.mesh = bool('mesh');
   c.exports = bool('exports');

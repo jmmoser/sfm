@@ -140,6 +140,64 @@ describe('CompassSensor (iOS: arbitrary alpha + webkitCompassHeading)', () => {
   });
 });
 
+describe('CompassSensor north reference (magnetic → true via WMM)', () => {
+  it('reports magnetic headings until a location / declination is known, then true north', () => {
+    const c = new CompassSensor({ target: null, screenAngle: () => 0 });
+    const pose = (i: number): Float64Array => mul(rz(-(40 + 0.2 * i)), rx(25));
+    const rec = feedIOS(c, 200, 300, pose, topAzimuth, 8);
+    const { t, Renu } = rec[250];
+    const mag = c.headingAt(t)!;
+    expect(mag.north).toBe('magnetic');
+    expect(mag.declinationDeg).toBe(0);
+    expect(c.northReference).toBe('magnetic');
+    expect(c.declinationInfo).toBeNull();
+    expect(c.attitudeAt(t)!.north).toBe('magnetic');
+    // Seattle, 2026-10-17: WMM2025 declination ≈ +15.0° (east)
+    const e = c.setLocation(47.6062, -122.3321, 56, Date.UTC(2026, 9, 17))!;
+    expect(e.declination).toBeGreaterThan(14.5);
+    expect(e.declination).toBeLessThan(15.5);
+    const tru = c.headingAt(t)!;
+    expect(tru.north).toBe('true');
+    expect(tru.declinationDeg).toBe(e.declination);
+    expect(angDiff(tru.heading, mag.heading + e.declination)).toBeLessThan(1e-9);
+    expect(angDiff(topAzimuth(c.attitudeAt(t)!.R_world_device), topAzimuth(Renu) + e.declination)).toBeLessThan(1);
+    expect(c.attitudeAt(t)!.north).toBe('true');
+    expect(c.declinationInfo).toMatchObject({ source: 'wmm', latDeg: 47.6062, lonDeg: -122.3321, altM: 56, blackoutZone: false, inValidityPeriod: true });
+    // invalid location: nothing changes
+    expect(c.setLocation(NaN, 0)).toBeNull();
+    expect(c.northReference).toBe('true');
+    // explicit declination, then back to magnetic
+    c.setDeclination(-3);
+    expect(c.headingAt(t)!).toMatchObject({ north: 'true', declinationDeg: -3 });
+    expect(c.declinationInfo).toEqual({ deg: -3, source: 'manual' });
+    c.setDeclination(null);
+    expect(c.headingAt(t)!).toMatchObject({ north: 'magnetic', declinationDeg: 0 });
+    expect(angDiff(c.headingAt(t)!.heading, mag.heading)).toBeLessThan(1e-9);
+    // a declination in the constructor means true north from the start
+    expect(new CompassSensor({ target: null, declinationDeg: 0 }).northReference).toBe('true');
+  });
+
+  it('setLocationFromFix: first usable fix, refined once by a precise fix, never over a manual declination', () => {
+    const c = new CompassSensor({ target: null });
+    const date = Date.UTC(2026, 9, 17);
+    const fix = (lat: number, lon: number, accuracy: number) => ({ t: 0, lat, lon, alt: 50, accuracy, altitudeAccuracy: null });
+    expect(c.setLocationFromFix(null)).toBe(false);
+    expect(c.setLocationFromFix(fix(47.6, -122.3, 80_000), date)).toBe(false); // too coarse
+    expect(c.northReference).toBe('magnetic');
+    expect(c.setLocationFromFix(fix(47.7, -122.2, 3000), date)).toBe(true); // approximate (Precise Location off)
+    const d0 = c.declinationDeg;
+    expect(c.northReference).toBe('true');
+    expect(c.setLocationFromFix(fix(47.6, -122.3, 500), date)).toBe(false); // not precise enough to refine
+    expect(c.setLocationFromFix(fix(47.6062, -122.3321, 8), date)).toBe(true); // precise: refined once
+    expect(Math.abs(c.declinationDeg - d0)).toBeLessThan(0.2);
+    expect(c.declinationInfo!.latDeg).toBe(47.6062);
+    expect(c.setLocationFromFix(fix(47.61, -122.33, 5), date)).toBe(false); // first precise fix kept
+    c.setDeclination(12);
+    expect(c.setLocationFromFix(fix(47.6, -122.3, 5), date)).toBe(false);
+    expect(c.declinationDeg).toBe(12);
+  });
+});
+
 describe('CompassSensor (deviceorientationabsolute)', () => {
   it('uses absolute alpha/beta/gamma as ENU attitude', () => {
     const c = new CompassSensor({ target: null });

@@ -27,7 +27,18 @@ import {
   type SparseResult,
 } from '../../workers/protocol';
 import { createHarnessEngine, type HarnessEngine } from './engines';
-import { cleanGeoFix, compassHeading, gravityDownAt, hfovLongSideDeg, latestAtOrBefore, numStats, planFrames, samplesBetween, type HeadingRow } from './feed';
+import {
+  HeadingNorthEmulator,
+  cleanGeoFix,
+  compassHeading,
+  gravityDownAt,
+  hfovLongSideDeg,
+  latestAtOrBefore,
+  numStats,
+  planFrames,
+  samplesBetween,
+  type HeadingRow,
+} from './feed';
 import { bbox, mapCamerasToFrames, medianIntrinsics, normalizeIntrinsics, poseToJSON, stageTimings, type CameraLike, type DeliveredRef } from './result';
 import type { CloudSummary, FrameRecord, HarnessConfig, HarnessError, HarnessResult, LiveSummary, ProgressRecord, ResolvedHarnessConfig } from './types';
 
@@ -43,6 +54,8 @@ interface DatasetMeta {
   screenAngle: ScreenAngle;
   sceneExtent: number;
   intrinsics: { f: number; cx: number; cy: number; k1: number; k2: number; width: number; height: number };
+  /** WGS84 [lat°, lon°, alt m] of the dataset's ENU origin (null: no location). */
+  originLatLonAlt?: [number, number, number] | null;
 }
 
 interface DatasetFrame {
@@ -171,6 +184,8 @@ function resolveConfig(c: HarnessConfig, meta: DatasetMeta | null): ResolvedHarn
     useImu,
     useGps: c.useGps ?? true,
     useHeading: c.useHeading ?? true,
+    headingNorth: c.headingNorth ?? (meta?.originLatLonAlt && (c.useGps ?? true) ? 'magnetic' : 'true'),
+    captureDateMs: c.captureDateMs ?? Date.now(),
     useGravity: c.useGravity ?? useImu,
     hfovPriorDeg: prior,
     hfovPriorDegUsed: used,
@@ -398,6 +413,11 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
     let pending: Promise<Decoded> | null = plan.length ? decode(plan[0]) : null;
     pending?.catch(() => undefined);
     let prevT = -Infinity;
+    // compass north reference: the datasets store TRUE-north headings (feed.ts HeadingNorthMode)
+    const northEmu = new HeadingNorthEmulator(cfg.headingNorth, ds.meta.originLatLonAlt ?? null, cfg.captureDateMs);
+    cfg.headingNorth = northEmu.mode; // 'true' when the dataset has no location
+    if (cfg.useHeading && ds.headings?.length)
+      log(`[harness] compass north: ${northEmu.mode}${northEmu.mode !== 'true' ? ` (WMM2025 declination at the dataset location ${northEmu.datasetDeclinationDeg.toFixed(3)}°)` : ''}`);
 
     for (let k = 0; k < plan.length; k++) {
       const f = plan[k];
@@ -434,7 +454,7 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
         // what CompassSensor.headingAt reports: device-top azimuth while the top is within 45° of
         // horizontal (landscape yard), else the optical axis (dataset `heading`) — gravity from
         // the IMU like the sensor's DeviceOrientation (independent of useImu)
-        input.heading = compassHeading(latestAtOrBefore(ds.headings, t), gravityDownAt(ds.imu, t));
+        input.heading = northEmu.convert(compassHeading(latestAtOrBefore(ds.headings, t), gravityDownAt(ds.imu, t)), input.geo ?? null);
       }
       prevT = t;
       const rec: FrameRecord = {

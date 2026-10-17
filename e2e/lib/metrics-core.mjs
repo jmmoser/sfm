@@ -186,7 +186,23 @@ export function computeMetrics(dataset, result, opts = {}) {
         typeof ri.k1 === 'number'
           ? Math.abs(distortionDisplacementPx(gi, ri.k1, ri.k2 ?? 0, rCorner) - distortionDisplacementPx(gi, gi.k1, gi.k2, rCorner))
           : null,
+      perFrameFocal: null,
     };
+    // Focus breathing (informational): datasets with real-capture artefacts carry a GT focal per
+    // frame (frames.json f; meta f = f0). Compare the single estimated focal with their mean over
+    // the registered frames, and report the spread.
+    const fAll = frames.map((f) => f.f).filter((v) => typeof v === 'number');
+    if (fAll.length === frames.length && fAll.length > 0) {
+      const fReg = pairs.map((p) => byIndex.get(p.index).f);
+      const fRegMean = fReg.length ? mean(fReg) : null;
+      out.intrinsics.perFrameFocal = {
+        min: Math.min(...fAll),
+        max: Math.max(...fAll),
+        mean: mean(fAll),
+        registeredMean: fRegMean,
+        focalErrorPctVsRegisteredMean: fRegMean ? (100 * (ri.f - fRegMean)) / fRegMean : null,
+      };
+    }
   }
 
   // ---------------- dense ----------------
@@ -377,6 +393,11 @@ export function formatTable(m) {
   }
   if (m.intrinsics) {
     add('focal error', m.intrinsics.focalErrorPct, '%');
+    const pf = m.intrinsics.perFrameFocal;
+    if (pf) {
+      add('per-frame GT focal min / mean / max', `${fmt(pf.min, 2)} / ${fmt(pf.mean, 2)} / ${fmt(pf.max, 2)}`, 'px');
+      add('focal error vs mean GT focal of registered', pf.focalErrorPctVsRegisteredMean, '%');
+    }
     add('principal point error', m.intrinsics.ppErrorPx, 'px');
     add('corner distortion error', m.intrinsics.cornerDistortionErrorPx, 'px');
   }

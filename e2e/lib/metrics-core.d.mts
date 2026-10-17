@@ -43,7 +43,11 @@ export interface Metrics {
   } | null;
   metric: { scale: number; scaleError: number; ateSe3Rmse: number | null; ateSe3Relative: number | null } | null;
   frame: { gravityAligned: boolean; northAligned: boolean; gravityErrorDeg: number; gravityErrorDegSim3: number | null; headingErrorDeg: number; headingErrorDegSim3: number | null } | null;
-  intrinsics: { fGt: number; fRes: number; focalErrorPct: number; ppErrorPx: number | null; k1Error: number | null; k2Error: number | null; cornerDistortionErrorPx: number | null } | null;
+  intrinsics: {
+    fGt: number; fRes: number; focalErrorPct: number; ppErrorPx: number | null; k1Error: number | null; k2Error: number | null; cornerDistortionErrorPx: number | null;
+    /** Datasets with per-frame GT focal (focus breathing; frames.json f): spread and error vs the registered frames' mean. */
+    perFrameFocal: { min: number; max: number; mean: number; registeredMean: number | null; focalErrorPctVsRegisteredMean: number | null } | null;
+  } | null;
   dense: {
     tau: number; align: string; icp: { iterations: number; rotationDeg: number; translation: number } | null; roi: boolean; numPointsRaw: number; numPointsEvaluated: number;
     accuracyMedian: number; accuracyP90: number; accuracyMeanCapped: number; precision: number;

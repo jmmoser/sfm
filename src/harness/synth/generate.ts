@@ -13,6 +13,7 @@ import type { CameraIntrinsics, Pose } from '../../core/types';
 import {
   exposureGainFn,
   frameTime,
+  hasCaptureArtefacts,
   intrinsicsFor,
   resolveConfig,
   screenAngleFor,
@@ -21,16 +22,30 @@ import {
   type SynthConfigInput,
 } from './config';
 import { cameraCenter, rCamDevice } from './conventions';
+import {
+  blurSampleCount,
+  centerFocusDistance,
+  focusBreathingSeries,
+  globalShutterBand,
+  imageMotionPx,
+  readoutBands,
+  readoutGeometry,
+  rectProbes,
+  rsBandCount,
+  subframeOffsetsMs,
+  whiteBalanceFn,
+  type ReadoutBand,
+} from './realism';
 import { simulateGps } from './gps';
 import { simulateHeadings } from './heading';
 import { simulateImu } from './imu';
-import { SynthRenderer } from './render';
+import { SynthRenderer, type RenderBand } from './render';
 import { hashString, SynthRng } from './rng';
 import { accumulateVisibility, quantizeNormals, sampleSurfaces } from './sampling';
 import type { SynthScene } from './scene-common';
 import { buildObjectScene } from './scene-object';
 import { buildYardScene } from './scene-yard';
-import { trajectoryPose } from './trajectory';
+import { angularSpeedStats, panPeakRate, trajectoryPose } from './trajectory';
 
 export interface SynthSink {
   /** Write (or append to) a file of the dataset. */
@@ -95,8 +110,32 @@ export async function generateDataset(input: SynthConfigInput, sink: SynthSink):
   ts = performance.now();
   const synth = buildScene(cfg);
   timings.scene = performance.now() - ts;
-  const renderer = new SynthRenderer(synth, cam, cfg.effects);
+  const fb = cfg.focusBreathing;
+  const renderer = new SynthRenderer(synth, cam, cfg.effects, fb ? { minFocal: cam.f * (1 - Math.abs(fb.amplitude)) } : {});
   sink.log(`[synth] ${cfg.name}: ${N} frames ${cam.width}x${cam.height}, f=${cam.f.toFixed(2)}, RT ${renderer.renderTargetSize.join('x')}, scene ${timings.scene.toFixed(0)} ms`);
+
+  // ---- real-capture artefacts (all off by default; see realism.ts) ----
+  const artefacts = hasCaptureArtefacts(cfg);
+  const adaptiveBlur = cfg.effects.motionBlurPxPerSample > 0;
+  const geom = cfg.rsReadoutMs > 0 ? readoutGeometry(theta, cam.width, cam.height, cfg.rsReverse) : null;
+  const useBands = geom !== null || adaptiveBlur;
+  const fullRect = { u0: 0, u1: cam.width - 1, v0: 0, v1: cam.height - 1 };
+  const wbOf = whiteBalanceFn(cfg.seed, cfg.whiteBalanceDrift);
+  // Autofocus target distance per frame (centre depth at the GT pose): drives focus breathing
+  // and the depth of the image-motion probes of the adaptive blur / motion statistics.
+  let focusM: number[] | null = null;
+  let focal: number[] | null = null;
+  if (artefacts) {
+    ts = performance.now();
+    focusM = [];
+    for (let i = 0; i < N; i++) focusM.push(centerFocusDistance(renderer.renderWindowDepth(trajectoryPose(traj, frameTime(cfg, i)), cfg.visibilityScale), cam, fb ?? undefined));
+    timings.focus = performance.now() - ts;
+    if (fb) {
+      const series = focusBreathingSeries(focusM, Array.from({ length: N }, (_, i) => frameTime(cfg, i)), fb);
+      focal = series.b.map((b) => cam.f * (1 + b));
+    }
+  }
+  const frameStats: { omega: number; blurPx: number; rsPx: number; renders: number; blurMax: number; bands: number }[] = [];
 
   // ---- GT surface samples ----
   ts = performance.now();
@@ -120,15 +159,55 @@ export async function generateDataset(input: SynthConfigInput, sink: SynthSink):
     for (let i = 0; i < N; i++) {
       const tau = frameTime(cfg, i);
       const pose = trajectoryPose(traj, tau);
-      const nb = Math.max(1, Math.round(cfg.effects.motionBlurSamples));
-      const poses: Pose[] = [];
-      for (let k = 0; k < nb; k++) {
-        const dt = nb === 1 ? 0 : (k / (nb - 1) - 0.5) * (cfg.effects.exposureMs / 1000);
-        poses.push(nb === 1 ? pose : trajectoryPose(traj, tau + dt));
-      }
+      const camI: CameraIntrinsics = focal ? { ...cam, f: focal[i] } : cam;
+      if (focal) renderer.setFocal(focal[i]);
+      const wb = wbOf(tau);
+      if (cfg.whiteBalanceDrift > 0) renderer.setWhiteBalance(wb);
       const gain = gainOf(tau, i);
       let a = performance.now();
-      renderer.renderFrame(poses, gain, hashString(`frame${i}`, cfg.seed));
+      const seed = hashString(`frame${i}`, cfg.seed);
+      const expMs = cfg.effects.exposureMs;
+      const nbMax = Math.max(1, Math.round(cfg.effects.motionBlurSamples));
+      let renders = 0,
+        blurMax = 1;
+      // Image motion (px, at the AF depth) over the exposure and over the readout, at the frame time.
+      const depthProbe = focusM ? focusM[i] : 1;
+      const fullProbes = rectProbes(fullRect);
+      const blurPx = artefacts ? imageMotionPx(camI, trajectoryPose(traj, tau - expMs / 2000), trajectoryPose(traj, tau + expMs / 2000), fullProbes, depthProbe) : 0;
+      const rsPx = cfg.rsReadoutMs > 0 ? imageMotionPx(camI, trajectoryPose(traj, tau - cfg.rsReadoutMs / 2000), trajectoryPose(traj, tau + cfg.rsReadoutMs / 2000), fullProbes, depthProbe) : 0;
+      const bandsDef: ReadoutBand[] = geom
+        ? readoutBands(geom, cam.width, cam.height, rsBandCount(rsPx, blurPx, cfg.rsBands, cfg.rsBandStepPx), cfg.rsReadoutMs)
+        : [globalShutterBand(cam.width, cam.height)];
+      if (useBands) {
+        // Rolling shutter / adaptive blur: per band, sub-frames across the band's exposure,
+        // centred on the band's readout time tau + dt_k.
+        const bands: RenderBand[] = bandsDef.map((b) => {
+          const tb = tau + b.dtMs / 1000;
+          let n = nbMax;
+          if (adaptiveBlur) {
+            const p0 = trajectoryPose(traj, tb - expMs / 2000),
+              p1 = trajectoryPose(traj, tb + expMs / 2000);
+            n = blurSampleCount(imageMotionPx(camI, p0, p1, rectProbes(b.rect), depthProbe), cfg.effects.motionBlurPxPerSample, nbMax);
+          }
+          blurMax = Math.max(blurMax, n);
+          const offs = subframeOffsetsMs(n, expMs, adaptiveBlur ? 'midpoints' : 'endpoints');
+          return { rect: b.rect, poses: offs.map((o) => (o === 0 && b.dtMs === 0 ? pose : trajectoryPose(traj, tb + o / 1000))) };
+        });
+        renders = renderer.renderFrameBands(bands, gain, seed);
+      } else {
+        const poses: Pose[] = [];
+        for (let k = 0; k < nbMax; k++) {
+          const dt = nbMax === 1 ? 0 : (k / (nbMax - 1) - 0.5) * (expMs / 1000);
+          poses.push(nbMax === 1 ? pose : trajectoryPose(traj, tau + dt));
+        }
+        blurMax = nbMax;
+        renders = poses.length;
+        renderer.renderFrame(poses, gain, seed);
+      }
+      if (artefacts) {
+        const w = traj.evaluate(tau).omegaDev;
+        frameStats.push({ omega: Math.hypot(w[0], w[1], w[2]), blurPx, rsPx, renders, blurMax, bands: bandsDef.length });
+      }
       const jpeg = await renderer.toJpeg(cfg.jpegQuality);
       const b2 = performance.now();
       tRender += b2 - a;
@@ -146,8 +225,8 @@ export async function generateDataset(input: SynthConfigInput, sink: SynthSink):
       if (cfg.visibilityEvery > 0 && i % cfg.visibilityEvery === 0) {
         a = performance.now();
         const wd = renderer.renderWindowDepth(pose, cfg.visibilityScale);
-        accumulateVisibility(gt.positions, visibility, pose, cam, wd);
-        if (focus && focusVisibility) accumulateVisibility(focus.positions, focusVisibility, pose, cam, wd);
+        accumulateVisibility(gt.positions, visibility, pose, camI, wd);
+        if (focus && focusVisibility) accumulateVisibility(focus.positions, focusVisibility, pose, camI, wd);
         tVis += performance.now() - a;
       }
       const C = cameraCenter(pose);
@@ -161,6 +240,19 @@ export async function generateDataset(input: SynthConfigInput, sink: SynthSink):
         center: [C[0], C[1], C[2]],
         gain,
         ...(depthFile ? { depthFile } : {}),
+        ...(artefacts
+          ? {
+              f: camI.f,
+              focusDistance: focusM ? focusM[i] : null,
+              wb: cfg.whiteBalanceDrift > 0 ? wb : [1, 1, 1],
+              omega: frameStats[i].omega,
+              blurPx: frameStats[i].blurPx,
+              rsPx: frameStats[i].rsPx,
+              blurSamples: frameStats[i].blurMax,
+              rsBands: frameStats[i].bands,
+              renders: frameStats[i].renders,
+            }
+          : {}),
       });
       if (i % 10 === 0 || i === N - 1) sink.log(`[synth] ${cfg.name}: frame ${i + 1}/${N}`);
     }
@@ -202,6 +294,49 @@ export async function generateDataset(input: SynthConfigInput, sink: SynthSink):
       hi[k] = Math.max(hi[k], c[k]);
     }
   const sceneExtent = Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+
+  function captureArtefactsMeta() {
+    const stat = (xs: number[]) => {
+      const v = [...xs].sort((a, b) => a - b);
+      const q = (p: number) => (v.length ? v[Math.min(v.length - 1, Math.floor(p * v.length))] : null);
+      return { p50: q(0.5), p90: q(0.9), max: v.length ? v[v.length - 1] : null };
+    };
+    const sh = cfg.trajectory.shake ?? null;
+    const fs = focal ?? [];
+    return {
+      rollingShutter:
+        geom && cfg.rsReadoutMs > 0
+          ? {
+              readoutMs: cfg.rsReadoutMs,
+              bands: cfg.rsBands,
+              bandStepPx: cfg.rsBandStepPx,
+              axis: geom.axis,
+              lines: geom.lines,
+              lineDelayUs: (1000 * cfg.rsReadoutMs) / Math.max(1, geom.lines - 1),
+              firstLine: geom.axis === 'cols' ? (geom.sign === 1 ? 'left column (u = 0)' : 'right column (u = W-1)') : geom.sign === 1 ? 'top row (v = 0)' : 'bottom row (v = H-1)',
+              reverse: cfg.rsReverse,
+              definition:
+                'line i (readout order) of L is exposed around t_frame + (i/(L-1) - 0.5) * readoutMs; frames.json t/tTrue and pose are at mid-readout (s = 0.5). Native sensor rows (upright at screen angle 90) are read top to bottom, i.e. from the device +x edge to -x.',
+            }
+          : null,
+      focusBreathing: fb
+        ? { ...fb, f0: cam.f, fMin: Math.min(...fs), fMax: Math.max(...fs), fMean: fs.reduce((a, b) => a + b, 0) / Math.max(1, fs.length), note: 'per-frame GT focal in frames.json f; meta.intrinsics.f = f0' }
+        : null,
+      whiteBalanceDrift: cfg.whiteBalanceDrift,
+      exposureJitter: cfg.exposureJitter,
+      adaptiveBlur: adaptiveBlur ? { pxPerSample: cfg.effects.motionBlurPxPerSample, maxSamples: cfg.effects.motionBlurSamples, exposureMs: cfg.effects.exposureMs } : null,
+      shake: sh ? { ...sh, panPeakRates: (sh.pans ?? []).map(panPeakRate) } : null,
+      angularSpeed: angularSpeedStats(traj, 0, lastTau),
+      frames: {
+        omega: stat(frameStats.map((x) => x.omega)),
+        blurPx: stat(frameStats.map((x) => x.blurPx)),
+        rsPx: stat(frameStats.map((x) => x.rsPx)),
+        renders: stat(frameStats.map((x) => x.renders)),
+        rsBands: stat(frameStats.map((x) => x.bands)),
+        focusDistance: focusM ? stat(focusM) : null,
+      },
+    };
+  }
 
   // ---- JSON ----
   await write('frames.json', JSON.stringify(framesJson));
@@ -247,6 +382,8 @@ export async function generateDataset(input: SynthConfigInput, sink: SynthSink):
       : null,
     headingNoise: { rateHz: cfg.heading.rateHz, sigmaDeg: cfg.heading.sigmaDeg, biasDeg: cfg.heading.biasDeg, definition: 'camera optical axis projected to horizontal, deg clockwise from true north' },
     render: { ...cfg.effects, exposureJitter: cfg.exposureJitter, jpegQuality: cfg.jpegQuality, renderTargetSize: renderer.renderTargetSize },
+    preset: cfg.preset,
+    captureArtefacts: artefacts ? captureArtefactsMeta() : null,
     depth: { every: cfg.depthEvery, format: 'Float32 little-endian, width*height, row 0 = top, z-depth (m) of the surface at each pixel centre of the distorted JPEG, 0 = none' },
     gt: {
       points: gt.count,
@@ -275,6 +412,7 @@ export async function generateDataset(input: SynthConfigInput, sink: SynthSink):
     timingsMs: timings,
   };
   await write('meta.json', JSON.stringify(meta, null, 2));
+
   sink.log(`[synth] ${cfg.name}: done in ${(timings.total / 1000).toFixed(1)} s (${(bytes / 1048576).toFixed(1)} MB)`);
   return {
     name: cfg.name,

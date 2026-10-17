@@ -5,6 +5,8 @@
  * direction metadata. No DOM, unit-tested in feed.test.ts.
  */
 import type { GeoFix, ImuSample } from '../../core/types';
+import { CompassSensor } from '../../sensors/orientation';
+import { decimalYearFromDate, magneticField, trueToMagneticHeading } from '../../sensors/wmm';
 
 export interface TimedFrame {
   index: number;
@@ -109,6 +111,57 @@ export function compassHeading(row: HeadingRow | null, gravityDownDevice: ArrayL
   const top = row.headingDeviceTop;
   const heading = topNearHorizontal && typeof top === 'number' && Number.isFinite(top) ? top : row.heading;
   return { heading, accuracy: row.accuracy };
+}
+
+/**
+ * North reference of the replayed compass (the datasets store TRUE-north headings):
+ *  - 'magnetic': converted to MAGNETIC headings with WMM2025 at the dataset location
+ *    (`meta.originLatLonAlt`) and the capture date, flagged `north: 'magnetic'` — a phone whose
+ *    compass never learned the declination; the engine converts back with the declination at its
+ *    first GPS fix (the full magnetic → true path);
+ *  - 'app': what the app sends — magnetic until a usable GPS fix was delivered, then true north
+ *    via `CompassSensor.setLocationFromFix` (the app's policy, run on the delivered fixes);
+ *  - 'true': the dataset headings unchanged, flagged `north: 'true'` (the declination is known
+ *    from elsewhere). Datasets without a location always replay 'true' (magnetic north is
+ *    undefined without a place).
+ */
+export type HeadingNorthMode = 'magnetic' | 'app' | 'true';
+
+/** A FrameInput heading with its north reference (protocol `HeadingSample` extension fields). */
+export interface NorthHeading {
+  heading: number;
+  accuracy: number;
+  north: 'true' | 'magnetic';
+  declinationDeg: number | null;
+}
+
+/** Turns dataset (true-north) compass headings into what the phone would report (see `HeadingNorthMode`). */
+export class HeadingNorthEmulator {
+  readonly mode: HeadingNorthMode;
+  /** WMM declination (deg, east positive) at the dataset location and date (0 without a location). */
+  readonly datasetDeclinationDeg: number;
+  private readonly compass = new CompassSensor({ target: null });
+  private readonly dateMs: number;
+
+  constructor(mode: HeadingNorthMode, location: readonly number[] | null | undefined, dateMs: number) {
+    const ok = !!location && location.length >= 2 && Number.isFinite(location[0]) && Number.isFinite(location[1]);
+    this.mode = ok ? mode : 'true';
+    this.dateMs = dateMs;
+    const alt = ok && Number.isFinite(location![2]) ? location![2] : 0;
+    this.datasetDeclinationDeg = ok ? magneticField(location![0], location![1], alt / 1000, decimalYearFromDate(dateMs)).declination : 0;
+  }
+
+  /** The heading for one frame; `fix` = the GPS fix delivered with it (app mode learns the declination from it). */
+  convert(h: { heading: number; accuracy: number } | null, fix: GeoFix | null): NorthHeading | null {
+    if (!h || !Number.isFinite(h.heading)) return null;
+    if (this.mode === 'true') return { heading: h.heading, accuracy: h.accuracy, north: 'true', declinationDeg: null };
+    const magnetic = trueToMagneticHeading(h.heading, this.datasetDeclinationDeg);
+    if (this.mode === 'magnetic') return { heading: magnetic, accuracy: h.accuracy, north: 'magnetic', declinationDeg: 0 };
+    this.compass.setLocationFromFix(fix, this.dateMs);
+    const d = this.compass.declinationDeg;
+    const north = this.compass.northReference;
+    return { heading: north === 'true' ? (((magnetic + d) % 360) + 360) % 360 : magnetic, accuracy: h.accuracy, north, declinationDeg: d };
+  }
 }
 
 /** Field of view (deg) across the long image side of a pinhole with focal f (px). */

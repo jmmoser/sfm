@@ -17,9 +17,19 @@
  *   export-reopen    export finishes while its sheet is closed → the reopened sheet shows Save
  *   open-other-session processing a stored scan after viewing another: no stale name / stages
  *   focus            keyboard navigation moves focus to the new screen's heading
+ *   raw-overlay      a RAW sensor buffer (landscape bitmap in the portrait UI: the headless fake
+ *                    camera) gets its keypoint overlay turned onto the upright preview
+ *   finish-stuck     finishCapture hangs and ignores cancel → Cancel aborts it (engine restart),
+ *                    "Process now" reconstructs the scan
+ *   finish-stuck-home  same, "Back to home" keeps the scan (status captured)
+ *   memory-limit     the engine's capture memory cap → "Memory limit reached — finish scan now?",
+ *                    Continue (tracking only) adds no keyframes, Finish works
+ *   dense-resume     an interrupted densify (loadSession stats.denseResumablePass) → "Resume dense
+ *                    reconstruction" in the viewer + Build sheet; a densify cancelled here too
+ *   info-sheet       Model info: magnetic-north note for compass yaw, engine memory section
  * Usage: node e2e/ui/states.mjs [name ...] [--verbose]
  */
-import { launch, shot, sleep } from './lib.mjs';
+import { launch, layoutAudit, shot, sleep } from './lib.mjs';
 
 const args = process.argv.slice(2).filter((a) => !a.startsWith('--'));
 const want = (n) => !args.length || args.includes(n);
@@ -325,6 +335,206 @@ await scenario('focus', async () => {
   check(active.tag === 'H1' && active.text === 'New scan' && !active.inOld, `focus moves to the new screen's heading (got ${active.tag} "${active.text}")`);
   const exiting = await page.evaluate(() => [...document.querySelectorAll('.screen-exit')].every((el) => el.inert));
   check(exiting, 'the exiting screen is inert');
+  await context.close();
+});
+
+async function audit(page, name) {
+  const problems = await page.evaluate(layoutAudit);
+  for (const p of problems) check(false, `${name}: ${p}`);
+}
+
+const kf = (page) => page.evaluate(() => Number(document.querySelector('[data-testid="kf-count"]')?.textContent));
+
+await scenario('raw-overlay', async () => {
+  const { page, context } = await newPage();
+  await startCapture(page, `${base}?mock=1&mockSpeed=3`);
+  await page.waitForFunction(() => document.querySelector('.capture')?.getAttribute('data-phase') === 'running', null, { timeout: 45000 });
+  // Every LiveUpdate gets two keypoints at known raw-buffer positions: (0.9, 0.5) and (0.1, 0.5).
+  await page.evaluate(() => {
+    const em = globalThis.__sfmApp.engine.live;
+    const orig = em.emit.bind(em);
+    em.emit = (u) => orig({ ...u, overlay: new Float32Array([0.9, 0.5, 0.1, 0.5]) });
+  });
+  const info = await page.evaluate(() => {
+    const v = document.querySelector('video');
+    return { w: v.videoWidth, h: v.videoHeight, angle: screen.orientation?.angle ?? 0, vw: innerWidth, vh: innerHeight };
+  });
+  check(info.w > info.h && info.angle === 0, `fake camera delivers landscape frames in the portrait UI (${info.w}×${info.h}, θ ${info.angle}) — raw buffers`);
+  // Raw buffers are upright for θ = 90: one clockwise turn onto the portrait preview →
+  // (0.9, 0.5) → (0.5, 0.9) and (0.1, 0.5) → (0.5, 0.1): bottom-centre and top-centre.
+  // Unrotated (the old mapping) both would lie outside the cropped preview.
+  const found = await page.waitForFunction(
+    ({ vw, vh }) => {
+      const c = document.querySelector('.capture-overlay');
+      if (!c || !c.width) return false;
+      const ctx = c.getContext('2d');
+      const s = c.width / vw;
+      const hit = (x, y) => {
+        const d = ctx.getImageData(Math.round(x * s) - 3, Math.round(y * s) - 3, 7, 7).data;
+        for (let i = 3; i < d.length; i += 4) if (d[i] > 0) return true;
+        return false;
+      };
+      return hit(vw / 2, 0.9 * vh) && hit(vw / 2, 0.1 * vh) ? true : false;
+    },
+    { vw: info.vw, vh: info.vh },
+    { timeout: 20000, polling: 100 },
+  ).then(() => true, () => false);
+  check(found, 'raw-buffer keypoints are drawn at their rotated positions (bottom-centre, top-centre)');
+  await holdShot(page, 'state-raw-overlay');
+  await context.close();
+});
+
+async function stuckFinish(page) {
+  await startCapture(page, `${base}?mock=1&mockSpeed=3&mockStall=finishCapture`);
+  await page.waitForFunction(() => Number(document.querySelector('[data-testid="kf-count"]')?.textContent) >= 6, null, { timeout: 90000 });
+  await by(page, 'finish').tap();
+  await by(page, 'capture-finishing').waitFor({ timeout: 10000 });
+  check(await by(page, 'finish-cancel').isHidden(), 'no Cancel during a normal-length finish');
+  await by(page, 'finish-cancel').waitFor({ state: 'visible', timeout: 10000 });
+  await sleep(1200); // a progress message arrives (the stalled engine keeps reporting)
+  const text = await by(page, 'capture-finishing').textContent();
+  check(/mapping 2 keyframes|Still mapping/i.test(text ?? ''), `finishing card explains the wait ("${text?.replace(/\s+/g, ' ').trim()}")`);
+  await shot(page, 'state-finish-stuck');
+  await audit(page, 'finish-stuck');
+  const t0 = Date.now();
+  await by(page, 'finish-cancel').tap();
+  await by(page, 'capture-finish-stopped').waitFor({ timeout: 15000 });
+  const dt = Date.now() - t0;
+  check(dt < 9000, `a stuck finishCapture is aborted within the grace period (${(dt / 1000).toFixed(1)} s)`);
+  const card = await by(page, 'capture-finish-stopped').textContent();
+  check(/Engine restarted/.test(card ?? ''), 'the abort restarted the engine (it ignored the cancel)');
+  const toasts = await page.locator('.toast', { hasText: 'restarted after an error' }).count();
+  check(toasts === 0, 'no "restarted after an error" toast for a user abort');
+  await shot(page, 'state-finish-stopped');
+  await audit(page, 'finish-stopped');
+}
+
+await scenario('finish-stuck', async () => {
+  const { page, context } = await newPage();
+  await stuckFinish(page);
+  await by(page, 'finish-process').tap();
+  await page.waitForSelector('.processing', { timeout: 20000 });
+  await page.waitForSelector('.viewer-screen', { timeout: 120000 });
+  check(true, '"Process now" after an aborted finish reconstructs the scan');
+  await context.close();
+});
+
+await scenario('finish-stuck-home', async () => {
+  const { page, context } = await newPage();
+  await stuckFinish(page);
+  await by(page, 'finish-home').tap();
+  await by(page, 'session-item').first().waitFor({ timeout: 15000 });
+  const status = await page.evaluate(async () => {
+    const { SessionStore } = await import('/src/io/storage.ts');
+    const s = await SessionStore.open();
+    const list = await s.listSessions();
+    return list.map((m) => m.status);
+  });
+  check(status.length === 1 && status[0] === 'captured', `the scan is kept as captured (got ${JSON.stringify(status)})`);
+  await context.close();
+});
+
+async function memoryLimit(page, name) {
+  await startCapture(page, `${base}?mock=1&mockSpeed=3&mockMemoryLimit=6`);
+  await by(page, 'capture-memory-limit').waitFor({ timeout: 90000 });
+  check((await page.locator('.capture').getAttribute('data-phase')) === 'paused', `${name}: the capture pauses at the memory limit`);
+  const text = await by(page, 'capture-memory-limit').textContent();
+  check(/Memory limit reached — finish scan now\?/.test(text ?? ''), `${name}: the prompt asks to finish now`);
+  await holdShot(page, `state-${name}`);
+  await audit(page, name);
+}
+
+await scenario('memory-limit', async () => {
+  const { page, context } = await newPage();
+  await memoryLimit(page, 'memory-limit');
+  await by(page, 'memory-continue').tap();
+  await page.waitForFunction(() => document.querySelector('.capture')?.getAttribute('data-phase') === 'running', null, { timeout: 10000 });
+  check(await by(page, 'memory-limited').isVisible(), '"Tracking only" chip after Continue');
+  const before = await kf(page);
+  await sleep(5000);
+  const after = await kf(page);
+  check(before === 6 && after === 6, `no new keyframes while tracking only (${before} → ${after})`);
+  check((await page.locator('[data-testid="capture-memory-limit"]').count()) === 0, 'the prompt is shown once');
+  await holdShot(page, 'state-memory-limit-tracking');
+  await by(page, 'finish').tap();
+  await page.waitForSelector('.processing', { timeout: 20000 });
+  check(true, 'Finish works after continuing with tracking only');
+  await context.close();
+  // Landscape: the prompt fits and its "Finish scan" leads to processing.
+  const l = await newPage({ contextOptions: { viewport: { width: 852, height: 393 } } });
+  await memoryLimit(l.page, 'memory-limit-landscape');
+  await by(l.page, 'memory-finish').tap();
+  await l.page.waitForSelector('.processing', { timeout: 20000 });
+  check(true, '"Finish scan" from the memory prompt');
+  await l.context.close();
+});
+
+await scenario('dense-resume', async () => {
+  const { page, context } = await newPage();
+  // Slow stages: the resumed densify must still be running when Cancel is tapped.
+  await page.goto(`${base}?mock=1&mockSpeed=0.3`);
+  await by(page, 'new-scan').waitFor();
+  await page.evaluate(async () => {
+    const { SessionStore } = await import('/src/io/storage.ts');
+    const s = await SessionStore.open();
+    await s.createSession({ id: 'seed-resume', name: 'Garden wall', mode: 'scene', status: 'sparse', stats: { quality: 'balanced', keyframes: 30, denseResumablePass: 1 } });
+  });
+  await page.reload();
+  await by(page, 'session-item').first().tap();
+  await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  await by(page, 'dense-resume').waitFor({ state: 'visible', timeout: 5000 });
+  await sleep(800);
+  await shot(page, 'state-dense-resume');
+  await audit(page, 'dense-resume viewer');
+  await by(page, 'tool-build').tap();
+  await by(page, 'build-dense-resume').waitFor({ timeout: 5000 });
+  const item = await by(page, 'build-dense-resume').textContent();
+  check(/Resume dense reconstruction/.test(item ?? ''), 'Build sheet offers "Resume dense reconstruction"');
+  await sleep(400);
+  await shot(page, 'state-dense-resume-build');
+  await audit(page, 'dense-resume build sheet');
+  // Another quality starts over: the item says so.
+  await page.locator('.segment[data-value="fast"]').tap();
+  const changed = await by(page, 'build-dense-resume').textContent();
+  check(/Starts over at Fast quality/.test(changed ?? ''), 'another quality explains that it starts over');
+  await page.locator('.segment[data-value="balanced"]').tap();
+  await by(page, 'build-dense').tap();
+  await page.waitForSelector('.processing', { timeout: 20000 });
+  check((await page.locator('.proc-title').textContent()) === 'Resuming dense cloud', 'processing says it resumes');
+  // Cancel the resumed densify: the viewer offers to resume again.
+  await page.waitForSelector('[data-testid="stage-depth_maps"][data-status="active"]', { timeout: 20000 });
+  await by(page, 'processing-cancel').tap();
+  await by(page, 'dialog-confirm').tap();
+  await page.waitForSelector('.viewer-screen', { timeout: 20000 });
+  await by(page, 'dense-resume').waitFor({ state: 'visible', timeout: 10000 });
+  check(true, 'a densify cancelled in Processing is resumable from the viewer');
+  await by(page, 'dense-resume-button').tap();
+  await page.waitForSelector('.processing', { timeout: 20000 });
+  await page.waitForSelector('.viewer-screen', { timeout: 120000 });
+  await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  await sleep(500);
+  check(await by(page, 'dense-resume').isHidden(), 'no resume offer once the dense cloud exists');
+  await context.close();
+});
+
+await scenario('info-sheet', async () => {
+  const { page, context } = await newPage();
+  await page.goto(`${base}?mock=1`);
+  await by(page, 'new-scan').waitFor();
+  await seedMeshed(page);
+  await by(page, 'session-item').first().tap();
+  await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  await by(page, 'viewer-info').tap();
+  await by(page, 'sheet-info').waitFor();
+  const t = await by(page, 'sheet-info').textContent();
+  check(/Magnetic north/.test(t ?? '') && /declination/.test(t ?? ''), 'compass yaw is labelled magnetic north with the declination note');
+  check(/Engine memory \(last step\)/.test(t ?? ''), 'engine memory (stats.memoryMB) shown');
+  await sleep(400);
+  await shot(page, 'state-info-sheet');
+  await audit(page, 'info-sheet');
+  await page.locator('.section-title', { hasText: 'Memory' }).scrollIntoViewIfNeeded();
+  await sleep(300);
+  await shot(page, 'state-info-sheet-memory');
   await context.close();
 });
 

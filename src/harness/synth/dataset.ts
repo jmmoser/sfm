@@ -62,6 +62,23 @@ export interface SynthFrame {
   center: [number, number, number];
   gain: number;
   depthFile?: string;
+  // ---- only when real-capture artefacts are on (meta.captureArtefacts non-null) ----
+  /** GT focal length (px) of this frame (focus breathing; meta.intrinsics.f is f0). */
+  f?: number;
+  /** Autofocus target distance (m): median centre z-depth at the GT pose. */
+  focusDistance?: number | null;
+  /** Linear white-balance gains (r, g, b). */
+  wb?: [number, number, number];
+  /** |ω_dev| (rad/s) at the frame time. */
+  omega?: number;
+  /** Largest image motion (px) over the exposure / over the rolling-shutter readout, at the AF depth. */
+  blurPx?: number;
+  rsPx?: number;
+  /** Largest motion-blur sub-frame count of the frame's bands, and the total scene renders. */
+  blurSamples?: number;
+  /** Rolling-shutter bands rendered for this frame (1 = global shutter). */
+  rsBands?: number;
+  renders?: number;
 }
 
 export interface SynthGeoFix extends GeoFix {

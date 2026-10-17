@@ -5,6 +5,8 @@
  *   'hang-init'  never answers `init`
  *   'fatal'      answers `init`, then posts a fatal GPU-lost error event
  *   'slow-frame' never answers `frame`
+ *   'slow-finish'  `finishCapture` runs (progress every 30 ms) until cancelled
+ *   'stuck-finish' `finishCapture` never answers and ignores `cancel` (progress keeps coming)
  */
 import {
   ENGINE_ERRORS,
@@ -149,7 +151,23 @@ async function handle(req: EngineRequest): Promise<void> {
       hidden = (req.params as { hidden: boolean }).hidden;
       ok(req.id, undefined);
       return;
-    case 'finishCapture':
+    case 'finishCapture': {
+      if (mode !== 'slow-finish' && mode !== 'stuck-finish') {
+        ok(req.id, undefined);
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        const timer = setInterval(() => scope.postMessage({ type: 'progress', requestId: req.id, stage: 'matching', progress: -1, message: 'mapping 3 keyframes' }), 30);
+        // A stuck worker never registers a cancel hook: the request hangs for good.
+        if (mode === 'slow-finish')
+          longOps.set(req.id, () => {
+            clearInterval(timer);
+            resolve();
+          });
+      });
+      fail(req.id, namedError(ENGINE_ERRORS.cancelled, 'finishCapture cancelled'));
+      return;
+    }
     case 'dispose':
       ok(req.id, undefined);
       return;

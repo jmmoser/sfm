@@ -4,7 +4,10 @@
  *  - `alignToGps`: robust weighted similarity (reconstruction → ENU) from GPS fixes, either
  *    4-DOF (scale, yaw, translation) when the reconstruction is already gravity-aligned
  *    (+Z up) or a full Sim3 otherwise, with residual statistics and a scale uncertainty;
- *  - `yawFromCompass`: world yaw from compass headings when GPS cannot provide it.
+ *  - `yawFromCompass`: world yaw from (true-north) compass headings, with a statistical ⊕
+ *    systematic uncertainty;
+ *  - `fuseYaw`: inverse-variance fusion of the GPS 4-DOF yaw and the compass yaw on the circle,
+ *    dropping the less certain one when they disagree by > 3σ.
  *
  * Altitudes: `GeoFix.alt` on iOS is orthometric (MSL), not ellipsoidal. Inside a local ENU
  * frame the geoid undulation is a constant offset, so this only shifts `originLatLonAlt[2]`.
@@ -784,17 +787,58 @@ export interface CompassObservation {
   direction: ArrayLike<number>;
 }
 
+/** Options of `yawFromCompass`. */
+export interface CompassYawOptions {
+  /** Observations whose (unit) reference axis has a smaller horizontal component are skipped (default 0.5). */
+  minHorizontal: number;
+  /** Widest outlier gate around the circular mean (deg, default 45). */
+  outlierDeg: number;
+  /** Narrowest outlier gate (deg, default 10); in between: 3.5 robust σ (1.4826 × median |residual|). */
+  minOutlierDeg: number;
+  /**
+   * Systematic heading error that does not average out over the capture (hard / soft-iron
+   * calibration residuals, nearby steel and cars, the iOS heading filter), as a fraction of the
+   * mean reported accuracy (default 0.25).
+   */
+  systematicFraction: number;
+  /** Floor of the systematic σ (deg, default 1). */
+  minSystematicDeg: number;
+}
+
+const DEFAULT_COMPASS_YAW: CompassYawOptions = {
+  minHorizontal: 0.5,
+  outlierDeg: 45,
+  minOutlierDeg: 10,
+  systematicFraction: 0.25,
+  minSystematicDeg: 1,
+};
+
 /** Result of `yawFromCompass`. */
 export interface CompassYaw {
   /** Counter-clockwise rotation about +Z (rad) that maps the gravity-aligned frame to ENU (+Y north). */
   yaw: number;
-  /** 1-σ uncertainty (rad), inflated for time correlation, floored at 1°. */
+  /** Total 1-σ (rad) = √(statStdRad² + systematicStdRad²) (≥ 1° with the default floor). */
   stdRad: number;
+  /**
+   * Statistical part (rad): the larger of the standard error implied by the reported accuracies
+   * (1/√Σwᵢ, wᵢ = hᵢ²/accᵢ²) and by the residual scatter, both inflated by √(n / n_eff) for
+   * time-correlated residuals.
+   */
+  statStdRad: number;
+  /** Systematic part (rad): max(minSystematicDeg, systematicFraction × mean accuracy). */
+  systematicStdRad: number;
+  /** Weighted RMS of the inlier residuals (rad). */
+  scatterRad: number;
+  /** Mean reported accuracy of the inliers (deg). */
+  meanAccuracyDeg: number;
+  /** Effective number of independent observations, n (1 − ρ)/(1 + ρ) with the lag-1 autocorrelation ρ ≥ 0. */
+  effectiveSamples: number;
   numUsed: number;
   numInliers: number;
 }
 
 function wrapPi(a: number): number {
+  if (a >= -Math.PI && a < Math.PI) return a; // exact for in-range angles
   a = (a + Math.PI) % (2 * Math.PI);
   if (a < 0) a += 2 * Math.PI;
   return a - Math.PI;
@@ -804,37 +848,43 @@ function wrapPi(a: number): number {
  * World yaw from compass headings. Each observation gives φᵢ = az(dirᵢ) − headingᵢ, where
  * az = atan2(x, y) is the azimuth of the reference axis clockwise from +Y; φ is the
  * counter-clockwise rotation about +Z taking the frame to ENU. Weighted circular mean
- * (weights = horizontal-norm² / accuracy²), observations with a near-vertical axis
- * (horizontal norm < `minHorizontal`) are skipped, outliers beyond `outlierDeg` from the
- * mean are dropped (2 passes). Returns null without usable observations.
+ * (weights hᵢ²/accᵢ², h = horizontal norm of the unit axis, acc floored at 2°); observations with
+ * a near-vertical axis (h < `minHorizontal`) are skipped. Outliers (magnetic disturbances): a
+ * first pass gates at `outlierDeg` around the circular mean, later passes at 3.5 robust σ of
+ * the residuals (1.4826 × median |r|, clamped to [`minOutlierDeg`, `outlierDeg`]).
+ * Uncertainty: statistical (accuracies and scatter, time-correlation corrected) ⊕ systematic
+ * (see `CompassYawOptions.systematicFraction`) — the headings of one capture share the device's
+ * calibration error, so many samples do not make the compass arbitrarily precise.
+ * Returns null without usable observations. Headings must refer to the north wanted (true north
+ * for ENU; see `world.ts` for the magnetic declination).
  */
-export function yawFromCompass(
-  obs: readonly CompassObservation[],
-  opts: { minHorizontal?: number; outlierDeg?: number } = {},
-): CompassYaw | null {
-  const minH = opts.minHorizontal ?? 0.5;
-  const gate = (opts.outlierDeg ?? 45) * DEG;
+export function yawFromCompass(obs: readonly CompassObservation[], opts: Partial<CompassYawOptions> = {}): CompassYaw | null {
+  const o = { ...DEFAULT_COMPASS_YAW, ...opts };
+  const minH = o.minHorizontal;
+  const maxGate = o.outlierDeg * DEG;
+  const minGate = Math.min(o.minOutlierDeg, o.outlierDeg) * DEG;
   const n = obs.length;
   const phi = new Float64Array(n);
   const w = new Float64Array(n);
+  const accDeg = new Float64Array(n);
   let used = 0;
   for (let i = 0; i < n; i++) {
-    const o = obs[i];
-    const d = o.direction;
+    const ob = obs[i];
+    const d = ob.direction;
     const dn = Math.hypot(d[0], d[1], d[2]);
     const h = dn > 0 ? Math.hypot(d[0], d[1]) / dn : 0;
-    if (!(h >= minH) || !Number.isFinite(o.headingDeg)) continue;
-    const ad = o.accuracyDeg;
-    const acc = Math.max(ad !== null && ad !== undefined && Number.isFinite(ad) ? ad : 20, 2) * DEG;
-    phi[i] = wrapPi(Math.atan2(d[0], d[1]) - o.headingDeg * DEG);
+    if (!(h >= minH) || !Number.isFinite(ob.headingDeg)) continue;
+    const ad = ob.accuracyDeg;
+    accDeg[i] = Math.max(ad !== null && ad !== undefined && Number.isFinite(ad) ? ad : 20, 2);
+    const acc = accDeg[i] * DEG;
+    phi[i] = wrapPi(Math.atan2(d[0], d[1]) - ob.headingDeg * DEG);
     w[i] = (h * h) / (acc * acc);
     used++;
   }
   if (used === 0) return null;
   const inl = new Uint8Array(n);
   for (let i = 0; i < n; i++) inl[i] = w[i] > 0 ? 1 : 0;
-  let mean = 0;
-  for (let pass = 0; pass < 3; pass++) {
+  const circularMean = (): number | null => {
     let sc = 0,
       ss = 0;
     for (let i = 0; i < n; i++) {
@@ -842,21 +892,38 @@ export function yawFromCompass(
       sc += w[i] * Math.cos(phi[i]);
       ss += w[i] * Math.sin(phi[i]);
     }
-    if (sc === 0 && ss === 0) return null;
-    mean = Math.atan2(ss, sc);
-    if (pass === 2) break;
+    return sc === 0 && ss === 0 ? null : Math.atan2(ss, sc);
+  };
+  let mean = circularMean();
+  if (mean === null) return null;
+  const absRes: number[] = [];
+  for (let pass = 0; pass < 4; pass++) {
+    let gate = maxGate;
+    if (pass > 0) {
+      absRes.length = 0;
+      for (let i = 0; i < n; i++) if (inl[i]) absRes.push(Math.abs(wrapPi(phi[i] - mean)));
+      gate = Math.min(maxGate, Math.max(minGate, 3.5 * 1.4826 * median(absRes)));
+    }
     let any = 0;
+    const prev = Uint8Array.from(inl);
     for (let i = 0; i < n; i++) {
       inl[i] = w[i] > 0 && Math.abs(wrapPi(phi[i] - mean)) < gate ? 1 : 0;
       any += inl[i];
     }
     if (any === 0) {
-      for (let i = 0; i < n; i++) inl[i] = w[i] > 0 ? 1 : 0;
+      inl.set(prev);
       break;
     }
+    const m = circularMean();
+    if (m === null) {
+      inl.set(prev);
+      break;
+    }
+    mean = m;
   }
   let sw = 0,
     sr = 0,
+    sa = 0,
     cnt = 0,
     num = 0,
     den = 0,
@@ -866,6 +933,7 @@ export function yawFromCompass(
     const r = wrapPi(phi[i] - mean);
     sw += w[i];
     sr += w[i] * r * r;
+    sa += accDeg[i];
     cnt++;
     den += r * r;
     if (prev >= 0) num += r * wrapPi(phi[prev] - mean);
@@ -873,6 +941,105 @@ export function yawFromCompass(
   }
   const rho = den > 0 ? Math.max(0, num / den) : 0;
   const neff = Math.max(1, (cnt * (1 - rho)) / (1 + rho));
-  const sd = Math.sqrt(sr / sw / neff);
-  return { yaw: mean, stdRad: Math.max(sd, DEG), numUsed: used, numInliers: cnt };
+  const scatter = Math.sqrt(sr / sw);
+  const sdScatter = scatter / Math.sqrt(neff);
+  const sdAccuracy = Math.sqrt(cnt / neff / sw);
+  const stat = Math.max(sdScatter, sdAccuracy);
+  const meanAcc = sa / cnt;
+  const sys = Math.max(o.minSystematicDeg, o.systematicFraction * meanAcc) * DEG;
+  return {
+    yaw: mean,
+    stdRad: Math.hypot(stat, sys),
+    statStdRad: stat,
+    systematicStdRad: sys,
+    scatterRad: scatter,
+    meanAccuracyDeg: meanAcc,
+    effectiveSamples: neff,
+    numUsed: used,
+    numInliers: cnt,
+  };
+}
+
+// ---------------------------------------------------------------------------------------
+// Yaw fusion (GPS 4-DOF ⊕ compass)
+// ---------------------------------------------------------------------------------------
+
+/** A yaw about +Z (rad, counter-clockwise, gravity-aligned frame → ENU) with its 1-σ (rad). */
+export interface YawEstimate {
+  yaw: number;
+  stdRad: number;
+}
+
+/** Result of `fuseYaw`. */
+export interface YawFusion {
+  yaw: number;
+  stdRad: number;
+  /** The estimates that went into `yaw`. */
+  used: 'both' | 'gps' | 'compass';
+  /** The estimate dropped because the two disagree by more than the gate, else null. */
+  rejected: 'gps' | 'compass' | null;
+  /** compass − GPS (rad, wrapped to [−π, π)). */
+  differenceRad: number;
+  /** |difference| / √(σ_gps² + σ_compass²). */
+  disagreementSigma: number;
+  /** Weight of the compass in `yaw` (0 when not used). */
+  compassWeight: number;
+}
+
+/** Options of `fuseYaw`. */
+export interface YawFusionOptions {
+  /** Yaws disagreeing by more than this many combined σ are not fused (default 3). */
+  maxDisagreementSigma: number;
+  /**
+   * A GPS yaw with σ ≤ this (rad, default 10°) is "confident": on disagreement the COMPASS is
+   * dropped even when its claimed σ is smaller — compass errors are dominated by unmodelled
+   * effects (local magnetic disturbances, a wrong declination, the unverified iOS landscape
+   * heading compensation) whereas the GPS yaw is the RANSAC-checked geometry of the track.
+   * Above it the less certain estimate is dropped.
+   */
+  confidentGpsStdRad: number;
+}
+
+/**
+ * Inverse-variance fusion of the GPS (4-DOF) and compass yaws on the circle: ψ = ψ_gps +
+ * w_c/(w_g + w_c) · wrap(ψ_compass − ψ_gps), σ = (w_g + w_c)^−½. When they disagree by more than
+ * `maxDisagreementSigma` combined σ, the compass is dropped against a confident GPS yaw
+ * (`confidentGpsStdRad`), otherwise the less certain one. A non-finite yaw or σ means that
+ * estimate is ignored. (A number as the 3rd argument = `maxDisagreementSigma`.)
+ */
+export function fuseYaw(gps: YawEstimate, compass: YawEstimate, options: Partial<YawFusionOptions> | number = {}): YawFusion {
+  const o: YawFusionOptions = {
+    maxDisagreementSigma: 3,
+    confidentGpsStdRad: 10 * DEG,
+    ...(typeof options === 'number' ? { maxDisagreementSigma: options } : options),
+  };
+  const sg = Number.isFinite(gps.stdRad) && Number.isFinite(gps.yaw) ? Math.max(gps.stdRad, 1e-9) : Infinity;
+  const sc = Number.isFinite(compass.stdRad) && Number.isFinite(compass.yaw) ? Math.max(compass.stdRad, 1e-9) : Infinity;
+  const d = Number.isFinite(gps.yaw) && Number.isFinite(compass.yaw) ? wrapPi(compass.yaw - gps.yaw) : NaN;
+  const sd = Math.hypot(sg, sc);
+  const z = Number.isFinite(d) && Number.isFinite(sd) ? Math.abs(d) / sd : Infinity;
+  const only = (which: 'gps' | 'compass', rejected: 'gps' | 'compass' | null): YawFusion => ({
+    yaw: wrapPi(which === 'gps' ? gps.yaw : compass.yaw),
+    stdRad: which === 'gps' ? sg : sc,
+    used: which,
+    rejected,
+    differenceRad: d,
+    disagreementSigma: z,
+    compassWeight: which === 'compass' ? 1 : 0,
+  });
+  if (!Number.isFinite(sc)) return only('gps', null);
+  if (!Number.isFinite(sg)) return only('compass', null);
+  if (z > o.maxDisagreementSigma) return sg <= o.confidentGpsStdRad || sg <= sc ? only('gps', 'compass') : only('compass', 'gps');
+  const wg = 1 / (sg * sg),
+    wc = 1 / (sc * sc);
+  const a = wc / (wg + wc);
+  return {
+    yaw: wrapPi(gps.yaw + a * d),
+    stdRad: 1 / Math.sqrt(wg + wc),
+    used: 'both',
+    rejected: null,
+    differenceRad: d,
+    disagreementSigma: z,
+    compassWeight: a,
+  };
 }

@@ -185,7 +185,7 @@ function inBox(b, x, y, z) {
   return x >= b.min[0] && x <= b.max[0] && y >= b.min[1] && y <= b.max[1] && z >= b.min[2] && z <= b.max[2];
 }
 
-function centreOf(pose) {
+export function centreOf(pose) {
   const R = pose.R, t = pose.t;
   return [-(R[0] * t[0] + R[3] * t[1] + R[6] * t[2]), -(R[1] * t[0] + R[4] * t[1] + R[7] * t[2]), -(R[2] * t[0] + R[5] * t[1] + R[8] * t[2])];
 }
@@ -228,6 +228,52 @@ function accuracyPerPoint(P, dataset, maxD) {
   return acc;
 }
 
+const PLY_SIZES = { char: 1, int8: 1, uchar: 1, uint8: 1, short: 2, int16: 2, ushort: 2, uint16: 2, int: 4, int32: 4, uint: 4, uint32: 4, float: 4, float32: 4, double: 8, float64: 8 };
+
+/** Vertex colours (RGB, Uint8Array) of a binary little-endian PLY with fixed-size vertex properties, or null. */
+export function parsePlyColors(u8) {
+  const end = Buffer.from(u8.buffer, u8.byteOffset, Math.min(u8.length, 65536)).indexOf('end_header');
+  if (end < 0) return null;
+  const header = new TextDecoder().decode(u8.subarray(0, end));
+  if (!header.includes('binary_little_endian')) return null;
+  let n = 0;
+  let inVertex = false;
+  const props = [];
+  for (const l of header.split(/\r?\n/)) {
+    const p = l.trim().split(/\s+/);
+    if (p[0] === 'element') {
+      inVertex = p[1] === 'vertex';
+      if (inVertex) n = Number(p[2]);
+    } else if (p[0] === 'property' && inVertex) {
+      if (p[1] === 'list') return null;
+      props.push({ name: p[2], size: PLY_SIZES[p[1]] ?? 0 });
+    }
+  }
+  let off = 0;
+  const at = {};
+  for (const pr of props) {
+    at[pr.name] = off;
+    off += pr.size;
+  }
+  if (at.red === undefined || at.green === undefined || at.blue === undefined) return null;
+  let body = end + 'end_header'.length;
+  while (body < u8.length && u8[body] !== 0x0a) body++;
+  body++;
+  const out = new Uint8Array(3 * n);
+  for (let i = 0; i < n; i++) {
+    const b = body + i * off;
+    out[3 * i] = u8[b + at.red];
+    out[3 * i + 1] = u8[b + at.green];
+    out[3 * i + 2] = u8[b + at.blue];
+  }
+  return out;
+}
+
+/** Sky-coloured point (light / saturated blue; the synthetic yard sky runs from (205, 218, 232) to (95, 140, 205)). */
+function isSkyColour(r, g, b) {
+  return b >= 150 && b - r >= 20 && b >= g;
+}
+
 function pct(a, p) {
   if (!a.length) return NaN;
   const s = Float64Array.from(a).sort();
@@ -235,14 +281,16 @@ function pct(a, p) {
 }
 
 /** Breakdowns: accuracy/precision by region (object: focus box vs rest) or by camera distance; completeness by camera distance. */
-function breakdown(dataset, points, centres, tau, compVis) {
+export function breakdown(dataset, points, centres, tau, compVis, colors = null) {
   const meta = dataset.meta;
   const roi = meta.roi;
   const pts = [];
+  const sky = [];
   for (let i = 0; i < points.length; i += 3) {
     const x = points[i], y = points[i + 1], z = points[i + 2];
     if (roi && !inBox(roi, x, y, z)) continue;
     pts.push(x, y, z);
+    if (colors) sky.push(isSkyColour(colors[i], colors[i + 1], colors[i + 2]) ? 1 : 0);
   }
   const P = Float64Array.from(pts);
   const nP = P.length / 3;
@@ -274,6 +322,17 @@ function breakdown(dataset, points, centres, tau, compVis) {
       if (acc[i] <= tau) R.within++;
     }
   }
+  // sky-coloured points (yard: the halo fringe on roof / tree outlines) and their share of the points farther than tau
+  let skyN = 0, skyBad = 0, bad = 0;
+  for (let i = 0; i < nP; i++) {
+    const isBad = acc[i] > tau;
+    if (isBad) bad++;
+    if (colors && sky[i]) {
+      skyN++;
+      if (isBad) skyBad++;
+    }
+  }
+  const skyColoured = colors ? { points: skyN, bad: skyBad, allBad: bad, shareOfBad: bad ? skyBad / bad : 0 } : null;
   const fmtBin = (B) => ({ range: B.range, points: B.n, precision: B.n ? B.within / B.n : null, accMedian: pct(B.acc, 50), accP90: pct(B.acc, 90), relMedian: B.rel ? pct(B.rel, 50) : undefined });
   // completeness by camera distance (completeness set, all-frame visibility ≥ 1 and subset visibility ≥ 1)
   const compSet = dataset.gtFocus ?? dataset.gt;
@@ -296,6 +355,7 @@ function breakdown(dataset, points, centres, tau, compVis) {
   }
   return {
     accuracyByCameraDistance: byDist.map(fmtBin),
+    skyColoured,
     accuracyByRegion: meta.focus && meta.scene === 'object' ? { focus: fmtBin({ ...region.focus, range: 'focus box' }), rest: fmtBin({ ...region.rest, range: 'ROI minus focus box' }) } : null,
     completenessByCameraDistance: cb.map((B) => ({ range: B.range, samples: B.n, completeness: B.n ? B.covered / B.n : null, samplesSubsetVisible: B.nSub, completenessSubsetVisible: B.nSub ? B.coveredSub / B.nSub : null })),
   };
@@ -418,7 +478,18 @@ async function runScene(page, scene, opts, outDir) {
       console.log(`completeness (GT visible in the ${summary.frames.length} used views): ${f(ms.dense.completeness, 4)}  (${ms.dense.numGtEvaluated} samples), F-score ${f(ms.dense.fscore, 4)}`);
     }
     const centres = result.images.map((im) => centreOf(im.pose));
-    out.breakdown = breakdown(dataset, points, centres, m.dense.tau, compVis);
+    const plyBytes = new Uint8Array(await readFile(join(outDir, `${name}.ply`)));
+    out.breakdown = breakdown(dataset, points, centres, m.dense.tau, compVis, parsePlyColors(plyBytes));
+    if (out.breakdown.skyColoured) {
+      const s = out.breakdown.skyColoured;
+      console.log(`sky-coloured points: ${s.points} (${s.bad} farther than tau = ${pc(s.shareOfBad)} of the ${s.allBad} points farther than tau)`);
+    }
+    {
+      // whole scene: base GT set without the ROI (object: the room walls / floor around the table)
+      const mb = computeMetrics({ ...dataset, gtFocus: undefined }, result, { points, denseAlign: 'none', roi: false });
+      out.fullScene = { precision: mb.dense.precision, completeness: mb.dense.completeness, points: mb.dense.numPointsEvaluated, samples: mb.dense.numGtEvaluated };
+      console.log(`whole scene (base set, no ROI): precision ${f(mb.dense.precision, 4)} (${mb.dense.numPointsEvaluated} points), completeness ${f(mb.dense.completeness, 4)} (${mb.dense.numGtEvaluated} samples)`);
+    }
     console.log('accuracy by camera distance: ' + out.breakdown.accuracyByCameraDistance.map((b) => `[${b.range} m: n=${b.points} prec ${pc(b.precision)} med ${f(b.accMedian, 4)} p90 ${f(b.accP90, 4)} rel ${f(b.relMedian, 4)}]`).join(' '));
     if (out.breakdown.accuracyByRegion) {
       const r = out.breakdown.accuracyByRegion;

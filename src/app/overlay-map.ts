@@ -3,6 +3,69 @@
  * as submitted) to CSS pixels of a `<video>` element drawn with `object-fit: cover` (or
  * `contain`) and `object-position: 50% 50%`.
  */
+import { canonicalRotation, snapScreenAngle, type ScreenAngle } from '../sensors/frame-orientation';
+
+/**
+ * Which way the pixels of each submitted frame are upright — the SAME rule as the engine's
+ * `OrientationTracker` (src/engine/frame-ingest.ts), so a keypoint overlay given relative to the
+ * bitmap AS SUBMITTED (protocol) can be turned onto the `<video>` preview, which is always upright
+ * for the current UI rotation:
+ *  - a landscape bitmap in a portrait UI (θ ∈ {0, 180}) is a RAW sensor buffer (iOS pixel buffers
+ *    are sensor-landscape, rotated by metadata only): upright for θ = 90;
+ *  - raw delivery is a property of the capture path, fixed by the FIRST portrait-UI frame: with raw
+ *    delivery the landscape bitmaps of a landscape UI are raw too (upright for 90 also at θ = 270);
+ *  - a portrait bitmap in a landscape UI is a transient mis-rotation the engine drops: no overlay;
+ *  - frames within `settleMs` of a UI rotation are ignored for the delivery decision (as the engine
+ *    drops them before classifying).
+ * The preview shown at θ_display needs `canonicalRotation(θ_display, θ_upright)` CLOCKWISE quarter
+ * turns of the frame (θ = 90 raw buffer in a portrait UI: 1 turn).
+ */
+export class FrameOrientationTracker {
+  /** true = raw sensor buffers, false = frames rotated upright, null = not known yet. */
+  rawDelivery: boolean | null = null;
+  private lastUI: ScreenAngle | null = null;
+  private changeT = -Infinity;
+
+  constructor(readonly settleMs = 500) {}
+
+  /**
+   * Observe a submitted frame (call for EVERY frame, in submission order) and return the θ its
+   * pixels are upright for, or null when the engine drops such a frame (no overlay).
+   */
+  observe(f: { width: number; height: number; screenAngle: number; t?: number }): ScreenAngle | null {
+    const ui = snapScreenAngle(f.screenAngle);
+    const t = f.t ?? NaN;
+    if (this.lastUI !== null && ui !== this.lastUI) this.changeT = t;
+    this.lastUI = ui;
+    const settling = Number.isFinite(t) && t - this.changeT < this.settleMs;
+    return this.uprightTheta(f.width, f.height, ui, !settling);
+  }
+
+  /** θ the pixels of a `width × height` bitmap submitted at UI rotation `ui` are upright for (null: dropped). */
+  uprightTheta(width: number, height: number, ui: number, noteDelivery = false): ScreenAngle | null {
+    const s = snapScreenAngle(ui);
+    const portraitUI = s === 0 || s === 180;
+    if (portraitUI) {
+      if (width > height) {
+        if (noteDelivery && this.rawDelivery === null) this.rawDelivery = true;
+        return 90;
+      }
+      if (height > width && noteDelivery && this.rawDelivery === null) this.rawDelivery = false;
+      return s;
+    }
+    if (height > width) return null;
+    if (width > height && this.rawDelivery === true) return 90;
+    return s;
+  }
+
+  /**
+   * Clockwise quarter turns that map the overlay of a frame (relative to the bitmap as
+   * submitted, upright for `uprightTheta`) onto the preview shown at UI rotation `displayAngle`.
+   */
+  static overlayTurns(uprightTheta: number, displayAngle: number): number {
+    return canonicalRotation(displayAngle, uprightTheta);
+  }
+}
 
 export interface CoverTransform {
   /** CSS px per frame pixel. */

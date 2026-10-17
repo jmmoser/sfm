@@ -1336,6 +1336,12 @@ h3 {
   justify-self: end;
 }
 
+/* After the engine's capture memory cap: no new keyframes (tracking only). */
+.capture-mem-chip {
+  align-self: center;
+  white-space: nowrap;
+}
+
 .status-pill {
   display: inline-flex;
   align-items: center;
@@ -1614,6 +1620,11 @@ h3 {
   display: none;
 }
 
+/* The "Memory full" chip sits under the counters: the guidance moves below it. */
+.capture.memory-limited .guidance {
+  top: calc(var(--safe-t) + 146px);
+}
+
 .capture-controls {
   position: absolute;
   left: 0;
@@ -1863,6 +1874,9 @@ h3 {
   .guidance {
     top: calc(var(--safe-t) + 96px);
     left: calc(50% - 64px - var(--safe-r) / 2);
+  }
+  .capture.memory-limited .guidance {
+    top: calc(var(--safe-t) + 138px);
   }
   .mini-view {
     right: calc(var(--safe-r) + 136px);
@@ -2223,6 +2237,64 @@ h3 {
   min-width: 0;
 }
 
+/* Interrupted densify: "Resume" HUD (hidden while measuring — same place as the measure HUD). */
+.viewer-resume {
+  position: absolute;
+  top: calc(var(--safe-t) + 70px);
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: max-content;
+  max-width: calc(100vw - 24px);
+  padding: 8px 8px 8px 12px;
+  border-radius: 20px;
+  background: var(--glass-strong);
+  -webkit-backdrop-filter: blur(24px);
+  backdrop-filter: blur(24px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.viewer-screen.measuring .viewer-resume {
+  display: none;
+}
+
+.viewer-resume-icon {
+  display: inline-flex;
+  color: var(--warn);
+  flex: none;
+}
+
+.viewer-resume-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.viewer-resume-title {
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.viewer-resume-sub {
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.row-note {
+  min-height: 0;
+  padding-top: 0;
+}
+
+.group > .row + .row.row-note {
+  border-top: none;
+}
+
+.build-item-resume .build-icon {
+  color: var(--warn);
+}
+
 .measure-value {
   font-family: var(--font-display);
   font-size: 22px;
@@ -2393,6 +2465,217 @@ h3 {
 
 .diagnostics .section > .btn {
   margin-top: 10px;
+}
+
+/* ---- benchmark & self-test (Diagnostics) */
+
+.bench .section {
+  margin-top: 16px;
+}
+
+.bench-intro {
+  margin: 0 4px 12px;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.bench .banner {
+  margin-bottom: 12px;
+}
+
+.bench-row {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+}
+
+.bench-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.bench-head > .chip,
+.bench-chip-running {
+  flex: none;
+  margin-top: 2px;
+}
+
+.bench-body {
+  min-width: 0;
+}
+
+.bench-chip-running {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 24px;
+}
+
+.bench-row .row-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-weight: 600;
+}
+
+.bench-backend {
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--surface-3);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  color: var(--text-2);
+}
+
+.bench-row .row-sub {
+  margin-top: 3px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.bench-row[data-status='running'] .row-sub {
+  color: var(--info);
+}
+
+.bench-row[data-status='error'] .row-sub {
+  color: var(--bad);
+}
+
+.bench-note {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  font-size: 12.5px;
+  color: var(--warn);
+}
+
+.bench-note .icon-wrap {
+  flex: none;
+  margin-top: 1px;
+}
+
+.bench-checks {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12.5px;
+  line-height: 1.35;
+  color: var(--text-2);
+}
+
+.bench-checks li {
+  display: flex;
+  gap: 6px;
+}
+
+.bench-checks .icon-wrap {
+  flex: none;
+  margin-top: 1px;
+}
+
+.bench-checks li.ok .icon-wrap {
+  color: var(--good);
+}
+
+.bench-checks li.bad {
+  color: var(--bad);
+}
+
+.bench-timings {
+  margin-top: 8px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.bench-timings summary {
+  display: flex;
+  align-items: center;
+  min-height: 44px;
+  margin: -6px 0 -10px;
+  color: var(--info);
+  font-weight: 600;
+  cursor: pointer;
+  list-style: none;
+}
+
+.bench-timings summary::-webkit-details-marker {
+  display: none;
+}
+
+.bench-timings summary::after {
+  content: '›';
+  margin-left: 6px;
+  transition: transform 0.2s var(--ease);
+}
+
+.bench-timings[open] summary::after {
+  transform: rotate(90deg);
+}
+
+.bench-timings dl {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 12px;
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--surface-2);
+  font-size: 12.5px;
+}
+
+.bench-timings dt {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.bench-timings dd {
+  margin: 0;
+  text-align: right;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.bench-subtitle {
+  margin: 22px 4px 10px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+
+.bench-foot {
+  margin: 8px 4px 0;
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+
+.bench-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.bench-running {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 24px;
+  font-size: 14px;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
 }
 
 /* ---------------------------------------------------------------- overlays: sheets, dialogs, toasts */

@@ -657,6 +657,7 @@ export class LiveSession {
       info,
       gravityDevice: gDev,
       headingAccuracy: f.heading && Number.isFinite(f.heading.accuracy) ? f.heading.accuracy : null,
+      headingNorth: f.heading?.north === 'magnetic' ? 'magnetic' : 'true',
       segment: typeof f.segment === 'number' ? f.segment : 0,
       screenAngle: f.screenAngle,
       quarterTurns: k,

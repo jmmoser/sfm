@@ -44,7 +44,7 @@ and note the change in your module's README section at the bottom of this file.
 | Camera ← device rotation | Rear camera, processed image upright for the UI rotated by screen angle θ (device turned θ counter-clockwise from natural portrait as seen by the user; θ ∈ {0, 90, 180, 270}): `R_cam_device(θ) = diag(1, −1, −1) · Rz(θ)` where `Rz(θ) = [[cosθ, −sinθ, 0], [sinθ, cosθ, 0], [0, 0, 1]]`. θ=0: `diag(1,−1,−1)`; θ=90: rows `(0,−1,0), (−1,0,0), (0,0,−1)`. `v_cam = R_cam_device · v_device`. (iOS mapping of `screen.orientation.angle` / `window.orientation` to θ is verified in `src/sensors/frame-orientation.ts`.) |
 | Device attitude | `R_wd` = device-to-world rotation; camera pose rotation `R = R_cam_device · R_wdᵀ`. Gyro `ω_dev`: `dR_wd/dt = R_wd [ω_dev]×`. `accel_dev = R_wdᵀ a_world`, `accelG_dev = R_wdᵀ (a_world − g_world)`, `g_world = (0, 0, −9.81)` in the Z-up world. |
 | Gravity | `ImuSample.accelG` uses the W3C spec sign: device lying flat face-up reports ≈ (0, 0, +9.81) (specific force). "Gravity direction" vectors in this code base always point DOWN. |
-| World frame after alignment | +Z up (opposite gravity). If north is known: +Y = true north, +X = east (local ENU). Units = metres when `MetricInfo.metric`. |
+| World frame after alignment | +Z up (opposite gravity). If north is known: +Y = true north, +X = east (local ENU). Units = metres when `MetricInfo.metric`. `northAligned` means TRUE north only (compass headings are magnetic until the WMM declination is applied; a magnetic-only yaw leaves +Y ≈ magnetic north with `northAligned: false` — §6 "True-north heading"). |
 | Viewer | three.js is Y-up; the viewer converts from the Z-up world (`(x, y, z) → (x, z, -y)`). |
 | Random numbers | Always through the seeded `Rng` from `src/math/random.ts` (deterministic tests). |
 | Descriptors | RootSIFT, 128 bytes, `min(255, round(512 * v))` of the unit-L2 RootSIFT vector. |
@@ -456,7 +456,13 @@ class MotionSensor {
 }
 integrateGyro(samples: ImuSample[], t0: number, t1: number): Mat3   // R_{d(t1)←d(t0)} device-frame rotation
 // orientation.ts
-class CompassSensor { start(): void; stop(): void; headingAt(t: number): { heading: number; accuracy: number } | null }
+class CompassSensor { start(): void; stop(): void; headingAt(t: number): { heading: number; accuracy: number; north?: 'true' | 'magnetic' } | null
+  setLocation(latDeg, lonDeg, altM?, date?): MagneticElements | null   // WMM declination ⇒ TRUE north from now on
+  setLocationFromFix(fix, date?): boolean; setDeclination(deg | null): void; readonly northReference: 'true' | 'magnetic' }
+// wmm.ts — World Magnetic Model WMM2025 (pure; official coefficients; valid 2025.0–2030.0)
+magneticField(latDeg, lonDeg, altKm?, decimalYear?): MagneticElements   // D, I, X/Y/Z/H/F + rates, blackout flags
+declination(latDeg, lonDeg, altKm?, decimalYear?): number               // deg, east positive: true = magnetic + D
+decimalYearFromDate(d: Date | number): number
 // geolocation.ts
 class GeoSensor { start(): void; stop(): void; readonly fixes: GeoFix[]; nearest(t: number): GeoFix | null }
 // frame-orientation.ts
@@ -2365,3 +2371,249 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   keyframes; finishCapture during a frame; cancelled re-densify + mesh; pipeline hand-over key; DENSE_PRESETS
   precedence; low-excitation acceptance), `src/engine/review.gpu.test.ts` (loadSession of another session,
   IndexedDB). Each engine-level test fails on the code before its fix.
+
+### True-north heading (WMM2025 declination, compass ⊕ GPS yaw; amends the `src/sensors`, `src/sfm` extras and `src/engine` notes above)
+
+* **Problem**: `webkitCompassHeading` is MAGNETIC (ios-sensors.md); `CompassSensor.setDeclination` was never called, so
+  every compass heading the engine received was magnetic while the world alignment treated it as true north (≈ +15°
+  yaw error in Seattle, up to ±20–30° elsewhere), and the compass was ignored whenever GPS decided the yaw.
+* **`src/sensors/wmm.ts`** (new, pure, no DOM): World Magnetic Model WMM2025 with the official NOAA/NCEI `WMM.COF`
+  embedded verbatim (degree/order 12, epoch 2025.0, valid 2025.0–2030.0; dates outside are extrapolated, clamped to
+  ±5 years and flagged). Geodetic → geocentric (WGS84), Schmidt semi-normalised associated Legendre functions and
+  φ′-derivatives (Gauss-normalised recursions), secular variation, rotation back to geodetic north/east/down; the
+  geographic poles use the limit of P̆ₙ¹/cos φ′ (finite, continuous along a meridian). `magneticField` returns D, I,
+  X, Y, Z, H, F, their yearly rates and the WMM blackout (H < 2000 nT) / caution (H < 6000 nT) flags; `declination`,
+  `inclination`, `intensity`, `decimalYearFromDate`, `magneticToTrueHeading` / `trueToMagneticHeading`. Validated
+  against all 100 official `WMM2025_TestValues.txt` rows: |ΔD|, |ΔI| ≤ 0.005° (the table's print precision),
+  |ΔX..F| < 1e-3 nT, rates < 1e-5 °/yr and 1e-4 nT/yr (`wmm.test.ts`).
+* **CompassSensor**: headings / attitude are MAGNETIC until a declination is known and say so
+  (`HeadingReading.north`, `declinationDeg`, `AttitudeReading.north`, `northReference`, `declinationInfo`).
+  `setLocation(lat, lon, altM, date)` = WMM declination there; `setLocationFromFix(fix)` is the app policy: the first
+  fix with accuracy ≤ 50 km sets it (an iOS "approximate" 1–20 km fix is fine — the declination changes by ≲ 0.02°/km
+  outside the polar regions), re-evaluated once when a ≤ 100 m fix follows a > 1 km one, never over a manual
+  `setDeclination`. `setDeclination(null)` returns to magnetic. Diagnostics report `northReference` / `declination`.
+* **App** (`capture.ts`, two lines): `geo.onFix → compass.setLocationFromFix(fix)`; FrameInput headings carry
+  `north` (`'magnetic'` when the reading has none) and `declinationDeg`.
+* **Protocol / engine**: `HeadingSample.north?: 'true' | 'magnetic'` (absent = 'true', the FrameInfo.heading contract)
+  and `declinationDeg?`; `KeyframeRecord.headingNorth` (persisted with the keyframe; live.ts one line); refine passes
+  it as `WorldKeyframe.headingNorth` and merges `details.headingStats` into `stats` (`north`, `declinationDeg`,
+  `declinationSource`, `headingsConverted`, `yawStdDeg`, `compassYawStdDeg`, `gpsYawStdDeg`,
+  `compassMinusGpsYawDeg`, `yawDisagreementSigma`, `yawFusion`; `yawSource` may now be `'gps+compass'`).
+* **World alignment** (`sfm/world.ts`): magnetic keyframe headings + WMM declination at the FIRST GPS fix (in time)
+  with accuracy ≤ `maxDeclinationFixAccuracyM` (50 km) — the session's fixes, so also before the app learned the
+  location — else at the optional `coarseLocation` (none in the app today), at `captureDate` (default: now, i.e.
+  refine time; the secular variation is ≲ 0.2°/yr, so a later refine changes nothing measurable); `declinationDeg`
+  overrides. No location ⇒ the compass yaw refers to MAGNETIC north: still applied (+Y ≈ magnetic north beats an
+  arbitrary yaw) but `metric.northAligned = false`, `details.north = 'magnetic'`, warning (`useMagneticYaw: false`
+  skips it). True and magnetic headings are never mixed. In the WMM blackout zone the compass is not used.
+  `MetricInfo` is unchanged (core type); the north reference lives in `details.north` / `stats.north`.
+* **Compass yaw σ** (`yawFromCompass`): statistical = max(standard error implied by the reported accuracies
+  1/√Σ(h²/acc²), residual scatter / √n) × √(n/n_eff) (lag-1 autocorrelation), ⊕ systematic
+  max(1°, 0.25 × mean accuracy) — calibration errors and local disturbances are shared by all headings of a capture,
+  so many samples never make the compass arbitrarily precise (σ was scatter-only, floored at 1°). Outliers: a 45° gate,
+  then 3.5 robust σ (1.4826 × median |r|) clamped to [10°, 45°].
+* **GPS ⊕ compass yaw** (`fuseYaw`): whenever both a 4-DOF GPS yaw (σ = `alignToGps.yawStdRad`) and a TRUE-north compass
+  yaw exist: circular inverse-variance mean, σ = (σ_g⁻² + σ_c⁻²)^−½. Disagreement > 3 combined σ: the compass is
+  dropped against a CONFIDENT GPS yaw (σ_g ≤ 10°) even when the compass claims a smaller σ (its errors are dominated
+  by unmodelled effects: disturbances, wrong declination, the unverified iOS landscape compensation), otherwise the
+  less certain one; warning + `details.yawFusion`. Sim3 GPS (no gravity) is not fused. The GPS translation is
+  recomputed with the final yaw (unchanged code path).
+* **Harness** (`src/harness/engine/feed.ts` `HeadingNorthEmulator`, config `headingNorth`, `--set headingNorth='"app"'`):
+  the datasets store TRUE-north headings. Default `'magnetic'` (datasets with a location and GPS fed): converted to
+  magnetic with WMM2025 at `meta.originLatLonAlt` and the run's date (`captureDateMs`), flagged magnetic ⇒ the engine
+  must apply the declination at its first GPS fix (the full path). `'app'`: magnetic until a fix is delivered, then
+  `CompassSensor.setLocationFromFix` (the app's code). `'true'`: unchanged — also used for datasets without a location
+  (object) and with `--no-gps` by default (magnetic north is undefined without a place; a magnetic-only run would
+  correctly fail the yard north claim).
+* **Measured** (unit, `world-heading.test.ts`, 30–40 m walks, Seattle GPS σ 3 m, 5° compass noise): magnetic headings
+  converted with the first-fix declination (|ΔD| < 1e-3° vs the GPS origin); 6 seeds: fused yaw RMS 0.62° vs GPS-only
+  3.21°, z-score RMS 0.49 (σ conservative: the synthetic compass has no systematic error); a 15° (mislabelled
+  magnetic) or 40° compass bias is rejected against the GPS yaw; a 22 m track (σ_g 5.2°) gives the compass weight
+  > 0.5. e2e yard (worker, CPU features, `--no-dense`; magnetic headings by default): heading error −0.64° (yaw
+  `gps+compass`, declination 14.869° at the first fix, 80/80 headings converted, σ_gps 2.97°, σ_compass 1.47° ⇒
+  compass weight 0.80, fused σ 1.32°, compass − GPS 2.5° = 0.76σ) vs −2.66° with the GPS yaw alone (`--no-heading`,
+  = the behaviour before); `headingNorth: 'app'` gives the same −0.64° (headings already true north); object
+  (no location ⇒ true-north replay, compass yaw) −0.36° as before; yard `--no-gps` with magnetic headings: yaw
+  14.7° off true north = magnetic north, `northAligned: false` (the yard north claim then fails, by design).
+* **Limits**: the WMM ignores crustal anomalies and disturbance fields (declination RMS ≈ 0.3–0.5°, worse near the
+  magnetic poles / at high magnetic activity); the systematic compass σ (25 % of the reported accuracy) is a prior, not
+  calibrated on devices; the compass reference axis (device top vs optical axis when upright) and the iOS 26 landscape
+  heading behaviour remain unverified on hardware (ios-sensors.md) — the confident-GPS rule limits the damage; no
+  coarse-location source exists in the app (GPS denied ⇒ magnetic yaw, northAligned false).
+
+### `src/app` — capture / viewer gaps + on-device benchmark (amends the `src/app` notes above)
+
+* **Overlay of RAW sensor buffers** (`overlay-map.ts` `FrameOrientationTracker`, used by `capture.ts`): the same rule
+  as the engine's `OrientationTracker` (landscape bitmap in a portrait UI = raw buffer, upright for θ = 90; raw delivery
+  fixed by the first portrait-UI frame outside the 500 ms settle window, then landscape frames of a landscape UI are raw
+  too; portrait bitmap in a landscape UI = dropped). The overlay (relative to the bitmap AS SUBMITTED) is turned by
+  `canonicalRotation(θ_display, θ_upright)` clockwise quarter turns onto the upright `<video>` (portrait UI: 1 turn);
+  overlays of frames from before a UI rotation are still dropped. Fixes the rotated overlay reported by the engine
+  integration review. Tests: unit (random sequences agree with the engine tracker; a raw-buffer pixel lands where
+  `rotateImagePoint` puts it; device top / right edge projected with `R_cam_device(90)` appear up / right), e2e
+  `states.mjs raw-overlay` (the headless fake camera IS a landscape stream in the portrait UI).
+* **Cancel / abort of `finishCapture`**: `finishCapture` is a long operation of `EngineClient` (cancel target; progress
+  resets its inactivity timer). New `EngineLike.abortLongOperation({graceMs})`: cancel, and when the request has not
+  settled within `graceMs` (the engine checks the token only after `live.flush()`; a hung IndexedDB wait or a stuck
+  worker never answers — its 1 Hz progress events also keep the inactivity timeout from firing) it is rejected locally
+  with CancelledError and the worker respawned (manual: not counted against the cap; reason prefix `aborted: ` — no
+  "restarted after an error" toast); the replayed `init` uses `resume`, so the persisted keyframes come back (the
+  resume maps keyframes whose mapping never completed). Capture: the finishing card shows Cancel after 2 s (grace 4 s),
+  then "Finishing cancelled" / "Engine restarted" with **Process now** (refine maps what is left) or **Back to home**
+  (session kept as `captured`); a session without IndexedDB cannot be recovered after a restart (said so). Leaving the
+  capture (`abandon`) also aborts a running long operation. Engine follow-up (not app scope): check the cancel token
+  inside the `live.flush()` wait of `finishCapture`, so a slow-but-alive drain stops without a restart.
+* **Capture memory cap** (`error` event reason `'out-of-memory'` / `CaptureMemoryLimitError`, or
+  `LiveUpdate.timings.memoryLimited`): asked once — pause + card "Memory limit reached — finish scan now?" with
+  **Finish scan** / **Continue (tracking only)** (fewer than 5 keyframes: Continue / Back to home), like the storage-full
+  card; afterwards a "Memory full · tracking only" chip under the counters. Elsewhere an `out-of-memory` event is a toast.
+* **Dense resume**: `stats.denseResumablePass` (loadSession) or a densify cancelled / failed in Processing (app marker
+  `denseInterrupted`) ⇒ viewer HUD "Dense cloud interrupted · Resume" and a "Resume dense reconstruction" item in the
+  Build sheet (another quality says it starts over — the resume key includes the settings); Processing headline
+  "Resuming dense cloud"; markers cleared by a finished densify or a refine. Pure helpers in `model-info.ts`.
+* **Info sheet**: North row from `stats.north` / `yawSource` / `declinationDeg` / `declinationSource` / `yawStdDeg` of the
+  world alignment ("True north — from the GPS track / compass corrected by the declination / combined", or "Magnetic
+  north" with the declination note when the compass had no location; sessions without `stats.north`: compass ⇒
+  magnetic unless a declination is reported). Memory section: `memoryMB`, `denseMemPeakMB`, `denseMaxSize` (+ requested
+  when reduced), `fusionStep` > 1.
+* **On-device benchmark & self-test** (Diagnostics, top; `src/app/bench/`): `bench.ts` runs `runner.ts` in a dedicated
+  module worker (`bench.worker.ts`; UI stays responsive — 61 rAF/s in the e2e run). Tests: (1) WebGPU SIFT on a
+  procedural 1920×1440 image (`upsampleBelow: 0`, so cost ∝ pixels; warm-up + median of 3; stage timings upload /
+  detect / select / describe / assemble) + GPU-vs-CPU parity at 640×480 (count ±5 %, keypoints within 1 px ≥ 90 %,
+  median descriptor cosine ≥ 0.97) and the CPU speed; (2) GPU matcher 4096 × 4096 synthetic RootSIFT descriptors (60 %
+  noisy copies + distractors; first call incl. upload, cached call) vs `matchCPU` (≥ 99 % identical pairs, recall ≥ 80 %,
+  precision ≥ 98 %); (3) PatchMatchGPU on `makeSyntheticDataset('near')` 640×480, 8 sources, 4 iterations (per-iteration
+  times, accuracy vs GT on `surfaceMask`: valid ≥ 70 %, within 1 % ≥ 80 %) + GPU-vs-CPU agreement at 160×120 (≥ 70 %
+  within 2 %), also the CPU PatchMatch speed; (4) BA on `makeSyntheticBA` 100 images / 20 k points (strafe), 8 LM
+  iterations (time per iteration, final RMS < 0.8 px); (5) scan-time estimates per preset (`estimate.ts`, rough model
+  over the engine's `QUALITY_PRESETS` / `resolveDensePreset`, assumptions listed in the report). Sizes in `scales.ts`:
+  `full` / `small` (`?benchScale=small`, CI) / `tiny` (Node tests). No WebGPU (the page has none, or no adapter) ⇒ every
+  test measures the CPU fallback; no WebGPU module is imported statically. Cancel: token between steps + per BA
+  iteration, worker terminated after 2.5 s; hidden page / leaving Diagnostics cancels. "Copy report" = text + JSON
+  (`report.ts`). Headless SwiftShader at `small` (4 cores): SIFT 480×360 GPU ≈ 0.95 s (CPU 320×240 ≈ 30 ms), matcher
+  1024² GPU ≈ 1 s (CPU ≈ 30 ms), PatchMatch 160×120 × 4 sources ≈ 0.5–0.65 s per iteration (CPU 2 iterations 1.5 s),
+  parity 100 % / cosine 1.000 / 99.1 % depth agreement / 100 % identical pairs, BA 30 images ≈ 20–30 ms per iteration —
+  SwiftShader timings say nothing about Apple GPUs; the estimate coefficients are unverified on devices.
+* **MockEngine** knobs: `?mockStall=finishCapture[,refine|densify|mesh]` (hangs, ignores cancel; ends by
+  `abortLongOperation` = simulated restart), `?mockMemoryLimit=<n>` (cap after n keyframes, one `out-of-memory` event,
+  `timings.memoryLimited`), interrupted densify ⇒ `denseResumablePass` (also read from seeded session stats); mock stats
+  carry `memoryMB`, `denseMemPeakMB`, `yawSource`, `north`.
+* **Tests**: unit `overlay-map`, `model-info`, `mock-engine` (abort / stall / memory cap / resume), `bench/runner` (whole
+  CPU benchmark in Node = the no-WebGPU path, cancel, synthetic matcher sets, estimate monotonicity / CPU fallback);
+  browser `engine-client.gpu.test.ts` (cancel reaches finishCapture; abort of a cancel-honouring vs a stuck finishCapture
+  → restart with resume, later calls reach the new worker). E2E: `node e2e/ui/bench.mjs [run|cancel|no-webgpu]
+  [--scale small|full]` (prints the text report, writes `e2e/out/ui/bench-report.txt`), `states.mjs` gained
+  `raw-overlay`, `finish-stuck`, `finish-stuck-home`, `memory-limit` (portrait + landscape), `dense-resume`,
+  `info-sheet`; `layouts.mjs` audits the resume HUD + Build sheet; the audit function moved to `lib.mjs`
+  (`layoutAudit`).
+
+### `src/dense` — Sky / low-texture halo removal (GT-pose harness, 2026-10; amends "Dense tuning results" above)
+
+* **Problem**: with the tuned presets, sky-coloured points on roof and tree outlines were 27 % of the yard points farther
+  than τ (5,722 of 21,021). The colour-guided halo vote (`depthHaloMask`, radius 8) cannot remove a band wider than its
+  window: inside the band, most same-coloured samples are band pixels on the same extended plane. PatchMatch's own
+  texture gate (`minVariance`, bilateral weights with σc 3) does not fire either, because a sky pixel next to a roof keeps
+  small but non-zero weights on the high-contrast roof samples.
+* **Setup**: the same harness, poses, 480 px, 30 / 24 views and `--preset balanced` as above. The yard maps were
+  recomputed with `--save-maps` (`e2e/out/dense-gt/yard-skyb/maps/`) and reproduce the reference exactly (P 0.9809,
+  C 0.3523). The object uses `object-final/maps`. Every row re-fuses the saved maps with one filter change.
+  * New measures: sky-coloured points farther than τ (`b ≥ 150`, `b − r ≥ 20`, `b ≥ g`; the yard sky runs from
+    (205, 218, 232) to (95, 140, 205)).
+  * "Object whole scene" = P / C on the base GT set without the ROI. The object's metrics proper cover only the table
+    ROI and the focus set, so they cannot see the room's untextured walls; whole-scene C does.
+* **Texture measure** (`segmentTextureSampler`): the grey std of the window samples whose colour is within
+  `segmentColor` of the centre pixel. Samples of other colours get no weight, so a sky pixel next to a roof measures the
+  sky. Measured on the undistorted frames:
+
+  | pixels | std < 1 | std < 1.5 | std < 2 |
+  |---|---|---|---|
+  | yard sky | 68–83 % | 85–93 % | 94–96 % |
+  | yard surfaces | ≤ 0.1 % | ≤ 0.7 % | ≤ 1.7 % |
+  | object room (plaster walls) | 14–16 % | 30 % | 38 % |
+
+  Texture alone therefore cannot separate the sky from the object room's walls.
+  * Fused sky pixels are a harder case. Only 59 % of them have std < 2 and are top-connected, because pixels on the
+    blurred outline measure std 2–6. This is why the kept threshold is 3.
+* **Region coherence**: top-connected untextured regions (std < 2) on the PatchMatch geometric maps, area-weighted
+  coherence = the fraction of a region's pixels with a valid depth that has ≥ 3 of 4 neighbours valid and on its plane:
+
+  | regions | coherent / area | coherent / valid | valid / area |
+  |---|---|---|---|
+  | yard sky (39 regions, 688 k px) | 0.1–0.5 (100 %) | < 0.5 for 95 %, ≤ 0.8 | 0.5–1 |
+  | object room walls (78 regions, 965 k px) | ≥ 0.5 for 99.5 % | ≥ 0.7 for 99.5 % | 0.3–1 |
+
+  PatchMatch fills the sky with locally incoherent depths, while a wall gets one plane.
+  * The kept rule uses coherent / area, not coherent / valid. A sky that PatchMatch leaves mostly invalid (likely on
+    denoised phone images) would contain only the coherent halo bands. Measured per valid depth, such a region would
+    look coherent; measured per area, it does not.
+* **Experiments** (yard P / C, sky-coloured points > τ, all points > τ | object P / C | object whole scene P / C):
+
+  | # | Change | yard | object | object whole scene |
+  |---|---|---|---|---|
+  | 0 | reference (tuned presets, halo vote r 8) | .9809 / .3523, 5722, 21021 | .9997 / .9874 | .9557 / .3824 |
+  | 1 | drop every untextured pixel (std < 1.5) | .9849 / .3520, 1291, 16490 | .9997 / .9874 | .9843 / .2741 |
+  | 2 | drop untextured pixels connected to the top row: std < 1.5 · 2 (object also std < 1) | .9844 / .3522, 1829, 17117 · .9850 / .3521, 1163, 16444 | .9997 · .9998 / .9874 | .9833 / .2881 · .9879 / .2700 (std < 1: .9599 / .3707) |
+  | 3 | 2 (std < 2) but a wide same-colour plane vote instead of dropping: r 16 s 4 · r 24 s 6 · r 32 s 8 | .9838, 2521 · .9847, 1457 · .9849, 1259 (C .3521–.3522) | .9998 / .9874 | .9591 / .3770 · .9634 / .3695 · .9675 / .3620 |
+  | 3b | 3 with invalid samples ignored: r 24 · r 32 | .9844, 1763 · .9848, 1359 | .9998 / .9874 | .9609 / .3757 · .9645 / .3696 |
+  | 4 | larger halo window for every pixel (option "wider halo filter"): r 16 s 4 · r 24 s 6 | .9855 / .3443, 2119, 15705 · .9888 / .3328, 864, 11947 | .9999 / .9877 · .9999 / .9874 | .9594 / .3745 · .9643 / .3620 |
+  | 5 | fusion: untextured (std < 2) reference pixels need 3 · 4 views | .9840 / .3520, 2407 · .9847 / .3519, 1597 | .9997 / .9874 (3) | .9834 / .2966 (3) |
+  | 6 | **sky test** (std < 2, step 1): drop all depths of top-connected untextured regions with coherent / area < c; c .2 · .35 · **.5** · .7 | .9823, 4109 · .9847, 1425 · .9850 / .3521, 1163, 16444 · = .5 | .9997 / .9874 | unchanged (.9557 / .3824 → .9558 / .3823) for c ≤ .5; c .7: .9655 / .3415 |
+  | 7 | 6 (c .5) with std < 1.5 · 3 · **3, step 2** · 4, step 2 · 2, step 2 | .9844, 1829 · .9855 / .3520, 572, 15838 · **.9854 / .3521, 707, 15985** · .9854, 672 · .9850, 1103 | .9997 / .9874 | .9558 / .3822–.3823 |
+
+* **Kept**: the sky test of row 7 (std < 3, texture step 2, coherence 0.5) as step 2 of `depthHaloMask` /
+  `removeDepthHalos`, on by default.
+  * Default options: `skyMaxStd` 3 (0 = off), `skyMinCoherence` 0.5, `skyTextureRadius` / `Step` / `MinSamples`
+    5 / 2 / 8.
+  * New exports: `segmentTextureSampler`, `segmentTextureStd`, `borderComponents`, `borderConnectedMask`.
+  * The engine is unchanged: `removeDepthHalos(dm, image, cam)` with the defaults now includes the sky test, and so does
+    `DENSE_PRESETS[q].haloFilter: true`. Fusion's `haloFilter: {}` includes it too.
+  * Step 2 was chosen over step 1 because it gives the same result at a fifth of the sampling cost.
+* **Final, sky test off → on** (balanced, 480 px, saved maps, with TSDF):
+
+  | metric | yard | object |
+  |---|---|---|
+  | precision | 0.9809 → **0.9854** | 0.9997 → 0.9997 |
+  | completeness | 0.3523 → 0.3521 | 0.9874 → 0.9874 |
+  | F | 0.5184 → 0.5188 | 0.9935 → 0.9935 |
+  | completeness, subset visible | 0.4234 → 0.4232 | 0.9917 → 0.9917 |
+  | points farther than τ | 21,021 → 15,985 (−24 %) | 192 → 192 |
+  | sky-coloured points farther than τ | 5,722 → 707 (−88 %) | 0 → 0 |
+  | whole scene P / C | .9712 / .3036 → .9784 / .3034 | .9557 / .3824 → .9558 / .3822 |
+  | mesh P / C / F | .845 / .347 / .492 → .868 / .346 / .495 (accuracy p90 0.145 → 0.124 m) | .9989 / .9760 / .9873 → .9987 / .9751 / .9868 |
+
+  * Yard precision by distance to the nearest camera: 10–20 m 97.9 → 98.6 %, 20–40 m 88.3 → 91.2 %, > 40 m 53.3 → 58.0 %.
+    Completeness is unchanged in every distance bin (±0.1 pt).
+  * Yard fusion-input pixels without GT (sky) removed: 80.9 → 94.9 %. Pixels within 1 % removed: 0.77 → 0.82 %.
+  * Object: 99 of 757 k points removed. The ROI metrics are identical.
+  * The viewer render of yard frame 120 (`e2e/out/dense-gt/yard-skyfinal/render-cam120.png` vs
+    `yard-final/render-cam120.png`) no longer shows the light-blue rim around roofs and trees.
+* **Cost**: +7–17 ms per 480×360 map on one x86 core. Measured: yard frame 120 34 → 44 ms, object frame 80 (large wall
+  region) 38 → 54 ms. The cost scales with the top-connected untextured area, because texture is evaluated lazily during
+  the flood fill. Transient memory is +8 B/px: 16-bit grey, 16-bit labels and an Int32 flood-fill queue. The halo vote
+  itself is unchanged (37 ms).
+* **Not kept**:
+  * Rows 1, 2 and 5: they remove the object room's walls, −8.6 to −11 pt whole-scene completeness. Row 5 is also
+    impractical in the engine, because fusion only gets colour thumbnails.
+  * Rows 3 and 3b: −0.5 to −2 pt object wall completeness for yard gains that row 7 matches without that loss.
+  * Row 4: −0.8 / −1.95 pt yard completeness. The wider window erodes every textured edge, not just the sky.
+  * Coherence 0.7: object walls −4 pt.
+  * A PatchMatch-side gate was not tried. A segment texture test in the NCC rejects the same pixels as row 1 (the
+    reference image alone decides), so it would inherit row 1's wall loss and need a GPU/CPU kernel change.
+* **Limits / risks**:
+  * The thresholds come from the synthetic renders, where the sky std is about 1 grey level. Denoised iPhone frames
+    put both the sky and blank walls below 1. The coherence test separates them, not the texture, and it is untested on
+    device.
+  * A blank wall that touches the top of the image, and that PatchMatch fills with incoherent depths, is removed as sky.
+    Its depths were wrong anyway, but any coherent patches on it go too.
+  * Sky that is not connected to the top row (seen through foliage) is untouched. Neither are dark or textured skies
+    (clouds).
+  * The test relies on upright dense images (§2: frames are processed upright). The engine passes no gravity vector to
+    src/dense.
+  * Remaining yard error: far-field 2-view depth noise. 707 sky-coloured points remain, out of 15,985 farther than τ.
+* **Harness / runner additions**:
+  * `preHalo` accepts an options object (`--set 'preHalo={"skyMaxStd":0}'` = the previous filter).
+  * `textureAnalysis={...}` prints class counts (vs the surfel GT) of the fusion-input and fused pixels per texture
+    threshold, all pixels vs top-connected, plus the region-coherence histograms above
+    (`src/harness/dense-gt/texture-analysis.ts`).
+  * `run-dense-gt.mjs` additionally prints the sky-coloured points (and their share of the points farther than τ)
+    and the whole-scene P / C without ROI. It exports `parsePlyColors`, `breakdown` and `centreOf` for scripts.

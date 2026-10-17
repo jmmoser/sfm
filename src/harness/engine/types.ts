@@ -68,6 +68,15 @@ export interface HarnessConfig {
   useGps?: boolean;
   /** Pass compass headings (default true). */
   useHeading?: boolean;
+  /**
+   * North reference of the replayed compass headings (feed.ts `HeadingNorthMode`): 'magnetic'
+   * (WMM2025 at the dataset location; the engine must apply the declination), 'app' (magnetic
+   * until the first GPS fix, then true north like the app) or 'true'. Default: 'magnetic' when
+   * the dataset has a location and GPS is fed, else 'true'.
+   */
+  headingNorth?: 'magnetic' | 'app' | 'true';
+  /** Capture date (epoch ms) for the magnetic declination of the replayed headings (default: the run's start). */
+  captureDateMs?: number;
   /** Pass `gravityDevice` (FramePump metadata, from the IMU; default = useImu). */
   useGravity?: boolean;
   /**

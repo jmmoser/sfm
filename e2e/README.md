@@ -14,13 +14,16 @@ depth, dense surface samples) for headless end-to-end tests of the whole pipelin
 ## Generating
 
 ```sh
-node e2e/generate-synth.mjs [object|yard|all] [--frames N] [--fps F] [--size WxH]
-     [--duration S] [--out DIR] [--name NAME] [--seed N] [--blur N] [--no-noise]
+node e2e/generate-synth.mjs [object|yard|all|object-real|yard-real|real] [--frames N] [--fps F]
+     [--size WxH] [--duration S] [--out DIR] [--name NAME] [--seed N] [--blur N] [--no-noise]
      [--depth-every N] [--gt-points N] [--gt-focus-points N] [--time-offset MS]
-     [--texture-scale X] [--visibility-every N] [--supersample N] [--set key=json ...]
+     [--texture-scale X] [--visibility-every N] [--supersample N]
+     [--rs-readout MS] [--rs-bands N] [--focus-breathing AMP] [--wb-drift AMP]
+     [--exposure-jitter AMP] [--jpeg-quality Q] [--adaptive-blur PX] [--set key=json ...]
 
 node e2e/generate-synth.mjs all --frames 40     # quick: 40 frames spread over each trajectory
 node e2e/generate-synth.mjs yard                # full default: 240 frames (6 fps × 40 s)
+node e2e/generate-synth.mjs real                # object-real + yard-real (iPhone capture artefacts)
 ```
 
 * Defaults: `object` 720×960 portrait (θ = 0), 8 fps × 25 s; `yard` 960×720 landscape
@@ -53,7 +56,7 @@ node e2e/generate-synth.mjs yard                # full default: 240 frames (6 fp
 |---|---|
 | `meta.json` | `name, scene, width, height, fps, numFrames, duration, startTimeMs, intrinsics {f,cx,cy,k1,k2,width,height}, screenAngle, R_cam_device (row-major 9), worldFrame, gravityWorld, originLatLonAlt (yard) / null, sceneExtent, sceneBounds, roi, focus, denseTau, timeOffsetMs, imuNoise, gpsNoise, headingNoise, render, depth, gt {...}, seed, config, timingsMs` |
 | `frames/NNNNNN.jpg` | JPEG q = 0.92, upright for the UI orientation θ (`R_cam_device` applies) |
-| `frames.json` | `[{index, file, t, tTrue, pose: {R: number[9], t: number[3]}, center, gain, depthFile?}]` |
+| `frames.json` | `[{index, file, t, tTrue, pose: {R: number[9], t: number[3]}, center, gain, depthFile?}]`; with real-capture artefacts also `f` (GT focal of the frame), `focusDistance`, `wb`, `omega`, `blurPx`, `rsPx`, `blurSamples`, `rsBands`, `renders` (see below) |
 | `imu.json` | `ImuSample[]` at 60 Hz like iOS DeviceMotion (`t, gyro, accel, accelG`), from 0.5 s before the first frame to 0.5 s after the last (`--set imu.rateHz=100`, `--set imu.timeJitterMs=2` for delivery jitter) |
 | `heading.json` | `[{t, heading, accuracy, headingDeviceTop, trueHeading}]` at 10 Hz |
 | `geo.json` | yard only: `GeoFix[]` at 1 Hz (+ `trueEnu`) |
@@ -104,6 +107,59 @@ All materials are unlit, and the shading is Lambertian, baked and view-independe
 multi-view photo-consistency holds exactly. On top come realism effects: seeded sensor
 noise (shot + read, in linear light), 18 % corner vignetting, ±5 % auto-exposure drift,
 optional motion blur, and JPEG compression.
+
+### Real-capture artefacts (`object-real`, `yard-real`)
+
+iPhone video artefacts the clean datasets lack. Every option is deterministic and OFF by default
+(clean datasets are unchanged: same JPEGs, poses and IMU; only `meta.config` / `meta.render` list
+the new keys). The presets `object-real` (portrait θ = 0, 720×960, 8 fps × 25 s, 200 frames) and
+`yard-real` (landscape θ = 90, 960×720, 6 fps × 40 s, 240 frames) are the clean scenes with all
+of them on (`SYNTH_PRESETS` in `src/harness/synth/config.ts`); options and `--set` override a
+preset, e.g. an ablation without rolling shutter:
+`node e2e/generate-synth.mjs object-real --name object-real-gs --set rsReadoutMs=0`.
+
+| Artefact | Config (preset value) | Model |
+|---|---|---|
+| Rolling shutter | `rsReadoutMs` (22), `rsBands` (48 max), `rsBandStepPx` (0.3), `rsReverse` (false); `--rs-readout`, `--rs-bands` | see below |
+| Focus breathing | `focusBreathing` ({amplitude 0.006, lagS 0.25, …}; `--focus-breathing AMP`) | per-frame f_i = f0·(1 + b_i): AF target = median z-depth of the central ±15 % of the image at the GT pose; first-order AF lag (0.25 s) in diopters; b linear in diopters, scaled to span exactly ±amplitude over the sequence (near → longer focal). `meta.intrinsics.f` = f0, `frames.json` `f` = f_i. k1, k2, cx, cy fixed |
+| Hand shake | `trajectory.shake` ({tremorDeg 0.06, tremorM 1e-4, pans}) | tremor: 3 sinusoids per axis at 8–12 Hz, ±40 % amplitude modulation (yaw / pitch / roll and position); fast "glance" pans: Gaussian out-and-back yaw / pitch bumps, own peak rate 0.607·A/σ = 1.05–1.4 rad/s (object 3 at 5.5 / 12.8 / 19.6 s, yard 4 at 6 / 15 / 24.5 / 33 s; body rate peaks ≈ 1.4–1.5 rad/s with the trajectory's own motion). Exact jets, so the IMU (60 Hz, noise as before) is exact |
+| Motion blur | `effects.motionBlurPxPerSample` (1.5), `effects.motionBlurSamples` (12 max); `--adaptive-blur PX` | per band: 1 + ⌈image motion over the exposure / 1.5 px⌉ sub-frames (1 below 0.25 px) at the midpoints of equal exposure slices; exposure 12 ms object, 4 ms yard |
+| Exposure / WB drift | `exposureJitter` (0.15), `whiteBalanceDrift` (0.03); `--exposure-jitter`, `--wb-drift` | ±15 % slow auto-exposure (7 s and 2.9 s periods, ±1.5 % per-frame flicker); WB gains r = 1 + A·w, b = 1 − A·w (13 s and 4.1 s), g = 1 + 0.3·A·sin(9.7 s), in linear light |
+| JPEG | `jpegQuality` (0.85); `--jpeg-quality` | |
+
+**Rolling shutter: direction, sign and timestamp.** The iPhone sensor buffer is sensor-landscape,
+upright for θ = 90 (docs/research/ios-camera.md §1.4), and is read from its top row (row 0) to
+its bottom row. In the device frame that sweep runs from the device +x (right-edge) side to −x
+whatever the UI orientation, so with a = `R_cam_device`(θ)·x̂_dev:
+
+* θ = 0 (portrait, `object-real`): the readout sweeps image **columns from the right edge
+  (u = W−1) to the left (u = 0)**;
+* θ = 90 (landscape, `yard-real`): image **rows from the top (v = 0) to the bottom (v = H−1)**;
+* θ = 180: columns left → right; θ = 270: rows bottom → top. `rsReverse` flips the sweep.
+
+Line i (0-based, in readout order, of L = W or H lines) is exposed around
+`t_frame + (i/(L−1) − 0.5)·rsReadoutMs` (line delay rsReadoutMs/(L−1); first line at −11 ms, last
+at +11 ms for 22 ms). **`tTrue`, `t` = tTrue + timeOffsetMs, and the GT pose of a frame are those
+of mid-readout** (s = 0.5, also the middle of the middle line's exposure); the IMU stays on the
+true clock. Rendering: the lines are split into N contiguous bands; each band is rendered with
+the poses at `t_frame + (s̄ − 0.5)·readout` (s̄ = mean readout coordinate of its lines, ± the
+blur sub-frame offsets) into exactly the part of the undistorted target its distorted pixels
+sample, then resampled through the inverse RADIAL distortion under a scissor, so the lens
+distortion is applied consistently per line. N adapts per frame: N = ⌈rsPx / max(0.3 px,
+0.1·blurPx)⌉ in [4, 48] (rsPx = image motion over the readout), bounding the step between bands.
+A GPU test checks that bands with one pose reproduce the global-shutter image exactly and that
+markers seen during a 1.3 rad/s rotation land within 0.07 px of their band pose's projection.
+Depth maps and visibility stay global-shutter at the GT (mid-readout) pose.
+
+`meta.captureArtefacts` records the settings and statistics (`rollingShutter`, `focusBreathing`
+incl. fMin / fMax / fMean, `shake` incl. `panPeakRates`, `angularSpeed` of the trajectory, and
+per-frame p50 / p90 / max of `omega`, `blurPx`, `rsPx`, `renders`, `rsBands`, `focusDistance`);
+it is `null` for clean datasets. Per frame, `frames.json` adds `f`, `focusDistance`, `wb`, `omega`
+(|ω| at the frame time, rad/s), `blurPx` / `rsPx` (largest image motion over the exposure / the
+readout at the AF depth), `blurSamples`, `rsBands` and `renders`. `metrics.mjs` additionally
+reports the per-frame GT focal range and the focal error against the mean GT focal of the
+registered frames (`intrinsics.perFrameFocal`, informational; `focalErrorPct` stays against f0).
+Generation is slower: about 3.5 s per frame on SwiftShader (≈ 70 ms per band render).
 
 ## Scoring
 
@@ -181,9 +237,13 @@ view selection, fusion incl. the object / scene `minViews`, halo filter, SOR); e
 and `--set` override it, while the image size and view count stay the harness's (`--max-size`,
 `--views`). Config keys reachable with `--set` (see `DenseGTConfig` in
 `src/harness/dense-gt/main.ts`): `pm.*`, `geo.*`, `selection.*`, `fusion.*` (incl.
-`fusion.haloFilter={}`), `preHalo` (`removeDepthHalos` on the fusion input, as the engine does),
-`filter` (`filterPointCloud` on the fused cloud), `geometricPasses`, `multiScale`. When a halo
-filter is configured the run also prints which GT error classes it rejects.
+`fusion.haloFilter={}`), `preHalo` (`removeDepthHalos` on the fusion input, as the engine does;
+`true` or an options object, e.g. `--set 'preHalo={"skyMaxStd":0}'` turns the sky test off),
+`filter` (`filterPointCloud` on the fused cloud), `geometricPasses`, `multiScale`,
+`textureAnalysis={}` (per texture threshold: GT error classes of the fusion-input and fused pixels
+an untextured / sky gate would remove, plus the coherence of the top-connected untextured
+regions; `src/harness/dense-gt/texture-analysis.ts`). When a halo filter is configured the run
+also prints which GT error classes it rejects.
 
 The page is `dense-gt.html`, and the logic is in `src/harness/dense-gt/`. `window.runDenseGT(config)` does the following:
 
@@ -221,7 +281,11 @@ Scoring uses `metrics-core` with `denseAlign: 'none'`, plus these breakdowns:
 
 * completeness restricted to the GT samples visible in the used views;
 * accuracy and completeness by distance to the nearest camera;
-* for object, precision inside and outside the focus box.
+* for object, precision inside and outside the focus box;
+* sky-coloured points (light / saturated blue) and their share of the points farther than τ
+  (the yard halo fringe);
+* whole scene: precision and completeness on the base GT set without the ROI (object: includes
+  the room walls, which the focus-set metrics do not see).
 
 Reference run (2026-10): 480 px; 24 views for object and 30 for yard; 8 sources; 6 photometric
 and 3 geometric iterations; default fusion; τ = `denseTau`:
@@ -234,7 +298,10 @@ and 3 geometric iterations; default fusion; τ = `denseTau`:
 Tuned (`--preset balanced`, same views and 480 px: view-selection near margin 0.5, fusion
 `minViews` 2, normal 15°, `removeDepthHalos` on the final maps; see ARCHITECTURE §6 "Dense tuning
 results" for every experiment): object P 0.9997, C 0.987, F 0.994 (mesh F 0.963 → 0.987); yard
-P 0.981, C 0.352, F 0.518 (mesh F 0.348 → 0.492).
+P 0.981, C 0.352, F 0.518 (mesh F 0.348 → 0.492). With the sky test of `removeDepthHalos`
+(default since 2026-10, ARCHITECTURE §6 "Sky / low-texture halo removal"; yard maps saved under
+`yard-skyb`): yard P 0.9854, C 0.3521, F 0.5188, sky-coloured points farther than τ 5,722 → 707,
+mesh F 0.492 → 0.495; object unchanged (P 0.9997, C 0.9874, mesh F 0.9873 → 0.9868).
 
 ## Engine end-to-end runs (`run-e2e.mjs`)
 
@@ -277,6 +344,12 @@ with half a dataset frame interval of tolerance. Each frame is a `FrameInput` wi
   is the reference the engine's world alignment assumes (`compassReference: 'auto'`). Passing the
   optical-axis `heading` unchanged makes a landscape capture (yard: device top horizontal,
   pointing left) read 90° off whenever the compass decides the yaw (e.g. `--no-gps`).
+  North reference (`--set headingNorth='"magnetic"|"app"|"true"'`; the datasets store TRUE north):
+  by default (dataset with a location, GPS fed) the headings are converted to MAGNETIC with
+  WMM2025 at `meta.originLatLonAlt` and the run's date and flagged `north: 'magnetic'`, so the
+  engine has to apply the declination at its first GPS fix (yard: ≈ +15° E). `app` = magnetic
+  until a fix is delivered, then true north via `CompassSensor.setLocationFromFix` (what the app
+  sends); `true` = unchanged (default for object, which has no location, and with `--no-gps`).
 * FramePump metadata: `index` (0-based delivered-frame counter), `segment: 0`, `timeSource:
   'captureTime'`, `imuCalibrationVersion` (0, or −1 without IMU) and `gravityDevice`. The
   gravity is the unit DOWN vector from `accelG − accel` of the newest IMU sample.
@@ -400,6 +473,13 @@ Wall time per step (s; 4-core VM shared with other SwiftShader jobs, load 8–14
 depth maps 1780, fusion 4, mesh 5, exports 1; yard — capture 114 (p50 0.40 s), finishCapture 0.7,
 refine 56 (41 / 14 / 0.1), depth maps 1261, fusion 5, mesh 5, exports 1. Depth maps cost 12–45 s per
 480 px view on SwiftShader; this says nothing about Apple GPUs.
+
+True-north heading (2026-10, `--no-dense`, after the WMM2025 / compass ⊕ GPS yaw change): the yard compass is replayed
+as MAGNETIC headings (declination 14.87° at the dataset location) and converted back by the engine at its first GPS
+fix; GPS and compass yaws are fused (compass weight 0.80): heading error −0.64° (was −2.66° with the GPS yaw alone,
+reproduced with `--no-heading`); `--set headingNorth='"app"'` gives the same −0.64°. Object (no location ⇒ true-north
+replay): −0.36°, unchanged. Yard `--no-gps --set headingNorth='"magnetic"'`: +14.7° = magnetic north, `northAligned`
+false (the north claim fails, as it should without any location).
 
 Other runs: `--engine inline` (object, sparse) gives the same accuracy (ATE 2.0e-4, rotation 0.054°,
 scale +0.34 %). Yard with `--no-gps` (compass yaw): heading −0.15°, scale +0.30 % (IMU only). The app's

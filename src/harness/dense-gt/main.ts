@@ -48,6 +48,7 @@ import {
   type TsdfStats,
   type ViewSelectionOptions,
   type DenseQuality,
+  type HaloFilterOptions,
 } from '../../dense';
 import { encodeMeshPLY, encodePLY } from '../../io/ply';
 import { Viewer } from '../../viewer';
@@ -62,6 +63,7 @@ import {
   type GtSurfelSet,
 } from './gt-depth';
 import { costToRGBA, depthToRGBA, errorToRGBA, evalDepth, panelPNG, surfaceMask, type DepthEval } from './depth-eval';
+import { DEFAULT_THRESHOLDS, addCounts, countTexture, emptyCounts, formatSkyComponents, formatTextureCounts, skyComponents, textureMasks, type SkyComponent, type TextureAnalysisConfig, type TextureCounts } from './texture-analysis';
 
 // ------------------------------------------------------------------ types
 
@@ -109,10 +111,16 @@ export interface DenseGTConfig {
   geo?: Partial<PatchMatchOptions>;
   fusion?: Partial<FusionOptions>;
   /**
-   * Apply `removeDepthHalos` (default options) to the fusion input maps before fusion, as the
-   * engine does (default false). Independent of `fusion.haloFilter`.
+   * Apply `removeDepthHalos` to the fusion input maps before fusion, as the engine does
+   * (default false; true = default options, an object = those options). Independent of
+   * `fusion.haloFilter`.
    */
-  preHalo?: boolean;
+  preHalo?: boolean | Partial<HaloFilterOptions>;
+  /**
+   * Low-texture / sky analysis: class counts (vs the surfel GT) of the fusion-input and fused
+   * pixels a segment-texture gate would remove, per threshold (texture-analysis.ts).
+   */
+  textureAnalysis?: TextureAnalysisConfig;
   /** `filterPointCloud` options applied to the fused cloud before scoring (default: none). */
   filter?: PointCloudFilterOptions;
   /** TSDF mesh of the fusion-filtered maps (default false). */
@@ -206,6 +214,8 @@ export interface DenseGTResult {
   completenessVisibility: Uint8Array | null;
   /** Sum of the per-view halo counts (when `fusion.haloFilter` or `preHalo` is set). */
   halo: HaloCounts | null;
+  /** Texture analysis (when `textureAnalysis` is set): fusion input and fused pixels. */
+  texture: { thresholds: number[]; input: TextureCounts; fused: TextureCounts } | null;
   /** Kept for debug panels / rendering. */
   _views: DenseView[];
   _debug: { frame: number; png: Blob }[];
@@ -622,7 +632,8 @@ async function runDenseGT(configIn: DenseGTConfig): Promise<DenseGTResult> {
   let fusionSrc = fusionRaw;
   if (config.preHalo) {
     const m = new Map<number, DepthMap>();
-    for (const v of views) m.set(v.id, removeDepthHalos(fusionSrc.get(v.id)!, v.image, v.cam));
+    const ho = typeof config.preHalo === 'object' ? config.preHalo : {};
+    for (const v of views) m.set(v.id, removeDepthHalos(fusionSrc.get(v.id)!, v.image, v.cam, ho));
     fusionSrc = m;
     stage('preHalo');
   }
@@ -675,6 +686,10 @@ async function runDenseGT(configIn: DenseGTConfig): Promise<DenseGTResult> {
     for (let k = 0; k < Math.min(n, pool.length); k++) debugFrames.add(pool[Math.floor(((k + 0.5) * pool.length) / Math.min(n, pool.length))]);
   }
   const debug: { frame: number; png: Blob }[] = [];
+  const texCfg = config.textureAnalysis ?? null;
+  const texT = texCfg?.thresholds ?? DEFAULT_THRESHOLDS;
+  const texSum = texCfg ? { thresholds: texT, input: emptyCounts(texT.length), fused: emptyCounts(texT.length) } : null;
+  const skyComps: SkyComponent[] = [];
   for (let k = 0; k < views.length; k++) {
     const v = views[k];
     const fdm = await filtered.get(v.id);
@@ -691,7 +706,15 @@ async function runDenseGT(configIn: DenseGTConfig): Promise<DenseGTResult> {
       geo: gdm ? evalBoth(gdm, gt.depth, gt.normal, tau, mask) : undefined,
       fused: evalBoth(fdm ?? empty, gt.depth, gt.normal, tau, mask),
     };
-    const hopt = config.fusion?.haloFilter || (config.preHalo ? {} : null);
+    if (texCfg && texSum) {
+      const fin = fusionSrc.get(v.id)!;
+      const tm = textureMasks(v.image, fin.width, fin.height, texCfg);
+      addCounts(texSum.input, countTexture(fin, gt.depth, tm, texT));
+      addCounts(texSum.fused, countTexture(fdm, gt.depth, tm, texT));
+      // sky-test regions on the PatchMatch output (before any halo filter)
+      skyComps.push(...skyComponents(v.id, fusionRaw.get(v.id)!, v.image, v.cam, gt.depth, texCfg.skyMaxStd ?? 2, texCfg));
+    }
+    const hopt = config.fusion?.haloFilter || (config.preHalo ? (typeof config.preHalo === 'object' ? config.preHalo : {}) : null);
     let haloMask: Uint32Array | null = null;
     if (hopt) {
       const src = fusionRaw.get(v.id)!;
@@ -823,11 +846,17 @@ async function runDenseGT(configIn: DenseGTConfig): Promise<DenseGTResult> {
     completenessSet: compSet.name,
     completenessVisibility: compVis,
     halo: haloSum,
+    texture: texSum,
     _views: views,
     _debug: debug,
     _maps: config.saveMaps ? { half, photo, geo: geoMaps } : null,
   };
   window.denseGTLast = result;
+  if (texSum) {
+    log(formatTextureCounts('[dense-gt] texture gate, fusion input', texSum.input, texT));
+    log(formatTextureCounts('[dense-gt] texture gate, fused pixels', texSum.fused, texT));
+    log(formatSkyComponents(skyComps));
+  }
   log(`[dense-gt] done in ${(T.total / 1000).toFixed(1)} s`);
   return result;
 }

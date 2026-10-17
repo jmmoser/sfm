@@ -130,6 +130,8 @@ export interface KeyframeRecord {
   /** Gravity DOWN in the DEVICE frame (to recompute gravityCam after a mapping change). */
   gravityDevice: [number, number, number] | null;
   headingAccuracy: number | null;
+  /** North reference of info.heading ('magnetic' ⇒ declination applied in the world alignment; absent = 'true'). */
+  headingNorth?: 'true' | 'magnetic';
   segment: number;
   /** UI angle θ the frame was captured at and the quarter turns applied to make it canonical. */
   screenAngle: number;

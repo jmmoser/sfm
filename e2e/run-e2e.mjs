@@ -3,6 +3,8 @@
  * End-to-end run of the whole engine on synthetic datasets (headless Chromium + SwiftShader).
  *
  *   node e2e/run-e2e.mjs [object|yard|all|<dataset> ...] [--engine worker|inline|mock]
+ *        (<dataset> = any directory of e2e/data, e.g. the presets object-real / yard-real;
+ *        the capture mode and thresholds follow its meta.scene)
  *        [--quality fast|balanced|max] [--stride N] [--max-frames N] [--no-dense] [--no-mesh]
  *        [--timeout-min M] … (--help for every option)
  *
@@ -103,7 +105,8 @@ async function runDataset(browser, name, opts, outRoot, thresholdsSpec) {
   const log = (m) => console.log(`[${runName}] ${m}`);
   const dsDir = join(ROOT, 'e2e', 'data', name);
   if (!(await exists(join(dsDir, 'meta.json')))) {
-    log(`dataset missing: ${dsDir} (generate it: node e2e/generate-synth.mjs ${name === 'object' || name === 'yard' ? name : '<scene> --name ' + name})`);
+    const known = ['object', 'yard', 'object-real', 'yard-real'].includes(name); // scenes and generator presets
+    log(`dataset missing: ${dsDir} (generate it: node e2e/generate-synth.mjs ${known ? name : '<scene|preset> --name ' + name})`);
     return { name: runName, result: null, metrics: null, checks: [], failed: true };
   }
   const dir = join(outRoot, runName);

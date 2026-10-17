@@ -69,10 +69,18 @@ export interface InitResult {
 }
 
 export interface HeadingSample {
-  /** Degrees clockwise from north. */
+  /** Degrees clockwise from north (see `north`). */
   heading: number;
   /** Degrees. */
   accuracy: number;
+  /**
+   * Extension: north reference of `heading`. 'magnetic' (platform compass, declination unknown):
+   * the engine applies the WMM declination at the capture location in the world alignment.
+   * Absent = 'true' (the documented FrameInfo.heading contract).
+   */
+  north?: 'true' | 'magnetic';
+  /** Extension: declination (deg, east positive) already included in `heading` (informational). */
+  declinationDeg?: number | null;
 }
 
 export interface AttitudeSample {

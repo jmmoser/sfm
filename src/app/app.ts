@@ -12,7 +12,7 @@ import { isQuotaError } from './capture-policy';
 import { closeAllModals, initLayers } from './components/layers';
 import { toast } from './components/toast';
 import { h, reducedMotion } from './dom';
-import type { EngineLike, EngineStatus } from './engine-client';
+import { ABORT_REASON_PREFIX, type EngineLike, type EngineStatus } from './engine-client';
 import { detectEnvironment, probeWebGPU, type EnvInfo } from './env';
 import { defaultSessionName } from './format';
 import { nextRoute, type NavEvent, type Route } from './router';
@@ -113,7 +113,7 @@ export class App {
    * Debug / e2e hooks installed by screens (e.g. hold frame delivery while a headless test
    * takes a screenshot: software GPU emulation starves the compositor while frames are grabbed).
    */
-  readonly debug: { holdFrames?: (hold: boolean) => void } = {};
+  readonly debug: { holdFrames?: (hold: boolean) => void; /** Last Diagnostics benchmark report (e2e). */ benchReport?: unknown } = {};
   private permissions: Promise<CapturePermissionStatus> | null = null;
   private sessionsP: Promise<SessionStore | null> | null = null;
   private screen: Screen | null = null;
@@ -135,13 +135,17 @@ export class App {
 
     this.engine.onStatus((s) => {
       this.store.set({ engine: s });
-      if (s.state === 'respawning') toast('The processing engine restarted after an error. Recovering…', { tone: 'warn' });
+      // A restart the user asked for (abortLongOperation of a stuck step) is not an error.
+      if (s.state === 'respawning' && !s.reason?.startsWith(ABORT_REASON_PREFIX)) toast('The processing engine restarted after an error. Recovering…', { tone: 'warn' });
       else if (s.state === 'dead') toast('The processing engine stopped after repeated errors. Reload the app to continue.', { tone: 'bad', durationMs: 9000 });
     });
     this.engine.onError((e) => {
       if (e.fatal) console.warn('[app] engine fatal error', e.error);
       if (e.reason === 'storage' || isQuotaError(e.error)) {
         toast('Storage is full — free up space on this device, or delete old scans.', { tone: 'bad', durationMs: 9000 });
+      } else if (e.reason === 'out-of-memory' && this.route.screen !== 'capture') {
+        // The capture screen asks "finish scan now?" itself (its own prompt); elsewhere: say it.
+        toast(`Memory limit reached: ${e.error.message}`, { tone: 'warn', durationMs: 7000 });
       }
     });
 

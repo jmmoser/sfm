@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { ImuSample } from '../../core/types';
-import { cleanGeoFix, compassHeading, gravityDownAt, hfovLongSideDeg, latestAtOrBefore, numStats, planFrames, samplesBetween, upperBound } from './feed';
+import { declination } from '../../sensors/wmm';
+import { HeadingNorthEmulator, cleanGeoFix, compassHeading, gravityDownAt, hfovLongSideDeg, latestAtOrBefore, numStats, planFrames, samplesBetween, upperBound } from './feed';
 
 const frames = (n: number, fps: number, t0 = 10_000): { index: number; t: number }[] =>
   Array.from({ length: n }, (_, i) => ({ index: i, t: t0 + (1000 * i) / fps }));
@@ -115,5 +116,44 @@ describe('compassHeading (CompassSensor reference: device top within 45° of hor
     expect(compassHeading(row, null)).toEqual({ heading: 85, accuracy: 5 });
     expect(compassHeading({ ...row, headingDeviceTop: null }, [1, 0, 0])).toEqual({ heading: 85, accuracy: 5 });
     expect(compassHeading(null, [1, 0, 0])).toBeNull();
+  });
+});
+
+describe('HeadingNorthEmulator (dataset true-north headings → what the phone reports)', () => {
+  const yard: [number, number, number] = [47.6062, -122.3321, 56];
+  const date = Date.UTC(2026, 9, 17);
+  const D = declination(yard[0], yard[1], yard[2] / 1000, 2026 + (289 + 0.0) / 365); // ≈ +15°
+  const fix = { t: 0, lat: 47.60623, lon: -122.33199, alt: 57, accuracy: 3, altitudeAccuracy: 5 };
+  const ad = (a: number, b: number): number => Math.abs(((((a - b) % 360) + 540) % 360) - 180);
+
+  it("'magnetic': WMM at the dataset location, flagged magnetic", () => {
+    const e = new HeadingNorthEmulator('magnetic', yard, date);
+    expect(Math.abs(e.datasetDeclinationDeg - D)).toBeLessThan(0.01);
+    const h = e.convert({ heading: 10, accuracy: 5 }, fix)!;
+    expect(h.north).toBe('magnetic');
+    expect(ad(h.heading, 10 - e.datasetDeclinationDeg)).toBeLessThan(1e-9);
+    expect(h.accuracy).toBe(5);
+    expect(e.convert(null, fix)).toBeNull();
+  });
+
+  it("'app': magnetic until a usable fix was delivered, then true north (CompassSensor.setLocationFromFix)", () => {
+    const e = new HeadingNorthEmulator('app', yard, date);
+    const before = e.convert({ heading: 100, accuracy: 5 }, null)!;
+    expect(before.north).toBe('magnetic');
+    expect(ad(before.heading, 100 - e.datasetDeclinationDeg)).toBeLessThan(1e-9);
+    const after = e.convert({ heading: 100, accuracy: 5 }, fix)!;
+    expect(after.north).toBe('true');
+    // declination at the fix (a few metres from the origin) = the dataset's to ≪ 0.01°
+    expect(ad(after.heading, 100)).toBeLessThan(1e-3);
+    expect(Math.abs(after.declinationDeg! - e.datasetDeclinationDeg)).toBeLessThan(1e-3);
+    // stays true north afterwards, also without a fix
+    expect(e.convert({ heading: 50, accuracy: 5 }, null)!.north).toBe('true');
+  });
+
+  it("'true' and datasets without a location replay the dataset headings unchanged", () => {
+    expect(new HeadingNorthEmulator('true', yard, date).convert({ heading: 33, accuracy: 4 }, fix)).toEqual({ heading: 33, accuracy: 4, north: 'true', declinationDeg: null });
+    const none = new HeadingNorthEmulator('magnetic', null, date);
+    expect(none.mode).toBe('true');
+    expect(none.convert({ heading: 33, accuracy: 4 }, null)!.north).toBe('true');
   });
 });

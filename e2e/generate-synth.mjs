@@ -2,10 +2,15 @@
 /**
  * Synthetic dataset generator (headless).
  *
- *   node e2e/generate-synth.mjs [object|yard|all] [--frames N] [--fps F] [--size WxH]
+ *   node e2e/generate-synth.mjs [object|yard|all|object-real|yard-real|real] [--frames N] [--fps F] [--size WxH]
  *        [--duration S] [--out DIR] [--name NAME] [--seed N] [--blur N] [--no-noise]
  *        [--depth-every N] [--gt-points N] [--gt-focus-points N] [--time-offset MS] [--texture-scale X]
- *        [--visibility-every N] [--supersample N] [--set key=jsonValue ...]
+ *        [--visibility-every N] [--supersample N] [--rs-readout MS] [--rs-bands N] [--focus-breathing AMP]
+ *        [--wb-drift AMP] [--exposure-jitter AMP] [--jpeg-quality Q] [--adaptive-blur PX] [--set key=jsonValue ...]
+ *
+ * object-real / yard-real (real = both) are the clean scenes plus iPhone video-capture artefacts
+ * (rolling shutter, focus breathing, tremor + fast pans, adaptive motion blur, exposure / white-
+ * balance drift, JPEG 0.85); see e2e/README.md "Real-capture artefacts".
  *
  * Starts a Vite dev server on a free port, opens synth.html in headless Chromium
  * (SwiftShader GL/WebGPU) and calls window.generateSynth(config); every output file is

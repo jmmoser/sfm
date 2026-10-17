@@ -20,11 +20,18 @@
  * A second model (“ui-top”: heading of the UI top, the iOS 26 landscape compensation reported
  * for native apps, UNVERIFIED for Safari) is tracked in parallel and selected automatically
  * when it is clearly more consistent across UI rotations.
+ *
+ * North reference: platform headings are MAGNETIC. `setLocation(lat, lon, alt, date)` evaluates
+ * the World Magnetic Model (WMM2025, `./wmm`) there and applies the declination (east positive,
+ * true = magnetic + D) to every heading and to the ENU attitude; `setDeclination(deg)` sets it
+ * directly. Readings say which reference they use (`HeadingReading.north`, `declinationDeg`), so a
+ * consumer never has to guess: 'magnetic' until a declination is known, 'true' afterwards.
  */
 import type { Mat3 } from '../core/types';
 import { mat3ToRotvec, rotvecToMat3 } from '../math/rotation';
 import { screenAngle } from './frame-orientation';
 import { DEG_TO_RAD, azimuthDeg, deviceOrientationMatrix, type RawOrientationEvent } from './normalize';
+import { decimalYearFromDate, magneticField, type MagneticElements } from './wmm';
 
 export interface HeadingReading {
   /** Degrees clockwise from north (magnetic unless a declination was set), [0, 360). */
@@ -32,6 +39,29 @@ export interface HeadingReading {
   /** Degrees (platform-reported, or a nominal value for absolute-orientation sources). */
   accuracy: number;
   source?: 'compass' | 'absolute' | 'attitude';
+  /**
+   * North reference of `heading`: 'true' once a declination is known (`setLocation` /
+   * `setDeclination`), else 'magnetic'. Absent (other producers): unknown.
+   */
+  north?: 'true' | 'magnetic';
+  /** Declination (deg, east positive) included in `heading` (0 while magnetic). */
+  declinationDeg?: number;
+}
+
+/** Where the compass declination came from (`CompassSensor.declinationInfo`). */
+export interface DeclinationInfo {
+  /** Degrees, east positive (true = magnetic + declination). */
+  deg: number;
+  source: 'manual' | 'wmm';
+  /** WMM inputs (source 'wmm'). */
+  latDeg?: number;
+  lonDeg?: number;
+  altM?: number;
+  decimalYear?: number;
+  /** WMM: horizontal field < 2000 nT ⇒ compass headings unreliable here. */
+  blackoutZone?: boolean;
+  /** WMM: the date is inside the model validity period (2025.0–2030.0). */
+  inValidityPeriod?: boolean;
 }
 
 export interface AttitudeReading {
@@ -41,6 +71,8 @@ export interface AttitudeReading {
   absolute: boolean;
   /** 1-σ-ish yaw uncertainty (degrees) when absolute, null otherwise. */
   yawAccuracyDeg: number | null;
+  /** North reference of the ENU yaw when `absolute` ('true' once a declination is known). */
+  north?: 'true' | 'magnetic';
 }
 
 export interface CompassSensorOptions {
@@ -48,7 +80,11 @@ export interface CompassSensorOptions {
   /** Orientation samples kept per source (default 4096 ≈ 68 s at 60 Hz). */
   capacity?: number;
   screenAngle?: () => number;
-  /** Magnetic declination (east positive, degrees) added to every heading. Default 0 (magnetic). */
+  /**
+   * Magnetic declination (east positive, degrees) added to every heading; when given (finite),
+   * headings are reported as TRUE north. Default: none (magnetic) until `setLocation` /
+   * `setDeclination`.
+   */
   declinationDeg?: number;
   /** Ignore compass readings with a worse accuracy (degrees). Default 25. */
   maxAccuracyDeg?: number;
@@ -214,6 +250,10 @@ export class CompassSensor {
   private readonly restartGap: number;
   private readonly absAcc: number;
   private declination: number;
+  private declKnown: boolean;
+  private declInfo: DeclinationInfo | null;
+  /** Accuracy (m) of the fix the WMM declination was evaluated at. */
+  private declFixAccuracy = Infinity;
   private isRunning = false;
   private readonly h0 = new YawModel();
   private readonly h1 = new YawModel();
@@ -238,7 +278,10 @@ export class CompassSensor {
     this.tau = opts.yawTimeConstantMs ?? 30000;
     this.restartGap = opts.restartGapMs ?? 1000;
     this.absAcc = opts.absoluteAccuracyDeg ?? 20;
-    this.declination = opts.declinationDeg ?? 0;
+    const d0 = opts.declinationDeg;
+    this.declKnown = typeof d0 === 'number' && Number.isFinite(d0);
+    this.declination = this.declKnown ? (d0 as number) : 0;
+    this.declInfo = this.declKnown ? { deg: this.declination, source: 'manual' } : null;
   }
 
   get running(): boolean {
@@ -269,13 +312,77 @@ export class CompassSensor {
     this.lastYawT = -Infinity;
   }
 
-  /** Set the magnetic declination (east positive) to report true-north headings / ENU. */
-  setDeclination(deg: number): void {
-    this.declination = Number.isFinite(deg) ? deg : 0;
+  /**
+   * Set the magnetic declination (east positive, degrees) ⇒ headings and the ENU attitude refer
+   * to TRUE north from now on. `null` / non-finite ⇒ back to magnetic north (declination 0).
+   */
+  setDeclination(deg: number | null): void {
+    this.declFixAccuracy = Infinity;
+    if (typeof deg === 'number' && Number.isFinite(deg)) {
+      this.declination = deg;
+      this.declKnown = true;
+      this.declInfo = { deg, source: 'manual' };
+    } else {
+      this.declination = 0;
+      this.declKnown = false;
+      this.declInfo = null;
+    }
   }
 
+  /**
+   * Set the declination from the World Magnetic Model (WMM2025) at a position — the first good
+   * GPS fix; an approximate (1–20 km) fix is fine: the declination changes by ≲ 0.02°/km outside
+   * the polar regions — and date (default now). Returns the magnetic elements, or null (nothing
+   * changed) for a non-finite position. In the WMM blackout zone (H < 2000 nT) the declination is
+   * still applied, but compass headings there are unreliable (`declinationInfo.blackoutZone`).
+   */
+  setLocation(latDeg: number, lonDeg: number, altM: number | null = 0, date: Date | number = Date.now()): MagneticElements | null {
+    if (!Number.isFinite(latDeg) || !Number.isFinite(lonDeg)) return null;
+    const alt = typeof altM === 'number' && Number.isFinite(altM) ? altM : 0;
+    const e = magneticField(latDeg, lonDeg, alt / 1000, decimalYearFromDate(date));
+    if (!Number.isFinite(e.declination)) return null;
+    this.setDeclination(e.declination);
+    this.declInfo = {
+      deg: e.declination,
+      source: 'wmm',
+      latDeg,
+      lonDeg,
+      altM: alt,
+      decimalYear: e.decimalYear,
+      blackoutZone: e.blackoutZone,
+      inValidityPeriod: e.inValidityPeriod,
+    };
+    return e;
+  }
+
+  /**
+   * App helper for GeoSensor fixes: the first fix with a finite position and an accuracy ≤ 50 km
+   * sets the declination (WMM at the fix and `date`); it is re-evaluated once when a precise fix
+   * (≤ 100 m) follows an approximate one (> 1 km). A manual declination is never overridden.
+   * Returns true when the declination was (re)set. Headings before that stay MAGNETIC (and say so).
+   */
+  setLocationFromFix(fix: { lat: number; lon: number; alt?: number | null; accuracy: number } | null, date: Date | number = Date.now()): boolean {
+    if (!fix || !Number.isFinite(fix.lat) || !Number.isFinite(fix.lon) || !(fix.accuracy <= 50_000)) return false;
+    if (this.declInfo?.source === 'manual') return false;
+    if (this.declInfo?.source === 'wmm' && !(this.declFixAccuracy > 1000 && fix.accuracy <= 100)) return false;
+    if (!this.setLocation(fix.lat, fix.lon, fix.alt ?? 0, date)) return false;
+    this.declFixAccuracy = fix.accuracy;
+    return true;
+  }
+
+  /** Declination (deg, east positive) added to the headings; 0 while magnetic. */
   get declinationDeg(): number {
     return this.declination;
+  }
+
+  /** 'true' once a declination is known (headings / attitude refer to true north), else 'magnetic'. */
+  get northReference(): 'true' | 'magnetic' {
+    return this.declKnown ? 'true' : 'magnetic';
+  }
+
+  /** Where the declination came from (null while magnetic). */
+  get declinationInfo(): DeclinationInfo | null {
+    return this.declInfo ? { ...this.declInfo } : null;
   }
 
   /** Which compass reference model is in use (see file header). */
@@ -424,13 +531,13 @@ export class CompassSensor {
     const R = new Float64Array(9);
     if (this.attitudeFrom(this.abs, t, maxGapMs, R)) {
       rotateYaw(-this.declination * DEG_TO_RAD, R);
-      return { t, R_world_device: R, absolute: true, yawAccuracyDeg: this.absAcc };
+      return { t, R_world_device: R, absolute: true, yawAccuracyDeg: this.absAcc, north: this.northReference };
     }
     if (!this.attitudeFrom(this.rel, t, maxGapMs, R)) return null;
     const psi = this.yawOffsetDeg;
     if (psi === null) return { t, R_world_device: R, absolute: false, yawAccuracyDeg: null };
     rotateYaw(-(psi + this.declination) * DEG_TO_RAD, R);
-    return { t, R_world_device: R, absolute: true, yawAccuracyDeg: this.yawAccuracyDeg };
+    return { t, R_world_device: R, absolute: true, yawAccuracyDeg: this.yawAccuracyDeg, north: this.northReference };
   }
 
   /**
@@ -473,7 +580,7 @@ export class CompassSensor {
           h = ring.h[k % ring.cap];
           acc = ring.acc[k % ring.cap];
         }
-        return { heading: wrap360(h + this.declination), accuracy: acc, source: 'compass' };
+        return { heading: wrap360(h + this.declination), accuracy: acc, source: 'compass', north: this.northReference, declinationDeg: this.declination };
       }
     }
     const att = this.attitudeAt(t);
@@ -483,6 +590,8 @@ export class CompassSensor {
       heading: r.azimuth,
       accuracy: att.yawAccuracyDeg ?? this.absAcc,
       source: this.abs.size > 0 ? 'absolute' : 'attitude',
+      north: this.northReference,
+      declinationDeg: this.declination,
     };
   }
 

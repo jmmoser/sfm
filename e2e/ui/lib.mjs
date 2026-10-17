@@ -108,3 +108,43 @@ export async function shot(page, name, opts = {}) {
 }
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Runs in the page (`page.evaluate(layoutAudit)`): layout problems of the current screen + open
+ * overlays — horizontal overflow, controls outside the viewport, touch targets < 44 px, clipped text.
+ */
+export function layoutAudit() {
+  const problems = [];
+  const vw = window.innerWidth;
+  const de = document.documentElement;
+  if (de.scrollWidth > vw + 1) problems.push(`page scrollWidth ${de.scrollWidth} > ${vw}`);
+  const screen = document.querySelector('.screen:not(.screen-exit)');
+  if (screen && screen.scrollWidth > screen.clientWidth + 1) problems.push(`screen scrollWidth ${screen.scrollWidth} > ${screen.clientWidth}`);
+  const visible = (el) => {
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) return false;
+    const cs = getComputedStyle(el);
+    if (cs.visibility === 'hidden' || Number(cs.opacity) === 0) return false;
+    return !el.closest('[hidden], [inert], .screen-exit');
+  };
+  const describe = (el) => `${el.tagName.toLowerCase()}${el.dataset.testid ? `[${el.dataset.testid}]` : ''}.${[...el.classList].join('.')} "${(el.getAttribute('aria-label') || el.textContent || '').trim().slice(0, 30)}"`;
+  const roots = [screen, ...document.querySelectorAll('.sheet.show, .dialog.show')].filter(Boolean);
+  // A modal makes the screen inert: audit only the overlays then.
+  const modal = document.querySelector('.sheet.show, .dialog.show');
+  for (const root of modal ? roots.slice(1) : roots) {
+    for (const el of root.querySelectorAll('button, [role="button"], a[href], input, [role="switch"]')) {
+      if (!visible(el)) continue;
+      const target = el.matches('input[type="checkbox"]') ? (el.closest('label') ?? el) : el;
+      const r = target.getBoundingClientRect();
+      if (r.left < -1 || r.right > vw + 1) problems.push(`outside viewport (x ${Math.round(r.left)}…${Math.round(r.right)}): ${describe(el)}`);
+      if (r.width < 43.5 || r.height < 43.5) problems.push(`touch target ${Math.round(r.width)}×${Math.round(r.height)}: ${describe(el)}`);
+    }
+    for (const el of root.querySelectorAll('*')) {
+      if (!visible(el) || el.children.length > 0 || !el.textContent?.trim()) continue;
+      const cs = getComputedStyle(el);
+      const clips = cs.overflowX === 'hidden' || cs.overflowX === 'clip';
+      if (clips && cs.textOverflow !== 'ellipsis' && el.scrollWidth > el.clientWidth + 1) problems.push(`clipped text: ${describe(el)}`);
+    }
+  }
+  return problems;
+}

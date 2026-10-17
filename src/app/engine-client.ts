@@ -61,6 +61,11 @@ export interface EngineStatus {
   init?: InitResult;
 }
 
+export type AbortOutcome = 'none' | 'cancelled' | 'restarted';
+
+/** EngineStatus.reason of a restart caused by abortLongOperation (not an engine failure). */
+export const ABORT_REASON_PREFIX = 'aborted: ';
+
 export interface EngineErrorInfo {
   error: Error;
   fatal: boolean;
@@ -83,6 +88,16 @@ export interface EngineLike {
   loadSession(id: string, options?: Partial<EngineOptions>): Promise<SessionSummary>;
   /** Cancel the running long operation (it rejects with CancelledError). */
   cancel(): void;
+  /**
+   * Cancel the running long operation (finishCapture / refine / densify / mesh / export /
+   * loadSession) and make sure it ENDS: when the engine has not settled it within `graceMs` (a
+   * step that ignores cancel, a hung IndexedDB wait, a stuck worker), the request is rejected
+   * locally with CancelledError and the engine is restarted (EngineClient: the worker is
+   * respawned and the last init / loadSession replayed with `resume`, so the persisted capture
+   * comes back and later calls do not queue behind the stuck one). Resolves with what happened:
+   * 'none' (nothing running), 'cancelled' (the engine stopped it), 'restarted'.
+   */
+  abortLongOperation(opts?: { graceMs?: number }): Promise<AbortOutcome>;
   /** Page visibility (EngineClient forwards it automatically; MockEngine pauses timers). */
   setHidden(hidden: boolean): void;
   /** Every LiveUpdate: frame responses AND unsolicited `live` events. */
@@ -162,7 +177,11 @@ interface Pending {
 
 type Setup = { kind: 'init'; options: EngineOptions } | { kind: 'load'; id: string; options?: Partial<EngineOptions> };
 
-const LONG: ReadonlySet<EngineMethod> = new Set<EngineMethod>(['refine', 'densify', 'mesh', 'export', 'loadSession']);
+/**
+ * Long operations: `cancel()` targets the running one, progress resets their inactivity timer.
+ * finishCapture is one (it drains the keyframe mapping queue; the worker gives it a cancel token).
+ */
+const LONG: ReadonlySet<EngineMethod> = new Set<EngineMethod>(['finishCapture', 'refine', 'densify', 'mesh', 'export', 'loadSession']);
 const FIRE_AND_FORGET: ReadonlySet<EngineMethod> = new Set<EngineMethod>(['cancel', 'visibility', 'dispose']);
 
 function defaultWorker(): Worker {
@@ -197,6 +216,8 @@ export class EngineClient implements EngineLike {
   private longOp: number | null = null;
   private disposed = false;
   private hidden = false;
+  /** Resolvers waiting for a request to settle (abortLongOperation). */
+  private readonly settleWaiters = new Map<number, (() => void)[]>();
   private readonly live = new Emitter<LiveUpdate>();
   private readonly progressE = new Emitter<ProgressEvent>();
   private readonly logE = new Emitter<LogMessage>();
@@ -321,6 +342,31 @@ export class EngineClient implements EngineLike {
     const target = this.longOp;
     if (target === null || !this.worker) return;
     void this.call('cancel', { target }, { timeoutMs: this.opts.callTimeoutMs }).catch(() => undefined);
+  }
+
+  async abortLongOperation(opts: { graceMs?: number } = {}): Promise<AbortOutcome> {
+    const id = this.longOp;
+    const p = id !== null ? this.pending.get(id) : undefined;
+    if (id === null || !p) return 'none';
+    this.cancel();
+    const graceMs = Math.max(0, opts.graceMs ?? 5000);
+    const settled = await new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), graceMs);
+      const list = this.settleWaiters.get(id) ?? [];
+      list.push(() => {
+        clearTimeout(timer);
+        resolve(true);
+      });
+      this.settleWaiters.set(id, list);
+    });
+    if (settled || this.disposed) return 'cancelled';
+    // The engine did not react (synchronous step, a wait that ignores cancel, a hung worker): end
+    // the request here and restart the worker so later calls do not queue behind it. The restart
+    // replays the last init / loadSession with `resume` (the capture is persisted per keyframe).
+    const stuck = this.settle(id);
+    stuck?.reject(namedError(ENGINE_ERRORS.cancelled, `'${p.method}' did not stop within ${Math.round(graceMs / 1000)} s — the engine was restarted`));
+    this.respawn(`${ABORT_REASON_PREFIX}'${p.method}' did not respond to cancel`, false, true);
+    return 'restarted';
   }
 
   setHidden(hidden: boolean): void {
@@ -490,6 +536,11 @@ export class EngineClient implements EngineLike {
     if (p.timer) clearTimeout(p.timer);
     this.pending.delete(id);
     if (this.longOp === id) this.longOp = null;
+    const waiters = this.settleWaiters.get(id);
+    if (waiters) {
+      this.settleWaiters.delete(id);
+      for (const w of waiters) w();
+    }
     return p;
   }
 

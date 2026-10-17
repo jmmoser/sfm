@@ -8,8 +8,9 @@
  *   PatchMatch photometric: { ...patchMatch, iterations }      (multiScale: see below)
  *   PatchMatch geometric × geometricPasses: { ...patchMatch, geometric: true, geometricIterations },
  *     prior + sources = the maps of the previous pass
- *   haloFilter ⇒ removeDepthHalos(map, view.image, view.cam) on the final maps
- *     (or fuseDepthMaps(..., { haloFilter: {} }) — not both: a second pass erodes edges)
+ *   haloFilter ⇒ removeDepthHalos(map, view.image, view.cam) on the final maps, with the default
+ *     options: halo vote + sky test (or fuseDepthMaps(..., { haloFilter: {} }) — not both: a
+ *     second pass erodes edges)
  *   fuseDepthMaps(views, store, neighboursFromSelection(sel), { ...fusion, minViews })
  *   sorK > 0 ⇒ filterPointCloud(cloud, { statistical: { k: sorK, std: sorStd } })
  *
@@ -18,7 +19,9 @@
  *
  * Evidence (480 px, GT poses; P / C at τ): fusion `minViews` 2 + halo filter + normal 15°
  * took object 0.9991 / 0.960 → 0.9996 / 0.988 and yard 0.9885 / 0.231 → 0.979 / 0.347;
- * `depthMarginMin` 0.5 (yard near ground) → yard 0.981 / 0.352. SOR lowers completeness more
+ * `depthMarginMin` 0.5 (yard near ground) → yard 0.981 / 0.352; the sky test of the halo filter
+ * (untextured top-connected regions without coherent depth, ARCHITECTURE §6 "Sky / low-texture
+ * halo removal") → yard 0.985 / 0.352, object unchanged. SOR lowers completeness more
  * than it raises precision (off). 4 instead of 6 photometric iterations and 5 instead of 8
  * sources cost 0.2–0.8 pt of completeness (`fast` only); 2 instead of 3 geometric iterations
  * and a second geometric pass stay within ±0.2 pt with this fusion (`fast` uses 2 iterations,
@@ -60,7 +63,7 @@ export interface DensePreset {
   fusionMinViewsScene: number;
   /** Fusion neighbours per reference (bounds resident depth maps: (n + 2) × 20 B/px). */
   fusionMaxNeighbours: number;
-  /** Apply `removeDepthHalos` to the final depth maps before fusion. */
+  /** Apply `removeDepthHalos` (default options: halo vote + sky test) to the final depth maps before fusion. */
   haloFilter: boolean;
   /** Statistical outlier removal on the fused cloud: k neighbours (0 = off), σ multiplier. */
   sorK: number;

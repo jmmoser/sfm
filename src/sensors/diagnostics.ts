@@ -43,7 +43,17 @@ export interface SensorDiagnostics {
   cameras: CameraInfo[] | null;
   camera: { state: string; segment: number; result: unknown; settings: Record<string, unknown>; capabilities: Record<string, unknown> } | null;
   motion: { running: boolean; rateHz: number; calibration: unknown; stats: unknown } | null;
-  compass: { running: boolean; yawOffsetDeg: number | null; yawAccuracyDeg: number | null; headingModel: string; latest: unknown; stats: unknown } | null;
+  compass: {
+    running: boolean;
+    yawOffsetDeg: number | null;
+    yawAccuracyDeg: number | null;
+    headingModel: string;
+    /** 'true' once the WMM declination is applied (first GPS fix), else 'magnetic'. */
+    northReference: string;
+    declination: unknown;
+    latest: unknown;
+    stats: unknown;
+  } | null;
   geo: { status: string; fixes: number; approximate: boolean; latest: unknown; lastError: string | null } | null;
   storage: { usage: number | null; quota: number | null; persisted: boolean | null } | null;
   /** WebGPU, camera and IndexedDB all missing — Lockdown Mode disables them. */
@@ -227,6 +237,8 @@ export async function collectDiagnostics(opts: DiagnosticsOptions = {}): Promise
           yawOffsetDeg: cmp.yawOffsetDeg,
           yawAccuracyDeg: cmp.yawAccuracyDeg,
           headingModel: cmp.headingModel,
+          northReference: cmp.northReference,
+          declination: cmp.declinationInfo,
           latest: cmp.latest(),
           stats: { ...cmp.stats },
         }

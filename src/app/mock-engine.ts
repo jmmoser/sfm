@@ -31,7 +31,7 @@ import {
   type SparseResult,
   type TrackingState,
 } from '../workers/protocol';
-import { Emitter, type EngineErrorInfo, type EngineLike, type EngineStatus } from './engine-client';
+import { ABORT_REASON_PREFIX, Emitter, type AbortOutcome, type EngineErrorInfo, type EngineLike, type EngineStatus } from './engine-client';
 import { MockScene, type MockSamples } from './mock-scene';
 
 export interface MockEngineOptions {
@@ -42,6 +42,17 @@ export interface MockEngineOptions {
   sessions?: () => Promise<SessionStore | null>;
   /** Make a method fail (tests / error UI). */
   failOn?: Partial<Record<'init' | 'frame' | 'refine' | 'densify' | 'mesh' | 'export' | 'loadSession', string>>;
+  /**
+   * Make a long operation hang and IGNORE cancel (a stuck worker): it only ends through
+   * `abortLongOperation` (simulated engine restart) or dispose. Tests the abort UI.
+   */
+  stallOn?: Partial<Record<'finishCapture' | 'refine' | 'densify' | 'mesh', boolean>>;
+  /**
+   * Like the real engine's capture memory cap: after this many keyframes no more are added
+   * (tracking continues, `timings.memoryLimited = 1`) and one non-fatal 'out-of-memory' error
+   * event (CaptureMemoryLimitError) is emitted.
+   */
+  memoryLimitKeyframes?: number;
 }
 
 interface Sizes {
@@ -61,6 +72,15 @@ export class MockEngine implements EngineLike {
   private readonly speed: number;
   private readonly seed: number;
   private readonly failOn: NonNullable<MockEngineOptions['failOn']>;
+  private readonly stallOn: NonNullable<MockEngineOptions['stallOn']>;
+  private readonly memoryLimitKeyframes: number;
+  private memoryLimitHit = false;
+  /** Rejects the running long operation (abortLongOperation: simulated restart). */
+  private abortCurrent: ((e: Error) => void) | null = null;
+  /** Ends a stalled operation (abort / dispose). */
+  private releaseStall: (() => void) | null = null;
+  /** A densify was interrupted: the next one resumes (reported as stats.denseResumablePass). */
+  private denseResumablePass: number | null = null;
   private readonly sessionsSrc: () => Promise<SessionStore | null>;
   private st: EngineStatus = { state: 'idle', respawns: 0 };
   private options: EngineOptions | null = null;
@@ -96,6 +116,8 @@ export class MockEngine implements EngineLike {
     this.speed = opts.speed && opts.speed > 0 ? opts.speed : 1;
     this.seed = opts.seed ?? 7;
     this.failOn = opts.failOn ?? {};
+    this.stallOn = opts.stallOn ?? {};
+    this.memoryLimitKeyframes = opts.memoryLimitKeyframes && opts.memoryLimitKeyframes > 0 ? opts.memoryLimitKeyframes : Infinity;
     this.sessionsSrc =
       opts.sessions ??
       (async () => {
@@ -164,6 +186,8 @@ export class MockEngine implements EngineLike {
     this.denseCloud = null;
     this.meshModel = null;
     this.cancelled = false;
+    this.memoryLimitHit = false;
+    this.denseResumablePass = null;
   }
 
   async init(options: EngineOptions): Promise<InitResult> {
@@ -225,6 +249,17 @@ export class MockEngine implements EngineLike {
       let decision: KeyframeDecision = 'skip';
       if (blur) decision = rng.next() < 0.5 ? 'reject_blur' : 'reject_motion';
       else if (this.lastKfS < 0 || s - this.lastKfS >= stepS) decision = 'keyframe';
+      // Capture memory cap (real engine: CaptureMemoryLimitError once, tracking continues).
+      const memoryLimited = this.keyframes.length >= this.memoryLimitKeyframes;
+      if (memoryLimited && decision === 'keyframe') decision = 'skip';
+      if (memoryLimited && !this.memoryLimitHit) {
+        this.memoryLimitHit = true;
+        this.errorE.emit({
+          error: namedError('CaptureMemoryLimitError', `Capture memory limit reached after ${this.keyframes.length} keyframes: no more keyframes, tracking continues`, 'out-of-memory'),
+          fatal: false,
+          reason: 'out-of-memory',
+        });
+      }
       const cam = this.scene.intrinsics(w, h);
       const pose = this.scene.poseAt(s);
       if (decision === 'keyframe') {
@@ -254,7 +289,7 @@ export class MockEngine implements EngineLike {
         numKeyframes: k,
         numRegistered: Math.max(0, k - (k > 6 ? 1 : 0)),
         numPoints: revealed,
-        timings: { total: 40 + rng.next() * 30, features: 18 + rng.next() * 8, matching: 6 + rng.next() * 4 },
+        timings: { total: 40 + rng.next() * 30, features: 18 + rng.next() * 8, matching: 6 + rng.next() * 4, ...(memoryLimited ? { memoryLimited: 1 } : {}) },
       };
       // Overlay: projections of the visible scene into the current (true) camera.
       upd.overlay = this.overlay(pose, cam, rng);
@@ -301,9 +336,24 @@ export class MockEngine implements EngineLike {
     return { positions: new Float32Array(pos), colors: new Uint8Array(col) };
   }
 
-  async finishCapture(): Promise<void> {
-    await sleep(200 / this.speed);
-    this.captureDone = true;
+  finishCapture(): Promise<void> {
+    return this.longRun(async () => {
+      if (this.stallOn.finishCapture) await this.stall('mapping 2 keyframes');
+      await this.stage('matching', 200, undefined, 'finishing capture');
+      this.captureDone = true;
+    });
+  }
+
+  /** Hang (ignoring cancel) like a stuck worker; progress keeps coming like the real engine's. */
+  private stall(message: string): Promise<never> {
+    return new Promise<never>((_, reject) => {
+      const timer = setInterval(() => this.progressE.emit({ stage: 'matching', progress: -1, message }), 1000);
+      this.releaseStall = () => {
+        clearInterval(timer);
+        this.releaseStall = null;
+        reject(namedError(ENGINE_ERRORS.cancelled, 'Aborted'));
+      };
+    });
   }
 
   // ---- processing ----------------------------------------------------------------------------
@@ -337,11 +387,15 @@ export class MockEngine implements EngineLike {
   private async longRun<T>(fn: () => Promise<T>): Promise<T> {
     this.cancelled = false;
     this.longOp = true;
+    const aborted = new Promise<never>((_, reject) => {
+      this.abortCurrent = reject;
+    });
     try {
-      return await fn();
+      return await Promise.race([fn(), aborted]);
     } finally {
       this.longOp = false;
       this.cancelled = false;
+      this.abortCurrent = null;
     }
   }
 
@@ -353,7 +407,8 @@ export class MockEngine implements EngineLike {
   private metric(): MetricInfo {
     return this.scene?.kind === 'scene'
       ? { metric: true, source: 'imu+gps', relativeUncertainty: 0.012, gravityAligned: true, northAligned: true, originLatLonAlt: [47.3769, 8.5417, 408] }
-      : { metric: true, source: 'imu', relativeUncertainty: 0.028, gravityAligned: true, northAligned: false, originLatLonAlt: null };
+      : // object scans: yaw from the compass without a location → MAGNETIC north (northAligned false)
+        { metric: true, source: 'imu', relativeUncertainty: 0.028, gravityAligned: true, northAligned: false, originLatLonAlt: null };
   }
 
   private buildSparse(numKeyframes: number, timings: Record<string, number>): SparseResult {
@@ -392,6 +447,11 @@ export class MockEngine implements EngineLike {
         focalPx: Math.round(intr.f * 10) / 10,
         k1: intr.k1,
         k2: intr.k2,
+        scaleSource: scene.kind === 'scene' ? 'imu+gps' : 'imu',
+        yawSource: scene.kind === 'scene' ? 'gps' : 'compass',
+        north: scene.kind === 'scene' ? 'true' : 'magnetic',
+        yawStdDeg: scene.kind === 'scene' ? 1.8 : 4.5,
+        memoryMB: Math.round(150 + n * 0.6),
         ...timings,
       },
     };
@@ -412,6 +472,7 @@ export class MockEngine implements EngineLike {
       await run('alignment', 700, 'alignmentMs');
       this.sparse = this.buildSparse(this.keyframes.length, t);
       this.captureDone = true;
+      this.denseResumablePass = null; // refine invalidates stored depth maps
       return this.sparse;
     });
   }
@@ -424,12 +485,31 @@ export class MockEngine implements EngineLike {
       const q = options?.quality ?? this.options?.quality ?? 'balanced';
       const f = q === 'fast' ? 0.6 : q === 'max' ? 1.6 : 1;
       const t0 = performance.now();
-      await this.stage('depth_maps', 2600 * f, onProgress, `${this.sparse.cameras.length} views`);
-      const t1 = performance.now();
-      await this.stage('fusion', 1100 * f, onProgress);
+      const resumed = this.denseResumablePass;
+      let t1 = t0;
+      try {
+        await this.stage('depth_maps', 2600 * f * (resumed !== null ? 0.4 : 1), onProgress, `${this.sparse.cameras.length} views`);
+        t1 = performance.now();
+        await this.stage('fusion', 1100 * f, onProgress);
+      } catch (e) {
+        // Like the real engine: stored depth maps make an interrupted densify resumable.
+        if ((e as { name?: string })?.name === ENGINE_ERRORS.cancelled) this.denseResumablePass = 1;
+        throw e;
+      }
+      this.denseResumablePass = null;
       const n = Math.round(this.sizes.dense * (q === 'fast' ? 0.6 : q === 'max' ? 1.5 : 1));
       this.denseCloud = scene.dense(n);
-      this.sparse.stats = { ...this.sparse.stats, densePoints: n, depthMapsMs: Math.round(t1 - t0), fusionMs: Math.round(performance.now() - t1) };
+      const size = q === 'fast' ? 800 : q === 'max' ? 1600 : 1280;
+      this.sparse.stats = {
+        ...this.sparse.stats,
+        densePoints: n,
+        depthMapsMs: Math.round(t1 - t0),
+        fusionMs: Math.round(performance.now() - t1),
+        denseMaxSize: size,
+        denseMemPeakMB: Math.round(q === 'fast' ? 210 : q === 'max' ? 820 : 560),
+        memoryMB: Math.round(160 + this.keyframes.length * 0.6 + n * 105e-6),
+        ...(resumed !== null ? { denseResumedPass: resumed } : {}),
+      };
       return this.denseCloud;
     });
   }
@@ -443,7 +523,7 @@ export class MockEngine implements EngineLike {
       const t0 = performance.now();
       await this.stage('meshing', 1800 * (q === 'fast' ? 0.6 : q === 'max' ? 1.6 : 1), onProgress);
       this.meshModel = scene.mesh();
-      if (this.sparse) this.sparse.stats = { ...this.sparse.stats, triangles: this.meshModel.triangleCount, meshingMs: Math.round(performance.now() - t0) };
+      if (this.sparse) this.sparse.stats = { ...this.sparse.stats, triangles: this.meshModel.triangleCount, meshingMs: Math.round(performance.now() - t0), memoryMB: Math.round(190 + this.keyframes.length * 0.6) };
       return this.meshModel;
     });
   }
@@ -570,6 +650,8 @@ export class MockEngine implements EngineLike {
         if (st === 'sparse' || st === 'dense' || st === 'meshed') this.sparse = this.buildSparse(kf, {});
         if (st === 'dense' || st === 'meshed') this.denseCloud = scene.dense(this.sizes.dense);
         if (st === 'meshed') this.meshModel = scene.mesh();
+        const rp = meta.stats?.denseResumablePass;
+        if (typeof rp === 'number' && this.sparse && !this.denseCloud) this.denseResumablePass = rp;
         this.sessionName = meta.name;
       }
       this.setState('ready');
@@ -586,7 +668,7 @@ export class MockEngine implements EngineLike {
         sparse: this.sparse,
         dense: this.denseCloud,
         mesh: this.meshModel,
-        stats: this.sparse?.stats ?? {},
+        stats: { ...(this.sparse?.stats ?? {}), ...(this.denseResumablePass !== null ? { denseResumablePass: this.denseResumablePass } : {}) },
       };
     } catch (e) {
       this.setState('idle', (e as Error).message);
@@ -603,6 +685,22 @@ export class MockEngine implements EngineLike {
     if (this.longOp) this.cancelled = true;
   }
 
+  async abortLongOperation(opts: { graceMs?: number } = {}): Promise<AbortOutcome> {
+    if (!this.longOp) return 'none';
+    this.cancel();
+    const graceMs = Math.max(0, opts.graceMs ?? 5000);
+    const t0 = performance.now();
+    while (this.longOp && performance.now() - t0 < graceMs) await sleep(40);
+    if (!this.longOp) return 'cancelled';
+    // Stuck: end it here and "restart" (the in-memory session survives, like a resume from IndexedDB).
+    this.abortCurrent?.(namedError(ENGINE_ERRORS.cancelled, 'The operation did not stop — the engine was restarted'));
+    this.releaseStall?.();
+    this.setState('respawning', `${ABORT_REASON_PREFIX}the operation did not respond to cancel`);
+    await sleep(250 / this.speed);
+    if (!this.disposed) this.setState('ready', 'recovered after an abort');
+    return 'restarted';
+  }
+
   setHidden(hidden: boolean): void {
     this.hidden = hidden;
   }
@@ -610,6 +708,7 @@ export class MockEngine implements EngineLike {
   dispose(): void {
     this.disposed = true;
     this.cancelled = true;
+    this.releaseStall?.();
     this.setState('disposed');
     this.live.clear();
     this.progressE.clear();

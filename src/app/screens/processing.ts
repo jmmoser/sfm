@@ -18,6 +18,7 @@ import { icon } from '../icons';
 import type { ProcessingStep, Route } from '../router';
 import { STAGES, estimateRemainingMs, stageIdFor, stageWeights, type StageId, type StageState } from '../stages';
 import { decimate } from './capture';
+import { denseResumable } from '../model-info';
 
 interface StageRow {
   el: HTMLElement;
@@ -55,6 +56,12 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
   }
   initStates();
 
+  /** The dense cloud was (re)built, or refine invalidated the stored depth maps: nothing to resume. */
+  function clearDenseResume(): void {
+    delete app.results.stats.denseResumablePass;
+    delete app.results.stats.denseInterrupted;
+  }
+
   // ---- DOM ---------------------------------------------------------------------------------------
   const previewHost = h('div', { class: 'proc-preview-canvas' });
   const previewEmpty = h('div', { class: 'proc-preview-empty' }, spinner('md'), h('span', { text: 'Preparing preview…' }));
@@ -62,7 +69,9 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
   const preview = h('div', { class: 'proc-preview', 'data-testid': 'processing-preview' }, previewHost, previewEmpty, previewCaption);
   const elapsedEl = h('span', { class: 'proc-elapsed', text: '0:00' });
   const etaEl = h('span', { class: 'proc-eta', text: 'Estimating time…', 'data-testid': 'eta' });
-  const headline = h('h1', { class: 'proc-title', text: steps.includes('refine') ? 'Reconstructing' : steps.includes('mesh') ? 'Building mesh' : 'Building dense cloud' });
+  const resuming = steps[0] === 'densify' && denseResumable(app.results);
+  const headlineText = steps.includes('refine') ? 'Reconstructing' : steps.includes('mesh') ? 'Building mesh' : resuming ? 'Resuming dense cloud' : 'Building dense cloud';
+  const headline = h('h1', { class: 'proc-title', text: headlineText });
   const rows = new Map<StageId, StageRow>();
   const list = h('ol', { class: 'stage-list' });
   for (const s of STAGES) {
@@ -279,6 +288,7 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
           if (closed) return;
           app.results.sparse = sparse;
           app.results.stats = { ...app.results.stats, ...sparse.stats };
+          clearDenseResume(); // refine deletes the depth maps of the old poses
           completeStep('refine');
           showPreview();
           void app.updateSession(route.sessionId, { status: 'sparse', stats: numericStats(sparse.stats) });
@@ -289,6 +299,7 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
           const dense = await app.engine.densify({ quality }, (e) => onProgress('densify', e));
           if (closed) return;
           app.results.dense = dense;
+          clearDenseResume();
           completeStep('densify');
           showPreview();
           void app.updateSession(route.sessionId, { status: 'dense', stats: { densePoints: dense.count } });
@@ -304,6 +315,9 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
       }
     } catch (e) {
       running = false;
+      // An interrupted densify of a stored scan continues from its saved depth maps next time
+      // (the viewer offers "Resume dense reconstruction").
+      if (step === 'densify' && route.sessionId && !app.results.dense) app.results.stats = { ...app.results.stats, denseInterrupted: 1 };
       if (closed) return;
       if (step) failStep(step);
       if (isCancelledError(e) || cancelling) {
@@ -356,7 +370,7 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
   }
 
   async function retry(): Promise<void> {
-    headline.textContent = steps.includes('refine') ? 'Reconstructing' : steps.includes('mesh') ? 'Building mesh' : 'Building dense cloud';
+    headline.textContent = headlineText;
     for (const s of STAGES) {
       const st = states.get(s.id)!;
       if (st.status === 'error' || st.status === 'active') {

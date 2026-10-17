@@ -9,7 +9,17 @@
  *  - time offset: gyro rotations (`estimateTimeOffset`); if unobservable (little angular
  *    acceleration), linear acceleration (`estimateTimeOffsetFromAcceleration`); else default;
  *  - gravity: IMU specific force (`estimateGravity`), else per-keyframe `gravityCam`;
- *  - yaw: GPS 4-DOF alignment (needs gravity) when the GPS track is long enough, else compass;
+ *  - north: compass headings flagged MAGNETIC (`WorldKeyframe.headingNorth`) are turned into
+ *    true-north headings with the WMM2025 declination (`sensors/wmm.ts`) at the first GPS fix
+ *    whose accuracy is ≤ 50 km (an "approximate" iOS fix is plenty), else at the optional
+ *    `coarseLocation`, at `captureDate` (default now). Without any location the compass yaw is
+ *    MAGNETIC: it is still applied (+Y ≈ magnetic north, better than an arbitrary yaw) but
+ *    `northAligned` stays false and `details.north` = 'magnetic';
+ *  - yaw: GPS 4-DOF alignment (needs gravity) when the GPS track is long enough and/or the
+ *    compass; with both, inverse-variance fusion on the circle (GPS σ from `alignToGps`,
+ *    compass σ from the reported accuracies, the sample count and a systematic floor); when they
+ *    disagree by > 3 combined σ the compass is dropped against a confident GPS yaw (σ ≤ 10°),
+ *    otherwise the less certain one (`details.yawFusion`, `yawSource`, warning);
  *  - scale: IMU and GPS combined by inverse-variance weighting in log-scale when both are
  *    reliable and consistent (else the more certain one);
  *  - translation: GPS ⇒ local ENU at `originLatLonAlt`; otherwise the first camera (or the
@@ -17,7 +27,18 @@
  */
 import type { FrameInfo, GeoFix, ImuSample, Mat3, MetricInfo, Pose, Vec3 } from '../core/types';
 import { mat3Mul } from '../math/mat3';
-import { alignToGps, yawFromCompass, type CompassObservation, type CompassYaw, type GpsAlignment, type GpsAlignOptions } from './geo';
+import { decimalYearFromDate, magneticField } from '../sensors/wmm';
+import {
+  alignToGps,
+  fuseYaw,
+  yawFromCompass,
+  type CompassObservation,
+  type CompassYaw,
+  type CompassYawOptions,
+  type GpsAlignment,
+  type GpsAlignOptions,
+  type YawFusion,
+} from './geo';
 import {
   composeGravityAlignment,
   estimateGravity,
@@ -44,16 +65,26 @@ export interface WorldKeyframe {
   R_cam_device: Mat3;
   /** Gravity DOWN in the camera frame (e.g. FrameInfo.gravityCam). */
   gravityCam?: ArrayLike<number> | null;
-  /** Compass heading (deg clockwise from true north) of the reference axis (FrameInfo.heading). */
+  /** Compass heading (deg clockwise from north, see `headingNorth`) of the reference axis (FrameInfo.heading). */
   heading?: number | null;
   /** 1-σ heading accuracy (deg). */
   headingAccuracy?: number | null;
+  /**
+   * North reference of `heading`: 'magnetic' headings get the WMM declination at the capture
+   * location (see the module comment); 'true' / absent = already true north.
+   */
+  headingNorth?: 'true' | 'magnetic' | null;
   /** GPS fix associated with the keyframe (used when no `gpsFixes` are given). */
   geo?: GeoFix | null;
 }
 
 /** `WorldKeyframe` from the recorded frame metadata and the reconstructed pose. */
-export function worldKeyframeFromFrame(info: FrameInfo, pose: Pose, headingAccuracyDeg: number | null = null): WorldKeyframe {
+export function worldKeyframeFromFrame(
+  info: FrameInfo,
+  pose: Pose,
+  headingAccuracyDeg: number | null = null,
+  headingNorth: 'true' | 'magnetic' | null = null,
+): WorldKeyframe {
   return {
     id: info.id,
     t: info.t,
@@ -62,6 +93,7 @@ export function worldKeyframeFromFrame(info: FrameInfo, pose: Pose, headingAccur
     gravityCam: info.gravityCam,
     heading: info.heading,
     headingAccuracy: headingAccuracyDeg,
+    headingNorth,
     geo: info.geo,
   };
 }
@@ -90,6 +122,27 @@ export interface WorldAlignmentOptions {
   compassReference: 'auto' | 'device-top' | 'optical-axis';
   /** Minimum compass observations (default 3). */
   minCompassObservations: number;
+  /** Options of `yawFromCompass` (outlier gates, systematic σ). */
+  compass: Partial<CompassYawOptions>;
+  /** Capture date for the magnetic declination (Date or epoch ms); default: now. */
+  captureDate: Date | number | null;
+  /**
+   * Location [lat°, lon°, alt m] for the declination when no usable GPS fix exists (e.g. a coarse
+   * location from elsewhere); default null.
+   */
+  coarseLocation: readonly [number, number, number?] | null;
+  /** GPS fixes less accurate than this (m) are not used for the declination (default 50 000). */
+  maxDeclinationFixAccuracyM: number;
+  /** Explicit declination (deg, east positive) instead of the model; default null (WMM). */
+  declinationDeg: number | null;
+  /** Fuse the compass yaw with the GPS 4-DOF yaw (default true; false: GPS decides alone). */
+  fuseCompassYaw: boolean;
+  /** GPS and compass yaws disagreeing by more than this many combined σ are not fused (default 3). */
+  maxYawDisagreementSigma: number;
+  /** On such a disagreement a GPS yaw with σ ≤ this (deg, default 10) wins even against a more certain compass. */
+  confidentGpsYawStdDeg: number;
+  /** Apply a MAGNETIC compass yaw when no declination is available (default true; northAligned stays false). */
+  useMagneticYaw: boolean;
   /** GPS scale is used only below this relative σ (default 0.25). */
   maxGpsScaleRelUncertainty: number;
   /** IMU and GPS scales disagreeing by more than this many σ are not averaged (default 3). */
@@ -106,6 +159,15 @@ const DEFAULT_WORLD: WorldAlignmentOptions = {
   gps: {},
   compassReference: 'auto',
   minCompassObservations: 3,
+  compass: {},
+  captureDate: null,
+  coarseLocation: null,
+  maxDeclinationFixAccuracyM: 50_000,
+  declinationDeg: null,
+  fuseCompassYaw: true,
+  maxYawDisagreementSigma: 3,
+  confidentGpsYawStdDeg: 10,
+  useMagneticYaw: true,
   maxGpsScaleRelUncertainty: 0.25,
   maxScaleDisagreementSigma: 3,
   origin: 'first-camera',
@@ -128,12 +190,41 @@ export interface WorldAlignment {
     gravity: GravityResult | null;
     imuScale: MetricScaleResult | null;
     gps: GpsAlignment | null;
+    /** Compass yaw (true north when `north` is 'true' or a GPS yaw exists, else magnetic). */
     compass: CompassYaw | null;
-    yawSource: 'gps' | 'compass' | 'none';
+    /** Where the applied yaw comes from ('gps+compass' = inverse-variance fusion). */
+    yawSource: 'gps' | 'compass' | 'gps+compass' | 'none';
+    /** 1-σ of the applied yaw (rad), null without one. */
+    yawStdRad: number | null;
+    /** GPS ⊕ compass fusion (null unless both yaws were available). */
+    yawFusion: YawFusion | null;
+    /** What +Y points to: true north, magnetic north (compass without a declination), or nothing known. */
+    north: 'true' | 'magnetic' | 'none';
+    /** Magnetic declination used / available at the capture location (null without a location). */
+    declination: DeclinationEstimate | null;
+    /** Flat summary for engine stats: north reference, declination, yaw σ and fusion. */
+    headingStats: Record<string, number | string>;
     /** Scale candidates (metres per reconstruction unit) with their relative σ. */
     scaleCandidates: { source: 'imu' | 'gps'; scale: number; relUncertainty: number }[];
     warnings: string[];
   };
+}
+
+/** Declination at the capture location (WMM2025, `sensors/wmm.ts`). */
+export interface DeclinationEstimate {
+  /** Degrees, east positive (true heading = magnetic heading + declination). */
+  deg: number;
+  /** Location source: first usable GPS fix, `coarseLocation`, or an explicit `declinationDeg`. */
+  source: 'gps' | 'coarse' | 'explicit';
+  latDeg: number | null;
+  lonDeg: number | null;
+  decimalYear: number | null;
+  /** The date is inside the model's validity period (2025.0–2030.0). */
+  inValidityPeriod: boolean;
+  /** Horizontal field < 2000 nT: compass unreliable (compass yaw not used). */
+  blackoutZone: boolean;
+  /** Keyframe headings converted from magnetic to true north. */
+  numConverted: number;
 }
 
 /**
@@ -264,25 +355,21 @@ export function computeWorldAlignment(input: WorldAlignmentInput, options: Parti
     if (!gps) warnings.push('GPS track too short / too few fixes for alignment');
   }
 
-  // ---- rotation / yaw
-  let R: Mat3 = Rg;
-  let yawSource: 'gps' | 'compass' | 'none' = 'none';
+  // ---- north reference: magnetic declination at the capture location
+  const anyHeading = kfs.some((k) => k.heading !== null && k.heading !== undefined && Number.isFinite(k.heading));
+  const anyMagnetic = kfs.some((k) => k.headingNorth === 'magnetic' && k.heading !== null && k.heading !== undefined && Number.isFinite(k.heading));
+  const declination = anyHeading ? resolveDeclination(fixes, o) : null;
+  if (declination && !declination.inValidityPeriod) warnings.push(`capture date outside the WMM2025 validity period (${declination.decimalYear?.toFixed(2)}): declination extrapolated`);
+  if (anyMagnetic && !declination) warnings.push('compass headings are magnetic and no location is known for the declination: compass yaw refers to magnetic north');
+
+  // ---- compass yaw (true north when every used heading is true north)
   let compass: CompassYaw | null = null;
-  let northAligned = false;
-  let gravityAligned = gravityOk;
-  if (gps && gps.mode === '4dof') {
-    R = mat3Mul(gps.R, Rg);
-    yawSource = 'gps';
-    northAligned = true;
-  } else if (gps && gps.mode === 'sim3') {
-    R = gps.R;
-    yawSource = 'gps';
-    northAligned = true;
-    gravityAligned = true;
-    warnings.push('up direction from the GPS track only (no gravity)');
-  } else if (gravityOk) {
-    const obs: CompassObservation[] = [];
-    const dir = new Float64Array(3);
+  let compassNorth: 'true' | 'magnetic' = 'true';
+  if (gravityOk && anyHeading && declination?.blackoutZone) warnings.push('compass unusable here (WMM blackout zone, horizontal field < 2000 nT)');
+  else if (gravityOk && anyHeading) {
+    const trueObs: CompassObservation[] = [];
+    const magObs: CompassObservation[] = [];
+    let converted = 0;
     for (let i = 0; i < n; i++) {
       const k = kfs[i];
       if (k.heading === null || k.heading === undefined || !Number.isFinite(k.heading)) continue;
@@ -296,18 +383,70 @@ export function computeWorldAlignment(input: WorldAlignmentInput, options: Parti
       if (o.compassReference === 'device-top') ref = top;
       else if (o.compassReference === 'optical-axis') ref = axis;
       else ref = Math.abs(top[2]) / Math.hypot(top[0], top[1], top[2]) < Math.SQRT1_2 ? top : axis;
-      dir.set(ref);
-      obs.push({ headingDeg: k.heading, accuracyDeg: k.headingAccuracy ?? null, direction: Float64Array.from(dir) });
+      const ob: CompassObservation = { headingDeg: k.heading, accuracyDeg: k.headingAccuracy ?? null, direction: ref };
+      if (k.headingNorth !== 'magnetic') trueObs.push(ob);
+      else if (declination) {
+        trueObs.push({ ...ob, headingDeg: k.heading + declination.deg });
+        converted++;
+      } else magObs.push(ob);
+    }
+    if (declination) declination.numConverted = converted;
+    // never mix references: true north when enough true headings exist, else magnetic ones
+    let obs = trueObs;
+    if (trueObs.length < o.minCompassObservations && magObs.length >= o.minCompassObservations && o.useMagneticYaw) {
+      obs = magObs;
+      compassNorth = 'magnetic';
     }
     if (obs.length >= o.minCompassObservations) {
-      compass = yawFromCompass(obs);
-      if (compass && compass.numInliers >= o.minCompassObservations) {
-        R = mat3Mul(rotZ(compass.yaw), Rg);
-        yawSource = 'compass';
-        northAligned = true;
-      } else compass = null;
+      compass = yawFromCompass(obs, o.compass);
+      if (compass && compass.numInliers < o.minCompassObservations) compass = null;
     }
   }
+
+  // ---- rotation / yaw
+  let R: Mat3 = Rg;
+  let yawSource: WorldAlignment['details']['yawSource'] = 'none';
+  let yawStdRad: number | null = null;
+  let yawFusion: YawFusion | null = null;
+  let north: WorldAlignment['details']['north'] = 'none';
+  let gravityAligned = gravityOk;
+  if (gps && gps.mode === '4dof') {
+    const gpsYaw = Math.atan2(gps.R[3], gps.R[0]);
+    let yaw = gpsYaw;
+    yawSource = 'gps';
+    yawStdRad = gps.yawStdRad;
+    if (compass && compassNorth === 'true' && o.fuseCompassYaw) {
+      yawFusion = fuseYaw(
+        { yaw: gpsYaw, stdRad: gps.yawStdRad },
+        { yaw: compass.yaw, stdRad: compass.stdRad },
+        { maxDisagreementSigma: o.maxYawDisagreementSigma, confidentGpsStdRad: (o.confidentGpsYawStdDeg * Math.PI) / 180 },
+      );
+      yaw = yawFusion.yaw;
+      yawStdRad = yawFusion.stdRad;
+      yawSource = yawFusion.used === 'both' ? 'gps+compass' : yawFusion.used;
+      if (yawFusion.rejected) {
+        warnings.push(
+          `compass and GPS yaws disagree by ${((yawFusion.differenceRad * 180) / Math.PI).toFixed(1)}° (${yawFusion.disagreementSigma.toFixed(1)}σ); ` +
+            `using the ${yawFusion.used === 'gps' ? 'GPS' : 'compass'} yaw`,
+        );
+      }
+    } else if (compass && compassNorth === 'magnetic') warnings.push('magnetic compass yaw not fused with the GPS yaw');
+    R = mat3Mul(rotZ(yaw), Rg);
+    north = 'true';
+  } else if (gps && gps.mode === 'sim3') {
+    R = gps.R;
+    yawSource = 'gps';
+    yawStdRad = gps.yawStdRad;
+    north = 'true';
+    gravityAligned = true;
+    warnings.push('up direction from the GPS track only (no gravity)');
+  } else if (compass) {
+    R = mat3Mul(rotZ(compass.yaw), Rg);
+    yawSource = 'compass';
+    yawStdRad = compass.stdRad;
+    north = compassNorth;
+  }
+  const northAligned = north === 'true';
 
   // ---- scale
   const cands: { source: 'imu' | 'gps'; scale: number; relUncertainty: number }[] = [];
@@ -412,8 +551,101 @@ export function computeWorldAlignment(input: WorldAlignmentInput, options: Parti
       northAligned,
       originLatLonAlt,
     },
-    details: { timeOffset, accelTimeOffset, offsetMs, offsetSource, gravity, imuScale, gps, compass, yawSource, scaleCandidates: cands, warnings },
+    details: {
+      timeOffset,
+      accelTimeOffset,
+      offsetMs,
+      offsetSource,
+      gravity,
+      imuScale,
+      gps,
+      compass,
+      yawSource,
+      yawStdRad,
+      yawFusion,
+      north,
+      declination,
+      headingStats: headingStats(north, yawStdRad, declination, compass, compassNorth, gps, yawFusion),
+      scaleCandidates: cands,
+      warnings,
+    },
   };
+}
+
+/**
+ * Declination for the magnetic → true conversion: an explicit value, else WMM2025 at the first
+ * (in time) GPS fix with a finite position and an accuracy ≤ `maxDeclinationFixAccuracyM`, else
+ * at `coarseLocation`; null without a location. Heights: GeoFix altitudes are MSL on iOS — fine
+ * for the declination.
+ */
+function resolveDeclination(fixes: readonly GeoFix[], o: WorldAlignmentOptions): DeclinationEstimate | null {
+  const date = o.captureDate instanceof Date ? o.captureDate.getTime() : typeof o.captureDate === 'number' ? o.captureDate : Date.now();
+  const year = decimalYearFromDate(date);
+  if (o.declinationDeg !== null && Number.isFinite(o.declinationDeg)) {
+    return { deg: o.declinationDeg, source: 'explicit', latDeg: null, lonDeg: null, decimalYear: null, inValidityPeriod: true, blackoutZone: false, numConverted: 0 };
+  }
+  let loc: { lat: number; lon: number; alt: number; source: 'gps' | 'coarse' } | null = null;
+  let firstT = Infinity;
+  for (const f of fixes) {
+    if (!Number.isFinite(f.lat) || !Number.isFinite(f.lon) || Math.abs(f.lat) > 90) continue;
+    if (!(f.accuracy <= o.maxDeclinationFixAccuracyM)) continue;
+    const t = Number.isFinite(f.t) ? f.t : Infinity;
+    if (loc && !(t < firstT)) continue;
+    firstT = t;
+    loc = { lat: f.lat, lon: f.lon, alt: f.alt !== null && Number.isFinite(f.alt) ? f.alt : 0, source: 'gps' };
+  }
+  const c = o.coarseLocation;
+  if (!loc && c && Number.isFinite(c[0]) && Number.isFinite(c[1]) && Math.abs(c[0]) <= 90) {
+    const alt = c[2];
+    loc = { lat: c[0], lon: c[1], alt: typeof alt === 'number' && Number.isFinite(alt) ? alt : 0, source: 'coarse' };
+  }
+  if (!loc) return null;
+  const e = magneticField(loc.lat, loc.lon, loc.alt / 1000, year);
+  if (!Number.isFinite(e.declination)) return null;
+  return {
+    deg: e.declination,
+    source: loc.source,
+    latDeg: loc.lat,
+    lonDeg: loc.lon,
+    decimalYear: e.decimalYear,
+    inValidityPeriod: e.inValidityPeriod,
+    blackoutZone: e.blackoutZone,
+    numConverted: 0,
+  };
+}
+
+const RAD2DEG = 180 / Math.PI;
+const r3 = (x: number): number => Math.round(x * 1000) / 1000;
+
+/** Flat, JSON-friendly heading summary (merged into the engine's refine stats). */
+function headingStats(
+  north: WorldAlignment['details']['north'],
+  yawStdRad: number | null,
+  decl: DeclinationEstimate | null,
+  compass: CompassYaw | null,
+  compassNorth: 'true' | 'magnetic',
+  gps: GpsAlignment | null,
+  fusion: YawFusion | null,
+): Record<string, number | string> {
+  const st: Record<string, number | string> = { north };
+  if (yawStdRad !== null && Number.isFinite(yawStdRad)) st.yawStdDeg = r3(yawStdRad * RAD2DEG);
+  if (decl) {
+    st.declinationDeg = r3(decl.deg);
+    st.declinationSource = decl.source;
+    if (decl.numConverted > 0) st.headingsConverted = decl.numConverted;
+  }
+  if (compass) {
+    st.compassNorth = compassNorth;
+    st.compassYawStdDeg = r3(compass.stdRad * RAD2DEG);
+    st.compassInliers = compass.numInliers;
+  }
+  if (gps && gps.mode === '4dof') st.gpsYawStdDeg = r3(gps.yawStdRad * RAD2DEG);
+  if (fusion) {
+    st.compassMinusGpsYawDeg = r3(fusion.differenceRad * RAD2DEG);
+    st.yawDisagreementSigma = Math.round(fusion.disagreementSigma * 100) / 100;
+    st.yawFusion = fusion.rejected ? `${fusion.rejected} rejected` : `compass weight ${fusion.compassWeight.toFixed(2)}`;
+  }
+  return st;
 }
 
 function transposeOf(R: Mat3): Mat3 {
