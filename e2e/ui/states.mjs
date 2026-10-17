@@ -13,6 +13,7 @@
  *   processing-error refine fails → error banner with retry
  *   storage-full-start   IndexedDB quota exceeded → the scan is blocked with an explanation
  *   storage-full-capture keyframes cannot be stored → capture pauses, "Finish scan" works
+ *   storage-write-error-capture  a non-quota write failure → capture pauses, not "Storage is full"
  *   engine-dead      EngineClient gave up (respawn cap) → error card, no toast storm
  *   export-reopen    export finishes while its sheet is closed → the reopened sheet shows Save
  *   open-other-session processing a stored scan after viewing another: no stale name / stages
@@ -246,6 +247,28 @@ await scenario('storage-full-capture', async () => {
   await page.locator('[data-testid="capture-storage-full"] button', { hasText: 'Finish scan' }).tap();
   await page.waitForSelector('.processing', { timeout: 20000 });
   check(true, 'the scan can be finished with the keyframes captured so far');
+  await context.close();
+});
+
+await scenario('storage-write-error-capture', async () => {
+  const { page, context } = await newPage();
+  await startCapture(page, `${base}?mock=1&mockSpeed=3`);
+  await page.waitForFunction(() => Number(document.querySelector('[data-testid="kf-count"]')?.textContent) >= 6, null, { timeout: 90000 });
+  // A write fails for another reason than quota (iOS: the IndexedDB connection was lost).
+  await page.evaluate(() => {
+    const e = globalThis.__sfmApp.engine;
+    e.processFrame = async (f) => {
+      f.bitmap.close?.();
+      const err = new Error('UnknownError: Connection to Indexed Database server lost. Refresh the page to try again');
+      err.name = 'StorageWriteError';
+      err.code = 'storage';
+      throw err;
+    };
+  });
+  await by(page, 'capture-storage-error').waitFor({ timeout: 15000 });
+  check((await page.locator('.capture').getAttribute('data-phase')) === 'paused', 'capture pauses when a write fails for another reason than quota');
+  const text = await by(page, 'capture-storage-error').textContent();
+  check(!/Storage is full/.test(text ?? '') && /Connection to Indexed Database server lost/.test(text ?? ''), 'a non-quota write failure is not reported as a full storage');
   await context.close();
 });
 

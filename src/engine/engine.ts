@@ -385,7 +385,7 @@ export class PhotogrammetryEngine {
   }
 
   private onStorageError(e: unknown): void {
-    const err = e instanceof Error ? e : new Error(String(e));
+    const err = storageWriteError(e);
     if (!this.storageErr) this.storageErr = err;
     this.log('error', `storage write failed: ${err.message}`);
     this.emitError(err, false, 'storage');
@@ -1175,4 +1175,17 @@ export class PhotogrammetryEngine {
     this.listeners.log.clear();
     this.listeners.error.clear();
   }
+}
+
+/**
+ * A failed session-store write as the app sees it: quota errors keep their name (the app says
+ * "Storage is full"); anything else (iOS UnknownError, InvalidStateError on a closed connection,
+ * an aborted transaction…) becomes a StorageWriteError with code 'storage' and the original
+ * name in the message — never mistaken for a full disk, but still pausing the capture.
+ */
+function storageWriteError(e: unknown): Error {
+  const name = (e as { name?: string } | null)?.name;
+  if (name === 'StorageQuotaError' || name === 'QuotaExceededError') return e as Error;
+  const message = (e as { message?: string } | null)?.message ?? String(e);
+  return namedError(ENGINE_ERRORS.storageWrite, name && name !== 'Error' ? `${name}: ${message}` : message, 'storage');
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ENGINE_ERRORS, namedError } from '../workers/protocol';
-import { frameErrorAction, overlayMatchesView } from './capture-policy';
+import { frameErrorAction, isQuotaError, isStorageWriteError, overlayMatchesView } from './capture-policy';
 
 describe('frameErrorAction', () => {
   it('ignores back-pressure and cancellation', () => {
@@ -21,6 +21,15 @@ describe('frameErrorAction', () => {
   it('missing / uninitialised engines are unavailable', () => {
     expect(frameErrorAction(namedError(ENGINE_ERRORS.notImplemented, 'engine not implemented yet'), 'idle')).toBe('unavailable');
     expect(frameErrorAction(namedError(ENGINE_ERRORS.notInitialized, 'init first'), 'ready')).toBe('unavailable');
+  });
+  it('failed writes pause the capture, quota or not', () => {
+    expect(frameErrorAction(namedError('StorageQuotaError', 'Storage quota exceeded while storing a keyframe'), 'ready')).toBe('storage');
+    expect(frameErrorAction(namedError('QuotaExceededError', 'The quota has been exceeded.'), 'ready')).toBe('storage');
+    // an iOS UnknownError / closed connection, as the engine reports it: not a full disk
+    const err = namedError(ENGINE_ERRORS.storageWrite, 'UnknownError: Connection to Indexed Database server lost', 'storage');
+    expect(frameErrorAction(err, 'ready')).toBe('storage');
+    expect(isQuotaError(err)).toBe(false);
+    expect(isStorageWriteError(err)).toBe(true);
   });
   it('other errors are transient', () => {
     expect(frameErrorAction(new Error('decode failed'), 'ready')).toBe('transient');

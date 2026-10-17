@@ -289,13 +289,15 @@ export const ENGINE_ERRORS = {
   busy: 'EngineBusyError',
   notInitialized: 'EngineNotInitializedError',
   gpuLost: 'GPUDeviceLostError',
+  /** A write to the session store failed for a reason other than quota (code 'storage'). */
+  storageWrite: 'StorageWriteError',
 } as const;
 
 export interface SerializedError {
   name: string;
   message: string;
   stack?: string;
-  /** Optional machine-readable code (e.g. 'quota', 'gpu-lost'). */
+  /** Optional machine-readable code (e.g. 'quota', 'storage', 'gpu-lost'). */
   code?: string;
 }
 

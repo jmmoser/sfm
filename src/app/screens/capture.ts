@@ -34,7 +34,7 @@ import { toast } from '../components/toast';
 import { Disposer, h, replaceChildren } from '../dom';
 import { defaultSessionName, formatAccuracy, formatBytes, formatClock, formatCount, guidanceInfo, trackingLabel } from '../format';
 import { icon, type IconName } from '../icons';
-import { frameErrorAction, overlayMatchesView } from '../capture-policy';
+import { frameErrorAction, isQuotaError, overlayMatchesView } from '../capture-policy';
 import { FrameOrientationTracker, mapOverlay } from '../overlay-map';
 import { createDebugOverlay } from '../debug-overlay';
 import { MIN_KEYFRAMES, type Route } from '../router';
@@ -530,15 +530,20 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
         if (phase !== 'running') return;
         pause('user');
         const enough = numKeyframes >= MIN_KEYFRAMES;
+        const full = isQuotaError(e);
         showCard(
           infoCard({
             icon: 'storage',
             tone: 'bad',
-            title: 'Storage is full',
-            text: enough
-              ? `New photos cannot be saved. Finish now to reconstruct the ${numKeyframes} keyframes captured so far, or free up space and resume.`
-              : 'New photos cannot be saved. Free up space on this device (or delete old scans), then resume.',
-            testId: 'capture-storage-full',
+            title: full ? 'Storage is full' : 'Could not save photos',
+            text: full
+              ? enough
+                ? `New photos cannot be saved. Finish now to reconstruct the ${numKeyframes} keyframes captured so far, or free up space and resume.`
+                : 'New photos cannot be saved. Free up space on this device (or delete old scans), then resume.'
+              : `Saving to on-device storage failed (${(e as Error)?.message ?? 'unknown error'}). ${
+                  enough ? `Finish now to reconstruct the ${numKeyframes} keyframes captured so far, or resume to try again.` : 'Resume to try again.'
+                }`,
+            testId: full ? 'capture-storage-full' : 'capture-storage-error',
             actions: [
               ...(enough ? [button({ label: 'Finish scan', icon: 'check', variant: 'primary', size: 'lg', block: true, onClick: () => void finish() })] : []),
               button({ label: 'Resume', variant: enough ? 'secondary' : 'primary', size: 'lg', block: true, onClick: () => resume() }),

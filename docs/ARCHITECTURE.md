@@ -1929,7 +1929,9 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
 * **Capture**: frame errors go through `frameErrorAction` (`capture-policy.ts`): a `dead` engine
   (respawn cap) stops the pump with an error card instead of failing every frame at 10 Hz;
   quota errors (`StorageQuotaError` / `QuotaExceededError` / `code: 'quota'`) pause the scan
-  with "Finish scan / Resume / Back to home". A quota error when the session record is created
+  with "Finish scan / Resume / Back to home"; so does any other failed store write, which the
+  engine reports as `StorageWriteError` (`code: 'storage'`, original name in the message) and
+  the app shows as "Could not save photos", never as "Storage is full". A quota error when the session record is created
   blocks the scan before any frame ("Storage is full"); < 300 MB of origin quota left ⇒ warning.
   `App.createSession` returns `{status: 'ok' | 'quota' | 'error' | 'unavailable'}`.
 * **Overlay**: keypoints of a frame captured at another UI rotation are dropped, not rotated —

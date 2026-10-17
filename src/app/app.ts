@@ -144,8 +144,10 @@ export class App {
     });
     this.engine.onError((e) => {
       if (e.fatal) console.warn('[app] engine fatal error', e.error);
-      if (e.reason === 'storage' || isQuotaError(e.error)) {
+      if (isQuotaError(e.error)) {
         toast('Storage is full — free up space on this device, or delete old scans.', { tone: 'bad', durationMs: 9000 });
+      } else if (e.reason === 'storage') {
+        toast(`Could not save to on-device storage: ${e.error.message}`, { tone: 'bad', durationMs: 9000 });
       } else if (e.reason === 'out-of-memory' && this.route.screen !== 'capture') {
         // The capture screen asks "finish scan now?" itself (its own prompt); elsewhere: say it.
         toast(`Memory limit reached: ${e.error.message}`, { tone: 'warn', durationMs: 7000 });
