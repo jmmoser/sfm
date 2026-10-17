@@ -184,6 +184,22 @@ function canvasToRGBA(canvas: OffscreenCanvas): RGBAImage {
   return { width: d.width, height: d.height, data: d.data };
 }
 
+/** Mean and standard deviation of an RGBA image's luma (0–255; Rec. 601 weights). A blank frame gives ≈ 0 / 0. */
+export function lumaStats(img: RGBAImage): { mean: number; std: number } {
+  const d = img.data;
+  const n = img.width * img.height;
+  if (!(n > 0)) return { mean: NaN, std: NaN };
+  let s = 0;
+  let s2 = 0;
+  for (let i = 0; i < n; i++) {
+    const y = 0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2];
+    s += y;
+    s2 += y * y;
+  }
+  const mean = s / n;
+  return { mean, std: Math.sqrt(Math.max(0, s2 / n - mean * mean)) };
+}
+
 /** JPEG of an RGBA image (null without OffscreenCanvas). */
 export async function encodeJpegRGBA(img: RGBAImage, quality = 0.92): Promise<Blob | null> {
   if (!hasOffscreenCanvas()) return null;

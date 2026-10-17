@@ -143,6 +143,38 @@ export interface LiveUpdate {
   sparse?: { positions: Float32Array; colors: Uint8Array };
   cameras?: LiveCamera[];
   timings: Record<string, number>;
+  /** Per-frame diagnostics for the capture debug overlay. */
+  debug?: LiveDebug;
+}
+
+/** Diagnostics of one processed frame (capture debug overlay). */
+export interface LiveDebug {
+  /** Feature backend in use. */
+  backend: 'webgpu' | 'cpu';
+  /** Why the CPU backend is used (null on WebGPU). */
+  fallbackReason: string | null;
+  /** Input the features of this frame were extracted from (null = not extracted). */
+  featureInput: 'bitmap' | 'gray' | null;
+  /** Frame size as submitted / canonical (0 = dropped before preparation). */
+  srcWidth: number;
+  srcHeight: number;
+  width: number;
+  height: number;
+  /** Features of this frame (null = not extracted) and the keyframe minimum. */
+  numFeatures: number | null;
+  minFeatures: number;
+  /** Sharpness of this frame and the running reference of the blur gate (NaN = none yet). */
+  sharpness: number;
+  sharpnessRef: number;
+  /** Gyro angular speed (rad/s, NaN = unknown). */
+  angularSpeed: number;
+  /** Mean / standard deviation of the frame's luma (0–255); ≈ 0 / 0 = blank frame. */
+  lumaMean: number;
+  lumaStd: number;
+  /** Inliers to the last keyframe (NaN = not tracked). */
+  inliers: number;
+  /** Why the frame got its decision. */
+  reason: string;
 }
 
 export interface SparseCamera {

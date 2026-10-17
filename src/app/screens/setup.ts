@@ -88,6 +88,17 @@ export function createSetupScreen(app: App): Screen {
       app.config.torch = v;
     },
   });
+  const debugRow = switchRow({
+    label: 'Debug overlay',
+    description: 'Show backend, features per frame and engine warnings while capturing',
+    icon: 'activity',
+    checked: cfg.debugOverlay,
+    testId: 'toggle-debug',
+    onChange: (v) => {
+      cfg.debugOverlay = v;
+      app.saveConfig({ debugOverlay: v });
+    },
+  });
   const denseRow = switchRow({
     label: 'Dense model after capture',
     description: 'Build the detailed point cloud right away',
@@ -185,7 +196,7 @@ export function createSetupScreen(app: App): Screen {
       { class: 'content content-cta' },
       section('What are you scanning?', modeList, tipsHost),
       section('Quality', quality.el, qualityNote),
-      section('Options', group(gpsRow.el, torchRow.el, denseRow.el)),
+      section('Options', group(gpsRow.el, torchRow.el, denseRow.el, debugRow.el)),
     ),
     h(
       'div',
