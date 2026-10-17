@@ -22,6 +22,14 @@ export default defineConfig({
   },
   worker: {
     format: 'es',
+    // One file per worker. With code splitting, the chunks a worker loads lazily (the feature
+    // extractor, GPU kernels) import shared code back from the worker's entry chunk. WebKit does
+    // not reuse the running worker script for that import: it evaluates a second copy, whose
+    // `onmessage` (fresh state, no engine) then receives every later request ("Engine not
+    // initialised" on the first frame of the first scan).
+    rolldownOptions: {
+      output: { codeSplitting: false },
+    },
   },
   server: {
     host: true,
