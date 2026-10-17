@@ -424,7 +424,11 @@ export class SessionStore {
         result = await op(true);
       } catch (e2) {
         if (e2 instanceof StorageQuotaError || e2 instanceof SessionNotFoundError) throw e2;
-        throw e; // not a Blob problem: report the original error, keep Blob mode
+        // not (only) a Blob problem: report the original error, keep Blob mode — with the retry's
+        // error in the message, which otherwise vanishes
+        const err = new Error(`${(e as Error).message} (retry as ArrayBuffer: ${errorName(e2) ?? 'Error'}: ${(e2 as Error)?.message ?? e2})`);
+        err.name = errorName(e) ?? 'Error';
+        throw err;
       }
       this.blobsAsBuffers = true;
       return result;
