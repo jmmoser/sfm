@@ -1488,9 +1488,16 @@ export function estimateMetricScale(
   }
   const s0 = beta[0];
   const relUnc = Math.sqrt(Math.max(varS0, 0)) / Math.abs(s0);
-  let rr = 0;
-  for (let i = 0; i < N; i++) rr += r[i] * r[i];
-  const r2 = ysq > 0 ? 1 - rr / ysq : 0;
+  // R² with the robust (Huber) weights of the fit: one misregistered keyframe (a few rows with
+  // huge residuals) must not turn an excellent fit into R² ≈ 0 (e2e yard-real: the IMU scale was
+  // rejected for "R² 0.01" and the far less precise GPS scale used instead).
+  let rr = 0,
+    wy = 0;
+  for (let i = 0; i < N; i++) {
+    rr += w[i] * r[i] * r[i];
+    wy += w[i] * y[i] * y[i];
+  }
+  const r2 = ysq > 0 && wy > 0 ? 1 - rr / wy : 0;
   const reasons: string[] = [];
   if (!(s0 > 0)) reasons.push('non-positive scale');
   if (excit < o.minExcitation) reasons.push(`insufficient excitation (${excit.toFixed(3)} m/s² < ${o.minExcitation})`);

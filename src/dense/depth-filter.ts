@@ -29,9 +29,12 @@
  * no texture of its own, so every depth on it comes from propagation: (a) the texture of each
  * pixel's colour segment (`segmentTextureSampler`: grey std of the same-coloured window
  * samples, so a sky pixel next to a roof measures the sky, not the roof edge) marks
- * untextured pixels; (b) untextured regions connected to the TOP image row through
- * untextured, similar-coloured 4-neighbours (`borderComponents`; dense images are upright)
- * are sky candidates; (c) a candidate region is sky when fewer than `skyMinCoherence` of its
+ * untextured pixels; (b) untextured regions connected to the image border(s) facing UP through
+ * untextured, similar-coloured 4-neighbours (`borderComponents`) are sky candidates. Without
+ * `skyUp` the image is taken as upright (top row). Frames rotated to a session's canonical
+ * orientation, or captured under portrait lock, are not upright: with `skyUp` (the up direction
+ * in the camera frame, `skyBorders`) the borders within 60° of the projected up direction are
+ * used. (c) A candidate region is sky when fewer than `skyMinCoherence` of its
  * pixels carry a coherent depth (valid, with ≥ 3 of 4 neighbours valid and on the pixel's
  * plane): PatchMatch fills the sky with random, locally incoherent depths (or none), while a
  * smooth wall gets one consistent plane. All valid depths of a sky region are rejected, halo
@@ -80,6 +83,14 @@ export interface HaloFilterOptions {
   skyTextureRadius: number;
   skyTextureStep: number;
   skyTextureMinSamples: number;
+  /**
+   * Up direction (opposite gravity) in the map's camera frame (+x right, +y down, +z forward),
+   * e.g. `worldUpInCamera(pose.R)` for a Z-up world or −gravityCam. It selects the image borders where
+   * sky regions are seeded (`skyBorders`). null = upright image (top row). Default null.
+   * Per view: pass it to `removeDepthHalos` / `depthHaloMask`, not to `FusionOptions.haloFilter`
+   * (one options object for every view).
+   */
+  skyUp: ArrayLike<number> | null;
 }
 
 export const DEFAULT_HALO_FILTER_OPTIONS: Readonly<HaloFilterOptions> = Object.freeze({
@@ -94,7 +105,37 @@ export const DEFAULT_HALO_FILTER_OPTIONS: Readonly<HaloFilterOptions> = Object.f
   skyTextureRadius: 5,
   skyTextureStep: 2,
   skyTextureMinSamples: 8,
+  skyUp: null,
 });
+
+/**
+ * Image borders where the sky test seeds its regions, for the up direction `up` in the camera
+ * frame (bit 0 top, 1 bottom, 2 left, 3 right; the `borderComponents` bits):
+ * - null / undefined / not finite: 1 (upright image, top row);
+ * - camera within ~15° of looking straight up (in-plane part of the unit `up` < 0.25, up·z > 0): all borders;
+ * - camera within ~15° of looking straight down: 0 (no sky test);
+ * - otherwise the borders whose outward direction is within 60° of `up` projected onto the image
+ *   plane (one border, or the two of a corner when the camera is rolled by ≈ 30–60°).
+ */
+export function skyBorders(up: ArrayLike<number> | null | undefined): number {
+  if (!up || up.length < 3) return 1;
+  const ux = up[0];
+  const uy = up[1];
+  const uz = up[2];
+  const len = Math.hypot(ux, uy, uz);
+  if (!(len > 0 && len < Infinity)) return 1;
+  const s = Math.hypot(ux, uy) / len;
+  if (s < 0.25) return uz > 0 ? 15 : 0;
+  const dx = ux / (s * len);
+  const dy = uy / (s * len);
+  return (-dy > 0.5 ? 1 : 0) | (dy > 0.5 ? 2 : 0) | (-dx > 0.5 ? 4 : 0) | (dx > 0.5 ? 8 : 0);
+}
+
+/** World up `worldUp` (default +Z, §2) in the camera frame of a world-to-camera rotation `R` (row-major): R · worldUp. */
+export function worldUpInCamera(R: ArrayLike<number>, worldUp: ArrayLike<number> = [0, 0, 1]): [number, number, number] {
+  const [a, b, c] = [worldUp[0], worldUp[1], worldUp[2]];
+  return [R[0] * a + R[1] * b + R[2] * c, R[3] * a + R[4] * b + R[5] * c, R[6] * a + R[7] * b + R[8] * c];
+}
 
 /**
  * Halo mask of one depth map: bit i (Uint32 words, 1 bit per pixel, the layout of fusion's
@@ -106,7 +147,8 @@ export function depthHaloMask(dm: DepthMap, image: RGBAImage, cam: CameraIntrins
   const o: HaloFilterOptions = { ...DEFAULT_HALO_FILTER_OPTIONS, ...options };
   const e = Math.max(0, Math.floor(o.radius));
   const st = Math.max(1, Math.floor(o.step));
-  const skyOn = o.skyMaxStd > 0 && o.skyMinCoherence > 0;
+  const skyB = o.skyMaxStd > 0 && o.skyMinCoherence > 0 ? skyBorders(o.skyUp) : 0;
+  const skyOn = skyB !== 0;
   const W = dm.width;
   const H = dm.height;
   const n = W * H;
@@ -164,7 +206,7 @@ export function depthHaloMask(dm: DepthMap, image: RGBAImage, cam: CameraIntrins
   const out = new Uint32Array((n + 31) >>> 5);
   let rejected = 0;
   if (e > 0) rejected += haloVote(dm, rgb, o, e, st, onPlane, pa, pb, pc, pn, out);
-  if (skyOn) rejected += skyTest(dm, rgb, o, onPlane, out);
+  if (skyOn) rejected += skyTest(dm, rgb, o, skyB, onPlane, out);
   return rejected > 0 ? out : null;
 }
 
@@ -299,15 +341,21 @@ function haloVote(
   return rejected;
 }
 
-/** Step 2 (file header): rejects every valid depth of the incoherent top-connected untextured regions. */
-function skyTest(dm: DepthMap, rgb: Uint8Array, o: HaloFilterOptions, onPlane: PlaneTest, out: Uint32Array): number {
+/** Step 2 (file header): rejects every valid depth of the incoherent untextured regions connected to `borders`. */
+function skyTest(dm: DepthMap, rgb: Uint8Array, o: HaloFilterOptions, borders: number, onPlane: PlaneTest, out: Uint32Array): number {
   const W = dm.width;
   const H = dm.height;
   const depth = dm.depth;
   const std = segmentTextureSampler(rgb, W, H, o.skyTextureRadius, o.skyTextureStep, o.segmentColor, Math.max(1, o.skyTextureMinSamples));
   const maxStd = o.skyMaxStd;
-  // flood fill from the top row; each pixel's texture is evaluated at most once, on the way
-  const { labels, count } = borderComponents((i) => std(i) < maxStd, rgb, W, H, o.segmentColor, 1);
+  // flood fill from the up-facing border(s); each pixel's texture is evaluated at most once, on
+  // the way (memo: 0 unknown, 1 untextured, 2 textured)
+  const memo = new Uint8Array(W * H);
+  const low = (i: number): boolean => {
+    if (!memo[i]) memo[i] = std(i) < maxStd ? 1 : 2;
+    return memo[i] === 1;
+  };
+  const { labels, count } = borderComponents(low, rgb, W, H, o.segmentColor, borders);
   if (count === 0) return 0;
   const area = new Float64Array(count + 1);
   const coherent = new Float64Array(count + 1);

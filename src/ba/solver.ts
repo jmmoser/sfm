@@ -263,6 +263,14 @@ class BAEngine {
         prior += 0.5 * (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
       }
     }
+    const fps = p.focalPriors;
+    if (fps) {
+      for (let k = 0; k < fps.length; k++) {
+        const fp = fps[k];
+        const r = (K[5 * fp.camera] - fp.f) / fp.sigma;
+        prior += 0.5 * r * r;
+      }
+    }
     const total = cost + comp + prior;
     return { cost: total === total ? total : Infinity, sqErr: sq };
   }
@@ -834,6 +842,20 @@ class BAEngine {
             for (let bb = 0; bb < 3; bb++)
               U[off + 6 * a + bb] += A[a] * B[bb] + A[3 + a] * B[3 + bb] + A[6 + a] * B[6 + bb];
         }
+      }
+    }
+
+    // focal priors: r = (f − f₀)/σ, ∂r/∂f = 1/σ (focal is the first parameter of a camera block when refined)
+    const fps = p.focalPriors;
+    if (fps) {
+      for (let k = 0; k < fps.length; k++) {
+        const fp = fps[k];
+        const cb = this.camBlock[fp.camera];
+        if (cb < 0 || this.camIdx[5 * fp.camera] !== 0) continue;
+        const is = 1 / fp.sigma;
+        const r = (this.K[5 * fp.camera] - fp.f) * is;
+        gY[bStart[cb]] += is * r;
+        U[diagOff[cb]] += is * is;
       }
     }
 

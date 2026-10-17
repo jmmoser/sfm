@@ -544,10 +544,14 @@ export class CompassSensor {
    * Compass heading at time t: the platform value (iOS `webkitCompassHeading`, interpolated
    * along the shorter arc, within 500 ms) or, for absolute-orientation sources, the azimuth of
    * the same reference direction (device top, camera direction when upright).
+   * Under the 'ui-top' model the platform value refers to the UI top (±90° off the device top in
+   * landscape), so the reading comes from the ψ-corrected attitude instead: consumers
+   * (FrameInfo.heading, the world alignment's compassReference 'auto') always get the device-top /
+   * camera-direction convention.
    */
   headingAt(t: number): HeadingReading | null {
     const ring = this.rel;
-    if (ring.size > 0) {
+    if (ring.size > 0 && this.model === 'device-top') {
       // nearest valid compass readings around t
       const i = ring.lowerBound(t);
       let before = -1;

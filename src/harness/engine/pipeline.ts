@@ -26,6 +26,7 @@ import {
   type ScreenAngle,
   type SparseResult,
 } from '../../workers/protocol';
+import { debugKeyframes, debugPairs } from './debug-dump';
 import { createHarnessEngine, type HarnessEngine } from './engines';
 import {
   HeadingNorthEmulator,
@@ -206,6 +207,8 @@ function resolveConfig(c: HarnessConfig, meta: DatasetMeta | null): ResolvedHarn
     embedDensePoints: c.embedDensePoints ?? true,
     maxFrameErrors: c.maxFrameErrors ?? 3,
     logFrames: c.logFrames ?? true,
+    liveTrace: c.liveTrace ?? false,
+    debugDump: c.debugDump ?? false,
   };
 }
 
@@ -358,6 +361,15 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
     eng.onLive((u) => {
       liveEvents++;
       lastLive = u;
+      if (cfg.liveTrace && u.cameras)
+        (result.liveTrace ??= []).push({
+          ms: now(),
+          frameIndex: u.frameIndex,
+          keyframes: u.numKeyframes,
+          registered: u.numRegistered,
+          points: u.numPoints,
+          poses: u.cameras.map((c) => poseToJSON(c.pose)),
+        });
     });
     eng.onLog((l) => {
       if (result.logs.length < 1000 || l.level === 'error' || l.level === 'warn') result.logs.push({ ms: now(), level: l.level, message: l.message });
@@ -481,6 +493,10 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
       try {
         upd = await eng.processFrame(input);
         consecutiveErrors = 0;
+        if (cfg.debugDump && upd.decision === 'keyframe') {
+          const kfs = debugKeyframes(eng);
+          if (kfs) (result.debug ??= { keyframeTrace: [] }).keyframeTrace.push({ frameIndex: f.index, keyframes: kfs });
+        }
       } catch (e) {
         consecutiveErrors++;
         const err = errorOf(`frame ${f.index}`, e);
@@ -582,6 +598,10 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
       await eng.finishCapture();
       mark('finishCapture', t0);
       applyLive();
+      if (cfg.debugDump) {
+        const d = (result.debug ??= { keyframeTrace: [] });
+        d.afterCapture = { keyframes: debugKeyframes(eng), pairs: debugPairs(eng) };
+      }
       log(`[harness] mapping queue drained: ${result.live.keyframes} keyframes, ${result.live.registered} registered live, ${result.live.points} points (${result.live.unsolicitedUpdates} background updates)`);
     } catch (e) {
       mark('finishCapture', t0);
@@ -596,6 +616,10 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
     try {
       sparse = await eng.refine(onProgress('refine'));
       mark('refine', t0);
+      if (cfg.debugDump) {
+        const d = (result.debug ??= { keyframeTrace: [] });
+        d.afterRefine = { keyframes: debugKeyframes(eng), pairs: debugPairs(eng) };
+      }
     } catch (e) {
       mark('refine', t0);
       fail('refine', e);

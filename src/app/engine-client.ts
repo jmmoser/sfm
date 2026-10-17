@@ -218,6 +218,8 @@ export class EngineClient implements EngineLike {
   private hidden = false;
   /** Resolvers waiting for a request to settle (abortLongOperation). */
   private readonly settleWaiters = new Map<number, (() => void)[]>();
+  /** abortLongOperation in progress per request id (a second abort of the same request shares it). */
+  private readonly aborts = new Map<number, Promise<AbortOutcome>>();
   private readonly live = new Emitter<LiveUpdate>();
   private readonly progressE = new Emitter<ProgressEvent>();
   private readonly logE = new Emitter<LogMessage>();
@@ -344,10 +346,21 @@ export class EngineClient implements EngineLike {
     void this.call('cancel', { target }, { timeoutMs: this.opts.callTimeoutMs }).catch(() => undefined);
   }
 
-  async abortLongOperation(opts: { graceMs?: number } = {}): Promise<AbortOutcome> {
+  abortLongOperation(opts: { graceMs?: number } = {}): Promise<AbortOutcome> {
     const id = this.longOp;
     const p = id !== null ? this.pending.get(id) : undefined;
-    if (id === null || !p) return 'none';
+    if (id === null || !p) return Promise.resolve('none');
+    // Overlapping aborts of the same request (capture: Cancel, then Discard) share one outcome:
+    // otherwise the first one's restart settles the request and the second reports 'cancelled'.
+    let run = this.aborts.get(id);
+    if (!run) {
+      run = this.abortRequest(id, p, opts).finally(() => this.aborts.delete(id));
+      this.aborts.set(id, run);
+    }
+    return run;
+  }
+
+  private async abortRequest(id: number, p: Pending, opts: { graceMs?: number }): Promise<AbortOutcome> {
     this.cancel();
     const graceMs = Math.max(0, opts.graceMs ?? 5000);
     const settled = await new Promise<boolean>((resolve) => {

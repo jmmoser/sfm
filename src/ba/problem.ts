@@ -11,6 +11,7 @@
  *  - Point j: world XYZ, additive updates.
  *
  * Cost (Ceres convention): `½ Σ_obs ρ(‖w (π(X) − uv)‖²) + ½ Σ_priors ‖r_prior‖²`
+ * (priors: camera centres, relative rotations, focal lengths)
  * where `w = obsWeight[o]` (1/σ, default 1) and ρ is the robust loss with scale
  * `lossScalePx` applied to the WEIGHTED residual (i.e. in units of σ when weights
  * are 1/σ). Priors use the trivial loss.
@@ -42,6 +43,16 @@ export interface BARelRotationPrior {
   sigma: number;
 }
 
+/**
+ * Focal-length prior of a camera: residual `(f_c − f)/sigma` (pixels / pixels). Only acts when the
+ * camera's focal is refined. E.g. per-image focal lengths (focus breathing) tied to a shared value.
+ */
+export interface BAFocalPrior {
+  camera: number;
+  f: number;
+  sigma: number;
+}
+
 export interface BAProblem {
   /** Intrinsics per camera; refined in place. */
   cameras: CameraIntrinsics[];
@@ -69,6 +80,7 @@ export interface BAProblem {
   obsWeight?: Float32Array;
   centerPriors?: BACenterPrior[];
   relRotationPriors?: BARelRotationPrior[];
+  focalPriors?: BAFocalPrior[];
 }
 
 export type BALossType = 'trivial' | 'huber' | 'cauchy' | 'soft_l1';
@@ -243,6 +255,12 @@ export function validateBAProblem(p: BAProblem): void {
       if (!(cp.pose >= 0 && cp.pose < nP) || (cp.pose | 0) !== cp.pose)
         throw new RangeError(`BA: centerPrior pose ${cp.pose} out of range`);
       if (!(cp.sigma > 0)) throw new RangeError('BA: centerPrior sigma must be > 0');
+    }
+  }
+  if (p.focalPriors) {
+    for (const fp of p.focalPriors) {
+      if (!(fp.camera >= 0 && fp.camera < nC) || (fp.camera | 0) !== fp.camera) throw new RangeError(`BA: focalPrior camera ${fp.camera} out of range`);
+      if (!(fp.sigma > 0) || !Number.isFinite(fp.f)) throw new RangeError('BA: focalPrior needs a finite f and sigma > 0');
     }
   }
   if (p.relRotationPriors) {

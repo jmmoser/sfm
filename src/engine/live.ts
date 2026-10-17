@@ -26,9 +26,13 @@ import { cameraFromDevice, type ScreenAngle } from '../sensors/frame-orientation
 import { angularSpeedAt, integrateGyro } from '../sensors/motion';
 import { CorrespondenceGraph } from '../sfm/correspondence-graph';
 import { FeatureDatabase, pairKey } from '../sfm/database';
+import { checkPairRotation, checkPoseRotation, GyroReference, type GyroToleranceOptions, type TimedRotation } from '../sfm/gyro';
+import { estimateTimeOffset, type InertialKeyframe } from '../sfm/inertial';
 import { KeyframeSelector, rotationCompensatedParallax, type KeyframeCandidate } from '../sfm/keyframes';
 import { LiveMapper } from '../sfm/live';
-import { intrinsicsFromFov } from '../sfm/mapper';
+import { rsModelFromDevice, type RollingShutterModel } from '../sfm/rolling-shutter';
+import { intrinsicsFromFov, type MapperOptions } from '../sfm/mapper';
+import type { Reconstruction } from '../sfm/reconstruction';
 import { VocabularyIndex } from '../sfm/vocab';
 import type { CaptureMode, FrameInput, Guidance, LiveCamera, LiveUpdate, QualityPreset, TrackingState } from '../workers/protocol';
 import {
@@ -54,6 +58,7 @@ import {
   type StoredPairs,
 } from './persistence';
 import { MB, MEM, captureMemory, formatBreakdown, sumBreakdown, type MemoryBreakdown } from './memory';
+import { correctKeyframeRS } from './refine-camera';
 import { ENGINE_DEFAULTS, modeConfig, type QualityPresetConfig } from './presets';
 import type { EngineConfig, KeyframeRecord } from './types';
 
@@ -158,6 +163,14 @@ export class CaptureState {
   imuChunks = 0;
   captureFinished = false;
   timeOffsetMs: number | null = null;
+  /** Gyro bias (rad/s, device frame) estimated from the live keyframes; null until estimated. */
+  gyroBias: [number, number, number] | null = null;
+  /**
+   * Rolling-shutter model applied to the keyframe keypoints (in place; null = none) and the
+   * original keypoints of every corrected keyframe (src/engine/refine-camera.ts).
+   */
+  rollingShutter: RollingShutterModel | null = null;
+  readonly rsOriginal = new Map<number, Float32Array>();
 
   /** R_cam_device of the canonical images. */
   cameraFromDevice(): Mat3 {
@@ -196,6 +209,18 @@ function kMatrix(cam: CameraIntrinsics): Float64Array {
 function kInverse(cam: CameraIntrinsics): Float64Array {
   const fi = 1 / cam.f;
   return Float64Array.of(fi, 0, -cam.cx * fi, 0, fi, -cam.cy * fi, 0, 0, 1);
+}
+
+function mat3TransposeOf(R: ArrayLike<number>): Float64Array {
+  return Float64Array.of(R[0], R[3], R[6], R[1], R[4], R[7], R[2], R[5], R[8]);
+}
+
+function mat3MulVecOf(R: ArrayLike<number>, v: ArrayLike<number>): Float64Array {
+  return Float64Array.of(R[0] * v[0] + R[1] * v[1] + R[2] * v[2], R[3] * v[0] + R[4] * v[1] + R[5] * v[2], R[6] * v[0] + R[7] * v[1] + R[8] * v[2]);
+}
+
+function negate(v: ArrayLike<number>): Float64Array {
+  return Float64Array.of(-v[0], -v[1], -v[2]);
 }
 
 function poseCentre(p: Pose): Float64Array {
@@ -320,7 +345,6 @@ export class LiveSession {
   readonly mapper: LiveMapper;
   private ref: TrackingRef | null = null;
   private segment: number | null = null;
-  private evaluated = 0;
   private queue: Promise<void> = Promise.resolve();
   private queued = 0;
   private readonly writes = new Set<Promise<unknown>>();
@@ -340,14 +364,40 @@ export class LiveSession {
   private disposed = false;
   private readonly minPairInliers = ENGINE_DEFAULTS.minPairInliers;
   /** Accumulated diagnostics. */
-  readonly stats = { frames: 0, keyframes: 0, mappingMs: 0, featureMs: 0, trackingMs: 0, guidedFallbacks: 0, handEye: null as HandEyeResult | null };
+  readonly stats = {
+    frames: 0,
+    keyframes: 0,
+    mappingMs: 0,
+    featureMs: 0,
+    trackingMs: 0,
+    guidedFallbacks: 0,
+    handEye: null as HandEyeResult | null,
+    /** Keyframes forced by the hard rotation limit (fast pans). */
+    forcedKeyframes: 0,
+    /** Verified pairs / registrations / initial pairs rejected by the gyro check. */
+    gyroRejectedPairs: 0,
+    gyroRejectedPoses: 0,
+    /** Planar pairs whose two-fold ambiguity the gyro resolved (alternative branch taken). */
+    gyroPlanarSwaps: 0,
+    /** Live gyro calibrations (bias / time offset from the registered keyframes). */
+    gyroCalibrations: 0,
+  };
+  /** Bias-aware gyro integration (camera frame) shared by tracking, gates and refine. */
+  private readonly gyroRef = new GyroReference();
+  private gyroCalibratedAt = 0;
 
   constructor(private readonly deps: LiveDeps) {
     const mc = modeConfig(deps.mode);
     this.selector = new KeyframeSelector({ mode: mc.keyframeMode, ...mc.keyframe, ...(deps.config.keyframe ?? {}) });
+    // RS-aware motion gate: with the device's rolling shutter corrected live, fast rotation no
+    // longer skews the keypoints — only blur limits the angular speed (the sharpness gate sees it)
+    if (deps.config.rollingShutter && deps.config.rollingShutter.readoutMs > 0 && deps.config.keyframe?.maxAngularSpeed === undefined) {
+      this.selector.options.maxAngularSpeed = Math.max(this.selector.options.maxAngularSpeed, deps.config.rsMaxAngularSpeed ?? 2.0);
+    }
     this.orientation = new OrientationTracker(deps.config.settleMs ?? ENGINE_DEFAULTS.settleMs);
     this.mapper = new LiveMapper(this.state.db, this.state.graph, {
       hfovPriorDeg: deps.hfovPriorDeg ?? 69,
+      rotationCheck: this.rotationCheck(),
       ...(deps.config.live ?? {}),
     });
   }
@@ -370,11 +420,127 @@ export class LiveSession {
 
   /** Gyro rotation of the camera between t0 and t1 (camera-t0 → camera-t1 frame), or null. */
   gyroRotation(t0: number, t1: number): Mat3 | null {
-    const off = this.state.timeOffsetMs ?? 0;
-    if (!this.state.imu.covers(t0 + off, t1 + off)) return null;
-    const G = integrateGyro(this.state.imu.samples, t0 + off, t1 + off);
-    const Rcd = this.state.cameraFromDevice();
-    return mat3MulTranspose(mat3Mul(Rcd, G), Rcd);
+    return this.gyro().relative(t0, t1);
+  }
+
+  /**
+   * The capture's gyro (bias-compensated once estimated, camera–IMU offset, current R_cam_device),
+   * synchronised with the IMU log.
+   */
+  gyro(): GyroReference {
+    const st = this.state;
+    const g = this.gyroRef;
+    g.offsetMs = st.timeOffsetMs ?? 0;
+    g.R_cam_device = st.cameraFromDevice();
+    const b = st.gyroBias;
+    const cur = g.bias;
+    if ((b === null) !== (cur === null) || (b && cur && (b[0] !== cur[0] || b[1] !== cur[1] || b[2] !== cur[2]))) g.setBias(b, st.imu.samples);
+    else g.sync(st.imu.samples);
+    return g;
+  }
+
+  /**
+   * The gyro for consistency checks (pairs, registrations, models): only once the camera←device
+   * mapping is verified (hand-eye check) — a wrong R_cam_device would reject every correct pair —
+   * and unless disabled (`EngineConfig.gyroGate: false`). Null otherwise.
+   */
+  gyroForChecks(): GyroReference | null {
+    if (this.deps.config.gyroGate === false || !this.state.cameraThetaVerified) return null;
+    const g = this.gyro();
+    return g.numSamples >= 2 ? g : null;
+  }
+
+  /** Tolerance of the gyro checks (the drift allowance shrinks once the bias is estimated). */
+  gyroTolerance(): Partial<GyroToleranceOptions> {
+    const t = this.deps.config.gyroTolerance ?? {};
+    return { driftDegPerS: this.state.gyroBias ? 0.1 : 0.3, ...t };
+  }
+
+  /**
+   * Gyro check of a verified pair (a → b): null when its rotation disagrees with the gyro (false
+   * matches on repeated structure); a planar pair whose ambiguous alternative branch agrees is
+   * switched to it. Pairs without a rotation or without gyro coverage pass unchanged.
+   */
+  gatePair(a: number, b: number, g: TwoViewGeometry | null): TwoViewGeometry | null {
+    if (!g || g.config === 'degenerate' || !g.R) return g;
+    const gyro = this.gyroForChecks();
+    const ra = this.state.records.get(a),
+      rb = this.state.records.get(b);
+    if (!gyro || !ra || !rb) return g;
+    const tol = this.gyroTolerance();
+    const c = checkPairRotation(gyro, ra.t, rb.t, g.R, tol);
+    if (!c || c.ok) return g;
+    const alt = (g as TwoViewGeometry & { planarAlternative?: { R: Mat3; t: Float64Array } }).planarAlternative;
+    if (alt) {
+      const c2 = checkPairRotation(gyro, ra.t, rb.t, alt.R, tol);
+      if (c2 && c2.ok) {
+        this.stats.gyroPlanarSwaps++;
+        return { ...g, R: alt.R, t: alt.t };
+      }
+    }
+    this.stats.gyroRejectedPairs++;
+    this.deps.log('debug', `pair ${a}-${b} rejected by the gyro: rotation ${(c.errRad / DEG).toFixed(1)}° off (tolerance ${(c.tolRad / DEG).toFixed(1)}°)`);
+    return null;
+  }
+
+  /** Gyro check of a new absolute pose against the registered keyframes nearest in time (majority vote). */
+  checkPoseGyro(id: number, pose: Pose, rec: Reconstruction): boolean {
+    const gyro = this.gyroForChecks();
+    const r = this.state.records.get(id);
+    if (!gyro || !r) return true;
+    const nbs: TimedRotation[] = [];
+    for (const rid of rec.registeredImageIds()) {
+      if (rid === id) continue;
+      const rr = this.state.records.get(rid);
+      const im = rec.images.get(rid);
+      if (rr && im) nbs.push({ id: rid, t: rr.t, R: im.pose.R });
+    }
+    const c = checkPoseRotation(gyro, r.t, pose.R, nbs, { tolerance: this.gyroTolerance() });
+    if (!c || c.ok) return true;
+    this.stats.gyroRejectedPoses++;
+    this.deps.log('debug', `registration of keyframe ${id} rejected by the gyro: rotation ${(c.errRad / DEG).toFixed(1)}° off (${c.disagree}/${c.agree + c.disagree} neighbours disagree)`);
+    return false;
+  }
+
+  /** `MapperOptions.rotationCheck` backed by the capture's gyro (live and offline mapping). */
+  rotationCheck(): NonNullable<MapperOptions['rotationCheck']> {
+    return {
+      pair: (a, b, R) => {
+        const g = this.gatePair(a, b, { config: 'calibrated', inliers: new Uint32Array(0), R });
+        return g !== null;
+      },
+      pose: (id, pose, rec) => this.checkPoseGyro(id, pose, rec),
+    };
+  }
+
+  /**
+   * Gyro bias and camera–IMU offset from the registered live keyframes (every 10 registrations
+   * once 12 are registered and R_cam_device is verified): `estimateTimeOffset` (vision vs gyro
+   * relative rotations, robust). The bias is adopted when ≥ 8 pairs agree, the offset when the
+   * estimate is reliable. Improves the gyro prediction of tracking / guided matching and tightens
+   * the gyro gates (the drift allowance drops from 0.3 to 0.1°/s).
+   */
+  private maybeCalibrateGyro(): void {
+    const st = this.state;
+    if (this.deps.config.liveGyroCalibration === false || !st.cameraThetaVerified) return;
+    const kfs = this.registeredKeyframes();
+    if (kfs.length < 12 || kfs.length - this.gyroCalibratedAt < 10) return;
+    this.gyroCalibratedAt = kfs.length;
+    const Rcd = st.cameraFromDevice();
+    const ik: InertialKeyframe[] = kfs.map((k) => ({ t: k.t, R_wc: mat3TransposeOf(k.pose.R), C: poseCentre(k.pose), R_cam_device: Rcd }));
+    const cur = st.timeOffsetMs ?? 0;
+    const t0 = now();
+    const r = estimateTimeOffset(ik, st.imu.samples, { initialOffsetMs: cur, searchRangeMs: st.gyroBias ? 60 : 150, maxPairGapMs: 2000 });
+    if (!r || r.numInliers < 8 || ![...r.gyroBias].every(Number.isFinite)) return;
+    st.gyroBias = [r.gyroBias[0], r.gyroBias[1], r.gyroBias[2]];
+    if (r.reliable) st.timeOffsetMs = r.offsetMs;
+    this.stats.gyroCalibrations++;
+    this.deps.log(
+      'info',
+      `live gyro calibration (${kfs.length} keyframes, ${Math.round(now() - t0)} ms): bias ${st.gyroBias.map((x) => (x * 1000).toFixed(1)).join(', ')} mrad/s, ` +
+        `time offset ${r.reliable ? `${r.offsetMs.toFixed(1)} ms` : `kept ${cur.toFixed(1)} ms (σ ${r.stdMs.toFixed(1)} ms)`}`,
+    );
+    this.persistState();
   }
 
   // ------------------------------------------------------------------------------------------
@@ -466,10 +632,8 @@ export class LiveSession {
       const W = prep.width,
         H = prep.height;
       const angSpeed = angularSpeedAt(st.imu.samples, f.t + (st.timeOffsetMs ?? 0));
-      const so = this.selector.options;
-      const warm = this.evaluated >= Math.min(Math.max(0, so.sharpnessWarmup), so.sharpnessWindow);
-      const sref = this.selector.sharpnessReference;
-      this.evaluated++;
+      // gyro rotation since the last keyframe (hard rotation limit: fast pans force keyframes)
+      const Rk = this.ref ? this.gyroRotation(this.ref.t, f.t) : null;
       const cand: KeyframeCandidate = {
         t: f.t,
         sharpness: prep.sharpness,
@@ -478,13 +642,12 @@ export class LiveSession {
         numMatchesToLastKF: 0,
         numInliersToLastKF: NaN,
         medianParallaxPx: NaN,
-        rotationSinceLastKFRad: NaN,
+        rotationSinceLastKFRad: Rk ? rotationAngle(Rk) : NaN,
         imageWidth: W,
       };
-      // pre-gate: blurry / fast-rotating frames are rejected without feature extraction
-      const blurry = warm && Number.isFinite(sref) && prep.sharpness < so.blurRatio * sref;
-      const fast = Number.isFinite(angSpeed) && angSpeed > so.maxAngularSpeed;
-      if (blurry || fast || !(prep.sharpness >= so.minSharpness)) {
+      // pre-gate: blurry / fast-rotating frames are rejected without feature extraction (the
+      // selector's own gate, relaxed for frames the hard rotation limit forces)
+      if (this.selector.gate(cand).reject) {
         const d = this.selector.evaluate(cand);
         return finish(this.baseUpdate(frameIndex, d.decision, this.mapGuidance(d.guidance), timings));
       }
@@ -519,6 +682,7 @@ export class LiveSession {
         this.lastFrameInliers = NaN;
       }
       let decision = this.selector.evaluate(cand);
+      if (decision.decision === 'keyframe' && decision.forced) this.stats.forcedKeyframes++;
       if (decision.decision === 'keyframe' && (st.captureFinished || this.disposed)) {
         // finishCapture / refine started while this frame was being analysed: no new keyframe
         // (its mapping job would change the live model under refine)
@@ -675,12 +839,29 @@ export class LiveSession {
     this.track(img.then((im) => store.putFrame(id, im, rec)), 4 * prep.width * prep.height);
     const fsBytes = serializeFeatureSet(fs);
     this.track(store.putBinary(`kf/${id}/features`, fsBytes), 2 * fsBytes.byteLength);
+    // a rolling shutter known in advance is corrected live (the store keeps the original keypoints)
+    this.applyLiveRollingShutter(id);
     this.track(store.putBinary(`kf/${id}/colors`, colors), colors.byteLength);
     const chunk = st.imu.takeChunk();
     if (chunk.length) this.track(store.putBinary(`imu/${st.imuChunks++}`, packImu(chunk)));
     if (st.geo.length) this.track(store.putValue('geo', st.geo));
     this.persistState();
     return id;
+  }
+
+  /** Canonical-image rolling-shutter model known in advance (`EngineConfig.rollingShutter`), or null. */
+  liveRollingShutter(): RollingShutterModel | null {
+    const dev = this.deps.config.rollingShutter;
+    if (!dev || !(dev.readoutMs > 0)) return null;
+    return rsModelFromDevice(dev, this.state.cameraFromDevice());
+  }
+
+  /** Correct keyframe `id` for the rolling shutter known in advance (no-op without one). */
+  private applyLiveRollingShutter(id: number): void {
+    const model = this.liveRollingShutter();
+    const r = this.state.records.get(id);
+    if (!model || !r) return;
+    if (correctKeyframeRS(this.state, id, this.intrinsics(r.width, r.height), this.gyro(), model)) this.state.rollingShutter = model;
   }
 
   /** Track a background write holding `bytes` until it completes; failures are reported as storage errors. */
@@ -778,6 +959,8 @@ export class LiveSession {
       hasDense: false,
       hasMesh: false,
       timeOffsetMs: st.timeOffsetMs,
+      gyroBias: st.gyroBias,
+      rollingShutter: st.rollingShutter,
       updatedAt: Date.now(),
       ...extra,
     };
@@ -844,7 +1027,8 @@ export class LiveSession {
     const ca = this.intrinsics(ra.width, ra.height);
     const cb = this.intrinsics(rb.width, rb.height);
     const Rp = this.gyroRotation(ra.t, rb.t);
-    return estimateTwoViewGeometry(fa.keypoints, fb.keypoints, m, ca, cb, { maxIterations: opts.maxIterations ?? 2000, rotationPrior: Rp ?? undefined });
+    const g = estimateTwoViewGeometry(fa.keypoints, fb.keypoints, m, ca, cb, { maxIterations: opts.maxIterations ?? 2000, rotationPrior: Rp ?? undefined });
+    return this.gatePair(a, b, g);
   }
 
   /** Record a verified pair in the DB and graph. */
@@ -901,7 +1085,7 @@ export class LiveSession {
       st.attempted.add(key);
       attempted.push(key);
       let g: TwoViewGeometry | null = null;
-      if (job.tracking && job.tracking.other === c.other && usable(job.tracking.geom, this.minPairInliers)) g = job.tracking.geom;
+      if (job.tracking && job.tracking.other === c.other && usable(job.tracking.geom, this.minPairInliers)) g = this.gatePair(c.other, id, job.tracking.geom);
       else {
         try {
           g = await this.matchPair(c.other, id, { maxIterations: c.speculative ? 1000 : 2000 });
@@ -921,6 +1105,7 @@ export class LiveSession {
     // vocabulary: train once enough keyframes exist, then index incrementally
     this.updateVocabulary(id);
     this.maybeVerifyCameraFromDevice();
+    this.maybeCalibrateGyro();
     this.maybeResolveMode();
     const rec: StoredPairs = { pairs: stored, attempted };
     this.track(this.deps.store.putValue(`kf/${id}/pairs`, rec));
@@ -946,7 +1131,15 @@ export class LiveSession {
       const C = poseCentre(p);
       return Float64Array.of(C[0] + depth * p.R[6], C[1] + depth * p.R[7], C[2] + depth * p.R[8]);
     };
-    const ap = rec.images.get(anchor)!.pose;
+    // The new keyframe looks where the gyro says, not where the anchor looked: after a fast pan
+    // (or while tracking is lost) the last registered keyframe can be tens of degrees away, and
+    // its neighbours are then wrong candidates (false matches on repeated structure). Centre:
+    // the anchor's (translation is not observed by the gyro).
+    const anchorPose = rec.images.get(anchor)!.pose;
+    const ra = st.records.get(anchor),
+      rn = st.records.get(st.order[pos]);
+    const G = ra && rn ? this.gyroRotation(ra.t, rn.t) : null;
+    const ap: Pose = G ? { R: mat3Mul(G, anchorPose.R), t: mat3MulVecOf(mat3Mul(G, anchorPose.R), negate(poseCentre(anchorPose))) } : anchorPose;
     const aL = look(ap);
     const out: { id: number; d: number }[] = [];
     for (const rid of rec.registeredImageIds()) {
@@ -1155,6 +1348,7 @@ export class LiveSession {
     st.frameCounter = rec.frameCounter;
     st.captureFinished = rec.captureFinished;
     st.timeOffsetMs = rec.timeOffsetMs ?? null;
+    st.gyroBias = rec.gyroBias && rec.gyroBias.length === 3 && rec.gyroBias.every(Number.isFinite) ? [rec.gyroBias[0], rec.gyroBias[1], rec.gyroBias[2]] : null;
     this.orientation.thetaSession = st.thetaSession;
     st.rawDelivery = rec.rawDelivery ?? null;
     this.orientation.rawDelivery = st.rawDelivery;
@@ -1188,6 +1382,10 @@ export class LiveSession {
     // a keyframe record is written once, when the keyframe is created: R_cam_device / gravityCam
     // of keyframes stored before a hand-eye switch (or a θ₀ re-interpretation) are stale
     if (st.cameraTheta !== null) this.setCameraTheta(st.cameraTheta);
+    // the store holds the ORIGINAL keypoints: a refine-estimated rolling shutter is estimated again
+    // by the next refine; one known in advance is applied again
+    st.rollingShutter = null;
+    for (const id of st.order) this.applyLiveRollingShutter(id);
     // pairs
     const pairsById = new Map<number, StoredPair[]>();
     for (const id of st.order) {

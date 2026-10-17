@@ -865,8 +865,10 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
 * **GT surface**: area-uniform samples with int8 normals and per-sample visibility
   counts (depth-tested against every frame). The object scene has an extra dense
   "focus" set on the object of interest, so mm-level accuracy can be measured.
-* **Known limits**: global shutter (no rolling shutter); no lighting changes beyond
-  ±5 % exposure; no specularity; the camera and IMU have no lever arm; textures repeat
+* **Known limits**: global shutter and fixed focal by default (rolling shutter, focus
+  breathing, hand shake / fast pans, WB drift: opt-in `*-real` presets, e2e/README.md
+  "Real-capture artefacts"); no lighting changes beyond ±5 % exposure (±15 % in the
+  presets); no specularity; the camera and IMU have no lever arm; textures repeat
   only where the material is periodic (bricks, shingles, grass/soil detail tiles of
   2.3 / 3.7 m). SwiftShader renders about 0.75–0.9 s per frame, so a full 240-frame
   yard dataset takes about 4 min.
@@ -2440,6 +2442,18 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   calibrated on devices; the compass reference axis (device top vs optical axis when upright) and the iOS 26 landscape
   heading behaviour remain unverified on hardware (ios-sensors.md) — the confident-GPS rule limits the damage; no
   coarse-location source exists in the app (GPS denied ⇒ magnetic yaw, northAligned false).
+* **Review (adversarial, 2026-10)**: the embedded `WMM.COF` and the 100-row test table are byte-identical to the official
+  `WMM2025COF.zip` (sha256 of WMM.COF dfa85978…b075582f); `wmm-independent.test.ts` re-synthesises the field a different
+  way (potential from explicit Legendre polynomials, −∇V by central differences in ECEF, geodetic NED projection) and
+  agrees with the official rows and with `magneticField` at 300 random places / heights / dates and at the poles
+  (≤ 5e-3 nT, ≤ 1e-4°). Heading conventions are checked on hand-built ENU poses (`world-heading.test.ts`: portrait
+  upright = optical axis, landscape θ = 90 / 270 and pitched-down = device top, magnetic = true − D restored by the
+  declination at one GPS fix; yaw recovered to 1e-6°). Fixed: under the `'ui-top'` heading model (selected when the
+  platform heading follows the UI top across rotations) `CompassSensor.headingAt` returned the raw UI-top heading, which
+  the world alignment reads as the device-top azimuth (±90° in landscape); it now reports the device-top / camera
+  reference from the ψ-corrected attitude (orientation.test.ts). Open: persisted keyframes from before this change carry
+  no `headingNorth` and are read as true north although the old app sent magnetic headings (`refine.ts`
+  `k.rec.headingNorth ?? 'true'`; `'magnetic'` would be right for app sessions).
 
 ### `src/app` — capture / viewer gaps + on-device benchmark (amends the `src/app` notes above)
 
@@ -2463,6 +2477,9 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   (session kept as `captured`); a session without IndexedDB cannot be recovered after a restart (said so). Leaving the
   capture (`abandon`) also aborts a running long operation. Engine follow-up (not app scope): check the cancel token
   inside the `live.flush()` wait of `finishCapture`, so a slow-but-alive drain stops without a restart.
+  Review fix: overlapping `abortLongOperation` calls for the same request (finishing card Cancel, then X → Discard
+  within the grace period) share one outcome — the second used to report `'cancelled'` although the worker was
+  restarted (`engine-client.gpu.test.ts`, one restart, both `'restarted'`).
 * **Capture memory cap** (`error` event reason `'out-of-memory'` / `CaptureMemoryLimitError`, or
   `LiveUpdate.timings.memoryLimited`): asked once — pause + card "Memory limit reached — finish scan now?" with
   **Finish scan** / **Continue (tracking only)** (fewer than 5 keyframes: Continue / Back to home), like the storage-full
@@ -2589,8 +2606,8 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
     `yard-final/render-cam120.png`) no longer shows the light-blue rim around roofs and trees.
 * **Cost**: +7–17 ms per 480×360 map on one x86 core. Measured: yard frame 120 34 → 44 ms, object frame 80 (large wall
   region) 38 → 54 ms. The cost scales with the top-connected untextured area, because texture is evaluated lazily during
-  the flood fill. Transient memory is +8 B/px: 16-bit grey, 16-bit labels and an Int32 flood-fill queue. The halo vote
-  itself is unchanged (37 ms).
+  the flood fill. Transient memory is +9 B/px: 16-bit grey, 16-bit labels, an Int32 flood-fill queue and a 1-byte
+  texture memo (each pixel's texture is evaluated at most once). The halo vote itself is unchanged (37 ms).
 * **Not kept**:
   * Rows 1, 2 and 5: they remove the object room's walls, −8.6 to −11 pt whole-scene completeness. Row 5 is also
     impractical in the engine, because fusion only gets colour thumbnails.
@@ -2607,8 +2624,9 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
     Its depths were wrong anyway, but any coherent patches on it go too.
   * Sky that is not connected to the top row (seen through foliage) is untouched. Neither are dark or textured skies
     (clouds).
-  * The test relies on upright dense images (§2: frames are processed upright). The engine passes no gravity vector to
-    src/dense.
+  * Without `skyUp` the test assumes upright dense images. Session frames are not always upright: they are rotated to
+    the session's canonical orientation (`src/sensors/frame-orientation.ts`), and under the portrait orientation lock
+    frames stay portrait-tagged (docs/research/ios-camera.md). See "Orientation (`skyUp`)" below.
   * Remaining yard error: far-field 2-view depth noise. 707 sky-coloured points remain, out of 15,985 farther than τ.
 * **Harness / runner additions**:
   * `preHalo` accepts an options object (`--set 'preHalo={"skyMaxStd":0}'` = the previous filter).
@@ -2617,3 +2635,53 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
     (`src/harness/dense-gt/texture-analysis.ts`).
   * `run-dense-gt.mjs` additionally prints the sky-coloured points (and their share of the points farther than τ)
     and the whole-scene P / C without ROI. It exports `parsePlyColors`, `breakdown` and `centreOf` for scripts.
+  * `haloSkyUp=true` passes each view's GT up direction as `skyUp`. `haloRotate=k` runs `preHalo` on views rotated
+    by k clockwise quarter turns and rotates the result back (`src/harness/dense-gt/halo-rotation.ts`), to simulate
+    frames that are not upright.
+* **Orientation (`skyUp`)**: the sky regions were seeded only at the top image row, so the test silently stops working
+  on frames that are not upright.
+  * New option `HaloFilterOptions.skyUp`: the up direction (opposite gravity) in the map's camera frame. The default is
+    null, which keeps the top row, so the defaults and `DENSE_PRESETS` are unchanged.
+  * `skyBorders(up)` picks the seed borders: those within 60° of the up direction projected onto the image (two borders
+    when the camera is rolled ≈ 30–60°). It uses all four borders when the camera looks within ≈ 15° of straight up,
+    and none (no sky test) when it looks within ≈ 15° of straight down.
+  * `worldUpInCamera(R)` = R · (0, 0, 1), for a Z-up world (§2). Both helpers are exported from `src/dense`.
+  * `skyUp` is per view: pass it to `removeDepthHalos` / `depthHaloMask`, not to `FusionOptions.haloFilter`.
+  * Measured on the saved maps (balanced, 480 px):
+
+  | views | yard P / C, sky-coloured > τ, all > τ | object P / C, whole scene P / C |
+  |---|---|---|
+  | upright, default (top row) | .9854 / .3521, 707, 15,985 | .9997 / .9874, .9558 / .3822 |
+  | upright, `skyUp` from the pose | identical | identical |
+  | rotated 90°, no `skyUp` | .9829 / .3522, 3,446, 18,734 | .9997 / .9874, .9558 / .3824 |
+  | rotated 180°, no `skyUp` | .9809 / .3523, 5,722, 21,021 (= sky test off) | .9997 / .9874, .9557 / .3824 |
+  | rotated 90° · 180°, with `skyUp` | identical to upright | identical to upright |
+
+  * At 90° the sky still reaches the top row at one corner, so part of it is found. At 180° (upside down) nothing is.
+    With `skyUp`, both rotations reproduce the upright result exactly.
+  * **For the engine owner** (src/engine is not changed here): `runDensify` calls `halo(dm, ref.image, ref.cam)`.
+    When the model is gravity-aligned, it should pass `{ skyUp: worldUpInCamera(image.pose.R) }`, or the frame's
+    −`gravityCam` (canonical camera axes). Without it, the sky test works only on upright frames.
+* **Phone-realistic captures** (`yard-real` / `object-real`: JPEG 0.85, motion blur, white-balance drift, focus breathing,
+  rolling shutter; e2e/README "Real-capture artefacts"). These are mini subsets with GT poses: yard 15 views and object
+  12 views, stride 8, balanced, 480 px. Maps were saved, then re-fused with the sky test off and on. The low absolute
+  P / C come from the capture artefacts under GT poses, not from the halo filter (another task is diagnosing them).
+
+  | | sky test off | sky test on |
+  |---|---|---|
+  | yard-real P / C / Csub | .9129 / .0994 / .2894 | .9153 / .0993 / .2890 |
+  | yard-real sky-coloured > τ, all > τ | 1,742, 44,584 | 405 (−77 %), 43,238 |
+  | yard-real fusion-input pixels without GT removed | 82.3 % | 94.0 % (≤ 1 % pixels: 1.6 → 1.6 %) |
+  | object-real P / C / Csub (ROI) | .9995 / .7409 / .9100 | identical (84 of 300 k points removed) |
+  | object-real whole scene P / C | .8719 / .0232 | .8736 / .0230 |
+  | object-real fusion-input pixels removed: > 5 % · 1–5 % · ≤ 1 % | 50.6 · 7.5 · 0.7 % | 52.4 · 10.2 · 0.9 % |
+
+  * The texture gate holds up under JPEG 0.85 on yard-real. Of the fusion-input sky pixels (no GT), 72.7 % have
+    std < 2 (clean yard 79.7 %) and 79.1 % have std < 3. All 22 top-connected untextured regions are GT sky, each with
+    coherence < 0.7.
+  * The coherence margin shrinks on object-real. 19 % of the top-connected untextured wall area (78 k of 414 k px) falls
+    below coherence 0.5 (clean object: 0.5 %), so it is treated as sky. The artefacts mostly ruin those wall depths
+    anyway: the top-connected untextured pixels hold 45 % of the > 5 % outliers but only 1.1 % of the ≤ 1 % pixels (clean
+    object at std < 2: 16 % and 14.5 %). The net effect is +0.17 pt whole-scene P for −0.02 pt C. This is the first case
+    to re-check on device. If real walls keep good but less coherent depths, lower `skyMinCoherence`. At 0.35 the clean
+    yard keeps 1,425 sky-coloured points farther than τ instead of 707 (row 6).

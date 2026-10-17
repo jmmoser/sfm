@@ -66,6 +66,8 @@ export interface KeyframeDecision {
   guidance?: CaptureGuidance;
   /** Set when decision = 'keyframe'. */
   trigger?: KeyframeTrigger;
+  /** True when the hard rotation limit forced the keyframe (`KeyframeSelector.isForced`). */
+  forced?: boolean;
 }
 
 /** Options of `KeyframeSelector`. */
@@ -106,6 +108,19 @@ export interface KeyframeSelectorOptions {
   hardOverlap: number;
   /** 'move_slower' warning above this fraction of maxAngularSpeed (default 0.75). */
   warnAngularRatio: number;
+  /**
+   * Hard rotation limit (deg, default 20; 0 = off): a keyframe is FORCED at the last frame before
+   * the gyro rotation since the last keyframe would pass it (rotation ≥ ½ maxRotationDeg and
+   * rotation + angular speed × frame interval ≥ limit) or at the first frame past it. Forced
+   * frames are not deferred for sharpness, are blur-rejected only below `forcedBlurRatio` × the
+   * median sharpness and motion-rejected only above `forcedMaxAngularSpeed`: a slightly blurred
+   * keyframe inside a fast pan keeps the map connected, a 35–45° gap does not (e2e yard-real: the
+   * keyframes after such a gap could not register and the walk was reconnected through false
+   * matches).
+   */
+  hardRotationDeg: number;
+  forcedBlurRatio: number;
+  forcedMaxAngularSpeed: number;
 }
 
 /** Defaults of `KeyframeSelectorOptions`. */
@@ -131,6 +146,9 @@ export const DEFAULT_KEYFRAME_OPTIONS: KeyframeSelectorOptions = {
   deferSharpnessRatio: 0.85,
   hardOverlap: 0.5,
   warnAngularRatio: 0.75,
+  hardRotationDeg: 20,
+  forcedBlurRatio: 0.25,
+  forcedMaxAngularSpeed: 3,
 };
 
 const DEG = Math.PI / 180;
@@ -156,6 +174,11 @@ export class KeyframeSelector {
   private histLen = 0;
   private deferStart: number | null = null;
   private kfCount = 0;
+  /** Recent frame intervals (ms) for the hard-rotation prediction. */
+  private dtRing = new Float64Array(5);
+  private dtCount = 0;
+  private dtHead = 0;
+  private lastFrameT: number | null = null;
 
   constructor(opts: Partial<KeyframeSelectorOptions> = {}) {
     this.options = {
@@ -203,6 +226,9 @@ export class KeyframeSelector {
     this.sharpHead = 0;
     this.resetTracking();
     this.kfCount = 0;
+    this.dtCount = 0;
+    this.dtHead = 0;
+    this.lastFrameT = null;
   }
 
   /** Start a new tracking segment (keeps the sharpness statistics). */
@@ -251,6 +277,61 @@ export class KeyframeSelector {
     this.kfCount = Math.max(0, this.kfCount - 1);
   }
 
+  private pushFrameTime(t: number): void {
+    if (this.lastFrameT !== null && t > this.lastFrameT) {
+      this.dtRing[this.dtHead] = t - this.lastFrameT;
+      this.dtHead = (this.dtHead + 1) % this.dtRing.length;
+      if (this.dtCount < this.dtRing.length) this.dtCount++;
+    }
+    this.lastFrameT = t;
+  }
+
+  /** Median interval (ms) of the recent frames presented to `evaluate` (NaN before two frames). */
+  get frameIntervalMs(): number {
+    const n = this.dtCount;
+    if (n === 0) return NaN;
+    const s = Array.from(this.dtRing.subarray(0, n)).sort((a, b) => a - b);
+    return s[n >> 1];
+  }
+
+  /**
+   * True when the candidate must become a keyframe for the hard rotation limit
+   * (`hardRotationDeg`): its rotation since the last keyframe is past the limit, or at least
+   * ½ maxRotationDeg and the next frame (angular speed × frame interval later) would be past it.
+   */
+  isForced(c: KeyframeCandidate): boolean {
+    const o = this.options;
+    const hard = o.hardRotationDeg * DEG;
+    if (this.lastKfT === null || !(hard > 0) || !Number.isFinite(c.rotationSinceLastKFRad)) return false;
+    const rot = c.rotationSinceLastKFRad;
+    if (rot >= hard) return true;
+    if (rot < 0.5 * o.maxRotationDeg * DEG) return false;
+    const dt = this.frameIntervalMs;
+    const w = Number.isFinite(c.angularSpeed) ? c.angularSpeed : 0;
+    return Number.isFinite(dt) && rot + w * (dt / 1000) >= hard;
+  }
+
+  /**
+   * Blur / motion gate of a frame without changing any state: the rejection `evaluate` would give
+   * it (blur relative to the running median of the previous frames, angular speed; relaxed for
+   * forced frames, `isForced`), or null. The engine uses it to skip feature extraction.
+   */
+  gate(c: KeyframeCandidate): { reject: 'reject_blur' | 'reject_motion' | null; forced: boolean; reference: number; reason: string } {
+    const o = this.options;
+    const warmup = Math.min(Math.max(0, o.sharpnessWarmup), this.sharpRing.length);
+    const ref = this.sharpCount >= warmup ? this.sharpnessReference : NaN;
+    const forced = this.isForced(c);
+    const ratio = forced ? Math.min(o.blurRatio, o.forcedBlurRatio) : o.blurRatio;
+    if (!(c.sharpness >= o.minSharpness) || (Number.isFinite(ref) && c.sharpness < ratio * ref)) {
+      return { reject: 'reject_blur', forced, reference: ref, reason: `sharpness ${fmt(c.sharpness)} < ${fmt(ratio)} × median ${fmt(ref)}` };
+    }
+    const maxW = forced ? Math.max(o.maxAngularSpeed, o.forcedMaxAngularSpeed) : o.maxAngularSpeed;
+    if (Number.isFinite(c.angularSpeed) && c.angularSpeed > maxW) {
+      return { reject: 'reject_motion', forced, reference: ref, reason: `angular speed ${fmt(c.angularSpeed)} rad/s > ${fmt(maxW)}` };
+    }
+    return { reject: null, forced, reference: ref, reason: '' };
+  }
+
   private pushSharpness(v: number): void {
     if (!Number.isFinite(v)) return;
     const w = this.sharpRing.length;
@@ -266,25 +347,16 @@ export class KeyframeSelector {
     // 1) Blur relative to the running median of PREVIOUS frames (then include this one so the
     //    reference adapts when the whole scene becomes less textured or the light drops).
     //    The warm-up cannot exceed the ring size (else the first keyframe would never come).
-    const warmup = Math.min(Math.max(0, o.sharpnessWarmup), this.sharpRing.length);
-    const ref = this.sharpCount >= warmup ? this.sharpnessReference : NaN;
+    //    Forced frames (hard rotation limit) are judged with the relaxed limits.
+    const g = this.gate(c);
+    const ref = g.reference;
+    const forced = g.forced;
     this.pushSharpness(c.sharpness);
+    this.pushFrameTime(c.t);
     const fastRot = Number.isFinite(c.angularSpeed) && c.angularSpeed > o.warnAngularRatio * o.maxAngularSpeed;
-    if (!(c.sharpness >= o.minSharpness) || (Number.isFinite(ref) && c.sharpness < o.blurRatio * ref)) {
-      return {
-        decision: 'reject_blur',
-        reason: `sharpness ${fmt(c.sharpness)} < ${fmt(o.blurRatio)} × median ${fmt(ref)}`,
-        guidance: fastRot ? 'move_slower' : 'good',
-      };
-    }
+    if (g.reject === 'reject_blur') return { decision: 'reject_blur', reason: g.reason, guidance: fastRot ? 'move_slower' : 'good' };
     // 2) Fast rotation (motion blur / rolling shutter).
-    if (Number.isFinite(c.angularSpeed) && c.angularSpeed > o.maxAngularSpeed) {
-      return {
-        decision: 'reject_motion',
-        reason: `angular speed ${fmt(c.angularSpeed)} rad/s > ${fmt(o.maxAngularSpeed)}`,
-        guidance: 'move_slower',
-      };
-    }
+    if (g.reject === 'reject_motion') return { decision: 'reject_motion', reason: g.reason, guidance: 'move_slower' };
     // 3) Too little texture to be useful.
     if (c.numFeatures < o.minFeatures) {
       return { decision: 'skip', reason: `only ${c.numFeatures} features`, guidance: 'more_texture' };
@@ -333,19 +405,23 @@ export class KeyframeSelector {
       trigger = 'max_interval';
       reason = `${fmt(dt)} ms since last keyframe while moving`;
     }
+    if (trigger === null && forced) {
+      trigger = 'rotation';
+      reason = `rotation ${fmt(rot / DEG)}° (+ ${fmt(((Number.isFinite(c.angularSpeed) ? c.angularSpeed : 0) * (this.frameIntervalMs || 0)) / 1000 / DEG)}° by the next frame) reaches the ${o.hardRotationDeg}° limit`;
+    } else if (trigger !== null && forced) reason += ` (hard rotation limit ${o.hardRotationDeg}°)`;
     if (trigger === null) {
       this.deferStart = null;
       return { decision: 'skip', reason: 'view has not changed enough', guidance };
     }
-    // Soft triggers: wait briefly for a sharper frame.
-    if (trigger !== 'tracking_lost' && overlap >= o.hardOverlap && Number.isFinite(ref) && c.sharpness < o.deferSharpnessRatio * ref) {
+    // Soft triggers: wait briefly for a sharper frame (never at the hard rotation limit).
+    if (!forced && trigger !== 'tracking_lost' && overlap >= o.hardOverlap && Number.isFinite(ref) && c.sharpness < o.deferSharpnessRatio * ref) {
       if (this.deferStart === null) this.deferStart = c.t;
       if (c.t - this.deferStart < o.maxDeferMs) {
         return { decision: 'skip', reason: `${reason}; waiting for a sharper frame`, guidance };
       }
     }
     this.commitKeyframe(c.t);
-    return { decision: 'keyframe', reason, guidance, trigger };
+    return forced ? { decision: 'keyframe', reason, guidance, trigger, forced } : { decision: 'keyframe', reason, guidance, trigger };
   }
 }
 

@@ -411,6 +411,47 @@ describe('bundleAdjust: gauge handling', () => {
   });
 });
 
+describe('bundleAdjust: focal priors', () => {
+  const setup = () => {
+    const s = makeSyntheticBA({ numPoses: 12, numPoints: 600, layout: 'orbit', trackWindow: 3, noisePx: 0.2, seed: 61, numCameras: 4 });
+    const p = s.problem;
+    fixGaugeTwoPoses(p);
+    for (let c = 0; c < p.cameras.length; c++) p.cameraRefine[c] = { focal: true, principalPoint: false, distortion: false };
+    return { s, p };
+  };
+
+  it('a weak prior lets each camera recover its own focal; a tight one holds it at the prior', () => {
+    const { s, p } = setup();
+    p.focalPriors = p.cameras.map((c, k) => ({ camera: k, f: s.gtCameras[0].f, sigma: 1e5 }));
+    perturbBA(s, { focalScale: 0.03, rotSigma: 0.002, centreSigma: 0.01 });
+    const r = bundleAdjust(p, { loss: 'trivial', maxIterations: 100 });
+    expect(r.success).toBe(true);
+    for (let c = 0; c < 4; c++) expect(Math.abs(p.cameras[c].f / s.gtCameras[c].f - 1)).toBeLessThan(2e-3);
+
+    const t = setup();
+    const target = t.s.gtCameras[2].f * 1.01;
+    t.p.focalPriors = [{ camera: 2, f: target, sigma: 1e-3 }];
+    perturbBA(t.s, { focalScale: 0.03 });
+    const r2 = bundleAdjust(t.p, { loss: 'trivial', maxIterations: 100 });
+    expect(r2.success).toBe(true);
+    expect(Math.abs(t.p.cameras[2].f - target)).toBeLessThan(0.05);
+    expect(Math.abs(t.p.cameras[1].f / t.s.gtCameras[1].f - 1)).toBeLessThan(2e-3); // others unaffected
+  });
+
+  it('the prior enters the cost and the gradient; a prior on a camera without focal refinement is inert', () => {
+    const { s, p } = setup();
+    const base = evaluateBACost(cloneBAProblem(p)).cost;
+    p.focalPriors = [{ camera: 1, f: s.gtCameras[1].f + 10, sigma: 2 }];
+    expect(evaluateBACost(p).cost).toBeCloseTo(base + 0.5 * 25, 6);
+    p.cameraRefine[1] = { focal: false, principalPoint: false, distortion: false };
+    const f1 = p.cameras[1].f;
+    bundleAdjust(p, { loss: 'trivial', maxIterations: 10 });
+    expect(p.cameras[1].f).toBe(f1);
+    expect(() => bundleAdjust({ ...p, focalPriors: [{ camera: 9, f: 1, sigma: 1 }] })).toThrow(RangeError);
+    expect(() => bundleAdjust({ ...p, focalPriors: [{ camera: 0, f: 1, sigma: 0 }] })).toThrow(RangeError);
+  });
+});
+
 describe('bundleAdjust: priors', () => {
   it('centre priors fix the gauge in the prior frame', () => {
     const s = makeSyntheticBA({ numPoses: 12, numPoints: 600, layout: 'orbit', trackWindow: 3, noisePx: 0.3, seed: 51 });

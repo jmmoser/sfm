@@ -281,6 +281,10 @@ export interface EngineStateRecord {
   hasMesh: boolean;
   /** Camera–IMU offset estimated by the last world alignment (ms). */
   timeOffsetMs: number | null;
+  /** Gyro bias (rad/s, device frame) estimated from the live keyframes; absent in older records. */
+  gyroBias?: [number, number, number] | null;
+  /** Rolling-shutter model applied by the last refine / live (canonical image); informational after a reload. */
+  rollingShutter?: { axis: 'rows' | 'cols'; readoutMs: number } | null;
   updatedAt: number;
 }
 

@@ -177,6 +177,30 @@ describe('EngineClient', () => {
     expect(sp.points.count).toBe(5000);
   });
 
+  it('abortLongOperation: overlapping aborts of one stuck request restart the worker ONCE (review)', async () => {
+    // capture: "Cancel" on the finishing card, then X → Discard within the grace period
+    const { c, spawned } = client(['stuck-finish', 'ok']);
+    await c.init({ mode: 'object', quality: 'fast', sessionId: 's1' });
+    const statuses: EngineStatus[] = [];
+    c.onStatus((s) => statuses.push(s));
+    let progress = 0;
+    c.onProgress(() => progress++);
+    const settled = c.finishCapture().catch((e: Error) => e);
+    await waitFor(() => progress >= 2);
+    const a = c.abortLongOperation({ graceMs: 400 });
+    await new Promise((r) => setTimeout(r, 100));
+    const b = c.abortLongOperation({ graceMs: 400 });
+    expect(await a).toBe('restarted');
+    expect(await b).toBe('restarted');
+    expect(await settled).toMatchObject({ name: 'CancelledError' });
+    await waitFor(() => c.status.state === 'ready');
+    await new Promise((r) => setTimeout(r, 300)); // a second (late) restart would show up here
+    expect(spawned).toEqual(['stuck-finish', 'ok']);
+    expect(c.status.respawns).toBe(1);
+    expect(statuses.filter((s) => s.state === 'respawning')).toHaveLength(1);
+    expect(c.status.state).toBe('ready');
+  });
+
   it('init timeout respawns the worker and replays init with resume', async () => {
     const { c, spawned } = client(['hang-init', 'ok'], { initTimeoutMs: 300 });
     const statuses: EngineStatus[] = [];

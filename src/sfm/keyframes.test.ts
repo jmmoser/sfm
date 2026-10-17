@@ -139,6 +139,35 @@ describe('KeyframeSelector', () => {
     expect(s.evaluate(cand(1100, { numInliersToLastKF: 200, sharpness: 75 }))).toMatchObject({ decision: 'keyframe', trigger: 'overlap' });
   });
 
+  it('hard rotation limit: keyframes are forced through a fast pan (blur / motion gates relaxed, no deferral)', () => {
+    const D = Math.PI / 180;
+    const run = (opts: ConstructorParameters<typeof KeyframeSelector>[0]) => {
+      const s = warmed(opts);
+      // 6 fps, slow drift: no trigger
+      for (let i = 1; i <= 4; i++) expect(s.evaluate(cand(i * 167, { rotationSinceLastKFRad: i * 0.5 * D, angularSpeed: 0.05 })).decision).toBe('skip');
+      expect(s.frameIntervalMs).toBe(167);
+      return s;
+    };
+    // pan at 1.3 rad/s (12.4° per frame), frames blurred to 40 % of the median sharpness
+    const s = run({});
+    const blurry = cand(835, { rotationSinceLastKFRad: 8 * D, angularSpeed: 1.3, sharpness: 40 });
+    expect(s.gate(blurry)).toMatchObject({ reject: null, forced: true }); // 8° + 12.4° ≥ 20°
+    expect(s.evaluate(blurry)).toMatchObject({ decision: 'keyframe', trigger: 'rotation' });
+    // without the hard limit the same frame is rejected as blurry
+    const s0 = run({ hardRotationDeg: 0 });
+    expect(s0.evaluate({ ...blurry })).toMatchObject({ decision: 'reject_blur' });
+    // past the limit and faster than maxAngularSpeed (1.2): forced, the motion gate is relaxed up to 3 rad/s
+    expect(s.evaluate(cand(1002, { rotationSinceLastKFRad: 21 * D, angularSpeed: 2.0, sharpness: 60 }))).toMatchObject({ decision: 'keyframe' });
+    expect(s.evaluate(cand(1169, { rotationSinceLastKFRad: 22 * D, angularSpeed: 3.5, sharpness: 60 })).decision).toBe('reject_motion');
+    // completely smeared frames are still rejected (forcedBlurRatio 0.25)
+    expect(s.evaluate(cand(1336, { rotationSinceLastKFRad: 25 * D, angularSpeed: 1.0, sharpness: 20 })).decision).toBe('reject_blur');
+    // soft rotation trigger well below the limit is deferred for a sharper frame as before
+    const s2 = run({});
+    expect(s2.evaluate(cand(835, { rotationSinceLastKFRad: 13 * D, angularSpeed: 0.1, sharpness: 75 })).reason).toMatch(/sharper/);
+    // small rotation, fast: not forced (< ½ maxRotationDeg)
+    expect(s2.isForced(cand(1002, { rotationSinceLastKFRad: 3 * D, angularSpeed: 2.5 }))).toBe(false);
+  });
+
   it('revert / reset', () => {
     const s = warmed();
     s.evaluate(cand(500, { medianParallaxPx: 500 }));

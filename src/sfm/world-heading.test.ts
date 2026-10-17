@@ -288,3 +288,94 @@ describe('fuseYaw', () => {
     expect(fuseYaw({ yaw: 0.1, stdRad: 0.05 }, { yaw: NaN, stdRad: 0.05 })).toMatchObject({ used: 'gps', rejected: null, yaw: 0.1 });
   });
 });
+
+/**
+ * Review: heading sign / axis conventions on hand-built poses (no simulator): ENU world, cameras with
+ * known azimuths; the heading is what CompassSensor reports (`'auto'`): the device TOP's azimuth while
+ * the top is within 45° of horizontal (landscape upright, phone pitched down), else the optical axis
+ * (portrait upright). Degrees clockwise from north; magnetic = true − D (D east positive).
+ */
+describe('world alignment: heading conventions on hand-built poses', () => {
+  /** R_cam_device(θ) = diag(1, −1, −1) · Rz(θ) (ARCHITECTURE §2). */
+  const camFromDevice = (theta: number): Mat3 => {
+    const c = Math.round(Math.cos(theta * DEG)),
+      s = Math.round(Math.sin(theta * DEG));
+    return Float64Array.of(c, -s, 0, -s, -c, 0, 0, 0, -1);
+  };
+  /** World→camera R (ENU) of a camera looking at azimuth `azDeg`, pitched by `pitchDeg` (+ up), image upright. */
+  const lookR = (azDeg: number, pitchDeg: number): Mat3 => {
+    const a = azDeg * DEG,
+      p = pitchDeg * DEG;
+    const z = [Math.sin(a) * Math.cos(p), Math.cos(a) * Math.cos(p), Math.sin(p)];
+    const x = [Math.cos(a), -Math.sin(a), 0];
+    const y = [z[1] * x[2] - z[2] * x[1], z[2] * x[0] - z[0] * x[2], z[0] * x[1] - z[1] * x[0]];
+    return Float64Array.of(x[0], x[1], x[2], y[0], y[1], y[2], z[0], z[1], z[2]);
+  };
+  const azimuthOf = (v: ArrayLike<number>): number => (((Math.atan2(v[0], v[1]) / DEG) % 360) + 360) % 360;
+  /** Reconstruction frame = ENU turned by an unknown yaw (37°) and scale; the alignment must undo the yaw. */
+  const YAW = 37 * DEG;
+  const Ry = Float64Array.of(Math.cos(YAW), -Math.sin(YAW), 0, Math.sin(YAW), Math.cos(YAW), 0, 0, 0, 1); // ENU → recon
+
+  function scene(theta: number, pitchDeg: number, north: 'true' | 'magnetic', declDeg: number): WorldKeyframe[] {
+    const Rcd = camFromDevice(theta);
+    const kfs: WorldKeyframe[] = [];
+    for (let i = 0; i < 10; i++) {
+      const R = lookR(25 * i - 60, pitchDeg);
+      const Rwc = mat3Transpose(R);
+      const Rwd = mat3Mul(Rwc, Rcd);
+      const top = [Rwd[1], Rwd[4], Rwd[7]];
+      const axis = [Rwc[2], Rwc[5], Rwc[8]];
+      const trueHeading = azimuthOf(Math.abs(top[2]) < Math.SQRT1_2 ? top : axis);
+      const Rrec = mat3Mul(R, mat3Transpose(Ry)); // X_enu = Ryᵀ X_rec
+      const C = mat3MulVec(Ry, Float64Array.of(0.4 * i, 0.1 * i, 0));
+      const t = mat3MulVec(Rrec, C);
+      for (let j = 0; j < 3; j++) t[j] = -t[j];
+      kfs.push({
+        id: i,
+        t: 1000 * i,
+        pose: { R: Rrec, t },
+        R_cam_device: Rcd,
+        gravityCam: mat3MulVec(R, Float64Array.of(0, 0, -1)),
+        heading: north === 'magnetic' ? trueHeading - declDeg : trueHeading,
+        headingAccuracy: 5,
+        headingNorth: north,
+      });
+    }
+    return kfs;
+  }
+  /** Residual yaw (deg) of the alignment: R · Ry should be the identity. */
+  const residualYawDeg = (R: Mat3): number => {
+    const M = mat3Mul(R, Ry);
+    return Math.atan2(M[3], M[0]) / DEG;
+  };
+
+  for (const [name, theta, pitch] of [
+    ['portrait upright (optical axis)', 0, 0],
+    ['landscape θ = 90 upright (device top = image left)', 90, 0],
+    ['landscape θ = 270 upright (device top = image right)', 270, 0],
+    ['portrait pitched down 60° (device top)', 0, -60],
+  ] as const) {
+    it(`${name}: true-north headings recover the yaw exactly`, () => {
+      const res = computeWorldAlignment({ keyframes: scene(theta, pitch, 'true', 0) }, { captureDate: DATE });
+      expect(res.details.yawSource).toBe('compass');
+      expect(res.metric.northAligned).toBe(true);
+      expect(Math.abs(residualYawDeg(res.R))).toBeLessThan(1e-6);
+    });
+  }
+
+  it('magnetic headings (true − D): the WMM declination at a single GPS fix restores true north; without it +Y is magnetic north (D east of true north)', () => {
+    const D = wmmDeclination(SEATTLE[0], SEATTLE[1], SEATTLE[2] / 1000, decimalYearFromDate(DATE));
+    const kfs = scene(90, -10, 'magnetic', D);
+    const fix: GeoFix = { t: 0, lat: SEATTLE[0], lon: SEATTLE[1], alt: SEATTLE[2], accuracy: 5000, altitudeAccuracy: null };
+    const withFix = computeWorldAlignment({ keyframes: kfs, gpsFixes: [fix] }, { captureDate: DATE });
+    expect(withFix.details.declination!.source).toBe('gps');
+    expect(withFix.details.declination!.numConverted).toBe(kfs.length);
+    expect(withFix.details.north).toBe('true');
+    expect(Math.abs(residualYawDeg(withFix.R))).toBeLessThan(1e-6);
+    const noFix = computeWorldAlignment({ keyframes: kfs }, { captureDate: DATE });
+    expect(noFix.details.north).toBe('magnetic');
+    expect(noFix.metric.northAligned).toBe(false);
+    // +Y = magnetic north (true azimuth D): every aligned azimuth is D smaller ⇒ a residual CCW yaw of +D
+    expect(Math.abs(wrapDeg(residualYawDeg(noFix.R) - D))).toBeLessThan(1e-6);
+  });
+});

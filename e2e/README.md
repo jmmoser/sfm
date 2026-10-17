@@ -147,9 +147,34 @@ blur sub-frame offsets) into exactly the part of the undistorted target its dist
 sample, then resampled through the inverse RADIAL distortion under a scissor, so the lens
 distortion is applied consistently per line. N adapts per frame: N = ⌈rsPx / max(0.3 px,
 0.1·blurPx)⌉ in [4, 48] (rsPx = image motion over the readout), bounding the step between bands.
-A GPU test checks that bands with one pose reproduce the global-shutter image exactly and that
-markers seen during a 1.3 rad/s rotation land within 0.07 px of their band pose's projection.
+GPU tests (`realism.gpu.test.ts`, portrait column bands and landscape row bands) check that bands
+with one pose (or several identical blur sub-frames) reproduce the global-shutter image exactly
+and that markers seen during a 1.3 rad/s rotation land within 0.07 px of their band pose's
+projection (≥ 1.2 px away from the mid-readout projection).
 Depth maps and visibility stay global-shutter at the GT (mid-readout) pose.
+
+Modelling assumptions (docs/research/ios-camera.md establishes only the sensor-landscape buffer,
+upright at θ = 90; the readout order and the timestamp's reference instant are not documented
+there): native row 0 is read first, and the frame timestamp is mid-readout. If iOS stamps the
+start of readout or of exposure instead, the difference is a constant (≈ readout/2, plus
+exposure/2) that a camera–IMU time-offset estimate absorbs like the datasets' +25 ms;
+`rsReverse` covers a bottom-to-top sensor.
+
+Ablation datasets (one artefact family on, everything else at the clean values) are built from
+the presets with `--set`; the recipes of the baselines below:
+
+```sh
+CLEAN='--set exposureJitter=0.05 --set jpegQuality=0.92 --set whiteBalanceDrift=0'
+NOBLUR='--set effects.motionBlurPxPerSample=0 --set effects.motionBlurSamples=1'
+# rolling shutter only (smooth trajectory, no blur)
+node e2e/generate-synth.mjs object-real --name abl-object-rs $CLEAN $NOBLUR --set focusBreathing=null --set trajectory.shake=null
+node e2e/generate-synth.mjs yard-real   --name abl-yard-rs   $CLEAN $NOBLUR --set focusBreathing=null --set trajectory.shake=null
+# hand shake + fast pans with their adaptive motion blur (global shutter)
+node e2e/generate-synth.mjs object-real --name abl-object-shake $CLEAN --set rsReadoutMs=0 --set focusBreathing=null
+node e2e/generate-synth.mjs yard-real   --name abl-yard-shake   $CLEAN --set rsReadoutMs=0 --set focusBreathing=null
+# focus breathing only
+node e2e/generate-synth.mjs object-real --name abl-object-breath $CLEAN $NOBLUR --set rsReadoutMs=0 --set trajectory.shake=null
+```
 
 `meta.captureArtefacts` records the settings and statistics (`rollingShutter`, `focusBreathing`
 incl. fMin / fMax / fMean, `shake` incl. `panPeakRates`, `angularSpeed` of the trajectory, and
@@ -239,6 +264,9 @@ and `--set` override it, while the image size and view count stay the harness's 
 `src/harness/dense-gt/main.ts`): `pm.*`, `geo.*`, `selection.*`, `fusion.*` (incl.
 `fusion.haloFilter={}`), `preHalo` (`removeDepthHalos` on the fusion input, as the engine does;
 `true` or an options object, e.g. `--set 'preHalo={"skyMaxStd":0}'` turns the sky test off),
+`haloSkyUp=true` (the halo filter gets each view's GT up direction as `skyUp`, as an engine with a
+gravity-aligned model would pass it), `haloRotate=k` (`preHalo` on views rotated by k clockwise
+quarter turns, result rotated back: frames that are not upright, `src/harness/dense-gt/halo-rotation.ts`),
 `filter` (`filterPointCloud` on the fused cloud), `geometricPasses`, `multiScale`,
 `textureAnalysis={}` (per texture threshold: GT error classes of the fusion-input and fused pixels
 an untextured / sky gate would remove, plus the coherence of the top-connected untextured
@@ -402,6 +430,19 @@ k-th frame answered with `'keyframe'`. `sparse.images[].via` records which rule 
 Engine intrinsics at another resolution are rescaled with the §2 rule. Transposed sizes are
 flagged in `sparse.intrinsicsNote`.
 
+**Diagnostics** (off by default; large results):
+
+* `--set liveTrace=true` (any engine): `result.liveTrace` keeps the camera poses of every
+  `LiveUpdate` that carries the model (frame index, keyframe / registered / point counts). Poses
+  are the registered keyframes sorted by id, so they map to `live.keyframeIndices` only while every
+  keyframe is registered.
+* `--engine inline --set debugDump=true --set 'engineConfig={"mapping":"inline",…}'`:
+  `result.debug` (`src/harness/engine/debug-dump.ts`, reads engine internals) has, after every
+  keyframe frame, each keyframe's live registration state, 3D-point count and pose
+  (`keyframeTrace`), and after finishCapture and after refine the live model plus every verified
+  pair (keyframe ids, frame indices, model, inliers, median triangulation angle, R, t). Comparing
+  R / t with the GT relative pose separates wrong pairs from wrong registrations.
+
 ### Checks and thresholds (`e2e/thresholds.json`)
 
 Limits merge in order: `default`, then `<meta.scene>`, then `datasets[<name>]`. The check names
@@ -487,3 +528,66 @@ GPU path (default `featureBackend`, WebGPU SIFT + matcher in the worker; object 
 88/88 registered, ATE 2.0e-4, rotation 0.039°, focal +0.06 %, scale +0.86 %, gravity 0.035°, heading
 −0.99°, principal point 0.20 px — the same accuracy class, but 25 s per frame and 1.5 s per refine pair
 on SwiftShader (capture 38 min, refine 24 min).
+
+### Real-capture baselines (2026-10, sparse, CPU features, worker engine)
+
+`node e2e/run-e2e.mjs <dataset> --no-dense --no-mesh --tag sparse --set 'engineConfig={"featureBackend":"cpu"}'`
+(quality fast, all sensors; outputs `e2e/out/e2e/<dataset>-sparse`; the clean references are
+`object-clean-sparse2` / `yard-clean-sparse2`). Scale error = 1/s − 1 of the Sim3; gravity /
+heading in the result's own world frame; Δt = the engine's camera–IMU offset (truth −25 ms);
+decisions = skip / keyframe / reject_blur / reject_motion; lost = frames reported `lost`.
+
+| dataset | kf reg (model) | ATE / extent | rot° p50 | focal % (vs mean GT f) | pp px | scale % (source) | grav° | head° | Δt ms | decisions | lost | sparse P |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| object (clean) | 90/90 (live) | 2.1e-4 | 0.05 | +0.03 | 0.4 | +0.3 (imu) | 0.01 | −0.36 | −25.0 | 110/90/0/0 | 0 | 0.981 |
+| object-real | 89/89 (live) | 8.6e-4 | 0.73 | −0.04 (−0.14) | 8.1 | −4.3 (imu) | 0.03 | −0.73 | −25.2 | 100/89/11/0 | 0 | 0.977 |
+| object-real, `refinePrincipalPoint: false` | 89/89 (live) | 8.6e-4 | 0.14 | −0.59 (−0.69) | 1.8 | −4.3 (imu) | 0.02 | −0.75 | −25.2 | 100/89/11/0 | 0 | 0.978 |
+| abl-object-rs | 91/91 (live) | 5.1e-4 | 0.49 | −0.40 | 5.0 | −3.0 (imu) | 0.01 | −0.67 | −24.5 | 109/91/0/0 | 0 | 0.978 |
+| abl-object-shake | 88/88 (live) | 1.8e-4 | 0.04 | +0.02 | 0.3 | −0.0 (imu) | 0.03 | −0.51 | −25.1 | 99/88/13/0 | 0 | 0.979 |
+| abl-object-breath | 90/90 (live) | 8.0e-4 | 0.47 | +0.32 (+0.48) | 5.9 | −0.1 (imu) | 0.01 | −0.61 | −25.0 | 110/90/0/0 | 0 | 0.979 |
+| yard (clean) | 80/80 (live) | 2.2e-4 | 0.05 | +0.07 | 0.3 | −0.0 (imu+gps) | 0.01 | −0.64 | −24.9 | 160/80/0/0 | 0 | 0.919 |
+| **yard-real** | 75/75 (live) | **0.103** | **152** | −0.08 (−0.19) | 6.1 | −1.9 (gps) | **3.55** | +7.80 | −29.4 | 152/75/12/1 | 22 | **0.028** |
+| abl-yard-rs | 80/80 (live) | 7.8e-4 | 0.25 | +0.05 | 2.5 | +5.3 (imu+gps) | 0.02 | −0.95 | −27.8 | 160/80/0/0 | 0 | 0.860 |
+| **abl-yard-shake** | 76/76 (offline) | **0.033** | 1.21 | +0.01 | 0.2 | −4.7 (gps) | 0.71 | −0.22 | −25.0 | 150/76/13/1 | 26 | **0.256** |
+
+object-real with dense (`--dense-size 480`): P 0.9991, C 0.9926, F 0.9958 (accuracy p50 1.3 mm).
+Every object run passes. Rolling shutter and focus breathing are absorbed by the free principal
+point (2.5–8 px off, ≈ a constant 0.25–0.7° camera rotation; without principal-point refinement the
+rotation error is 0.14° but the focal −0.6 %), and rolling shutter biases the IMU scale (−3 / −4 %
+object, +5 % yard, within 1–2 σ of the reported uncertainty) and the time offset (−28 / −29 ms).
+
+**Yard breakdown (shake, not rolling shutter: `abl-yard-rs` passes).** Replayed with
+`--engine inline --set debugDump=true` and inline mapping (same failure, see Diagnostics above):
+
+1. Pan 2 (t = 15 s, 1.1–1.3 rad/s): frames 91–94 are rejected as blurry (< 0.6 × the median
+   sharpness) after 89 / 90 were deferred "waiting for a sharper frame", so the keyframe gap is
+   87 → 95 (34.5°, `abl-yard-shake`) / 89 → 95 (45°, `yard-real`). The first keyframe after the
+   gap sees a thin map (`yard-real`: 95 registers with 122 point observations, ≈ 700 is usual);
+   the next ones see 40, 20, 21, 0, 0 … 3D points and stay pending although their mutual pairs
+   have 200–400 inliers: 8–10 keyframes unregistered, `tracking_lost` for 3.7–4.5 s after the pan.
+2. Relocalisation through false pairs: the spatial candidates come from the last REGISTERED
+   keyframe (stale anchor 87 / 95 → its neighbours 79 / 81 / 84 / 85, which look ≈ 85–100° away).
+   Both views see the west fence ≈ 20 m apart; its repeated boards verify as `calibrated` pairs
+   with 59–79 inliers, a 131–137° median triangulation angle and R 127–136° off the truth. Keyframe
+   127 registers through them 74° / 92° off, and `retryPending` then registers 124 … 95 in the same
+   wrong frame: one model made of two rigid fragments (each with 1–8 cm ATE) joined by a
+   55–90° / ≈ 10 m error.
+3. Refine compounds it: its retrieval / spatial pairs (spatial from the broken live model) add
+   ≈ 70 more wrong pairs (R > 10° off, many with 50–150 inliers); the offline model then misplaces keyframes too (`abl-yard-shake`: only 87, by
+   53°, so the offline model wins; `yard-real`: keyframe 85 and the fragment 95 … 184 rotated by
+   ≈ 160°, 188 … 239 attached to the start of the loop).
+   Live vs offline is chosen by registered count, then mean reprojection error (0.512 vs 0.517 px).
+4. World alignment fits the broken trajectory: the IMU scale is rejected (R² 0.01–0.02; the R² ignores
+   the robust weights) → GPS scale (within a fragment the true scale error is −15 % for `yard-real`,
+   −7 % for `abl-yard-shake`); `yard-real` gravity 3.5°, heading 7.8°.
+
+With the keyframe gates relaxed (`--set 'engineConfig={"featureBackend":"cpu","keyframe":{"maxDeferMs":0,"blurRatio":0.3}}'`,
+only ω > 1.2 rad/s rejected; tags `kfgate`) `abl-yard-shake` (inline engine) is as good as the clean yard: 83/83 keyframes, max gap
+33.7°, no `lost` frame, ATE 2.3e-4, rotation 0.04°, scale −0.01 % (imu+gps), gravity 0.04°, heading
+−0.69°, sparse P 0.921 — although 15 (capture) / 109 (refine) pairs are still wrong: false pairs are
+harmless while registration is continuous. `yard-real` (worker) with the same gates: no `lost` frame and a
+live model without a break (live ATE 5.6e-3, all consecutive relative rotations < 2°), but the
+offline model, chosen by 0.592 vs 0.611 px, misregisters keyframe 212 by 109° / 14 m, which alone
+gives ATE 4.2e-2 (1.1e-3 = 4.2 cm without it), rejects the IMU scale (R² −0.00) and leaves the
+GPS scale (−6 %). Likewise the `abl-yard-shake` baseline without its keyframe 87: ATE 2.5e-4, GPS
+scale −7.3 %.

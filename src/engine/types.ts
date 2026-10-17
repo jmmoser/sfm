@@ -9,7 +9,9 @@
 import type { CameraIntrinsics, FrameInfo, Pose } from '../core/types';
 import type { FeaturePipeline } from '../features/extractor';
 import type { SiftOptions } from '../features/sift-common';
+import type { GyroToleranceOptions } from '../sfm/gyro';
 import type { KeyframeSelectorOptions } from '../sfm/keyframes';
+import type { RollingShutterDevice, RollingShutterEstimateOptions } from '../sfm/rolling-shutter';
 import type { LiveMapperOptions } from '../sfm/live';
 import type { MapperOptions } from '../sfm/mapper';
 import type { LiveUpdate, LogLevel, SparseCamera, SparseResult } from '../workers/protocol';
@@ -92,6 +94,37 @@ export interface EngineConfig {
   verifyCameraFromDevice?: boolean;
   /** RANSAC iterations of the per-frame verification against the last keyframe (default 400). */
   trackingMaxIterations?: number;
+  /**
+   * Gyro consistency gates (default true, active once R_cam_device is verified): verified pairs,
+   * registrations and initial pairs whose rotation disagrees with the integrated gyro are rejected
+   * (live and refine), and refine prefers the model without gyro breaks (src/sfm/gyro.ts).
+   */
+  gyroGate?: boolean;
+  /** Tolerance of the gyro gates (defaults: 5° + 0.3°/s × |Δt| (0.1°/s once the bias is estimated) + 5 % of the rotation). */
+  gyroTolerance?: Partial<GyroToleranceOptions>;
+  /** Estimate the gyro bias / camera–IMU offset from the live keyframes every 10 registrations (default true). */
+  liveGyroCalibration?: boolean;
+  /**
+   * Rolling shutter estimated in refine (default true, needs the gyro): readout axis / direction /
+   * time from the reconstruction, keypoints corrected when it lowers the reprojection cost
+   * significantly (src/sfm/rolling-shutter.ts, src/engine/refine-camera.ts).
+   */
+  estimateRollingShutter?: boolean;
+  /** Options of the rolling-shutter estimation (search range, acceptance threshold, …). */
+  rollingShutterOptions?: Partial<RollingShutterEstimateOptions> & { minImages?: number; maxImages?: number; minOmega?: number };
+  /**
+   * Readout of this device, known in advance (e.g. estimated by an earlier capture: stats
+   * rsReadoutMs / rsSweepDevice): every keyframe's keypoints are corrected live and the motion gate
+   * allows faster rotation (`rsMaxAngularSpeed`).
+   */
+  rollingShutter?: RollingShutterDevice | null;
+  /** Motion gate (rad/s) while a known rolling shutter is corrected live (default 2.0). */
+  rsMaxAngularSpeed?: number;
+  /** Per-image focal lengths tied to the shared focal in the final refinement (default true; kept only if it helps). */
+  perImageFocal?: boolean;
+  /** Prior σ of the per-image focal (relative, default 0.005) and the required reprojection improvement (default 0.03). */
+  perImageFocalSigma?: number;
+  perImageFocalMinImprovement?: number;
   /**
    * Back-pressure of 'background' mapping: a keyframe frame's response waits until at most this
    * many keyframes are queued or being mapped (default 2; -1 = never wait). Without it the live

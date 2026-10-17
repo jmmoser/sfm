@@ -138,6 +138,25 @@ describe('CompassSensor (iOS: arbitrary alpha + webkitCompassHeading)', () => {
     expect(c.headingModel).toBe('ui-top');
     expect(angDiff(c.yawOffsetDeg!, psi)).toBeLessThan(1);
   });
+
+  it('ui-top model: headingAt still reports the device-top / camera reference (the FrameInfo.heading convention) in landscape (review)', () => {
+    let theta = 0;
+    const c = new CompassSensor({ target: null, screenAngle: () => theta });
+    const pose = (i: number): Float64Array => mul(rz(-(0.2 * i)), rx(15));
+    const uiTopAz = (R: Float64Array): number => (theta === 90 ? azimuthDeg(R[0], R[3]) : topAzimuth(R));
+    let last: { t: number; Renu: Float64Array }[] = [];
+    for (let k = 0; k < 6; k++) {
+      theta = k % 2 === 0 ? 0 : 90;
+      last = feedIOS(c, 120, 120, (i) => pose(i + 120 * k), uiTopAz, 8, 1000 + k * 2000);
+    }
+    expect(c.headingModel).toBe('ui-top');
+    // last block: landscape (θ = 90); the platform reported the RIGHT edge's azimuth (90° off the top)
+    const { t, Renu } = last[100];
+    const h = c.headingAt(t)!;
+    // the world alignment (compassReference 'auto') reads it as the device-top azimuth here
+    expect(angDiff(h.heading, referenceAzimuth(Renu).azimuth)).toBeLessThan(2);
+    expect(h.north).toBe('magnetic');
+  });
 });
 
 describe('CompassSensor north reference (magnetic → true via WMM)', () => {

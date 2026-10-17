@@ -35,7 +35,7 @@ import {
   tsdfMesh,
   undistortImage,
   depthHaloMask,
-  removeDepthHalos,
+  worldUpInCamera,
   type DenseView,
   type DepthMap,
   type FusionOptions,
@@ -64,6 +64,7 @@ import {
 } from './gt-depth';
 import { costToRGBA, depthToRGBA, errorToRGBA, evalDepth, panelPNG, surfaceMask, type DepthEval } from './depth-eval';
 import { DEFAULT_THRESHOLDS, addCounts, countTexture, emptyCounts, formatSkyComponents, formatTextureCounts, skyComponents, textureMasks, type SkyComponent, type TextureAnalysisConfig, type TextureCounts } from './texture-analysis';
+import { removeDepthHalosRotated } from './halo-rotation';
 
 // ------------------------------------------------------------------ types
 
@@ -116,6 +117,17 @@ export interface DenseGTConfig {
    * `fusion.haloFilter`.
    */
   preHalo?: boolean | Partial<HaloFilterOptions>;
+  /**
+   * Halo filter (`preHalo` and the halo statistics) with each view's up direction as `skyUp`
+   * (`worldUpInCamera(pose.R)`, GT world +Z), as an engine with a gravity-aligned model would
+   * pass it (default false: upright images assumed).
+   */
+  haloSkyUp?: boolean;
+  /**
+   * `preHalo` on views rotated by this many clockwise quarter turns (result rotated back):
+   * simulates frames that are not gravity-upright (halo-rotation.ts). Default 0.
+   */
+  haloRotate?: number;
   /**
    * Low-texture / sky analysis: class counts (vs the surfel GT) of the fusion-input and fused
    * pixels a segment-texture gate would remove, per threshold (texture-analysis.ts).
@@ -630,10 +642,11 @@ async function runDenseGT(configIn: DenseGTConfig): Promise<DenseGTResult> {
   const store = new MemoryDepthMapStore();
   const fusionRaw = config.fusionInput === 'photo' || !geoMaps ? photo : geoMaps;
   let fusionSrc = fusionRaw;
+  const haloOptsFor = (v: DenseView, base: Partial<HaloFilterOptions>): Partial<HaloFilterOptions> => (config.haloSkyUp ? { ...base, skyUp: worldUpInCamera(v.pose.R) } : base);
   if (config.preHalo) {
     const m = new Map<number, DepthMap>();
     const ho = typeof config.preHalo === 'object' ? config.preHalo : {};
-    for (const v of views) m.set(v.id, removeDepthHalos(fusionSrc.get(v.id)!, v.image, v.cam, ho));
+    for (const v of views) m.set(v.id, removeDepthHalosRotated(fusionSrc.get(v.id)!, v.image, v.cam, haloOptsFor(v, ho), config.haloRotate ?? 0));
     fusionSrc = m;
     stage('preHalo');
   }
@@ -718,7 +731,12 @@ async function runDenseGT(configIn: DenseGTConfig): Promise<DenseGTResult> {
     let haloMask: Uint32Array | null = null;
     if (hopt) {
       const src = fusionRaw.get(v.id)!;
-      haloMask = depthHaloMask(src, v.image, v.cam, hopt);
+      if (config.preHalo && !config.fusion?.haloFilter) {
+        // the pixels preHalo invalidated (exact, whatever the orientation / skyUp settings)
+        const pre = fusionSrc.get(v.id)!;
+        haloMask = new Uint32Array((src.depth.length + 31) >>> 5);
+        for (let i = 0; i < src.depth.length; i++) if (src.depth[i] > 0 && !(pre.depth[i] > 0)) haloMask[i >>> 5] |= 1 << (i & 31);
+      } else haloMask = depthHaloMask(src, v.image, v.cam, haloOptsFor(v, hopt));
       const hc: HaloCounts = { all: { noGt: 0, bad: 0, mid: 0, good: 0 }, rejected: { noGt: 0, bad: 0, mid: 0, good: 0 } };
       for (let i = 0; i < src.depth.length; i++) {
         const z = src.depth[i];

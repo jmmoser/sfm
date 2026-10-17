@@ -21,26 +21,27 @@ function srgbToLinear(c: number): number {
   return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
 }
 
-function makeScene(pose: Pose) {
+/** Markers (u, v, z-depth) of the portrait camera: centres of 15-px column bands (16 bands over 240 columns). */
+const PORTRAIT_MARKERS: [number, number, number][] = [];
+for (let j = 0; j < 5; j++) for (let i = 0; i < 4; i++) PORTRAIT_MARKERS.push([37 + 60 * i, 25 + (j * (cam.height - 50)) / 4, 2 + 0.4 * ((i + 2 * j) % 3)]);
+
+function makeScene(pose: Pose, camera: CameraIntrinsics = cam, pixels: readonly (readonly [number, number, number])[] = PORTRAIT_MARKERS) {
   const scene = new Scene();
   const C = m3Vec(m3T(pose.R), pose.t).map((v) => -v);
   const markers: { X: number[] }[] = [];
   const geo = new SphereGeometry(1, 32, 24);
   const mat = new MeshBasicMaterial({ color: 0xffffff });
-  for (let j = 0; j < 5; j++)
-    for (let i = 0; i < 4; i++) {
-      const u = 37 + 60 * i; // centres of 15-px readout bands (16 bands over 240 columns)
-      const v = 25 + (j * (cam.height - 50)) / 4;
-      const z = 2 + 0.4 * ((i + 2 * j) % 3);
-      const xc = [((u - cam.cx) / cam.f) * z, ((v - cam.cy) / cam.f) * z, z];
-      const X = Array.from(m3Vec(m3T(pose.R), xc)).map((v2, k) => v2 + C[k]);
-      const m = new Mesh(geo, mat);
-      m.position.set(X[0], X[1], X[2]);
-      m.scale.setScalar(0.006 * z); // ≈ 1.6 px radius: much smaller than a band
-      scene.add(m);
-      m.updateMatrixWorld(true);
-      markers.push({ X });
-    }
+  for (let k = 0; k < pixels.length; k++) {
+    const [u, v, z] = pixels[k];
+    const xc = [((u - camera.cx) / camera.f) * z, ((v - camera.cy) / camera.f) * z, z];
+    const X = Array.from(m3Vec(m3T(pose.R), xc)).map((v2, d) => v2 + C[d]);
+    const m = new Mesh(geo, mat);
+    m.position.set(X[0], X[1], X[2]);
+    m.scale.setScalar(0.006 * z); // ≈ 1.6 px radius: much smaller than a band
+    scene.add(m);
+    m.updateMatrixWorld(true);
+    markers.push({ X });
+  }
   const synth: SynthScene = {
     name: 'markers',
     scene,
@@ -59,13 +60,13 @@ function makeScene(pose: Pose) {
   return { synth, markers };
 }
 
-function centroid(rgba: Uint8Array, u0: number, v0: number, rad: number): [number, number, number] {
+function centroid(rgba: Uint8Array, u0: number, v0: number, rad: number, camera: CameraIntrinsics = cam): [number, number, number] {
   let sw = 0,
     su = 0,
     sv = 0;
-  for (let v = Math.max(0, Math.round(v0) - rad); v <= Math.min(cam.height - 1, Math.round(v0) + rad); v++)
-    for (let u = Math.max(0, Math.round(u0) - rad); u <= Math.min(cam.width - 1, Math.round(u0) + rad); u++) {
-      const w = srgbToLinear(rgba[4 * (v * cam.width + u)]);
+  for (let v = Math.max(0, Math.round(v0) - rad); v <= Math.min(camera.height - 1, Math.round(v0) + rad); v++)
+    for (let u = Math.max(0, Math.round(u0) - rad); u <= Math.min(camera.width - 1, Math.round(u0) + rad); u++) {
+      const w = srgbToLinear(rgba[4 * (v * camera.width + u)]);
       sw += w;
       su += w * u;
       sv += w * v;
@@ -86,13 +87,13 @@ function rotatingPose(omega: [number, number, number], tMs: number): Pose {
 }
 
 /** Pixel of X in the RS image: fixed point band ↔ band pose. */
-function rsProjection(bands: ReadoutBand[], poseAt: (dtMs: number) => Pose, X: number[]): { uv: [number, number]; band: number } | null {
+function rsProjection(bands: ReadoutBand[], poseAt: (dtMs: number) => Pose, X: number[], camera: CameraIntrinsics = cam): { uv: [number, number]; band: number } | null {
   const out = new Float64Array(3);
   const find = (u: number, v: number) => bands.findIndex((b) => u >= b.rect.u0 - 0.5 && u < b.rect.u1 + 0.5 && v >= b.rect.v0 - 0.5 && v < b.rect.v1 + 0.5);
-  if (!projectRadial(cam, poseAt(0), X, out)) return null;
+  if (!projectRadial(camera, poseAt(0), X, out)) return null;
   let k = find(out[0], out[1]);
   for (let it = 0; it < 20 && k >= 0; it++) {
-    projectRadial(cam, poseAt(bands[k].dtMs), X, out);
+    projectRadial(camera, poseAt(bands[k].dtMs), X, out);
     const k2 = find(out[0], out[1]);
     if (k2 === k) return { uv: [out[0], out[1]], band: k };
     k = k2;
@@ -161,6 +162,65 @@ describe('SynthRenderer rolling shutter bands + focus breathing', () => {
         n++;
       }
       console.log(`[realism.gpu] RS markers: ${n} checked, worst error vs band projection ${worstRS.toFixed(3)} px, min offset from the GS projection ${minGS.toFixed(2)} px`);
+      expect(n).toBeGreaterThan(8);
+      expect(worstRS).toBeLessThan(0.15);
+      expect(minGS).toBeGreaterThan(0.5);
+    } finally {
+      r.dispose();
+      synth.dispose();
+    }
+  });
+
+  it('landscape θ = 90: row bands (top row first) reproduce GS, and markers land at their band pose projection', () => {
+    // exercises the row-band paths (output scissor y-flip, sub-frustum rows, accumulation scissor)
+    const camL: CameraIntrinsics = { width: 320, height: 240, f: 260, cx: 160.7, cy: 118.4, k1: -0.05, k2: 0.01 };
+    const g = readoutGeometry(90, camL.width, camL.height);
+    expect(g).toEqual({ axis: 'rows', sign: 1, lines: 240 });
+    // markers at the centres of 15-px row bands (16 bands over 240 rows)
+    const pix: [number, number, number][] = [];
+    for (let j = 0; j < 5; j++) for (let i = 0; i < 4; i++) pix.push([30 + (i * (camL.width - 60)) / 3, 37 + 45 * j, 2 + 0.4 * ((i + 2 * j) % 3)]);
+    const { synth, markers } = makeScene(pose0, camL, pix);
+    const r = new SynthRenderer(synth, camL, { noise: false, vignetting: 0, supersample: 3, motionBlurSamples: 3 });
+    try {
+      const bands = readoutBands(g, camL.width, camL.height, 16, 22);
+      expect(bands[0].rect).toEqual({ u0: 0, u1: camL.width - 1, v0: 0, v1: 14 }); // the top row band is read first
+      expect(bands[0].dtMs).toBeCloseTo((7 / 239 - 0.5) * 22, 10); // mean line 7 of 0…239: −10.36 ms
+      // one pose per band, and three identical sub-frames per band, = the global-shutter render
+      r.renderFrame([pose0], 1, 0);
+      const gs = r.readPixels();
+      r.renderFrameBands(bands.map((b) => ({ rect: b.rect, poses: [pose0] })), 1, 0);
+      const one = r.readPixels();
+      r.renderFrameBands(bands.map((b) => ({ rect: b.rect, poses: [pose0, pose0, pose0] })), 1, 0);
+      const three = r.readPixels();
+      let d1 = 0,
+        d3 = 0;
+      for (let i = 0; i < gs.length; i += 4) {
+        if (gs[i] !== one[i]) d1++;
+        if (Math.abs(gs[i] - three[i]) > 1) d3++;
+      }
+      expect(d1 / (camL.width * camL.height)).toBeLessThan(0.002);
+      expect(d3 / (camL.width * camL.height)).toBeLessThan(0.002);
+      // fast rotation (yaw-dominated: image motion across the rows → skew)
+      const poseAt = (dt: number) => rotatingPose([0.5, 1.3, 0.2], dt);
+      r.renderFrameBands(bands.map((b) => ({ rect: b.rect, poses: [poseAt(b.dtMs)] })), 1, 0);
+      const px = r.readPixels();
+      const out = new Float64Array(3);
+      let worstRS = 0,
+        minGS = Infinity,
+        n = 0;
+      for (const m of markers) {
+        const p = rsProjection(bands, poseAt, m.X, camL);
+        if (!p) continue;
+        const b = bands[p.band].rect;
+        if (p.uv[1] - b.v0 < 1.8 || b.v1 - p.uv[1] < 1.8) continue; // straddles two bands
+        const [cu, cv, mass] = centroid(px, p.uv[0], p.uv[1], 6, camL);
+        expect(mass).toBeGreaterThan(1);
+        worstRS = Math.max(worstRS, Math.hypot(cu - p.uv[0], cv - p.uv[1]));
+        projectRadial(camL, poseAt(0), m.X, out);
+        if (Math.abs(bands[p.band].dtMs) > 3) minGS = Math.min(minGS, Math.hypot(cu - out[0], cv - out[1]));
+        n++;
+      }
+      console.log(`[realism.gpu] θ=90 RS markers: ${n} checked, worst error vs band projection ${worstRS.toFixed(3)} px, min offset from the GS projection ${minGS.toFixed(2)} px`);
       expect(n).toBeGreaterThan(8);
       expect(worstRS).toBeLessThan(0.15);
       expect(minGS).toBeGreaterThan(0.5);

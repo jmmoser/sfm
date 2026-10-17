@@ -16,8 +16,10 @@ import { extractColors, IncrementalMapper, runIncrementalSfM, SfMCancelledError,
 import type { Reconstruction } from '../sfm/reconstruction';
 import { VocabularyIndex } from '../sfm/vocab';
 import { computeWorldAlignment, type WorldAlignment, type WorldKeyframe } from '../sfm/world';
+import { gyroConsistency, timedRotations, type GyroConsistency } from '../sfm/gyro';
 import { median } from '../math/stats';
 import { handEyeCheck, type LiveSession } from './live';
+import { refinePerImageFocal, refineRollingShutter, rsStats, type RefineRSResult } from './refine-camera';
 import { pairToStored, type EngineStore, type StoredPair, type StoredPairs } from './persistence';
 import { ENGINE_DEFAULTS } from './presets';
 import type { EngineConfig, SparseCameraEx, SparseModel, SparseResultEx } from './types';
@@ -286,6 +288,39 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     }
     await live.mapper.incrementalMapper.iterativeGlobalRefinement(undefined, cancel, true);
     liveRec = live.mapper.reconstruction;
+  }
+  checkCancel(cancel, 'reconstruction');
+  // Model choice: gyro consistency first (a model whose consecutive keyframes disagree with the
+  // gyro beyond isolated outliers is made of fragments joined by a wrong rotation), then the
+  // registered images, then the mean reprojection error.
+  const gyro = live.gyroForChecks();
+  const consistency = (r: Reconstruction | null): GyroConsistency | null => {
+    if (!r || !gyro) return null;
+    const imgs = timedRotations(r.registeredImageIds(), (id) => r.images.get(id)?.pose, (id) => st.records.get(id)?.t);
+    return gyroConsistency(imgs, gyro, { tolerance: live.gyroTolerance() });
+  };
+  // Rolling shutter: estimated on the refined live model (when it is gyro-consistent) so that the
+  // offline SfM already runs on corrected keypoints; otherwise on the chosen model below.
+  const rsEnabled = cfg.estimateRollingShutter !== false && !!gyro;
+  let rs: RefineRSResult | null = null;
+  const runRS = async (rec: Reconstruction, mapper: IncrementalMapper): Promise<void> => {
+    const prev = st.rollingShutter;
+    report('reconstruction', 0.08, 'rolling shutter');
+    await tick();
+    rs = refineRollingShutter(rec, st, gyro!, cfg.rollingShutterOptions ?? {}, live.liveRollingShutter());
+    Object.assign(stats, rsStats(rs, st.cameraFromDevice()));
+    deps.log('info', `rolling shutter: ${rs.applied ? `${rs.applied.axis} ${rs.applied.readoutMs.toFixed(1)} ms (${rs.corrected} keyframes corrected)` : 'none'} — ${rs.reason}`);
+    if (rs.applied || prev) {
+      // keypoints changed in place: drop cached normalised coordinates and re-adjust
+      live.mapper.incrementalMapper.triangulator.invalidate();
+      mapper.triangulator.invalidate();
+      await mapper.iterativeGlobalRefinement(undefined, cancel, true);
+    }
+  };
+  if (rsEnabled && liveRec && liveRec.numRegisteredImages >= 10 && (consistency(liveRec)?.breaksWithoutOutliers ?? 0) === 0) {
+    await runRS(liveRec, live.mapper.incrementalMapper);
+  }
+  if (liveRec) {
     extractColors(liveRec, st.db);
     liveRec.updatePointErrors();
   }
@@ -294,6 +329,8 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   const mapperOpts: Partial<RunSfMOptions> = {
     hfovPriorDeg: live.mapper.opts.hfovPriorDeg,
     ...(liveCam ? { intrinsics: { ...liveCam } } : {}),
+    // gyro gate of registrations / initial pairs (active once R_cam_device is verified)
+    rotationCheck: live.rotationCheck(),
     ...(cfg.mapper ?? {}),
   };
   let offline: Reconstruction | null = null;
@@ -312,18 +349,25 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   const score = (r: Reconstruction | null): [number, number] => (r ? [r.numRegisteredImages, r.meanReprojectionError()] : [0, Infinity]);
   const [lr, le] = score(liveRec);
   const [or, oe] = score(offline);
+  const lc = consistency(liveRec),
+    oc = consistency(offline);
   stats.liveRegistered = lr;
   stats.offlineRegistered = or;
+  if (lc) stats.gyroBreaksLive = `${lc.breaksWithoutOutliers} (+${lc.outliers.length} outliers, median ${lc.medianErrDeg.toFixed(2)}°)`;
+  if (oc) stats.gyroBreaksOffline = `${oc.breaksWithoutOutliers} (+${oc.outliers.length} outliers, median ${oc.medianErrDeg.toFixed(2)}°)`;
   let chosen: Reconstruction;
   let which: 'live' | 'offline';
   if (!offline && !liveRec) throw new Error('reconstruction failed: no initial pair found (move the camera sideways while scanning)');
-  if (!offline || (liveRec && (lr > or || (lr === or && le <= oe)))) {
+  const lb = lc ? lc.breaksWithoutOutliers : 0,
+    ob = oc ? oc.breaksWithoutOutliers : 0;
+  if (!offline || (liveRec && (lb < ob || (lb === ob && (lr > or || (lr === or && le <= oe)))))) {
     chosen = liveRec!;
     which = 'live';
   } else {
     chosen = offline;
     which = 'offline';
   }
+  const cc = which === 'live' ? lc : oc;
   // work on a copy so the live model stays in its own frame (refine can run again); the offline
   // model is used by nobody else (no copy), and when it lost it is dropped right away: every
   // reconstruction is ≈ 300 B per point + 40 B per observation, and refine otherwise held four
@@ -331,6 +375,21 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   if (which === 'live') chosen = chosen.clone();
   offline = null;
   stats.model = which;
+  // isolated gyro outliers (an image misplaced by false matches) are deregistered; the global
+  // refinement below re-triangulates without them
+  if (cc && cc.outliers.length) {
+    const m = new IncrementalMapper(st.db, st.graph, chosen, { ...(which === 'live' ? live.mapper.incrementalMapper.opts : mapperOpts) });
+    for (const id of cc.outliers) m.deregisterImage(id);
+    await m.iterativeGlobalRefinement(undefined, cancel, true);
+    stats.gyroOutliers = cc.outliers.join(',');
+    deps.log('warn', `refine: ${cc.outliers.length} keyframe(s) disagree with the gyro and were removed: ${cc.outliers.join(', ')}`);
+  }
+  if (rsEnabled && rs === null && chosen.numRegisteredImages >= 10) {
+    await runRS(chosen, new IncrementalMapper(st.db, st.graph, chosen, { ...(which === 'live' ? live.mapper.incrementalMapper.opts : mapperOpts) }));
+  }
+  stats.gyroRejectedPairs = live.stats.gyroRejectedPairs;
+  stats.gyroRejectedPoses = live.stats.gyroRejectedPoses;
+  stats.forcedKeyframes = live.stats.forcedKeyframes;
   // final global BA with the principal point free (well constrained by the many views of a
   // finished capture; fixed during mapping as in COLMAP). A fixed, offset principal point is
   // absorbed by a constant rotation of every camera (≈ 0.14° per 1.8 px on the e2e datasets).
@@ -346,6 +405,24 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
       if ((e as Error)?.name === 'CancelledError') throw e;
       stats.principalPoint = 'kept (BA failed)';
       deps.log('warn', `principal point BA failed: ${(e as Error)?.message ?? e}`);
+    }
+  }
+  // per-image focal lengths (focus breathing): only when they lower the reprojection error clearly
+  if (cfg.perImageFocal !== false && chosen.numRegisteredImages >= 10) {
+    report('reconstruction', 0.985, 'per-image focal');
+    try {
+      const pf = await refinePerImageFocal(chosen, st.db, st.graph, { ...(which === 'live' ? live.mapper.incrementalMapper.opts : mapperOpts) }, {
+        sigmaRel: cfg.perImageFocalSigma ?? 0.005,
+        minImprovement: cfg.perImageFocalMinImprovement ?? 0.03,
+        cancel,
+      });
+      if (pf.accepted) chosen = pf.rec;
+      stats.perImageFocal = pf.accepted ? `refined: ${pf.reason}` : `kept shared (${pf.reason})`;
+      deps.log('info', `per-image focal ${pf.accepted ? 'refined' : 'kept shared'}: ${pf.reason}`);
+    } catch (e) {
+      if ((e as Error)?.name === 'CancelledError') throw e;
+      stats.perImageFocal = 'kept shared (BA failed)';
+      deps.log('warn', `per-image focal BA failed: ${(e as Error)?.message ?? e}`);
     }
   }
   stats.reconstructionMs = Math.round(now() - tRec);
@@ -446,7 +523,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     meanReprojErrorPx: Math.round(chosen.meanReprojectionError() * 1000) / 1000,
     meanTrackLength: Math.round(chosen.meanTrackLength() * 100) / 100,
     medianTrackLength: trackLens.length ? median(trackLens) : 0,
-    ...(cam0 ? { focalPx: Math.round(cam0.f * 10) / 10, k1: cam0.k1, k2: cam0.k2 } : {}),
+    ...(cam0 ? { focalPx: Math.round(median(cameras.map((c) => c.intrinsics.f)) * 10) / 10, k1: cam0.k1, k2: cam0.k2 } : {}),
   });
   const result: SparseResultEx = {
     points: modelPointCloud(model),

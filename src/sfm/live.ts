@@ -218,6 +218,8 @@ export class LiveMapper {
       !!g && g.numInliers >= o.liveInitMinNumInliers && g.triAngle >= minAngle && g.forwardMotion < maxForward;
     const attempt = (key: number, a: number, b: number, g: InitPairGeometry): boolean => {
       this.initAttempted.add(key);
+      // external rotation check (gyro) of the initial pair, oriented a → b
+      if (o.rotationCheck?.pair && !o.rotationCheck.pair(a, b, g.R)) return false;
       return this.initializeFrom(a, b, g);
     };
     // 1. relaxed thresholds: pairs evaluated earlier may pass now (cached, free), largest angle first

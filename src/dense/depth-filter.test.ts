@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { CameraIntrinsics, RGBAImage } from '../core/types';
 import { Rng } from '../math/random';
-import { borderComponents, borderConnectedMask, depthHaloMask, removeDepthHalos, segmentTextureStd } from './depth-filter';
+import { borderComponents, borderConnectedMask, depthHaloMask, removeDepthHalos, segmentTextureStd, skyBorders, worldUpInCamera } from './depth-filter';
 import { rgbAtResolution } from './dense-util';
 import { fuseDepthMaps, type FusionStats } from './fusion';
 import { makeNearScene, orbitPoses, pinholeIntrinsics } from './synthetic';
@@ -291,6 +291,52 @@ describe('sky test (untextured top-connected regions without coherent depth)', (
     expect(only.band).toBe(1);
     expect(only.wall).toBe(0);
     expect(depthHaloMask(dm, image, cam, { radius: 0, skyMaxStd: 0 })).toBeNull();
+  });
+
+  it('skyBorders / worldUpInCamera: seed borders from the up direction in the camera frame', () => {
+    expect(skyBorders(null)).toBe(1);
+    expect(skyBorders([NaN, 0, 0])).toBe(1);
+    expect(skyBorders([0, -1, 0])).toBe(1); // upright
+    expect(skyBorders([0, 1, 0])).toBe(2); // upside down
+    expect(skyBorders([-1, 0, 0])).toBe(4); // sky on the left
+    expect(skyBorders([2, 0, 0])).toBe(8); // sky on the right (any length)
+    expect(skyBorders([-Math.SQRT1_2, -Math.SQRT1_2, 0])).toBe(1 | 4); // rolled 45°: top + left
+    expect(skyBorders([-Math.sin(0.3), -Math.cos(0.3), 0])).toBe(1); // rolled ≈ 17°: top only
+    expect(skyBorders([0, -Math.SQRT1_2, Math.SQRT1_2])).toBe(1); // pitched up 45°
+    expect(skyBorders([0, -0.1, 1])).toBe(15); // looking (almost) straight up
+    expect(skyBorders([0, -0.1, -1])).toBe(0); // looking (almost) straight down: no sky test
+    // level camera looking north in the Z-up world (x_cam = east, y_cam = down, z_cam = north)
+    const R = [1, 0, 0, 0, 0, -1, 0, 1, 0];
+    expect(worldUpInCamera(R)).toEqual([0, -1, 0]);
+    expect(skyBorders(worldUpInCamera(R))).toBe(1);
+  });
+
+  it('with skyUp, finds the sky of a rotated image (180°: sky at the bottom) exactly as in the upright image', () => {
+    const { dm, image, region } = skyScene();
+    const n = W * H;
+    // 180° turn: pixel i → n − 1 − i, normals (nx, ny) → (−nx, −ny), principal point mirrored
+    const rdm: DepthMap = { width: W, height: H, depth: new Float32Array(n), normal: new Float32Array(3 * n), cost: new Float32Array(n) };
+    const rimg: RGBAImage = { width: W, height: H, data: new Uint8ClampedArray(4 * n) };
+    for (let i = 0; i < n; i++) {
+      const j = n - 1 - i;
+      rdm.depth[j] = dm.depth[i];
+      rdm.cost[j] = dm.cost[i];
+      rdm.normal.set([-dm.normal[3 * i], -dm.normal[3 * i + 1], dm.normal[3 * i + 2]], 3 * j);
+      rimg.data.set(image.data.subarray(4 * i, 4 * i + 4), 4 * j);
+    }
+    const rcam: CameraIntrinsics = { ...cam, cx: W - 1 - cam.cx, cy: H - 1 - cam.cy };
+    const rregion = (x: number, y: number): string => region(W - 1 - x, H - 1 - y);
+    const upright = rejectedFractions(depthHaloMask(dm, image, cam, { radius: 0 }), dm, region);
+    const topOnly = rejectedFractions(depthHaloMask(rdm, rimg, rcam, { radius: 0 }), rdm, rregion);
+    const withUp = rejectedFractions(depthHaloMask(rdm, rimg, rcam, { radius: 0, skyUp: [0, 1, 0] }), rdm, rregion);
+    log(`rotated sky scene: upright ${JSON.stringify(upright)}, top row only ${JSON.stringify(topOnly)}, skyUp ${JSON.stringify(withUp)}`);
+    expect(topOnly.band ?? 0).toBe(0);
+    expect(topOnly.sky ?? 0).toBe(0);
+    expect(withUp).toEqual(upright);
+    // full filter, skyUp of the upright image = the default
+    expect(depthHaloMask(dm, image, cam, { skyUp: [0, -1, 0] })).toEqual(depthHaloMask(dm, image, cam));
+    // looking straight down: no sky test
+    expect(depthHaloMask(dm, image, cam, { radius: 0, skyUp: [0, 0, -1] })).toBeNull();
   });
 
   it('keeps an untextured top-connected surface with a coherent depth (a smooth wall), removes it when its depths are incoherent', () => {

@@ -10,7 +10,8 @@
  *     prior + sources = the maps of the previous pass
  *   haloFilter ⇒ removeDepthHalos(map, view.image, view.cam) on the final maps, with the default
  *     options: halo vote + sky test (or fuseDepthMaps(..., { haloFilter: {} }) — not both: a
- *     second pass erodes edges)
+ *     second pass erodes edges). With a gravity-aligned model pass
+ *     { skyUp: worldUpInCamera(view.pose.R) } per map: without it the sky test assumes upright frames.
  *   fuseDepthMaps(views, store, neighboursFromSelection(sel), { ...fusion, minViews })
  *   sorK > 0 ⇒ filterPointCloud(cloud, { statistical: { k: sorK, std: sorStd } })
  *

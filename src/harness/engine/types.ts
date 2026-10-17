@@ -4,6 +4,7 @@
  * Playwright's `page.evaluate` and can be written to disk as is.
  */
 import type { MetricInfo } from '../../core/types';
+import type { DebugKeyframe, DebugPair } from './debug-dump';
 import type {
   CaptureMode,
   DenseOptions,
@@ -112,6 +113,18 @@ export interface HarnessConfig {
   maxFrameErrors?: number;
   /** Log every frame to the runner (default true; false = every 10th). */
   logFrames?: boolean;
+  /**
+   * Diagnostics: keep the camera poses of every LiveUpdate that carries the live model in
+   * `result.liveTrace` (≈ 1–2 MB for 80 keyframes). Default false.
+   */
+  liveTrace?: boolean;
+  /**
+   * Diagnostics, `engine: 'inline'` only (debug-dump.ts reads engine internals): `result.debug`
+   * gets every keyframe's live registration state + pose after each keyframe frame (use
+   * `engineConfig.mapping: 'inline'` so the frame's keyframe is already mapped), and the verified
+   * pairs + live model after finishCapture and after refine. Default false.
+   */
+  debugDump?: boolean;
 }
 
 /** Config with every default filled in. */
@@ -316,5 +329,17 @@ export interface HarnessResult {
   errors: HarnessError[];
   /** JS heap of the page (Chromium `performance.memory`, bytes) after each step. Worker memory not included. */
   memory: Record<string, number>;
+  /**
+   * With `liveTrace`: one entry per LiveUpdate with cameras (frame responses and background
+   * model updates). `poses` are the registered keyframes' poses sorted by keyframe id; when
+   * `registered === keyframes` the k-th pose is the k-th keyframe (`live.keyframeIndices[k]`).
+   */
+  liveTrace?: { ms: number; frameIndex: number; keyframes: number; registered: number; points: number; poses: PoseJSON[] }[];
+  /** With `debugDump` (inline engine). */
+  debug?: {
+    keyframeTrace: { frameIndex: number; keyframes: DebugKeyframe[] }[];
+    afterCapture?: { keyframes: DebugKeyframe[] | null; pairs: DebugPair[] | null };
+    afterRefine?: { keyframes: DebugKeyframe[] | null; pairs: DebugPair[] | null };
+  };
 }
 

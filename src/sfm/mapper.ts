@@ -143,6 +143,17 @@ export interface MapperOptions {
   maxNumModels: number;
   minModelSize: number;
   maxModelOverlap: number;
+  // ---- external consistency checks
+  /**
+   * Optional checks of rotations against an independent sensor (the engine passes the gyro,
+   * src/sfm/gyro.ts): `pair` vets the relative rotation x_b = R x_a of a candidate initial pair,
+   * `pose` the absolute pose of an image about to be registered (PnP). Returning false rejects
+   * the pair / registration (the image stays unregistered and can be retried later).
+   */
+  rotationCheck?: {
+    pair?(a: number, b: number, R_ba: Mat3): boolean;
+    pose?(id: number, pose: Pose, rec: Reconstruction): boolean;
+  };
   // ---- misc
   triangulation: TriangulatorOptions;
   seed: number;
@@ -303,6 +314,8 @@ interface BundleConfig {
    * this contribute only every ⌈L/cap⌉-th observation (Infinity = all).
    */
   trackCap?: number;
+  /** Focal priors per camera id (BA `focalPriors`). */
+  focalPriors?: Map<number, { f: number; sigma: number }>;
 }
 
 /** Cancellation / per-iteration hook forwarded to `bundleAdjust`. */
@@ -446,6 +459,8 @@ export class IncrementalMapper {
   private readonly numRegPerCamera = new Map<number, number>();
   /** Registered images of this model that are also registered in other models. */
   numSharedRegImages = 0;
+  /** Registrations / initial pairs rejected by `rotationCheck`. */
+  numRotationRejects = 0;
 
   constructor(
     readonly db: FeatureDatabase,
@@ -698,8 +713,15 @@ export class IncrementalMapper {
     const minAngle = minTriAngleDeg * DEG;
     this.initBudget = budget;
     this.initSearchExhausted = false;
-    const accept = (g: InitPairGeometry | null): g is InitPairGeometry =>
-      !!g && g.numInliers >= minInliers && g.triAngle >= minAngle && g.forwardMotion < maxForwardMotion;
+    const check = this.opts.rotationCheck?.pair;
+    const accept = (g: InitPairGeometry | null, a: number, b: number): g is InitPairGeometry => {
+      if (!g || !(g.numInliers >= minInliers && g.triAngle >= minAngle && g.forwardMotion < maxForwardMotion)) return false;
+      if (check && !check(a, b, g.R)) {
+        this.numRotationRejects++;
+        return false;
+      }
+      return true;
+    };
     const evaluate = (a: number, b: number): InitPairGeometry | null | undefined => {
       // undefined = budget exhausted (pair not marked as tried)
       if (this.initBudget <= 0 && !this.shared.initGeometry.has(pairKey(a, b))) {
@@ -735,7 +757,7 @@ export class IncrementalMapper {
         if (this.shared.initPairsTried.has(`${levelKey}:${pairKey(a, b)}`)) continue;
         const g = evaluate(a, b);
         if (g === undefined) return null;
-        if (accept(g)) return { a, b, geom: g };
+        if (accept(g, a, b)) return { a, b, geom: g };
       }
     }
     return null;
@@ -921,6 +943,10 @@ export class IncrementalMapper {
     });
     if (!res || res.numInliers < o.absPoseMinNumInliers || res.numInliers < o.absPoseMinInlierRatio * n) return false;
     if (!poseIsUsable(res.pose, res.inlierMask, uv, n, o.absPoseMaxErrorPx)) return false;
+    if (o.rotationCheck?.pose && !o.rotationCheck.pose(id, res.pose, this.rec)) {
+      this.numRotationRejects++;
+      return false;
+    }
     this.rec.registerImage(id, res.pose);
     this.onRegistered(id);
     const added = new Set<number>();
@@ -1131,6 +1157,13 @@ export class IncrementalMapper {
       obsPoint: this.obsPointBuf.subarray(0, nO),
       obsUV: this.obsUVBuf.subarray(0, 2 * nO),
     };
+    if (cfg.focalPriors && cfg.focalPriors.size) {
+      problem.focalPriors = [];
+      for (const [cid, fp] of cfg.focalPriors) {
+        const ci = camIndex.get(cid);
+        if (ci !== undefined) problem.focalPriors.push({ camera: ci, f: fp.f, sigma: fp.sigma });
+      }
+    }
     const result = bundleAdjust(problem, {
       loss,
       lossScalePx,
@@ -1403,6 +1436,44 @@ export class IncrementalMapper {
       o.globalBALinearSolver === 'auto' && reg.length > 150 && this.rec.meanTrackLength() > 8 ? 'pcg_schur' : o.globalBALinearSolver,
       control,
     );
+    this.timings.globalBA += now() - t0;
+    this.timings.numGlobalBA++;
+    if (result) this.timings.globalBAIterations += result.iterations;
+    return result;
+  }
+
+  /**
+   * Global BA with per-camera focal priors and ONLY the focal of those cameras free (principal
+   * point / distortion fixed; other cameras constant): e.g. per-image cameras of a final refinement
+   * whose focal lengths breathe around a shared value, `priors` = camera id → shared focal,
+   * σ = sigmaRel · focal. Same gauge as `adjustGlobalBundle`; trivial loss; all observations.
+   */
+  async adjustGlobalBundleFocalPriors(priors: Map<number, number>, sigmaRel: number, cancel?: CancelToken): Promise<BAResult | null> {
+    const t0 = now();
+    const o = this.opts;
+    const reg = this.rec.registeredImageIds();
+    if (reg.length < 2) return null;
+    this.rec.filterObservationsWithNegativeDepth();
+    const constantPoses = new Set<number>([reg[0]]);
+    const ax = largestRelTranslationAxis(this.rec.images.get(reg[0])!.pose, this.rec.images.get(reg[1])!.pose);
+    const translationMask = new Map<number, number>([[reg[1], 1 << ax]]);
+    const fp = new Map<number, { f: number; sigma: number }>();
+    for (const [cid, f] of priors) fp.set(cid, { f, sigma: Math.max(1e-9, sigmaRel * f) });
+    const free: BACameraRefine = { focal: true, principalPoint: false, distortion: false };
+    const none: BACameraRefine = { focal: false, principalPoint: false, distortion: false };
+    await yieldToEventLoop();
+    const { result } = this.solveBundle(
+      { images: reg, constantPoses, translationMask, variablePoints: [], refine: (cid) => (fp.has(cid) ? free : none), maxConstObsPerImage: Infinity, focalPriors: fp },
+      'trivial',
+      o.globalBALossScalePx,
+      o.globalBAMaxIterations,
+      o.globalBATimeLimitMs,
+      1e-6,
+      undefined,
+      o.globalBALinearSolver === 'auto' && reg.length > 150 && this.rec.meanTrackLength() > 8 ? 'pcg_schur' : o.globalBALinearSolver,
+      { cancel },
+    );
+    if (cancel?.cancelled) throw new SfMCancelledError();
     this.timings.globalBA += now() - t0;
     this.timings.numGlobalBA++;
     if (result) this.timings.globalBAIterations += result.iterations;
