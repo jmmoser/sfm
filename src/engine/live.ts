@@ -53,6 +53,7 @@ import {
   type StoredPair,
   type StoredPairs,
 } from './persistence';
+import { MB, MEM, captureMemory, formatBreakdown, sumBreakdown, type MemoryBreakdown } from './memory';
 import { ENGINE_DEFAULTS, modeConfig, type QualityPresetConfig } from './presets';
 import type { EngineConfig, KeyframeRecord } from './types';
 
@@ -76,6 +77,10 @@ export interface LiveDeps {
   log(level: 'debug' | 'info' | 'warn' | 'error', message: string, data?: unknown): void;
   emitLive(u: LiveUpdate): void;
   storageError(e: unknown): void;
+  /** Tab memory budget in MB (device-derived; default ENGINE_DEFAULTS.memoryBudgetMB). */
+  memoryBudgetMB?(): number;
+  /** The capture reached its memory cap (no more keyframes); called once. */
+  memoryLimit?(message: string): void;
 }
 
 /** Sorted, de-duplicated IMU history of the capture (+ chunked persistence). */
@@ -145,6 +150,8 @@ export class CaptureState {
   /** θ whose R_cam_device describes the canonical images. */
   cameraTheta: ScreenAngle | null = null;
   cameraThetaVerified = false;
+  /** Frame delivery path (OrientationTracker.rawDelivery): raw sensor buffers, upright frames, unknown. */
+  rawDelivery: boolean | null = null;
   resolvedMode: 'object' | 'scene' | null = null;
   nextKeyframeId = 0;
   frameCounter = 0;
@@ -317,6 +324,12 @@ export class LiveSession {
   private queue: Promise<void> = Promise.resolve();
   private queued = 0;
   private readonly writes = new Set<Promise<unknown>>();
+  /** Bytes held by writes not yet completed (JPEG canvases / blobs, features, colours). */
+  private pendingWriteBytes = 0;
+  /** Capture memory estimate after the last mapped keyframe (bytes) and when it was last logged. */
+  private memEstimate = 0;
+  private memLoggedAt = 0;
+  private memWarned = false;
   private consecutiveUnregistered = 0;
   private lastFrameInliers = NaN;
   private lastGuidance: Guidance = 'initializing';
@@ -429,8 +442,14 @@ export class LiveSession {
       this.deps.log('debug', `frame ${frameIndex} dropped: ${verdict.reason}`);
       return finish(this.baseUpdate(frameIndex, 'skip', this.lastGuidance, timings));
     }
-    if (st.thetaSession === null) st.thetaSession = this.orientation.thetaSession;
+    const ts = this.orientation.thetaSession;
+    if (st.thetaSession === null) st.thetaSession = ts;
+    else if (ts !== null && ts !== st.thetaSession) this.reinterpretSessionTheta(ts);
     if (st.cameraTheta === null) st.cameraTheta = st.thetaSession;
+    if (st.rawDelivery !== this.orientation.rawDelivery) {
+      st.rawDelivery = this.orientation.rawDelivery;
+      this.persistState();
+    }
     if (verdict.raw) this.deps.log('debug', `frame ${frameIndex}: raw sensor-orientation buffer (treated as θ=90)`);
     let prep: PreparedFrame;
     try {
@@ -499,7 +518,20 @@ export class LiveSession {
       } else {
         this.lastFrameInliers = NaN;
       }
-      const decision = this.selector.evaluate(cand);
+      let decision = this.selector.evaluate(cand);
+      if (decision.decision === 'keyframe' && (st.captureFinished || this.disposed)) {
+        // finishCapture / refine started while this frame was being analysed: no new keyframe
+        // (its mapping job would change the live model under refine)
+        this.selector.revertLastKeyframe();
+        decision = { ...decision, decision: 'skip' };
+      }
+      if (decision.decision === 'keyframe' && this.captureMemoryFull()) {
+        // memory cap: refine peaks at ≈ 1.9× the capture state — keep tracking, add no
+        // more keyframes (the app should offer to finish the scan)
+        this.selector.revertLastKeyframe();
+        decision = { ...decision, decision: 'skip' };
+        timings.memoryLimited = 1;
+      }
       const overlay = overlayPoints(fs, W, H, kOut, this.deps.config.overlayMaxPoints ?? ENGINE_DEFAULTS.overlayMaxPoints);
       let mapped: Promise<void> | null = null;
       if (decision.decision === 'keyframe') {
@@ -521,6 +553,16 @@ export class LiveSession {
           const tw = now();
           while (this.queued > maxBacklog && !this.disposed && this.jobs.length) await this.jobs[0];
           timings.mappingWait = now() - tw;
+        }
+      }
+      if (mapped) {
+        // back-pressure of the store: a slow / stalled IndexedDB must not pile up full-size
+        // canvases, JPEG blobs and feature buffers in memory (≈ 12 MB per 1920×1440 keyframe)
+        const cap = this.writeBacklogBytes();
+        if (this.pendingWriteBytes > cap) {
+          const tw = now();
+          while (this.pendingWriteBytes > cap && this.writes.size && !this.disposed) await Promise.race([...this.writes]);
+          timings.writeWait = now() - tw;
         }
       }
       const u = this.baseUpdate(frameIndex, decision.decision, this.mapGuidance(decision.guidance), timings);
@@ -628,9 +670,11 @@ export class LiveSession {
     const store = this.deps.store;
     const img = prep.fullImage(0.92);
     prep.release();
-    this.track(img.then((im) => store.putFrame(id, im, rec)));
-    this.track(store.putBinary(`kf/${id}/features`, serializeFeatureSet(fs)));
-    this.track(store.putBinary(`kf/${id}/colors`, colors));
+    // the full-size canvas is alive while the JPEG is encoded, then the blob until it is stored
+    this.track(img.then((im) => store.putFrame(id, im, rec)), 4 * prep.width * prep.height);
+    const fsBytes = serializeFeatureSet(fs);
+    this.track(store.putBinary(`kf/${id}/features`, fsBytes), 2 * fsBytes.byteLength);
+    this.track(store.putBinary(`kf/${id}/colors`, colors), colors.byteLength);
     const chunk = st.imu.takeChunk();
     if (chunk.length) this.track(store.putBinary(`imu/${st.imuChunks++}`, packImu(chunk)));
     if (st.geo.length) this.track(store.putValue('geo', st.geo));
@@ -638,11 +682,77 @@ export class LiveSession {
     return id;
   }
 
-  /** Track a background write; failures are reported as storage errors. */
-  private track(p: Promise<unknown>): void {
+  /** Track a background write holding `bytes` until it completes; failures are reported as storage errors. */
+  private track(p: Promise<unknown>, bytes = 0): void {
     const q = p.catch((e: unknown) => this.deps.storageError(e));
     this.writes.add(q);
-    void q.finally(() => this.writes.delete(q));
+    this.pendingWriteBytes += bytes;
+    void q.finally(() => {
+      this.writes.delete(q);
+      this.pendingWriteBytes -= bytes;
+    });
+  }
+
+  private get memoryBudgetMB(): number {
+    return this.deps.memoryBudgetMB?.() ?? this.deps.config.memoryBudgetMB ?? ENGINE_DEFAULTS.memoryBudgetMB;
+  }
+
+  /** Pending-write bytes above which a keyframe frame waits for the store (3 % of the budget, ≥ 24 MB). */
+  private writeBacklogBytes(): number {
+    const cfg = this.deps.config.maxPendingWriteMB;
+    if (cfg !== undefined && cfg >= 0) return cfg * MB;
+    return Math.max(24 * MB, 0.03 * this.memoryBudgetMB * MB);
+  }
+
+  /** Estimated resident memory of the capture (features, pairs, graph, live model, vocabulary, IMU, pending writes). */
+  memoryBreakdown(): MemoryBreakdown {
+    const st = this.state;
+    return captureMemory({
+      db: st.db,
+      graph: st.graph,
+      rec: this.mapper.initialized ? this.mapper.reconstruction : null,
+      vocab: st.vocab,
+      imuSamples: st.imu.samples.length,
+      pendingWriteBytes: this.pendingWriteBytes,
+    });
+  }
+
+  /** Last capture memory estimate (bytes; updated per mapped keyframe). */
+  get memoryEstimate(): number {
+    return this.memEstimate;
+  }
+
+  /**
+   * Capture-state bytes above which no keyframes are added: EngineConfig.captureMemoryFraction of
+   * the budget left after the page / JS reserve and the feature pipeline's GPU caches.
+   */
+  private captureMemoryCap(): number {
+    const f = this.deps.config.captureMemoryFraction ?? ENGINE_DEFAULTS.captureMemoryFraction;
+    return f * Math.max(0, this.memoryBudgetMB * MB - MEM.reserve - 64 * MB);
+  }
+
+  /** True once the capture state reached its cap (reported once). */
+  private captureMemoryFull(): boolean {
+    if (!(this.memEstimate > this.captureMemoryCap())) return false;
+    if (!this.memWarned) {
+      this.memWarned = true;
+      const msg = `capture memory ≈ ${Math.round(this.memEstimate / MB)} MB at ${this.state.order.length} keyframes reached ${Math.round(this.captureMemoryCap() / MB)} MB (of a ${this.memoryBudgetMB} MB budget): no more keyframes — finish the scan`;
+      this.deps.log('warn', msg);
+      this.deps.memoryLimit?.(msg);
+    }
+    return true;
+  }
+
+  /** Update the capture memory estimate (per mapped keyframe); log it every 25 keyframes. */
+  private updateMemoryEstimate(): void {
+    const b = this.memoryBreakdown();
+    const total = sumBreakdown(b);
+    this.memEstimate = total;
+    const n = this.state.order.length;
+    if (n - this.memLoggedAt >= 25) {
+      this.memLoggedAt = n;
+      this.deps.log('info', `capture memory ≈ ${formatBreakdown(b, total)} at ${n} keyframes`, b);
+    }
   }
 
   /** Snapshot of the persisted engine state (extended by the engine). */
@@ -656,6 +766,7 @@ export class LiveSession {
       thetaSession: st.thetaSession,
       cameraTheta: st.cameraTheta,
       cameraThetaVerified: st.cameraThetaVerified,
+      rawDelivery: st.rawDelivery,
       resolvedMode: st.resolvedMode,
       nextKeyframeId: st.nextKeyframeId,
       frameCounter: st.frameCounter,
@@ -813,6 +924,7 @@ export class LiveSession {
     const rec: StoredPairs = { pairs: stored, attempted };
     this.track(this.deps.store.putValue(`kf/${id}/pairs`, rec));
     this.persistState();
+    this.updateMemoryEstimate();
     if (!this.inline) this.emitModelUpdate();
   }
 
@@ -935,6 +1047,21 @@ export class LiveSession {
     return r;
   }
 
+  /**
+   * The orientation tracker re-interpreted θ₀ (a session started in a landscape-270 UI turned out
+   * to deliver raw sensor buffers: the unrotated first frames are upright for θ = 90). The
+   * canonical images did not change, only what they are upright for: unless the hand-eye check
+   * already verified the mapping from the gyro, R_cam_device of every keyframe follows θ₀.
+   */
+  private reinterpretSessionTheta(theta: ScreenAngle): void {
+    const st = this.state;
+    const old = st.thetaSession;
+    st.thetaSession = theta;
+    this.deps.log('warn', `raw sensor buffers detected: the session's first frames (θ=${old}) were raw buffers, canonical θ is ${theta}`);
+    if (!st.cameraThetaVerified && st.cameraTheta !== theta) this.setCameraTheta(theta);
+    this.persistState();
+  }
+
   /** Change the camera←device mapping of the canonical images (updates every keyframe's FrameInfo). */
   setCameraTheta(theta: ScreenAngle): void {
     const st = this.state;
@@ -1028,6 +1155,8 @@ export class LiveSession {
     st.captureFinished = rec.captureFinished;
     st.timeOffsetMs = rec.timeOffsetMs ?? null;
     this.orientation.thetaSession = st.thetaSession;
+    st.rawDelivery = rec.rawDelivery ?? null;
+    this.orientation.rawDelivery = st.rawDelivery;
     if (st.resolvedMode) this.selector.setMode(st.resolvedMode);
     // IMU + GPS
     const imuKeys = await store.listBinaryKeys('imu/');
@@ -1055,6 +1184,9 @@ export class LiveSession {
       st.order.push(r.id);
       st.nextKeyframeId = Math.max(st.nextKeyframeId, r.id + 1);
     }
+    // a keyframe record is written once, when the keyframe is created: R_cam_device / gravityCam
+    // of keyframes stored before a hand-eye switch (or a θ₀ re-interpretation) are stale
+    if (st.cameraTheta !== null) this.setCameraTheta(st.cameraTheta);
     // pairs
     const pairsById = new Map<number, StoredPair[]>();
     for (const id of st.order) {
@@ -1077,14 +1209,25 @@ export class LiveSession {
       this.ref = { id: last.id, fs: st.db.features.get(last.id)!, t: last.t, width: last.width, height: last.height };
       this.selector.commitKeyframe(last.t);
     }
-    // rebuild the live model in the mapping queue (keyframes with no pairs simply stay pending)
+    // rebuild the live model in the mapping queue; keyframes whose mapping never completed (no
+    // pairs record: still queued when the worker died) are matched and mapped like new ones
     const ids = st.order.slice();
     this.queued++;
     this.queue = this.queue.then(async () => {
       const t0 = now();
+      let remapped = 0;
       try {
         for (const id of ids) {
           if (this.disposed) return;
+          if (!pairsById.has(id)) {
+            try {
+              await this.mapKeyframe({ id, tracking: null });
+              remapped++;
+            } catch (e) {
+              this.deps.log('error', `mapping keyframe ${id} failed: ${(e as Error)?.message ?? e}`, e);
+            }
+            continue;
+          }
           const fs = st.db.features.get(id)!;
           if (!st.graph.hasImage(id)) st.graph.addImage(id, fs.count);
           for (const sp of pairsById.get(id) ?? []) {
@@ -1096,7 +1239,7 @@ export class LiveSession {
           this.modelVersion++;
           if (!this.inline) await tick();
         }
-        this.deps.log('info', `live model rebuilt from ${ids.length} keyframes in ${Math.round(now() - t0)} ms`);
+        this.deps.log('info', `live model rebuilt from ${ids.length} keyframes (${remapped} matched again) in ${Math.round(now() - t0)} ms`);
       } finally {
         this.queued--;
       }

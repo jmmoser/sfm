@@ -55,6 +55,11 @@ export interface DensePresetConfig {
   /** Apply src/dense `removeDepthHalos` (when exported) to the final depth maps before fusion. Default true. */
   haloFilter?: boolean;
   /**
+   * Fusion pixel step (every n-th reference pixel). Default: derived from the memory budget
+   * (`planDense`): 1 unless the expected fused cloud would not fit (balanced / max at full size).
+   */
+  fusionStep?: number;
+  /**
    * Option blocks of the tuned `DENSE_PRESETS` (src/dense/presets.ts) passed through to the
    * dense module: PatchMatch kernel options (every pass), `selectSourceViews` options (over the
    * capture mode's depth margins) and `fuseDepthMaps` options (minViews / maxNeighbours /
@@ -171,9 +176,20 @@ export function externalDensePreset(quality: QualityPreset): Partial<DensePreset
   // computed key: the export may not exist (yet); a literal would make the bundler warn
   const ext = (denseModule as unknown as Record<string, unknown>)[['DENSE', 'PRESETS'].join('_')];
   if (!ext || typeof ext !== 'object') return {};
-  const entry = (ext as Record<string, unknown>)[quality];
+  return parseDensePresetEntry((ext as Record<string, unknown>)[quality]);
+}
+
+/**
+ * Engine fields of one `DENSE_PRESETS` entry: the option blocks (`patchMatch`, `viewSelection`,
+ * `fusion`), the flat numeric fields (engine names or aliases) and a few values derivable from the
+ * nested blocks (`fusion.minViews`, `fusion.maxNeighbours`, `tsdf.maxBlocks`, `patchMatch.*`). The
+ * flat fields are authoritative (src/dense/presets.ts: "minViews = fusionMinViews*"): a nested
+ * value only fills a field the entry does not set flat, whatever the key order.
+ */
+export function parseDensePresetEntry(entry: unknown): Partial<DensePresetConfig> {
   if (!entry || typeof entry !== 'object') return {};
   const out: Partial<DensePresetConfig> = {};
+  const nested: Partial<DensePresetConfig> = {};
   // option blocks for the dense module (plain JSON-like values only)
   for (const k of ['patchMatch', 'viewSelection', 'fusion'] as const) {
     const b = (entry as Record<string, unknown>)[k];
@@ -186,24 +202,26 @@ export function externalDensePreset(quality: QualityPreset): Partial<DensePreset
     out[k] = block;
   }
   const visit = (obj: Record<string, unknown>, depth: number): void => {
+    const dst = depth === 0 ? out : nested;
     for (const [k, v] of Object.entries(obj)) {
-      if (typeof v === 'number' && Number.isFinite(v) && DENSE_ALIASES[k]) (out as Record<string, number>)[DENSE_ALIASES[k]] = v;
-      else if (typeof v === 'boolean' && k === 'haloFilter') out.haloFilter = v;
-      else if (typeof v === 'boolean' && k === 'geometric' && !v) out.geometricPasses = 0;
+      if (typeof v === 'number' && Number.isFinite(v) && DENSE_ALIASES[k]) (dst as Record<string, number>)[DENSE_ALIASES[k]] = v;
+      else if (typeof v === 'boolean' && k === 'haloFilter') dst.haloFilter = v;
+      else if (typeof v === 'boolean' && k === 'geometric' && !v) dst.geometricPasses = 0;
       else if (v && typeof v === 'object' && !Array.isArray(v) && depth < 2) {
         // nested blocks like { patchMatch: { iterations }, fusion: { minViews } }
         const sub = v as Record<string, unknown>;
         if (k === 'fusion' && typeof sub.minViews === 'number') {
-          out.fusionMinViewsObject = sub.minViews;
-          out.fusionMinViewsScene = sub.minViews;
+          nested.fusionMinViewsObject = sub.minViews;
+          nested.fusionMinViewsScene = sub.minViews;
         }
-        if (k === 'fusion' && typeof sub.maxNeighbours === 'number') out.fusionMaxNeighbours = sub.maxNeighbours;
-        if (k === 'tsdf' && typeof sub.maxBlocks === 'number') out.tsdfMaxBlocks = sub.maxBlocks;
+        if (k === 'fusion' && typeof sub.maxNeighbours === 'number') nested.fusionMaxNeighbours = sub.maxNeighbours;
+        if (k === 'tsdf' && typeof sub.maxBlocks === 'number') nested.tsdfMaxBlocks = sub.maxBlocks;
         if (k === 'patchMatch' || k === 'patchmatch' || k === 'pm') visit(sub, depth + 1);
       }
     }
   };
   visit(entry as Record<string, unknown>, 0);
+  for (const [k, v] of Object.entries(nested)) if ((out as Record<string, unknown>)[k] === undefined) (out as Record<string, unknown>)[k] = v;
   return out;
 }
 
@@ -263,6 +281,14 @@ export const ENGINE_DEFAULTS = Object.freeze({
   refineRetrieval: 15,
   refineSpatial: 10,
   memoryBudgetMB: 1200,
+  /**
+   * Capture state (features, pairs, graph, live model, …) cap as a fraction of the memory budget
+   * minus the page / JS reserve (250 MB) and the feature GPU caches (64 MB): refine peaks at ≈ 1.8–1.9×
+   * the capture state (more pairs, a second reconstruction + the working copy, global BA:
+   * measured on the e2e object capture), so 0.45 keeps the refine peak ≈ 0.85 of what is left.
+   * 1200 MB → ≈ 400 MB (≈ 280 keyframes at balanced on 1920×1440), 850 MB → ≈ 240 MB.
+   */
+  captureMemoryFraction: 0.45,
   /** Two-view pairs with fewer inliers are not stored. */
   minPairInliers: 15,
   /** Long side of the per-frame colour / sharpness copy. */

@@ -266,6 +266,8 @@ export interface EngineStateRecord {
   /** θ whose R_cam_device describes the canonical images (= θ_s unless the hand-eye check switched it). */
   cameraTheta: number | null;
   cameraThetaVerified: boolean;
+  /** Frame delivery path (raw sensor buffers / upright frames / unknown); absent in older records. */
+  rawDelivery?: boolean | null;
   /** 'object' | 'scene' once 'auto' was resolved. */
   resolvedMode: 'object' | 'scene' | null;
   nextKeyframeId: number;

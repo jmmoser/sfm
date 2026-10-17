@@ -75,6 +75,14 @@ export class EngineDepthStore implements DepthMapStore {
     return this.ids();
   }
 
+  /** Delete one map (memory + store). */
+  async delete(id: number): Promise<void> {
+    this.memory.delete(id);
+    this.cache.delete(id);
+    this.known.delete(id);
+    if (this.persistent) await this.store!.deleteBinary(this.key(id)).catch(() => undefined);
+  }
+
   /** Delete every map of this prefix (memory + store). */
   async clear(): Promise<void> {
     const ids = await this.scan();

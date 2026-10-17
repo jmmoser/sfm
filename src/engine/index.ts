@@ -7,6 +7,8 @@ export { PhotogrammetryEngine, pipelineKey } from './engine';
 export type { EngineConfig, EngineEvents, EngineStage, KeyframeRecord, SparseCameraEx, SparseModel, SparseResultEx } from './types';
 export { QUALITY_PRESETS, ENGINE_DEFAULTS, resolveDensePreset, externalDensePreset, modeConfig } from './presets';
 export type { QualityPresetConfig, DensePresetConfig, FeaturePresetConfig, ModeConfig, ResolvedMode } from './presets';
+export { MEM, captureMemory, planDense, deviceMemoryBudgetMB, reconstructionBytes, featureSetBytes, formatBreakdown } from './memory';
+export type { MemoryBreakdown, DensePlan, DensePlanInput, DenseStagePeak } from './memory';
 export { MemoryEngineStore, SessionEngineStore, packSparseModel, unpackSparseModel, packImu, unpackImu } from './persistence';
 export type { EngineStore, EngineStateRecord, StoredImage, StoredPair } from './persistence';
 export { OrientationTracker, prepareFrame, overlayPoints, gravityDown, sampleFeatureColors, resizeRGBA, encodeJpegRGBA } from './frame-ingest';

@@ -51,9 +51,60 @@ import {
   type EngineStore,
   type SparseMetaRecord,
 } from './persistence';
+import { MB, deviceMemoryBudgetMB, formatBreakdown, sumBreakdown, type GpuMemoryHints, type MemoryBreakdown } from './memory';
 import { ENGINE_DEFAULTS, QUALITY_PRESETS, type QualityPresetConfig, type ResolvedMode } from './presets';
 import { modelPointCloud, runRefine } from './refine';
 import type { EngineConfig, EngineEvents, SparseModel, SparseResultEx } from './types';
+
+/** Bytes of a plain-array sparse model. */
+function sparseModelBytes(m: SparseModel): number {
+  return m.xyz.byteLength + m.colors.byteLength + m.errors.byteLength + m.trackOffsets.byteLength + m.trackImages.byteLength + m.trackFeatures.byteLength + 300 * m.images.length;
+}
+
+function cloudBytes(pc: PointCloud | null | undefined): number {
+  if (!pc) return 0;
+  return pc.positions.byteLength + (pc.colors?.byteLength ?? 0) + (pc.normals?.byteLength ?? 0) + (pc.radii?.byteLength ?? 0) + (pc.confidence?.byteLength ?? 0);
+}
+
+function meshBytes(m: TriangleMesh | null | undefined): number {
+  if (!m) return 0;
+  let b = 0;
+  for (const v of Object.values(m)) if (ArrayBuffer.isView(v)) b += v.byteLength;
+  return b;
+}
+
+/**
+ * GPU memory of a WebGPU feature pipeline (SIFT pyramids + matcher descriptor cache), read
+ * defensively (the pipeline class keeps its SiftGPU / MatcherGPU private).
+ */
+function pipelineGpuBytes(p: FeaturePipeline | null): number {
+  if (!p?.gpu) return 0;
+  const x = p as unknown as { sift?: { memoryBytes?: () => number }; matcher?: { cacheMemoryBytes?: () => number } };
+  try {
+    return (x.sift?.memoryBytes?.() ?? 0) + (x.matcher?.cacheMemoryBytes?.() ?? 0);
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Free the feature pipeline's size-dependent GPU caches (SIFT pyramids ≈ 70 MB per cached size
+ * at 1600 px, matcher descriptor cache ≤ 64 MB); the compiled pipelines stay. Defensive: uses
+ * `releaseCaches()` when the pipeline offers one, else its SiftGPU / MatcherGPU.
+ */
+function releasePipelineCaches(p: FeaturePipeline | null): void {
+  if (!p?.gpu) return;
+  const x = p as unknown as { releaseCaches?: () => void; sift?: { releaseCaches?: () => void }; matcher?: { clearCache?: () => void } };
+  try {
+    if (typeof x.releaseCaches === 'function') x.releaseCaches();
+    else {
+      x.sift?.releaseCaches?.();
+      x.matcher?.clearCache?.();
+    }
+  } catch {
+    /* device gone */
+  }
+}
 
 type Listener<K extends keyof EngineEvents> = EngineEvents[K];
 
@@ -76,6 +127,11 @@ export class PhotogrammetryEngine {
   private ownsStore = false;
   private pipeline: FeaturePipeline | null = null;
   private ownsPipeline = false;
+  /**
+   * pipelineKey of the SIFT configuration the pipeline was created with (an injected one: the
+   * worker's spare, created for the options this engine was constructed with).
+   */
+  private pipelineCfgKey: string;
   private live: LiveSession | null = null;
   private model: SparseModel | null = null;
   private sparse: SparseResultEx | null = null;
@@ -101,11 +157,22 @@ export class PhotogrammetryEngine {
   private scratch: SessionEngineStore | null | undefined = undefined;
   /** Resolved capture mode of a session opened with loadSession (no live session). */
   private loadedMode: ResolvedMode | null = null;
+  /**
+   * Capture state of a session without a live session (loadSession, or after the live session was
+   * released for the dense stage): written back unchanged so that orientation, time offset and
+   * counters survive later state writes.
+   */
+  private savedState: EngineStateRecord | null = null;
   private sessionName = 'Scan';
+  /** Memory budget derived from the GPU adapter (iPhone RAM class), null = not known. */
+  private deviceBudget: { budgetMB: number; reason: string } | null = null;
+  private stateWrite: Promise<void> | null = null;
+  private stateDirty = false;
 
   constructor(options: EngineOptions, config: EngineConfig = {}) {
     this.options = { persist: false, preferGPU: true, ...options };
     this.config = config;
+    this.pipelineCfgKey = pipelineKey(this.options.quality, this.options.preferGPU !== false, config);
     this.holder = new PatchMatchHolder(this.options.preferGPU !== false);
   }
 
@@ -192,8 +259,48 @@ export class PhotogrammetryEngine {
     return QUALITY_PRESETS[this.quality];
   }
 
-  private get memoryBudgetMB(): number {
-    return this.config.memoryBudgetMB ?? ENGINE_DEFAULTS.memoryBudgetMB;
+  /** Tab memory budget (MB): EngineConfig.memoryBudgetMB, else derived from the GPU adapter, else 1200. */
+  get memoryBudgetMB(): number {
+    return this.config.memoryBudgetMB ?? this.deviceBudget?.budgetMB ?? ENGINE_DEFAULTS.memoryBudgetMB;
+  }
+
+  /** Derive the memory budget from the WebGPU adapter (Apple GPUs: maxBufferSize ≈ RAM class). */
+  private applyDeviceBudget(ctx: GpuMemoryHints | null): void {
+    if (this.deviceBudget || !ctx) return;
+    const d = deviceMemoryBudgetMB(ctx);
+    if (!d) return;
+    this.deviceBudget = d;
+    if (this.config.memoryBudgetMB === undefined) this.log('info', `memory budget ${d.budgetMB} MB (${d.reason})`);
+  }
+
+  private async ensureDeviceBudget(): Promise<void> {
+    if (this.deviceBudget || this.config.memoryBudgetMB !== undefined || this.options.preferGPU === false || !hasWebGPU()) return;
+    this.applyDeviceBudget(await getGPU().catch(() => null));
+  }
+
+  /**
+   * Estimated resident memory of the engine's data (bytes per component): capture state (features,
+   * pairs, graph, live model, vocabulary, IMU, pending writes), sparse model, dense cloud, dense
+   * colour views, mesh and the feature pipeline's GPU caches. Excludes transient stage buffers
+   * (see `planDense`) and the page / JS baseline.
+   */
+  memoryReport(): { totalMB: number; budgetMB: number; parts: MemoryBreakdown } {
+    const parts: MemoryBreakdown = this.live ? this.live.memoryBreakdown() : {};
+    if (this.model) parts.sparseModel = sparseModelBytes(this.model);
+    const dense = this.denseCloud ?? this.denseOut?.cloud ?? null;
+    if (dense) parts.denseCloud = cloudBytes(dense);
+    if (this.denseOut) parts.denseViews = this.denseOut.views.reduce((s, v) => s + v.image.data.byteLength, 0);
+    if (this.meshModel) parts.mesh = meshBytes(this.meshModel);
+    const gpu = pipelineGpuBytes(this.pipeline);
+    if (gpu) parts.featureGpu = gpu;
+    const total = sumBreakdown(parts);
+    return { totalMB: Math.round((10 * total) / MB) / 10, budgetMB: this.memoryBudgetMB, parts };
+  }
+
+  private logMemory(when: string): number {
+    const r = this.memoryReport();
+    this.log('info', `memory after ${when} ≈ ${formatBreakdown(r.parts)} of a ${r.budgetMB} MB budget`, r.parts);
+    return r.totalMB;
   }
 
   /** SIFT options of the feature pipeline (preset working size / feature budget + overrides). */
@@ -246,6 +353,7 @@ export class PhotogrammetryEngine {
       this.pipeline = createCpuFeaturePipeline(this.siftOptions(), reason);
     }
     this.ownsPipeline = true;
+    this.pipelineCfgKey = pipelineKey(this.quality, this.options.preferGPU !== false, this.config);
     this.log('info', `feature pipeline ready (${this.pipeline.gpu ? 'WebGPU' : 'CPU'}, ${Math.round(now() - t0)} ms)`);
     return this.pipeline;
   }
@@ -267,6 +375,8 @@ export class PhotogrammetryEngine {
       log: (l, m, d) => this.log(l, m, d),
       emitLive: (u) => this.emitLive(u),
       storageError: (e) => this.onStorageError(e),
+      memoryBudgetMB: () => this.memoryBudgetMB,
+      memoryLimit: (msg) => this.emitError(namedError('CaptureMemoryLimitError', msg, 'out-of-memory'), false, 'out-of-memory'),
     });
     live.persistState = () => this.persistState();
     return live;
@@ -282,6 +392,10 @@ export class PhotogrammetryEngine {
   private stateRecord(): EngineStateRecord {
     const extra: Partial<EngineStateRecord> = { hasSparse: !!this.model, hasDense: this.hasDense, hasMesh: this.hasMesh };
     if (this.live) return this.live.stateRecord(extra);
+    // no live session (loadSession, or released for the dense stage): keep the stored capture
+    // state (θ, verified camera←device mapping, time offset, counters) — a generic record here
+    // would reset them in IndexedDB and a later refine would align with θ = 0
+    if (this.savedState) return { ...this.savedState, ...extra, updatedAt: Date.now() };
     return {
       version: 1,
       mode: this.options.mode,
@@ -304,9 +418,27 @@ export class PhotogrammetryEngine {
     };
   }
 
+  /**
+   * Write `engine/state` (coalesced: while a write is in flight, later requests collapse into one
+   * write of the then-current record — the live capture asks twice per keyframe).
+   */
   private persistState(): void {
     if (!this.store || this.disposed) return;
-    this.store.putValue('engine/state', this.stateRecord()).catch((e: unknown) => this.onStorageError(e));
+    if (this.stateWrite) {
+      this.stateDirty = true;
+      return;
+    }
+    const store = this.store;
+    this.stateWrite = store
+      .putValue('engine/state', this.stateRecord())
+      .catch((e: unknown) => this.onStorageError(e))
+      .finally(() => {
+        this.stateWrite = null;
+        if (this.stateDirty && !this.disposed && this.store === store) {
+          this.stateDirty = false;
+          this.persistState();
+        }
+      });
   }
 
   /**
@@ -352,10 +484,11 @@ export class PhotogrammetryEngine {
       try {
         const ctx = await getGPU();
         if (ctx) adapter = [ctx.info.vendor, ctx.info.architecture, ctx.info.description].filter(Boolean).join(' ') || 'WebGPU';
+        this.applyDeviceBudget(ctx);
       } catch {
         /* ignore */
       }
-    }
+    } else await this.ensureDeviceBudget();
     const res: InitResult = { gpu: pipeline.gpu };
     if (adapter) res.adapter = adapter;
     if (!pipeline.gpu && pipeline.fallbackReason) res.fallbackReason = pipeline.fallbackReason;
@@ -373,8 +506,11 @@ export class PhotogrammetryEngine {
     const old = this.pipeline;
     try {
       const { createFeaturePipeline } = await import('../features/extractor');
-      this.pipeline = await createFeaturePipeline({ preferGPU: true, sift: this.siftOptions(), context: ctx });
+      // under the GPU lock (and only while visible): pipeline compilation + self-tests must not
+      // overlap another command stream (dense PatchMatch recreating itself after the same loss)
+      this.pipeline = await this.gpu(() => createFeaturePipeline({ preferGPU: true, sift: this.siftOptions(), context: ctx }));
       this.ownsPipeline = true;
+      this.pipelineCfgKey = pipelineKey(this.quality, true, this.config);
       try {
         old?.destroy();
       } catch {
@@ -438,6 +574,12 @@ export class PhotogrammetryEngine {
   /** Wait for background keyframe mapping and pending writes. */
   async flush(): Promise<void> {
     if (this.live) await this.live.flush();
+    await this.settleState();
+  }
+
+  /** Wait until the coalesced `engine/state` writes are done. */
+  private async settleState(): Promise<void> {
+    while (this.stateWrite) await this.stateWrite;
   }
 
   private async longRun<T>(name: string, fn: () => Promise<T>): Promise<T> {
@@ -467,8 +609,12 @@ export class PhotogrammetryEngine {
         clearInterval(timer);
       }
       if (cancel?.cancelled) throw namedError(ENGINE_ERRORS.cancelled, 'finishCapture cancelled');
+      // capture-time scratch: CPU SIFT arena, GPU SIFT pyramids + matcher cache (pipelines stay compiled)
       releaseSiftCPUMemory();
+      releasePipelineCaches(this.pipeline);
       this.persistState();
+      await this.settleState();
+      this.logMemory('capture');
       progress?.({ stage: 'matching', progress: 0, message: `${live.state.order.length} keyframes` });
     });
   }
@@ -486,6 +632,7 @@ export class PhotogrammetryEngine {
     const live = this.createLive();
     await live.restore(st);
     this.live = live;
+    this.savedState = null;
     this.initialized = true;
     return live;
   }
@@ -512,6 +659,7 @@ export class PhotogrammetryEngine {
       this.hasDense = false;
       this.hasMesh = false;
       await this.persistSparse();
+      out.result.stats.memoryMB = this.logMemory('refine');
       return out.result;
     });
   }
@@ -534,10 +682,21 @@ export class PhotogrammetryEngine {
       await this.store.putValue('sparse/meta', meta);
       await this.store.deleteBinary('dense/points').catch(() => undefined);
       await this.store.deleteBinary('mesh').catch(() => undefined);
+      // depth maps of an earlier model (poses changed): no meshing / resuming from them, and
+      // free their storage (up to ≈ 2 GB of float16 maps at `max`)
+      await this.store.putValue('dense/meta', null);
+      await this.store.putValue('dense/progress', null);
+      await this.clearDepthMaps(this.store);
       await this.store.putValue('engine/state', this.stateRecord());
     } catch (e) {
       this.onStorageError(e);
     }
+  }
+
+  /** Delete every stored depth map (PatchMatch passes `pm<n>/`, fusion-filtered `depth/`). */
+  private async clearDepthMaps(store: EngineStore): Promise<void> {
+    const keys = (await store.listBinaryKeys().catch(() => [] as string[])).filter((k) => /^(pm\d+|depth)\//.test(k));
+    for (const k of keys) await store.deleteBinary(k).catch(() => undefined);
   }
 
   /**
@@ -584,6 +743,17 @@ export class PhotogrammetryEngine {
     return this.longRun('densify', async () => {
       const model = await this.ensureModel();
       if (!this.store) throw namedError(ENGINE_ERRORS.notInitialized, 'No session');
+      await this.ensureDeviceBudget();
+      // the dense stage needs the memory more than the capture state does
+      this.releaseCaptureMemory();
+      const resident = sumBreakdown(this.memoryReport().parts);
+      // This run deletes / overwrites the stored depth maps (other settings ⇒ cleared, fusion ⇒
+      // rewritten). Until it completes, mesh() must not pair them with the views of the previous
+      // run (a cancelled re-densify left it with an emptied or mixed map store): forget them; the
+      // previous dense CLOUD stays valid until it is replaced.
+      this.denseOut = null;
+      this.denseMeta = null;
+      await this.store.putValue('dense/meta', null).catch((e: unknown) => this.onStorageError(e));
       const out = await runDensify(
         {
           store: this.store,
@@ -597,6 +767,7 @@ export class PhotogrammetryEngine {
           gpuLock: (fn) => this.gpu(fn),
           log: (l, m, d) => this.log(l, m, d),
           memoryBudgetMB: this.memoryBudgetMB,
+          residentBytes: resident,
         },
         opts ?? {},
         progress,
@@ -618,8 +789,28 @@ export class PhotogrammetryEngine {
       } catch (e) {
         this.onStorageError(e);
       }
+      out.stats.memoryMB = this.logMemory('densify');
       return out.cloud;
     });
+  }
+
+  /**
+   * Before the dense stage: free what capture / refine no longer need — the feature pipeline's GPU
+   * caches and, when the session persists, the whole live session (features, pairs, graph, live
+   * model, vocabulary: ≈ 1–2 MB per keyframe at `balanced`). Everything is in the store:
+   * `refine` restores it (ensureLiveForRefine), exports read features from the store.
+   */
+  private releaseCaptureMemory(): void {
+    releaseSiftCPUMemory();
+    releasePipelineCaches(this.pipeline);
+    const live = this.live;
+    if (!live || !this.store?.persistent || !live.state.captureFinished || !this.model || live.pendingMapping > 0) return;
+    const before = sumBreakdown(live.memoryBreakdown());
+    this.savedState = live.stateRecord({ hasSparse: !!this.model, hasDense: this.hasDense, hasMesh: this.hasMesh });
+    this.loadedMode = live.state.resolvedMode ?? this.loadedMode;
+    live.dispose();
+    this.live = null;
+    this.log('info', `capture state released for the dense stage (≈ ${Math.round(before / MB)} MB; reloaded from storage if refine runs again)`);
   }
 
   /** TSDF mesh of the dense depth maps (densify runs first when needed). */
@@ -661,6 +852,7 @@ export class PhotogrammetryEngine {
       );
       this.meshModel = mesh;
       this.hasMesh = true;
+      stats.memoryMB = this.logMemory('mesh');
       Object.assign(this.stats, stats);
       if (this.sparse) Object.assign(this.sparse.stats, stats);
       try {
@@ -693,13 +885,13 @@ export class PhotogrammetryEngine {
     else this.meshModel = null;
   }
 
-  private async reloadResults(): Promise<void> {
+  private async reloadResults(dense = true, mesh = true): Promise<void> {
     if (!this.store) return;
-    if (this.hasDense && !this.denseCloud) {
+    if (dense && this.hasDense && !this.denseCloud) {
       const b = await this.store.getBinary('dense/points').catch(() => null);
       if (b) this.denseCloud = deserializePointCloud(b);
     }
-    if (this.hasMesh && !this.meshModel) {
+    if (mesh && this.hasMesh && !this.meshModel) {
       const b = await this.store.getBinary('mesh').catch(() => null);
       if (b) this.meshModel = deserializeTriangleMesh(b);
     }
@@ -709,16 +901,29 @@ export class PhotogrammetryEngine {
   async exportModel(format: ExportFormat): Promise<Blob> {
     if (this.disposed) throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');
     if (!this.model && this.store) await this.ensureModel().catch(() => null);
-    await this.reloadResults();
-    return buildExport(format, {
-      name: this.sessionName,
-      sparse: this.sparse?.points ?? (this.model ? modelPointCloud(this.model) : null),
-      model: this.model,
-      dense: this.denseCloud,
-      mesh: this.meshModel,
-      store: this.store,
-      features: (id) => this.featuresOf(id),
-    });
+    // load only what this format needs (a 4 M-point cloud is ≈ 140 MB, a mesh similar), and drop
+    // persisted results again afterwards: the page holds its own copy
+    const needMesh = format === 'ply-mesh' || format === 'glb';
+    const needDense = format === 'ply-points' || (format === 'glb' && !this.hasMesh);
+    const hadDense = !!this.denseCloud;
+    const hadMesh = !!this.meshModel;
+    await this.reloadResults(needDense, needMesh);
+    try {
+      return await buildExport(format, {
+        name: this.sessionName,
+        sparse: this.sparse?.points ?? (this.model ? modelPointCloud(this.model) : null),
+        model: this.model,
+        dense: needDense ? this.denseCloud : null,
+        mesh: needMesh ? this.meshModel : null,
+        store: this.store,
+        features: (id) => this.featuresOf(id),
+      });
+    } finally {
+      if (this.store?.persistent) {
+        if (!hadDense) this.denseCloud = null;
+        if (!hadMesh) this.meshModel = null;
+      }
+    }
   }
 
   // ------------------------------------------------------------------------------------------
@@ -779,6 +984,12 @@ export class PhotogrammetryEngine {
       this.meshModel = null;
       this.hasDense = false;
       this.hasMesh = false;
+      // nothing of the previous session may leak into this one (stats in the summary, the
+      // resolved capture mode of the dense / mesh stages, the FOV prior of a later refine)
+      this.stats = {};
+      this.loadedMode = null;
+      this.savedState = null;
+      this.options.hfovPriorDeg = undefined;
     }
     Object.assign(this.options, options, { sessionId: id });
     if (options.persist === undefined && !this.config.store) this.options.persist = true;
@@ -791,6 +1002,7 @@ export class PhotogrammetryEngine {
       if (!options.quality) this.options.quality = st.quality;
       if (this.options.hfovPriorDeg === undefined && st.hfovPriorDeg !== null) this.options.hfovPriorDeg = st.hfovPriorDeg;
       this.loadedMode = st.resolvedMode;
+      if (!this.live) this.savedState = st;
     } else {
       if (!options.mode) this.options.mode = meta.mode;
       const q = meta.stats?.quality;
@@ -800,6 +1012,10 @@ export class PhotogrammetryEngine {
     if (!this.model) await this.loadResults(st);
     else await this.reloadResults();
     const status = this.hasMesh ? 'meshed' : this.hasDense ? 'dense' : this.sparse ? 'sparse' : st?.captureFinished ? 'captured' : meta.status;
+    // a densify interrupted by a kill / cancel can resume from its stored depth maps
+    const prog = this.store!.persistent ? await this.store!.getValue<{ pass?: number }>('dense/progress').catch(() => null) : null;
+    const extra: Record<string, number> = {};
+    if (prog && typeof prog.pass === 'number') extra.denseResumablePass = prog.pass;
     return {
       id,
       name: meta.name,
@@ -812,7 +1028,7 @@ export class PhotogrammetryEngine {
       sparse: this.sparse,
       dense: this.denseCloud,
       mesh: this.meshModel,
-      stats: { ...(meta.stats ?? {}), ...this.stats },
+      stats: { ...(meta.stats ?? {}), ...this.stats, ...extra },
     };
   }
 
@@ -850,11 +1066,18 @@ export class PhotogrammetryEngine {
     if (!p) return null;
     this.pipeline = null;
     this.ownsPipeline = false;
-    return { pipeline: p, key: pipelineKey(this.quality, this.options.preferGPU !== false, this.config) };
+    // the configuration it was CREATED with: loadSession may have changed the quality since
+    return { pipeline: p, key: this.pipelineCfgKey };
   }
 
   dispose(): void {
     if (this.disposed) return;
+    // a coalesced state write still pending: issue it now (IndexedDB completes transactions
+    // created before close())
+    if (this.stateDirty && this.store) {
+      this.stateDirty = false;
+      this.store.putValue('engine/state', this.stateRecord()).catch(() => undefined);
+    }
     this.disposed = true;
     if (this.idleTimer) clearTimeout(this.idleTimer);
     this.live?.dispose();

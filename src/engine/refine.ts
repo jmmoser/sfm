@@ -107,17 +107,30 @@ export function modelPointCloud(m: SparseModel): PointCloud {
 
 /**
  * When the only reason the IMU scale was rejected is low excitation, but the fit itself is
- * excellent (R² ≥ 0.9, relative σ ≤ 3 %, excitation ≥ 0.03 m/s²), return the relaxed threshold to
- * retry with. Measured on the e2e `object` orbit with GT poses: scale error 0.3 % at excitation
- * 0.06 m/s² (rejected by the default 0.08 floor).
+ * excellent, return the relaxed threshold to retry with: relative σ ≤ 3 % and either R² ≥ 0.9 with
+ * excitation ≥ 0.03 m/s², or R² ≥ 0.95 with excitation ≥ 0.015 m/s².
+ *
+ * The excitation the inertial module measures is the band-limited IMU acceleration AS SAMPLED AT
+ * THE KEYFRAMES: it falls with the keyframe rate, not only with the hand motion (e2e `object`, GT
+ * poses, same motion: 0.110 m/s² with all 200 frames, 0.058 at 90 keyframes, 0.029 at 53 —
+ * R² 0.993 / 0.988 / 0.977, scale error +0.4 / +0.3 / +1.8 %). What the floor guards against is
+ * errors-in-variables attenuation of the regression (noise on the IMU side biases the scale), and
+ * that is bounded by the fit itself: attenuation ≤ 1 − R². So R² decides, and the caller reports
+ * σ ≥ 1 − R² (`lowExcitationSigma`).
  */
 export function lowExcitationRetry(a: WorldAlignment): { minExcitation: number; excitation: number; r2: number } | null {
   const s = a.details.imuScale;
   if (!s || s.reliable || a.metric.metric) return null;
   const reasons = s.reason.split(';').map((r) => r.trim()).filter(Boolean);
   if (reasons.length !== 1 || !reasons[0].startsWith('insufficient excitation')) return null;
-  if (!(s.excitationRms >= 0.03 && s.r2 >= 0.9 && s.relUncertainty <= 0.03 && s.scale > 0)) return null;
+  if (!(s.scale > 0 && s.relUncertainty <= 0.03)) return null;
+  if (!((s.excitationRms >= 0.03 && s.r2 >= 0.9) || (s.excitationRms >= 0.015 && s.r2 >= 0.95))) return null;
   return { minExcitation: Math.min(0.03, s.excitationRms * 0.99), excitation: s.excitationRms, r2: s.r2 };
+}
+
+/** σ claimed for a scale accepted by `lowExcitationRetry`: max(2σ, 2 %, 1 − R² — the EIV attenuation bound). */
+export function lowExcitationSigma(relUncertainty: number | null, r2: number): number {
+  return Math.max(2 * (relUncertainty ?? 0), 0.02, 1 - r2);
 }
 
 /**
@@ -151,6 +164,27 @@ export async function refinePrincipalPoint(
   return { rec: work, accepted: true, reason: `offset from the image centre ${shifts.join(', ')}; reprojection ${before.toFixed(3)} → ${after.toFixed(3)} px` };
 }
 
+/** Add the not-yet-indexed keyframes to a vocabulary index, yielding every ~30 ms. */
+async function indexVocabulary(
+  vocab: VocabularyIndex,
+  ids: readonly number[],
+  db: FeatureDatabase,
+  cancel: CancelToken | undefined,
+  onProgress?: (done: number) => void,
+): Promise<void> {
+  let last = now();
+  for (let k = 0; k < ids.length; k++) {
+    const fs = db.features.get(ids[k]);
+    if (fs && !vocab.has(ids[k])) vocab.add(ids[k], fs);
+    if (now() - last > 30) {
+      checkCancel(cancel, 'matching');
+      onProgress?.(k + 1);
+      await tick();
+      last = now();
+    }
+  }
+}
+
 /** Full refine pipeline. */
 export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, cancel?: CancelToken): Promise<RefineOutput> {
   const live = deps.live;
@@ -171,13 +205,17 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     if (!st.vocab || trained < 0.5 * order.length) {
       const sources = order.map((id) => st.db.features.get(id)!).filter((f) => f && f.count > 0);
       if (sources.length >= 2) {
-        st.vocab = VocabularyIndex.train(sources, { numWords: vc.refineWords ?? ENGINE_DEFAULTS.refineVocabularyWords });
+        const vocab = VocabularyIndex.train(sources, { numWords: vc.refineWords ?? ENGINE_DEFAULTS.refineVocabularyWords });
+        // indexing quantises every feature (≈ 35 ms per 4k-feature keyframe with SIMD, 260 ms in
+        // JS): yield between keyframes so cancel / progress / visibility messages get through
+        await indexVocabulary(vocab, order, st.db, cancel, (k) => report('matching', 0.04 * (k / order.length), `vocabulary ${k}/${order.length}`));
+        st.vocab = vocab;
         st.vocabTrainedOn = order.slice();
-        for (const id of order) st.vocab.add(id, st.db.features.get(id)!);
         void deps.store.putBinary('vocab', st.vocab.exportCodebook()).catch(() => undefined);
       }
-    } else for (const id of order) if (!st.vocab.has(id)) st.vocab.add(id, st.db.features.get(id)!);
+    } else await indexVocabulary(st.vocab, order, st.db, cancel);
   } catch (e) {
+    if ((e as Error)?.name === 'CancelledError') throw e;
     deps.log('warn', `vocabulary failed: ${(e as Error)?.message ?? e}`);
   }
   checkCancel(cancel, 'matching');
@@ -286,8 +324,12 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     chosen = offline;
     which = 'offline';
   }
-  // work on a copy so the live model stays in its own frame (refine can run again)
-  chosen = chosen.clone();
+  // work on a copy so the live model stays in its own frame (refine can run again); the offline
+  // model is used by nobody else (no copy), and when it lost it is dropped right away: every
+  // reconstruction is ≈ 300 B per point + 40 B per observation, and refine otherwise held four
+  // (live, offline, chosen copy, principal-point copy) at its peak
+  if (which === 'live') chosen = chosen.clone();
+  offline = null;
   stats.model = which;
   // final global BA with the principal point free (well constrained by the many views of a
   // finished capture; fixed during mapping as in COLMAP). A fixed, offset principal point is
@@ -324,6 +366,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     const r = handEyeCheck(
       kfs.map((k) => ({ t: k.rec.t, pose: k.pose })),
       st.imu,
+      { offsetMs: st.timeOffsetMs ?? 0 },
     );
     if (r && r.pairs >= 4) {
       const sorted = [...r.medianErrDeg].sort((x, y) => x - y);
@@ -351,11 +394,11 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     alignment = computeWorldAlignment(input, { timeOffsetMs: st.timeOffsetMs ?? 0 });
     const lowEx = lowExcitationRetry(alignment);
     if (lowEx) {
-      // gentle hand-held motion (smooth orbits): the IMU scale fit is excellent (R² ≥ 0.9, σ ≤ 3 %)
+      // gentle hand-held motion (smooth orbits) or sparse keyframes: the IMU scale fit is excellent
       // but below the excitation floor of the inertial module → accept it with an inflated σ
       const a2 = computeWorldAlignment(input, { timeOffsetMs: st.timeOffsetMs ?? 0, scale: { minExcitation: lowEx.minExcitation } });
       if (a2.metric.metric && a2.metric.source === 'imu') {
-        a2.metric.relativeUncertainty = Math.max(2 * (a2.metric.relativeUncertainty ?? 0), 0.02);
+        a2.metric.relativeUncertainty = lowExcitationSigma(a2.metric.relativeUncertainty, lowEx.r2);
         a2.details.warnings.push(`IMU scale accepted at low excitation (${lowEx.excitation.toFixed(3)} m/s², R² ${lowEx.r2.toFixed(2)})`);
         alignment = a2;
       }

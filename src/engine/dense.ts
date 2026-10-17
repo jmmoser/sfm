@@ -26,6 +26,7 @@ import type { DenseOptions, MeshOptions, QualityPreset } from '../workers/protoc
 import { EngineDepthStore } from './depth-store';
 import { fitSize, resizeRGBA } from './frame-ingest';
 import { LruCache, decodeStoredImage, rgbaBytes } from './image-cache';
+import { MB, formatBreakdown, planDense, type DensePlan } from './memory';
 import type { DenseMetaRecord, EngineStore } from './persistence';
 import { modeConfig, resolveDensePreset, type DensePresetConfig, type ResolvedMode } from './presets';
 import { cancelledError } from './refine';
@@ -106,6 +107,61 @@ export interface DenseDeps {
   gpuLock<T>(fn: () => Promise<T>): Promise<T>;
   log(level: 'debug' | 'info' | 'warn' | 'error', message: string, data?: unknown): void;
   memoryBudgetMB: number;
+  /** Engine data resident during the dense stage (bytes; capture state if kept, sparse model). */
+  residentBytes?: number;
+}
+
+/** Persisted dense progress (`dense/progress` in the depth backend): resume after a kill / cancel. */
+interface DenseProgress {
+  /** Hash of the model + view selection inputs + settings the maps were computed with. */
+  key: string;
+  /** Pass in progress (0 = photometric), or = number of passes when fusing. */
+  pass: number;
+}
+
+const PROGRESS_KEY = 'dense/progress';
+
+/** FNV-1a 32-bit of a string, hex. */
+function fnv1a(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, '0');
+}
+
+/** Identity of a dense run: model (poses, cameras, points) + reference views + settings. */
+function denseKey(model: SparseModel, refs: number[], settings: { maxSize: number; passes: number; mode: string; preset: DensePresetConfig; halo: boolean }): string {
+  const r6 = (v: number): number => Math.round(v * 1e6) / 1e6;
+  const poses = model.images.map((im) => [im.id, im.cameraId, ...Array.from(im.pose.R, r6), ...Array.from(im.pose.t, r6)]);
+  const p = settings.preset;
+  return fnv1a(
+    JSON.stringify({
+      poses,
+      cams: [...model.cameras.entries()],
+      points: model.numPoints,
+      xyz: model.numPoints ? [r6(model.xyz[0]), r6(model.xyz[model.xyz.length - 1])] : [],
+      refs,
+      maxSize: settings.maxSize,
+      passes: settings.passes,
+      mode: settings.mode,
+      halo: settings.halo,
+      pm: [p.iterations, p.geometricIterations, p.numSources, p.patchMatch ?? {}, p.viewSelection ?? {}],
+    }),
+  );
+}
+
+/** Delete stored PatchMatch-pass / filtered depth maps of an earlier, different dense run. */
+async function clearStoredDepthMaps(store: EngineStore): Promise<void> {
+  const keys = (await store.listBinaryKeys().catch(() => [] as string[])).filter((k) => /^(pm\d+|depth)\//.test(k));
+  for (const k of keys) await store.deleteBinary(k).catch(() => undefined);
+}
+
+/** The depth channel only (geometric-pass sources read nothing else). */
+function depthOnly(d: DepthMap | null): DepthMap {
+  if (!d) return emptyDepth();
+  return { width: d.width, height: d.height, depth: d.depth, normal: new Float32Array(0), cost: new Float32Array(0) };
 }
 
 /** Result of densify (kept by the engine for meshing / export). */
@@ -163,7 +219,8 @@ function emptyDepth(): DepthMap {
 
 function isDeviceLost(e: unknown): boolean {
   const m = String((e as Error)?.message ?? e);
-  return /device lost|device was lost|GPU device/i.test(m);
+  // 'instance destroyed': the worker's device-loss handler (recoverGPU) reset the holder under us
+  return /device lost|device was lost|GPU device|instance destroyed/i.test(m);
 }
 
 /** Dense point cloud of the sparse model (world frame). */
@@ -183,12 +240,66 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   report('depth_maps', 0, 'preparing views');
   let pm = await deps.holder.get();
   if (!pm && deps.holder.reason) deps.log('info', `dense: CPU PatchMatch (${deps.holder.reason})`);
-  const maxSize = Math.max(32, Math.round(opts.maxImageSize ?? (pm ? preset.maxImageSize : Math.min(preset.maxImageSize, preset.cpuMaxImageSize))));
+  let maxSize = Math.max(32, Math.round(opts.maxImageSize ?? (pm ? preset.maxImageSize : Math.min(preset.maxImageSize, preset.cpuMaxImageSize))));
   const maxViews = Math.max(2, Math.round(opts.maxViews ?? preset.maxViews));
   const images = spreadSubset(model.images, maxViews);
   stats.denseViews = images.length;
-  stats.denseMaxSize = maxSize;
   stats.patchMatch = pm ? 'gpu' : 'cpu';
+
+  // ---- memory plan (iPhone tab budget): cache sizes, fusion neighbours / pixel step / point cap;
+  // the image size is lowered (× 0.85 steps, not below 480 px) when even that does not fit
+  const passes = 1 + Math.max(0, Math.round(preset.geometricPasses));
+  const halo = preset.haloFilter === false ? null : haloFilter();
+  if (halo) stats.haloFilter = 1;
+  const presetStep = Number((preset.fusion as { step?: unknown } | undefined)?.step);
+  const largest = (size: number): { width: number; height: number } => {
+    let best = { width: 1, height: 1 };
+    for (const cam of model.cameras.values()) {
+      const c = undistortedCamera(cam, size);
+      if (c.width * c.height > best.width * best.height) best = { width: c.width, height: c.height };
+    }
+    return best;
+  };
+  const planFor = (size: number): DensePlan => {
+    const d = largest(size);
+    return planDense({
+      budgetMB: deps.memoryBudgetMB,
+      residentBytes: deps.residentBytes ?? 0,
+      views: images.length,
+      width: d.width,
+      height: d.height,
+      numSources: Math.min(16, preset.numSources),
+      geometricPasses: passes - 1,
+      fusionMaxNeighbours: preset.fusionMaxNeighbours,
+      gpu: !!pm,
+      haloFilter: !!halo,
+      tsdfMaxBlocks: preset.tsdfMaxBlocks,
+      fusionStep: preset.fusionStep ?? (Number.isFinite(presetStep) && presetStep >= 1 ? presetStep : undefined),
+    });
+  };
+  let plan = planFor(maxSize);
+  const requested = maxSize;
+  while (!plan.fits && maxSize > 480) {
+    maxSize = Math.max(480, Math.round(maxSize * 0.85));
+    plan = planFor(maxSize);
+  }
+  if (maxSize !== requested) {
+    stats.denseMaxSizeRequested = requested;
+    deps.log('warn', `dense: ${requested} px does not fit the ${deps.memoryBudgetMB} MB budget — using ${maxSize} px`);
+  }
+  stats.denseMaxSize = maxSize;
+  stats.denseMemPeakMB = Math.round(plan.peakBytes / MB);
+  stats.fusionStep = plan.fusionStep;
+  stats.fusionMaxNeighbours = plan.fusionMaxNeighbours;
+  {
+    const d = largest(maxSize);
+    deps.log(
+      plan.fits ? 'info' : 'warn',
+      `dense memory plan (${images.length} views ${d.width}×${d.height}, budget ${deps.memoryBudgetMB} MB, peak ≈ ${Math.round(plan.peakBytes / MB)} MB, storage ≈ ${Math.round(plan.storageBytes / MB)} MB): ` +
+        plan.stages.map((st) => `${st.stage} ${formatBreakdown(st.parts, st.bytes)}`).join('; ') +
+        `; fusion step ${plan.fusionStep}, ≤ ${plan.fusionMaxPoints} points (≈ ${plan.expectedPoints} expected), ${plan.fusionMaxNeighbours} neighbours`,
+    );
+  }
 
   // ---- geometry of the undistorted views (no pixels yet)
   const geom = images.map((im) => {
@@ -213,10 +324,8 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   );
 
   // ---- images: undistorted at the dense size (LRU) + colour thumbnails for fusion / TSDF
-  const budgetBytes = deps.memoryBudgetMB * 1024 * 1024;
-  const cache = new LruCache<number, DenseView>(Math.max(64 << 20, 0.15 * budgetBytes), (v) => rgbaBytes(v.image));
-  const colourBudget = Math.max(16 << 20, 0.08 * budgetBytes);
-  const colourBytesPerView = colourBudget / Math.max(1, geom.length);
+  const cache = new LruCache<number, DenseView>(plan.imageCacheBytes, (v) => rgbaBytes(v.image));
+  const colourBytesPerView = plan.colourBytes / Math.max(1, geom.length);
   const colour = new Map<number, RGBAImage>();
   const geomById = new Map(geom.map((g) => [g.id, g]));
   const loadView = (id: number): Promise<DenseView> =>
@@ -238,21 +347,61 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
     });
 
   // ---- depth maps
-  const depthCacheBytes = Math.max(48 << 20, 0.25 * budgetBytes);
-  const passes = 1 + Math.max(0, Math.round(preset.geometricPasses));
-  const halo = preset.haloFilter === false ? null : haloFilter();
-  if (halo) stats.haloFilter = 1;
+  // Resident maps are bounded explicitly: the pass stores keep ONE full map (write-through to
+  // IndexedDB), geometric-pass sources come from a depth-only LRU (sources only need `depth`), and
+  // a previous-pass map is deleted after its last use (peak storage ≈ one pass, not two).
   const ordered = geom.filter((g) => (sel.get(g.id)?.sources.length ?? 0) > 0);
   stats.viewsWithSources = ordered.length;
-  let prev: EngineDepthStore | null = null;
-  let cur: EngineDepthStore | null = null;
+  const backend = deps.depthBackend;
+  const persistent = !!backend?.persistent;
+  // resume after a kill / cancel: same model + settings ⇒ keep the maps already computed
+  const planKey = denseKey(model, ordered.map((g) => g.id), { maxSize, passes, mode: deps.mode, preset, halo: !!halo });
+  let resumePass = 0;
+  if (persistent) {
+    const prog = await backend!.getValue<DenseProgress>(PROGRESS_KEY).catch(() => null);
+    if (prog && prog.key === planKey && prog.pass >= 0 && prog.pass <= passes) {
+      resumePass = prog.pass;
+      deps.log('info', `dense: resuming ${resumePass < passes ? `pass ${resumePass + 1}/${passes}` : 'at fusion'} from stored depth maps`);
+    } else await clearStoredDepthMaps(backend!);
+  }
+  stats.denseResumedPass = resumePass;
+  const setProgress = async (pass: number | null): Promise<void> => {
+    if (!persistent) return;
+    await backend!.putValue(PROGRESS_KEY, pass === null ? null : ({ key: planKey, pass } satisfies DenseProgress));
+  };
+  const srcDepth = new LruCache<number, DepthMap>(plan.sourceDepthCacheBytes, (d) => d.depth.byteLength);
+  let prev: EngineDepthStore | null = resumePass > 0 ? new EngineDepthStore(backend, `pm${resumePass - 1}`, 0) : null;
+  let cur: EngineDepthStore | null = resumePass >= passes ? prev : null;
   const total = passes * ordered.length;
-  let done = 0;
+  let done = resumePass * ordered.length;
+  let skipped = 0;
   const tDepth = now();
-  for (let pass = 0; pass < passes; pass++) {
-    cur = new EngineDepthStore(deps.depthBackend, `pm${pass}`, depthCacheBytes);
-    for (const g of ordered) {
+  for (let pass = resumePass; pass < passes; pass++) {
+    await setProgress(pass);
+    cur = new EngineDepthStore(backend, `pm${pass}`, 0);
+    const have = new Set(persistent && pass === resumePass ? await cur.scan() : []);
+    // last reference (index in `ordered`) that reads each previous-pass map
+    const lastUse = new Map<number, number>();
+    if (pass > 0) ordered.forEach((g, i) => [g.id, ...sel.get(g.id)!.sources].forEach((id) => lastUse.set(id, i)));
+    const releasePrev = async (i: number): Promise<void> => {
+      if (!prev) return;
+      const gi = ordered[i];
+      const ids = [gi.id, ...sel.get(gi.id)!.sources];
+      for (const id of ids) {
+        if (lastUse.get(id) !== i) continue;
+        srcDepth.delete(id);
+        await prev.delete(id);
+      }
+    };
+    for (let i = 0; i < ordered.length; i++) {
+      const g = ordered[i];
       check('depth_maps');
+      if (have.has(g.id)) {
+        skipped++;
+        done++;
+        await releasePrev(i);
+        continue;
+      }
       const s = sel.get(g.id)!;
       const ref = await loadView(g.id);
       const srcs: DenseView[] = [];
@@ -261,9 +410,16 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
       let geometric: { prior: DepthMap; sourceDepths: DepthMap[] } | undefined;
       if (pass > 0 && prev) {
         const prior = await prev.get(g.id);
-        if (!prior) continue;
+        if (!prior) {
+          await releasePrev(i);
+          continue;
+        }
         const sourceDepths: DepthMap[] = [];
-        for (const sid of s.sources) sourceDepths.push((await prev.get(sid)) ?? emptyDepth());
+        const p0 = prev;
+        for (const sid of s.sources) {
+          const d = await srcDepth.getOrLoad(sid, async () => depthOnly(await p0.get(sid)));
+          sourceDepths.push(d.width > 0 ? d : emptyDepth());
+        }
         geometric = { prior, sourceDepths };
       }
       const pmOpts =
@@ -294,6 +450,7 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
       } else {
         dm = patchMatchCPU(ref, srcs, range, pmOpts, geometric);
       }
+      geometric = undefined;
       if (halo && pass === passes - 1) {
         try {
           dm = halo(dm, ref.image, ref.cam);
@@ -302,22 +459,29 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
         }
       }
       await cur.put(g.id, dm);
+      await releasePrev(i);
       done++;
       report('depth_maps', done / total, `${pass === 0 ? 'photometric' : `geometric ${pass}`} ${done}/${total} (${Math.round(now() - tv)} ms)`);
       await tick();
     }
     if (prev) await prev.clear();
+    srcDepth.clear();
     prev = cur;
   }
+  if (skipped) stats.denseResumedMaps = skipped;
   stats.depthMapsMs = Math.round(now() - tDepth);
   const finalStore = cur!;
   cache.clear();
+  // PatchMatchGPU's buffers (≈ 32 B per reference px + 5 B per source px: ~140 MB at 1600 px) are
+  // not needed for fusion / meshing: free them (recreated by the next densify)
+  if (pm) deps.holder.reset();
+  await setProgress(passes);
 
   // ---- fusion
   const tFuse = now();
   check('fusion');
   report('fusion', 0, 'fusing depth maps');
-  const filtered = new EngineDepthStore(deps.depthBackend, 'depth', depthCacheBytes);
+  const filtered = new EngineDepthStore(backend, 'depth', 0);
   await filtered.clear();
   // colour views: thumbnails (fusion / TSDF sample colours at any scale)
   const views: DenseView[] = [];
@@ -337,11 +501,23 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
     finalStore,
     neighbours,
     // halo clean-up happens once: on the depth maps above (engine) or in fusion (preset), never both
-    { ...(preset.fusion ?? {}), ...(halo ? { haloFilter: null } : {}), minViews, maxNeighbours: preset.fusionMaxNeighbours, filteredStore: filtered },
+    {
+      ...(preset.fusion ?? {}),
+      ...(halo ? { haloFilter: null } : {}),
+      minViews,
+      maxNeighbours: plan.fusionMaxNeighbours,
+      step: plan.fusionStep,
+      maxPoints: plan.fusionMaxPoints,
+      filteredStore: filtered,
+    },
     (e) => report('fusion', 0.9 * Math.max(0, e.progress), e.message),
     cancel,
   );
+  if (cloud.count >= plan.fusionMaxPoints) deps.log('warn', `fusion stopped at the memory cap of ${plan.fusionMaxPoints} points (later views not fused)`);
   stats.fusedPoints = cloud.count;
+  // fused: a later densify starts over (progress first, so a kill in between never resumes into
+  // deleted maps)
+  await setProgress(null);
   await finalStore.clear();
   check('fusion');
   report('fusion', 0.92, `filtering ${cloud.count} points`);

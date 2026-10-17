@@ -48,9 +48,28 @@ function snap(theta: number): ScreenAngle {
   return (q * 90) as ScreenAngle;
 }
 
-/** Tracks θ changes, detects raw sensor buffers and fixes the session's canonical θ₀. */
+/**
+ * Tracks θ changes, detects raw sensor buffers and fixes the session's canonical θ₀.
+ *
+ * Raw delivery is a property of the capture path (MSTP / VideoFrame, or a source whose rotation
+ * is metadata only), not of a single frame: once a landscape bitmap arrived in a portrait UI,
+ * the landscape frames of a landscape UI are raw buffers too — upright for θ = 90 also when the
+ * UI is at θ = 270 (treating them as upright-for-270 would turn them 180° against the rest of
+ * the session). A session that STARTED in a landscape-270 UI before any evidence is ambiguous
+ * (θ₀ = 270 assumed, frames kept unrotated); when raw delivery is detected later, those first
+ * frames were raw buffers kept as they are, i.e. upright for 90: θ₀ is re-interpreted as 90
+ * (`thetaSession` changes once — the engine then updates R_cam_device of the keyframes).
+ * The FIRST evidence decides the delivery path (a later contradicting frame is more likely a
+ * transient mis-rotation than a change of the path); portrait-UI frames are still classified
+ * by their own bitmap shape.
+ */
 export class OrientationTracker {
   thetaSession: ScreenAngle | null;
+  /**
+   * Delivery path, fixed by the first portrait-UI frame: true = raw sensor buffers (a landscape
+   * bitmap in a portrait UI), false = frames rotated upright (a portrait bitmap), null = unknown.
+   */
+  rawDelivery: boolean | null = null;
   private lastUI: ScreenAngle | null = null;
   private changeT = -Infinity;
 
@@ -59,6 +78,18 @@ export class OrientationTracker {
     thetaSession: number | null = null,
   ) {
     this.thetaSession = thetaSession === null ? null : snap(thetaSession);
+  }
+
+  /** θ₀ came from landscape-270 frames while the delivery path was unknown (raw buffers there look upright). */
+  get sessionAmbiguous(): boolean {
+    return this.thetaSession === 270 && this.rawDelivery === null;
+  }
+
+  private noteDelivery(raw: boolean): void {
+    if (this.rawDelivery !== null) return;
+    // the first frames (landscape-270 UI, kept unrotated) were raw buffers: upright for θ = 90
+    if (raw && this.sessionAmbiguous) this.thetaSession = 90;
+    this.rawDelivery = raw;
   }
 
   /** Decide for one frame (`width`/`height` = bitmap size as submitted). */
@@ -72,12 +103,19 @@ export class OrientationTracker {
     const portraitBitmap = f.height > f.width;
     let eff: ScreenAngle = ui;
     let raw = false;
-    if (portraitUI && landscapeBitmap) {
-      // raw sensor-landscape buffer: upright for θ = 90 (ios-camera.md §1.4)
+    if (portraitUI) {
+      if (landscapeBitmap) {
+        // raw sensor-landscape buffer: upright for θ = 90 (ios-camera.md §1.4)
+        this.noteDelivery(true);
+        eff = 90;
+        raw = true;
+      } else if (portraitBitmap) this.noteDelivery(false);
+    } else if (portraitBitmap) {
+      return { ok: false, reason: `portrait ${f.width}x${f.height} frame in a landscape UI (θ=${ui}): transient mis-rotation` };
+    } else if (landscapeBitmap && this.rawDelivery === true) {
+      // raw delivery path: the buffer keeps the sensor orientation whatever the UI angle
       eff = 90;
       raw = true;
-    } else if (!portraitUI && portraitBitmap) {
-      return { ok: false, reason: `portrait ${f.width}x${f.height} frame in a landscape UI (θ=${ui}): transient mis-rotation` };
     }
     if (this.thetaSession === null) this.thetaSession = eff;
     return { ok: true, effectiveTheta: eff, k: canonicalRotation(this.thetaSession, eff), raw };
@@ -136,9 +174,13 @@ function drawRotated(src: CanvasImageSource & { width: number; height: number },
   return canvas;
 }
 
+/** Pixels of a throwaway canvas; its backing store is released right away (per-frame canvases
+ * would otherwise wait for GC: ≈ 8 MB per frame on the CPU tier at 1600 px, 10 frames / s). */
 function canvasToRGBA(canvas: OffscreenCanvas): RGBAImage {
   const ctx = canvas.getContext('2d') as OffscreenCanvasRenderingContext2D;
   const d = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  canvas.width = 1;
+  canvas.height = 1;
   return { width: d.width, height: d.height, data: d.data };
 }
 
@@ -264,7 +306,14 @@ function prepareBitmap(bitmap: ImageBitmap, k: QuarterTurns, smallMaxSide: numbe
     async fullImage(quality = 0.92): Promise<StoredImage> {
       if (!bmp) throw new Error('frame released');
       const c = k === 0 ? drawRotated(bmp, 0) : (canonical() as OffscreenCanvas);
-      return c.convertToBlob({ type: 'image/jpeg', quality });
+      const blob = await c.convertToBlob({ type: 'image/jpeg', quality });
+      // the full-size canvas (11 MB at 1920×1440) is garbage now: free its backing store (the
+      // rotated canvas of k ≠ 0 is shrunk by release())
+      if (k === 0) {
+        c.width = 1;
+        c.height = 1;
+      }
+      return blob;
     },
     release(): void {
       if (bmp) {

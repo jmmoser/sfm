@@ -100,6 +100,20 @@ export interface EngineConfig {
    * response, so the FramePump simply delivers fewer frames.
    */
   maxMappingBacklog?: number;
+  /**
+   * Store back-pressure: a keyframe frame's response waits while more than this many MB of
+   * keyframe writes (full-size canvas / JPEG, features, colours) are not yet in the store
+   * (default: 3 % of the memory budget, at least 24 MB). Protects against a slow or stalled
+   * IndexedDB piling up ≈ 12 MB per 1920×1440 keyframe.
+   */
+  maxPendingWriteMB?: number;
+  /**
+   * No keyframes are added once the estimated capture state exceeds this fraction of the memory
+   * budget minus the 250 MB page reserve and 64 MB of feature GPU caches (default 0.45; refine
+   * peaks at ≈ 1.9× the capture state). The engine emits a non-fatal `error` event with reason
+   * 'out-of-memory' once.
+   */
+  captureMemoryFraction?: number;
 }
 
 /** What the engine knows about one keyframe (persisted with its JPEG as the frame `info`). */

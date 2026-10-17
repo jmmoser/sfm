@@ -2216,3 +2216,152 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   * Not tested: topK, the ACMH thresholds, the perturbation schedule, sigmaColor, window size,
     and relaxing source selection at trajectory turns (yard frame 184 keeps 3 sources).
   * Timings on Apple GPUs are still unmeasured.
+
+### `src/engine` + worker — iPhone constraints review (memory budget, caps, resume; amends the `src/engine` notes above)
+
+* **Memory accounting** (`src/engine/memory.ts`): `captureMemory` (features, colours, verified pairs,
+  correspondence graph pool at its capacity, live reconstruction ≈ 300 B / point + 40 B / observation, vocabulary,
+  IMU log, pending store writes — typed arrays exact, JS objects by JSC constants), `planDense` (analytic peak of
+  each dense stage + the caps below), `deviceMemoryBudgetMB` (Apple adapters: `maxBufferSize` ≥ 560 MiB → 1200 MB,
+  ≥ 400 → 850, > 256 → 600, exactly 256 MiB = Safari 26.0–26.1 floor → 850; others keep 1200 or
+  `EngineConfig.memoryBudgetMB`). `engine.memoryReport()`; logs `capture memory ≈ …` every 25 keyframes and
+  `memory after capture / refine / densify / mesh ≈ …`; `stats.memoryMB`, `stats.denseMemPeakMB`. Measured
+  (e2e object, `balanced`, 720×960, ≈ 1.6 k features / keyframe): 0.55 MB / keyframe after capture (features 233 KB,
+  graph 178 KB, reconstruction 100 KB, pairs 33 KB), 0.6 MB after refine.
+* **Budget table** (1.2 GB tab, 250 MB page / JS reserve; iPhone estimates scale the measured per-keyframe cost to
+  4 096 features / keyframe at 1920×1440 `balanced` ≈ 1.4 MB):
+
+  | stage | resident / peak | main items |
+  |---|---|---|
+  | capture, 300 keyframes | ≈ 430 MB state + ≈ 145 MB GPU + ≤ 60 MB per-frame transients + reserve ≈ 885 MB | features 180, graph 135, live model 75, pairs 26; GPU: SIFT pyramids ≈ 70 + input 11 + matcher cache ≤ 64 (CPU tier: SIFT arena 110) |
+  | refine | ≈ 1.0 GB (was ≈ 1.1 GB) | state + refine pairs ≈ 45 + 2nd reconstruction 75 + working copy 75 + global BA ≈ 85 + matcher cache 64 |
+  | dense `max`, 150 views 1600×1200, PatchMatch | 663 MB + reserve | image LRU 176, depth-only sources 120, prior + output + serialised + halo copies 132, colour thumbnails 96, PatchMatchGPU 140 |
+  | dense `max`, fusion | 822 MB + reserve (step 5) | 10 resident maps 366 + store 38, masks 34, colour 96, filtered output 59, ≈ 2.3 M points × 105 B (was ≈ 58 M points ≈ 6 GB) |
+  | mesh (`max`) | 570 MB + reserve | TSDF 40 k blocks 215, scratch 29, maps 110, colour 96, marching cubes / simplification ≈ 120 |
+  | dense `balanced`, 80 views 1280×960 | fusion 895 MB + reserve (step 2) | 10 maps 258, ≈ 4.7 M points 492 |
+
+* **Caps / adaptive limits added**:
+  * *Capture*: no more keyframes once the capture state exceeds `captureMemoryFraction` (0.45) × (budget − 250 MB
+    − 64 MB) ≈ 400 MB at 1.2 GB (≈ 280 keyframes at `balanced`, ≈ 150 at `max`), 240 MB at 850 MB; refine peaks at
+    ≈ 1.9× the capture state. Tracking continues; LiveUpdate.timings.memoryLimited = 1; one non-fatal `error`
+    event (`CaptureMemoryLimitError`, reason 'out-of-memory') — **the app does not surface it yet** (it should
+    offer "finish the scan").
+  * *Store back-pressure*: a keyframe frame waits while > `maxPendingWriteMB` (3 % of the budget, ≥ 24 MB) of
+    keyframe writes (full-size canvas / JPEG, features, colours) are not in IndexedDB (timings.writeWait); a
+    stalled IndexedDB piled up ≈ 12 MB per 1920×1440 keyframe before. `engine/state` writes are coalesced (one in
+    flight + one pending; flush / dispose settle them).
+  * *Refine*: the losing / chosen offline model is not copied (only the live model is cloned); the vocabulary
+    indexing loop (≈ 35 ms per keyframe with SIMD, ≈ 10 s blocking for 300 keyframes) yields every 30 ms and
+    honours cancel.
+  * *Dense* (`runDensify`): plan first, then: image LRU ≥ numSources + 2 images (15 % budget); every PatchMatch
+    pass store keeps ONE full map (write-through), geometric-pass sources come from a depth-only LRU (sources read
+    only `depth`: 4 instead of 20 B/px); a previous-pass map is deleted after its last use (peak storage ≈ one pass +
+    the filtered maps instead of two passes); PatchMatchGPU is destroyed after the passes (≈ 140 MB GPU at 1600 px);
+    fusion gets `maxNeighbours` (lowered from the preset only when the resident maps alone exceed 65 % of the share),
+    a pixel `step` sized so ≈ 0.2 × views × px / step² fused points fit the remaining share, and `maxPoints` as a
+    hard stop (logged). The 25 %-of-budget LRUs of the PatchMatch / filtered depth stores (up to 3 × 300 MB in
+    flight) are gone. When even that does not fit, the image size drops in × 0.85 steps (≥ 480 px; 4 GB phones at
+    `max`). e2e sizes (480 px, 40 views) keep step 1 and the preset's neighbours (results unchanged).
+  * *Before densify*: CPU SIFT arena + GPU SIFT pyramids / matcher cache released (also at finishCapture), and on a
+    persistent store the whole live session (≈ 1–2 MB / keyframe) — `refine` restores it from IndexedDB, exports
+    read features from the store.
+  * *Exports* load only what the format needs (PLY points: cloud; PLY mesh / GLB: mesh; COLMAP: neither) and drop
+    reloaded persisted results again afterwards.
+* **Resume after a kill mid-densify**: `dense/progress` {key = hash of model poses / cameras / points, reference
+  views, size, passes, PatchMatch + selection options, mode, halo; pass} in the depth backend. A new `densify`
+  with the same key skips every stored map of the pass in progress (`stats.denseResumedPass`,
+  `denseResumedMaps`) or goes straight to fusion; another key deletes the stale `pm<n>/` / `depth/` maps first.
+  Progress is cleared before the last pass's maps (after fusion). `loadSession` reports
+  `stats.denseResumablePass`. A cancelled densify resumes the same way. `refine` deletes all depth maps and the
+  dense meta (they belong to the old poses).
+* **Bugs fixed on the way**: `loadSession` (or a released live session) + densify / mesh wrote a GENERIC
+  `engine/state` (θ = null, cameraTheta / verified flag / time offset / vocabulary list / counters reset) — a later
+  refine after a reload aligned with θ = 0; the stored record is now kept (`savedState`). A PatchMatchGPU
+  destroyed by the worker's device-loss handler mid-dense ("instance destroyed") is treated like a device loss
+  (recreate once).
+* **Smaller fixes**: per-frame throwaway canvases (640 px copy, CPU working-size copy) and the keyframe JPEG
+  canvas (11 MB at 1920×1440) release their backing store right after use instead of waiting for GC
+  (`frame-ingest.ts`); `recoverGPU` compiles the new feature pipeline under the engine's GPU lock (no second
+  command stream next to a recreating PatchMatch).
+* **Validated**: Node `engine-persist.test.ts` (persistent store: cancel mid geometric pass → resume, live session
+  released / restored, state kept, export from the store; store back-pressure; capture memory cap),
+  `memory.test.ts` (plans, device classes, exact feature / pair / graph bytes), Chromium
+  `dense-resume.gpu.test.ts` (real IndexedDB: densify interrupted, NEW engine + loadSession reports
+  `denseResumablePass` 1 and resumes). e2e `object` through the worker (480 px, CPU features, scratch IndexedDB
+  depth store): 1 307 864 fused points (plan expected 1.38 M, step 1), P / C / F 0.9996 / 0.9966 / 0.9981, mesh
+  488 k triangles, ATE 2.06e-4 — same as before the changes (0.9997 / 0.996 / 0.998, 1.31 M points).
+* **Checked, unchanged**: every FrameInput bitmap is closed on all paths (busy, not initialised, hidden, settle
+  drop, prepare failure, disposed while waiting for the GPU lock); one GPU command stream (engine `gpu()` chain +
+  submitAndWait inside the modules), feature pipelines compiled at init, PatchMatch at densify start; frames are
+  skipped while hidden and dense waits for visibility before each view; quota errors surface on the next frame
+  (app: "Storage is full") or reject densify (resumable).
+* **Remaining risks (devices)**: all budgets are estimates — no on-device memory profile (no
+  `performance.memory` on iOS); the JSC heap slack on top of live data is covered only by the 250 MB reserve;
+  `maxBufferSize` budget classes are [U]; synchronous worker steps still ≈ 0.8–1 s (LiveMapper global BA budget
+  every 15 keyframes, vocabulary training at 25 keyframes, marching cubes / simplification, voxel downsampling of
+  ≥ 4 M points) — frames / cancel wait that long; PatchMatch cancel latency = one view (4–15 s per 1600 px view
+  on an iPhone, estimated); dense IndexedDB peak ≈ 2.2 × views × px × 12 B (≈ 6 GB at `max`) — free disk is not
+  exposed on iOS, a quota error mid-dense is resumable but not predicted; refine after densify re-matches the
+  refine pairs (restore does not read `refine/pairs`); the capture memory event is not shown by the app;
+  descriptor paging (descriptors are 86 % of the feature bytes and only needed for matching) would lift the
+  keyframe cap ≈ 2×.
+
+### `src/engine` + worker + harness — integration review (adversarial review; amends the `src/engine` notes above)
+
+* **Raw sensor delivery is a session property** (`OrientationTracker.rawDelivery`, `frame-ingest.ts`): the FIRST
+  portrait-UI frame decides the delivery path (landscape bitmap ⇒ raw buffers, portrait bitmap ⇒ upright frames;
+  later contradicting frames are treated as transients). With raw delivery, landscape frames of a landscape UI are
+  raw too — upright for θ = 90 also at θ = 270 (they were treated as upright-for-270 and turned 180° against the
+  rest of the session). A session that STARTED in a landscape-270 UI is ambiguous (θ₀ = 270, frames unrotated);
+  when raw buffers show up later, θ₀ is re-interpreted as 90 (`LiveSession.reinterpretSessionTheta`: R_cam_device of
+  every keyframe follows unless the hand-eye check already verified it). `EngineStateRecord.rawDelivery` persists
+  the path. Measured before the fix (synthetic raw capture, 1.2 s at 270 then portrait): 16 of 19 keyframes turned
+  180°, world alignment failed (gravity error 116°, not gravity-aligned); now all unrotated, gravity < 1°.
+  Remaining ambiguity: a raw-delivery session that starts at 270 and only ever turns to landscape-90 (no portrait
+  frame ⇒ no evidence) — the hand-eye check sees mixed rotations.
+* **Resume re-applies the camera←device mapping**: keyframe records are written once (at creation); a hand-eye
+  switch (or θ₀ re-interpretation) afterwards changed R_cam_device / gravityCam only in memory, so after a worker
+  respawn (IndexedDB clones the records) the keyframes stored before the switch came back with the old mapping:
+  measured gravity error 115°, no metric scale, no time offset. `restore` now calls `setCameraTheta(cameraTheta)`.
+* **Resume maps the keyframes whose mapping never completed** (no `kf/<id>/pairs` record — up to
+  `maxMappingBacklog` + 1 keyframes were queued when the worker died): they are matched / verified / mapped again
+  in the rebuild instead of staying unregistered without pairs.
+* **No keyframe after finishCapture**: a frame in flight when finishCapture (or refine) started could still become
+  a keyframe and its mapping job then changed the live model under refine; it is answered 'skip' now
+  (`revertLastKeyframe`).
+* **Re-densify**: `densify` forgets the previous run's in-memory views / filtered-map store and `dense/meta` before
+  it starts — the run clears (other settings) or rewrites (fusion) the stored `depth/` maps, and a cancelled
+  re-densify followed by `mesh` paired the old views with the emptied / partial maps (124 instead of 807
+  triangles in the test); `mesh` now runs (or resumes) densify. The previous dense CLOUD stays the result.
+* **`loadSession` of another session** on the same engine kept the previous session's stats (summary), resolved
+  mode and FOV prior (a later refine used the other session's `hfovPriorDeg`); reset now.
+* **Feature-pipeline hand-over**: `releasePipeline()` returned the key of the CURRENT quality; after a
+  `loadSession` that changed the quality, the worker reused e.g. a `fast` (1024 px, 2048 features) pipeline for a
+  new `balanced` capture. The key of the configuration the pipeline was created with is kept now.
+* **`DENSE_PRESETS` precedence**: values derived from the nested blocks (`fusion.minViews`, `patchMatch.*`, …)
+  overrode the flat fields when the blocks came later in the entry (the src/dense key order); the flat fields are
+  authoritative now (`parseDensePresetEntry`).
+* **Low-excitation IMU scale** (`lowExcitationRetry` / `lowExcitationSigma`, refine): the inertial module measures
+  the excitation on the keyframe-SAMPLED trajectory, so it falls with the keyframe rate, not only with the motion
+  (e2e object, GT poses, same motion: 0.110 m/s² with all 200 frames, 0.058 at 90 keyframes, 0.029 at 53 —
+  R² 0.993 / 0.988 / 0.977, scale error +0.4 / +0.3 / +1.8 %). `node e2e/run-e2e.mjs object --stride 3 --no-dense`
+  therefore claimed no metric scale. Errors-in-variables attenuation (what the floor guards against) is bounded
+  by 1 − R², so: accept with σ ≤ 3 % and (R² ≥ 0.9, excitation ≥ 0.03) or (R² ≥ 0.95, excitation ≥ 0.015); the
+  claimed σ is max(2σ, 2 %, 1 − R²). Stride-3 run: scale error +2.0 %, claimed σ 2.3 %.
+* **Smaller**: the refine-time hand-eye check uses the estimated camera–IMU offset.
+* **Checked, no change**: gyro homography direction (x_b ~ K R_c K⁻¹ x_a, R_c = R_cd·R_{d(t)←d(t_kf)}·R_cdᵀ;
+  `integrateGyro` = R_wd(t1)ᵀR_wd(t0)), hand-eye V = R_b R_aᵀ vs R_cd G R_cdᵀ, rotation prior / parallax
+  orientation, two-view (a, b) orientation into FeatureDatabase (canonical inversion) and CorrespondenceGraph,
+  LiveMapper call order (DB + graph before `addKeyframe`), refine pair exclusion / model choice / clone before
+  the world transform (X' = sRX + t, R'ᵢ = RᵢRᵀ), dense cameras = undistorted at the dense size with
+  world-frame poses, fusion neighbours restricted to views with maps, keyframe id ↔ FrameInput.index mapping,
+  IMU time domain (t_cam + offset), worker transfer lists (fresh arrays only; persisted dense / mesh released
+  before transfer), progress stage names = `src/app/stages.ts` ids, cancellation error names.
+* **Not in engine scope (reported)**: for raw sensor buffers the app maps `LiveUpdate.overlay` (relative to the
+  bitmap AS SUBMITTED, protocol) onto the upright `<video>` with the bitmap size — the overlay is drawn rotated;
+  `EngineClient.cancel()` does not reach a running `finishCapture` (not in the client's long-operation set).
+* **Tests**: `src/engine/review.test.ts` (raw delivery: tracker semantics + engine capture with a landscape-270
+  start and refine; resume with a store that clones like IndexedDB after a hand-eye switch; resume of unmapped
+  keyframes; finishCapture during a frame; cancelled re-densify + mesh; pipeline hand-over key; DENSE_PRESETS
+  precedence; low-excitation acceptance), `src/engine/review.gpu.test.ts` (loadSession of another session,
+  IndexedDB). Each engine-level test fails on the code before its fix.
