@@ -83,6 +83,37 @@ describe('computeWorldAlignment', () => {
     expect(Math.abs(res.details.offsetMs + 40)).toBeLessThan(5);
   });
 
+  it('orbit + IMU with an inverted accelerometer: sign corrected from gravityCam, not upside down', () => {
+    // the accelerometer sign self-check decided late or wrongly: every specific force is negated,
+    // which alone puts gravity exactly UP (a reliable-looking, upside-down model)
+    const rng = new Rng(1);
+    const traj = orbitTrajectory(rng);
+    const Rcd = cameraFromDevice(0);
+    const imu = simulateImu(traj, Rcd, rng).map((s) => ({
+      ...s,
+      accel: s.accel ? ([-s.accel[0], -s.accel[1], -s.accel[2]] as [number, number, number]) : null,
+      accelG: s.accelG ? ([-s.accelG[0], -s.accelG[1], -s.accelG[2]] as [number, number, number]) : null,
+    }));
+    const sim = simulateKeyframes(traj, Rcd, rng, { offsetMs: -40, s: 3.3 });
+    const Rw = new Float64Array(9);
+    const withGc = toWorldKeyframes(sim, (i, k) => {
+      traj.Rwc((sim.keyframes[i].tTrue - 5000) / 1000, Rw);
+      k.gravityCam = mat3MulVec(mat3Transpose(Rw), [0.009 * rng.gaussian(), 0.009 * rng.gaussian(), -1]);
+    });
+    const res = computeWorldAlignment({ keyframes: withGc, imu });
+    expect(res.details.accelSignCorrected).toBe(true);
+    expect(res.details.gravity!.source).toBe('accelG');
+    expect(res.metric.gravityAligned).toBe(true);
+    expect(Math.acos(-mat3MulVec(res.R, sim.downRec)[2])).toBeLessThan(1 * DEG);
+    // the corrected samples give the metric scale back as well
+    expect(res.metric.source).toBe('imu');
+    expect(Math.abs(res.s * sim.s - 1)).toBeLessThan(0.03);
+
+    // correct sign: nothing changes
+    const ok = computeWorldAlignment({ keyframes: withGc, imu: simulateImu(traj, Rcd, new Rng(1)) });
+    expect(ok.details.accelSignCorrected).toBe(false);
+  });
+
   it('orbit + IMU + compass: north-aligned within a few degrees', () => {
     const rng = new Rng(2);
     const traj = orbitTrajectory(rng);
