@@ -57,7 +57,10 @@ export class PatchMatchHolder {
         this.reason = 'WebGPU unavailable';
         return null;
       }
-      const pm = await PatchMatchGPU.create(ctx);
+      // Precompile only the source buckets the quality presets use (a config override
+      // with more sources compiles its bucket lazily).
+      const presetSources = Math.max(...(['fast', 'balanced', 'max'] as const).map((q) => resolveDensePreset(q).numSources));
+      const pm = await PatchMatchGPU.create(ctx, undefined, presetSources);
       const st = await pm.selfTest();
       if (!st.ok) {
         pm.destroy();

@@ -77,8 +77,11 @@ export interface LiveKeyframeResult {
   registered: boolean;
   initialized: boolean;
   numPoints: number;
-  /** Mean reprojection error (px) of the model (0 before initialisation). */
-  reprojError: number;
+  /**
+   * Mean reprojection error (px) of the model (0 before initialisation). Computed on
+   * read: it reprojects every observation, and the engine never reads it.
+   */
+  readonly reprojError: number;
 }
 
 export interface LiveSnapshot {
@@ -157,11 +160,15 @@ export class LiveMapper {
     this.maybeGlobalBA();
     this.timings.total += now() - t0;
     this.timings.keyframes++;
+    const rec = this.rec,
+      initialized = this.isInit;
     return {
-      registered: this.rec.images.get(id)!.registered,
-      initialized: this.isInit,
-      numPoints: this.rec.numPoints,
-      reprojError: this.isInit ? this.rec.meanReprojectionError() : 0,
+      registered: rec.images.get(id)!.registered,
+      initialized,
+      numPoints: rec.numPoints,
+      get reprojError() {
+        return initialized ? rec.meanReprojectionError() : 0;
+      },
     };
   }
 

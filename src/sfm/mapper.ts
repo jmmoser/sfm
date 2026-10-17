@@ -945,6 +945,7 @@ export class IncrementalMapper {
       minInliers: o.absPoseMinNumInliers,
       confidence: 0.99999,
       maxIterations: 10000,
+      minInlierRatio: o.absPoseMinInlierRatio,
       rng: this.rng,
     });
     if (!res || res.numInliers < o.absPoseMinNumInliers || res.numInliers < o.absPoseMinInlierRatio * n) return false;

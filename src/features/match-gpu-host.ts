@@ -41,33 +41,55 @@ export interface DescriptorStats {
 
 /** Norms (as match.ts computeInvNorms) and a content hash of a FeatureSet's descriptors. */
 export function descriptorStats(fs: FeatureSet, withPositions = false): DescriptorStats {
+  return { invNorm: descriptorInvNorms(fs), hash: descriptorHash(fs, withPositions) };
+}
+
+/** 1 / L2 norm of each descriptor (0 for all-zero), f64 exactly as match.ts computeInvNorms. */
+export function descriptorInvNorms(fs: FeatureSet): Float64Array {
   const n = fs.count;
   const src = fs.descriptors;
   const invNorm = new Float64Array(n);
-  let h = (0x811c9dc5 ^ n) >>> 0;
-  const aligned = src.byteOffset % 4 === 0;
-  const words = aligned ? new Uint32Array(src.buffer, src.byteOffset, (n * D) >> 2) : null;
   for (let i = 0; i < n; i++) {
     const o = i * D;
     let ss = 0;
     for (let k = 0; k < D; k++) ss += src[o + k] * src[o + k];
     invNorm[i] = ss > 0 ? 1 / Math.sqrt(ss) : 0;
-    if (words) {
-      const wo = o >> 2;
-      for (let k = 0; k < 32; k++) h = Math.imul(h ^ words[wo + k], 0x01000193);
-    } else {
-      for (let k = 0; k < D; k++) h = Math.imul(h ^ src[o + k], 0x01000193);
-    }
   }
+  return invNorm;
+}
+
+/**
+ * 32-bit content hash of count and descriptors (and keypoint positions when requested):
+ * four interleaved FNV-1a-style lanes over the descriptor bytes as u32 words, so the
+ * multiply chains run in parallel (the hash is checked on every match call to detect
+ * descriptor arrays refilled in place). Independent of the array's alignment.
+ */
+export function descriptorHash(fs: FeatureSet, withPositions = false): number {
+  const n = fs.count;
+  const src = fs.descriptors;
+  const P = 0x01000193;
+  let h0 = (0x811c9dc5 ^ n) >>> 0,
+    h1 = 0x050c5d1f,
+    h2 = 0x2c1b3c6d,
+    h3 = 0x297a2d39;
+  const nw = (n * D) >> 2;
+  const words = src.byteOffset % 4 === 0 ? new Uint32Array(src.buffer, src.byteOffset, nw) : packDescriptorWords(fs);
+  for (let k = 0; k < nw; k += 4) {
+    h0 = Math.imul(h0 ^ words[k], P);
+    h1 = Math.imul(h1 ^ words[k + 1], P);
+    h2 = Math.imul(h2 ^ words[k + 2], P);
+    h3 = Math.imul(h3 ^ words[k + 3], P);
+  }
+  let h = Math.imul(Math.imul(Math.imul(h0 ^ h1, P) ^ h2, P) ^ h3, P);
   if (withPositions) {
     const kp = fs.keypoints;
     const kw = new Uint32Array(kp.buffer, kp.byteOffset, 4 * n);
     for (let i = 0; i < 4 * n; i += 4) {
-      h = Math.imul(h ^ kw[i], 0x01000193);
-      h = Math.imul(h ^ kw[i + 1], 0x01000193);
+      h = Math.imul(h ^ kw[i], P);
+      h = Math.imul(h ^ kw[i + 1], P);
     }
   }
-  return { invNorm, hash: h >>> 0 };
+  return h >>> 0;
 }
 
 /** Descriptors as packed u32 words (4 bytes per word, little endian), copying only if unaligned. */

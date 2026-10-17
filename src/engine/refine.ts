@@ -8,7 +8,7 @@
  *
  * Progress stages: 'matching', 'reconstruction', 'alignment' (src/app/stages.ts).
  */
-import type { CancelToken, PointCloud, ProgressCallback, TwoViewGeometry } from '../core/types';
+import type { CancelToken, MatchPairs, PointCloud, ProgressCallback, TwoViewGeometry } from '../core/types';
 import { mergePairs, retrievalPairs, sequentialPairs, spatialPairs, type ImagePair, type SpatialCamera } from '../sfm/pairs';
 import type { CorrespondenceGraph } from '../sfm/correspondence-graph';
 import { pairKey, type FeatureDatabase } from '../sfm/database';
@@ -139,6 +139,8 @@ export function lowExcitationSigma(relUncertainty: number | null, r2: number): n
  * One global bundle adjustment of `rec` with the principal point refined (in place on a clone).
  * Accepted when every camera's principal point stays within 10 % of the image size of the image
  * centre and the mean reprojection error does not grow; otherwise the input model is kept.
+ * With `consumeInput` the adjustment runs on `rec` itself (no clone): for a throwaway input the
+ * caller discards when not accepted, since `rec` is then modified whatever the outcome.
  */
 export async function refinePrincipalPoint(
   rec: Reconstruction,
@@ -146,9 +148,10 @@ export async function refinePrincipalPoint(
   graph: CorrespondenceGraph,
   opts: Partial<MapperOptions>,
   cancel?: CancelToken,
+  consumeInput = false,
 ): Promise<{ rec: Reconstruction; accepted: boolean; reason: string }> {
-  const work = rec.clone();
   const before = rec.meanReprojectionError();
+  const work = consumeInput ? rec : rec.clone();
   const m = new IncrementalMapper(db, graph, work, { ...opts, refinePrincipalPoint: true, refineFocal: true });
   await m.adjustGlobalBundleSliced(Infinity, cancel, true);
   m.filterPoints();
@@ -265,15 +268,27 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   const attempted: number[] = [];
   let verified = 0;
   let lastYield = now();
+  // One-deep prefetch: pair i+1 is matched on the GPU while pair i is verified on the CPU
+  // (the GPU chain still runs one job at a time). Rejections surface when awaited.
+  const putative = (i: number): Promise<MatchPairs | null> | null => {
+    if (i >= pairs.length) return null;
+    const p = live.putativeMatches(pairs[i][0], pairs[i][1]);
+    p.catch(() => undefined);
+    return p;
+  };
+  let next = putative(0);
   for (let i = 0; i < pairs.length; i++) {
     checkCancel(cancel, 'matching');
     const [a, b] = pairs[i];
     const key = pairKey(a, b);
     st.attempted.add(key);
     attempted.push(key);
+    const cur = next!;
+    next = putative(i + 1);
     let g: TwoViewGeometry | null = null;
     try {
-      g = await live.matchPair(a, b, { maxIterations: speculative.has(key) ? 1000 : 2000 });
+      const m = await cur;
+      g = m ? live.verifyPair(a, b, m, { maxIterations: speculative.has(key) ? 1000 : 2000 }) : null;
     } catch (e) {
       deps.log('warn', `pair ${a}-${b}: ${(e as Error)?.message ?? e}`);
     }
@@ -487,7 +502,10 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
         rounds: cfg.perImageFocalRounds,
         ppPriorSigmaPx: cfg.perImageFocalPPSigmaPx,
         ppPriorAnchor: cfg.perImageFocalPPAnchor,
-        refinePrincipalPoint: ppOn ? (r, priors) => refinePrincipalPoint(r, st.db, st.graph, priors ? { ...mo, principalPointPriors: priors } : mo, cancel) : undefined,
+        // the per-image rounds pass a throwaway rescaled copy: refine it in place
+        refinePrincipalPoint: ppOn
+          ? (r, priors) => refinePrincipalPoint(r, st.db, st.graph, priors ? { ...mo, principalPointPriors: priors } : mo, cancel, true)
+          : undefined,
         cancel,
       });
       if (pf.accepted) chosen = pf.rec;

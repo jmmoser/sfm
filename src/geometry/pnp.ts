@@ -910,6 +910,13 @@ export interface PnPRansacOptions {
   maxIterations?: number;
   /** Minimum number of inliers for success (default 12). */
   minInliers?: number;
+  /**
+   * Inlier ratio below which the caller rejects the pose anyway (default 0). Caps the
+   * RANSAC budget at the iterations that find such a model with `confidence`, so a
+   * hopeless registration stops early instead of running all maxIterations
+   * (COLMAP's `abs_pose_min_inlier_ratio`).
+   */
+  minInlierRatio?: number;
   rng?: Rng;
 }
 
@@ -1043,6 +1050,7 @@ export function solvePnPRansac(
     thresholdSq: thr * thr,
     confidence: opts.confidence ?? 0.9999,
     maxIterations: opts.maxIterations ?? 10000,
+    minInlierRatio: opts.minInlierRatio ? Math.min(1, Math.max(opts.minInlierRatio, minInliers / n)) : undefined,
     rng: opts.rng,
   });
   if (!res.model || res.numInliers < minInliers) return null;
