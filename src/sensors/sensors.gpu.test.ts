@@ -1,6 +1,8 @@
 /**
  * Browser tests (headless Chromium, fake camera via --use-fake-device-for-media-stream,
- * --use-fake-ui-for-media-stream, SwiftShader WebGPU).
+ * --use-fake-ui-for-media-stream, SwiftShader WebGPU). All camera tests live in this one file:
+ * test files run in parallel, and a second file holding the fake camera changes the formats
+ * CameraCapture negotiates.
  */
 import { afterAll, describe, expect, it } from 'vitest';
 import { CameraCapture, type FrameMeta } from './camera';
@@ -8,6 +10,7 @@ import { collectDiagnostics } from './diagnostics';
 import { ScreenAngleTracker, screenAngle } from './frame-orientation';
 import { FramePump, type PumpFrame } from './frame-pump';
 import { MotionSensor } from './motion';
+import { MstpFrameSource } from './mstp-camera';
 import { requestCapturePermissions } from './permissions';
 import { WakeLock } from './wakelock';
 
@@ -242,5 +245,88 @@ describe('misc browser glue', () => {
     tr.start();
     expect(tr.angle).toBe(screenAngle());
     tr.stop();
+  });
+});
+
+// MediaStreamTrackProcessor path with the real camera worker. Chromium cannot transfer tracks, so
+// the main-thread processor's stream is transferred; frames are upright here, so this checks the
+// plumbing (frame announcements, timestamps, grabs, FramePump), not the iOS raw-buffer geometry.
+describe('MstpFrameSource (fake camera, real worker)', () => {
+  it('reads frames in the worker, maps their timestamps and grabs bitmaps', async () => {
+    const video = document.createElement('video');
+    document.body.appendChild(video);
+    videos.push(video);
+    const cam = new CameraCapture();
+    await cam.start(video, { quality: 'fast' });
+    const src = new MstpFrameSource(cam);
+    try {
+      const mode = await src.start();
+      expect(src.fallbackReason).toBeNull();
+      expect(mode).toBe('mstp');
+
+      const got: { t: number; meta: FrameMeta; at: number }[] = [];
+      const off = src.onFrame((t, meta) => got.push({ t, meta: { ...meta }, at: performance.now() }));
+      const t0 = performance.now();
+      while (got.length < 8 && performance.now() - t0 < 5000) await sleep(20);
+      off();
+      expect(got.length).toBeGreaterThanOrEqual(8);
+      for (let i = 1; i < got.length; i++) expect(got[i].t).toBeGreaterThan(got[i - 1].t);
+      for (const g of got) {
+        expect(g.meta.timeSource).toBe('frameTimestamp');
+        expect(g.t).toBeLessThanOrEqual(g.at + 1);
+        expect(g.at - g.t).toBeLessThan(500);
+        expect([g.meta.width, g.meta.height]).toEqual([1280, 720]);
+      }
+      expect(src.stats.codedWidth).toBeGreaterThan(0);
+
+      // FramePump on top: bitmaps at the requested size, paired with the frame callback
+      const frames: PumpFrame[] = [];
+      const pump = new FramePump({
+        camera: src,
+        consumer: (f) => void frames.push(f),
+        targetHz: 30,
+        maxSide: 320,
+        angleTracker: new ScreenAngleTracker({ read: () => 0 }),
+        isHidden: () => false,
+      });
+      pump.start();
+      const t1 = performance.now();
+      while (frames.length < 4 && performance.now() - t1 < 5000) await sleep(20);
+      pump.stop();
+      expect(frames.length).toBeGreaterThanOrEqual(4);
+      for (const f of frames) {
+        expect([f.bitmap.width, f.bitmap.height]).toEqual([320, 180]);
+        expect(f.timeSource).toBe('frameTimestamp');
+        f.bitmap.close();
+      }
+      expect(pump.stats.errors).toBe(src.stats.staleGrabs + src.stats.grabErrors);
+    } finally {
+      src.stop();
+      cam.stop();
+    }
+  });
+
+  it('re-attaches after a camera restart', async () => {
+    const video = document.createElement('video');
+    document.body.appendChild(video);
+    videos.push(video);
+    const cam = new CameraCapture();
+    await cam.start(video, { quality: 'fast' });
+    const src = new MstpFrameSource(cam);
+    try {
+      expect(await src.start()).toBe('mstp');
+      expect(await cam.restart('manual')).toBe(true);
+      const segs: number[] = [];
+      const off = src.onFrame((_t, m) => segs.push(m.segment));
+      const t0 = performance.now();
+      while (segs.length < 3 && performance.now() - t0 < 5000) await sleep(20);
+      off();
+      expect(segs.length).toBeGreaterThanOrEqual(3);
+      expect(segs.every((s) => s === cam.segment)).toBe(true);
+      expect(src.stats.reattaches).toBe(1);
+    } finally {
+      src.stop();
+      cam.stop();
+    }
   });
 });

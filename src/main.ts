@@ -22,14 +22,14 @@ import { registerServiceWorker, requestPersistenceIfInstalled } from './app/pwa'
 async function boot(): Promise<void> {
   // Validated (src/app/boot-params.ts): unknown values are ignored; the mockFail message is a
   // dev-build hook only.
-  const { mock, mockOptions, screen } = parseBootParams(location.search, import.meta.env.DEV);
+  const { mock, mockOptions, screen, cameraPath } = parseBootParams(location.search, import.meta.env.DEV);
   // The MockEngine (dev / tests) is loaded on demand: it is not part of the production entry chunk.
   const engine: EngineLike = mock ? new (await import('./app/mock-engine')).MockEngine(mockOptions) : new EngineClient();
   const root = document.getElementById('app') ?? document.body.appendChild(document.createElement('div'));
   root.id = 'app';
   installErrorToasts();
   const initialEvent: NavEvent | null = screen === 'diagnostics' ? { type: 'OPEN_DIAGNOSTICS' } : screen === 'setup' ? { type: 'NEW_SCAN' } : null;
-  const app = new App(root, { engine, mock, initialEvent });
+  const app = new App(root, { engine, mock, initialEvent, cameraPath });
   (globalThis as { __sfmApp?: App }).__sfmApp = app; // debugging / e2e hooks
   // the entry chunk's own (content-hashed) URL versions the service worker
   registerServiceWorker(import.meta.url);

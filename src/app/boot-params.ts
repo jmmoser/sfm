@@ -10,6 +10,8 @@
  *   mockStall=<method>[,…] a long MockEngine operation hangs (finishCapture | refine | densify | mesh)
  *   mockMemoryLimit=<n>    capture memory cap after n keyframes (integer ≥ 1)
  *   screen=diagnostics|setup   open that screen first
+ *   camera=mstp           capture frames with MediaStreamTrackProcessor in a worker (prototype,
+ *                          src/sensors/mstp-camera.ts; falls back to the <video> path)
  *
  * The mock* parameters only apply together with `mock`.
  */
@@ -20,6 +22,8 @@ export interface BootParams {
   /** MockEngine options (only with `mock`). */
   mockOptions: Pick<MockEngineOptions, 'speed' | 'failOn' | 'stallOn' | 'memoryLimitKeyframes'>;
   screen: 'diagnostics' | 'setup' | null;
+  /** Camera frame path: 'video' (rVFC + createImageBitmap, default) or 'mstp'. */
+  cameraPath: 'video' | 'mstp';
 }
 
 const FAIL_METHODS = ['init', 'frame', 'refine', 'densify', 'mesh', 'export', 'loadSession'] as const;
@@ -46,6 +50,7 @@ export function parseBootParams(search: string, dev: boolean): BootParams {
   const mock = mockParam === '1' || mockParam === 'true';
   const screenParam = q.get('screen');
   const screen = screenParam === 'diagnostics' || screenParam === 'setup' ? screenParam : null;
+  const cameraPath = q.get('camera') === 'mstp' ? 'mstp' : 'video';
   const mockOptions: BootParams['mockOptions'] = {};
   if (mock) {
     const speed = Number(q.get('mockSpeed') ?? '1');
@@ -64,5 +69,5 @@ export function parseBootParams(search: string, dev: boolean): BootParams {
     const limit = Number(q.get('mockMemoryLimit') ?? '');
     if (Number.isInteger(limit) && limit >= 1) mockOptions.memoryLimitKeyframes = limit;
   }
-  return { mock, mockOptions, screen };
+  return { mock, mockOptions, screen, cameraPath };
 }

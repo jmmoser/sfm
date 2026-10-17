@@ -14,3 +14,4 @@ export * from './wakelock';
 export * from './permissions';
 export * from './diagnostics';
 export * from './frame-pump';
+export * from './mstp-camera';

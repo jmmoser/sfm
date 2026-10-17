@@ -70,6 +70,8 @@ export interface AppOptions {
   mock?: boolean;
   /** Open this route first (dev / tests: `?screen=diagnostics`). */
   initialEvent?: NavEvent | null;
+  /** Camera frame path (`?camera=mstp`, src/app/boot-params.ts). Default 'video'. */
+  cameraPath?: 'video' | 'mstp';
 }
 
 const CONFIG_KEY = 'sfm.captureConfig.v1';
@@ -106,6 +108,7 @@ export class App {
   readonly root: HTMLElement;
   readonly engine: EngineLike;
   readonly mock: boolean;
+  readonly cameraPath: 'video' | 'mstp';
   readonly store: Store<AppState>;
   readonly wakeLock = new WakeLock();
   config: CaptureConfig;
@@ -126,6 +129,7 @@ export class App {
     this.root = root;
     this.engine = opts.engine;
     this.mock = !!opts.mock;
+    this.cameraPath = opts.cameraPath ?? 'video';
     this.config = loadConfig();
     this.results = App.emptyResults(this.config);
     const env = detectEnvironment();

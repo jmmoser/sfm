@@ -62,6 +62,7 @@ adjustment on the device and estimates scan times per quality preset.
 ```sh
 npm install
 npm run dev          # Vite dev server (desktop: http://localhost:5173; ?mock=1 = mock engine)
+                     # ?camera=mstp = prototype worker camera path (MediaStreamTrackProcessor)
 npm run build        # typecheck + production build into dist/
 npm test             # unit tests (Node)
 npm run test:gpu     # WebGPU / DOM tests in headless Chromium (SwiftShader)

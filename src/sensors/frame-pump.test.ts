@@ -158,6 +158,34 @@ describe('FramePump', () => {
     pump.stop();
   });
 
+  it('keeps raw sensor buffers of a fixed-orientation camera in every UI rotation', async () => {
+    const cam = Object.assign(new FakeCamera(), { fixedOrientation: true });
+    let angle: ScreenAngle = 0;
+    const tracker = new ScreenAngleTracker({ read: () => angle });
+    const frames: PumpFrame[] = [];
+    const pump = new FramePump({ camera: cam, angleTracker: tracker, targetHz: 1000, isHidden: () => false, consumer: (f) => void frames.push(f) });
+    pump.start();
+    cam.emit(1); // landscape 640×480 buffer in a portrait UI
+    angle = 90;
+    tracker.poll();
+    (tracker as unknown as { changeT: number }).changeT = -1e9;
+    await sleep(0);
+    cam.emit(2); // the same landscape buffer in a landscape UI
+    await sleep(0);
+    angle = 180;
+    tracker.poll();
+    (tracker as unknown as { changeT: number }).changeT = -1e9;
+    cam.emit(3);
+    await sleep(0);
+    expect(frames.map((f) => [f.width, f.height, f.screenAngle])).toEqual([
+      [640, 480, 0],
+      [640, 480, 90],
+      [640, 480, 180],
+    ]);
+    expect(pump.stats.skippedAspect).toBe(0);
+    pump.stop();
+  });
+
   it('closes the bitmap when the consumer throws and keeps running', async () => {
     const cam = new FakeCamera();
     const errors: unknown[] = [];

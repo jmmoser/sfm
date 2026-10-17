@@ -17,6 +17,7 @@
  */
 import type { PumpFrame } from '../../sensors/frame-pump';
 import { CameraCapture, type CameraStartResult, type CameraState } from '../../sensors/camera';
+import { MstpFrameSource } from '../../sensors/mstp-camera';
 import { CompassSensor } from '../../sensors/orientation';
 import { FramePump } from '../../sensors/frame-pump';
 import { GeoSensor } from '../../sensors/geolocation';
@@ -69,6 +70,8 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   const compass = new CompassSensor();
   const geo = cfg.useGps && GeoSensor.isSupported() ? new GeoSensor() : null;
   let pump: FramePump | null = null;
+  /** `?camera=mstp`: frames from MediaStreamTrackProcessor in a worker (falls back to `camera`). */
+  let frameSource: MstpFrameSource | null = null;
   let camRes: CameraStartResult | null = null;
   let phase: Phase = 'starting';
   let closed = false;
@@ -653,7 +656,14 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       return;
     }
     d.add(camera.onStateChange(onCameraState));
-    debugOverlay?.setCamera({ width: camRes.width, height: camRes.height, frameRate: camRes.frameRate, label: camRes.label, frameMaxSide: camRes.frameMaxSide });
+    if (app.cameraPath === 'mstp' && !frameSource && MstpFrameSource.isSupported()) {
+      frameSource = new MstpFrameSource(camera);
+      const mode = await frameSource.start();
+      if (closed) return;
+      if (mode === 'fallback') toast('Worker camera capture is unavailable here: using the standard camera path.', { tone: 'warn' });
+    }
+    const path = !frameSource ? 'video' : frameSource.mode === 'mstp' ? 'mstp' : `video (MSTP fallback: ${frameSource.fallbackReason ?? 'stopped'})`;
+    debugOverlay?.setCamera({ width: camRes.width, height: camRes.height, frameRate: camRes.frameRate, label: camRes.label, frameMaxSide: camRes.frameMaxSide, path });
     torchBtn.disabled = !camRes.torchAvailable;
     if (cfg.torch && camRes.torchAvailable) void toggleTorch(true);
     // Lock white balance after auto-WB settled (iOS supports manual WB only).
@@ -714,7 +724,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     if (closed) return;
     showCard(null);
     pump = new FramePump({
-      camera,
+      camera: frameSource ?? camera,
       consumer: consume,
       motion: motion?.running ? motion : null,
       geo,
@@ -823,6 +833,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
 
   function stopSensors(): void {
     pump?.stop();
+    frameSource?.stop(); // its track clone keeps the capture source open
     camera.stop();
     motion?.stop();
     compass.stop();

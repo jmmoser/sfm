@@ -446,6 +446,19 @@ class CameraCapture {
   grabFrame(): Promise<ImageBitmap>              // full-resolution current frame
   setTorch(on: boolean): Promise<boolean>; setZoom(z: number): Promise<boolean>
 }
+// mstp-camera.ts — prototype, opt-in with `?camera=mstp` (ios-camera.md §7 ladder step A). A FramePump
+// camera: a clone of CameraCapture's track is read with MediaStreamTrackProcessor in
+// workers/camera.worker.ts (Chromium: the main-thread processor's stream is transferred instead).
+// Frames keep the sensor orientation on iOS (fixedOrientation ⇒ raw buffers, classified by the
+// engine's OrientationTracker); t = VideoFrame.timestamp mapped by FrameClock (min arrival latency
+// over 300 frames); timeSource 'frameTimestamp'. Falls back to CameraCapture's rVFC path only
+// before the first frame; re-attaches after camera restarts and worker errors.
+class MstpFrameSource implements FramePumpCamera {
+  constructor(camera: CameraCapture, opts?: MstpFrameSourceOptions)
+  start(): Promise<'mstp' | 'fallback'>; stop(): void
+  readonly mode; readonly fallbackReason: string | null; readonly fixedOrientation: boolean; readonly stats: MstpStats
+  onFrame(cb: FrameCallback): () => void; grabFrame(opts?): Promise<ImageBitmap>   // grabs the frame being dispatched
+}
 // motion.ts
 class MotionSensor {
   static isSupported(): boolean

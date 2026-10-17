@@ -15,6 +15,8 @@ export interface DebugCameraInfo {
   label: string;
   /** grabFrame({maxSide}) of the pump (null = native size). */
   frameMaxSide: number | null;
+  /** Frame path ('video', 'mstp', or 'video (MSTP fallback: …)'). */
+  path?: string;
 }
 
 export interface DebugSnapshot {
@@ -42,7 +44,7 @@ export function formatDebugLines(s: DebugSnapshot): string[] {
   lines.push(
     `backend: ${d ? (d.backend === 'webgpu' ? 'WebGPU' : 'CPU') : '–'}${d?.fallbackReason ? ` (${d.fallbackReason})` : ''}${s.webgpuApi ? '' : ' · no navigator.gpu'}`,
   );
-  if (cam) lines.push(`camera: ${cam.width}×${cam.height} @ ${num(cam.frameRate)} fps${cam.frameMaxSide ? ` → ≤${cam.frameMaxSide}px` : ''} · ${cam.label || 'unnamed'}`);
+  if (cam) lines.push(`camera: ${cam.width}×${cam.height} @ ${num(cam.frameRate)} fps${cam.frameMaxSide ? ` → ≤${cam.frameMaxSide}px` : ''} · ${cam.label || 'unnamed'}${cam.path ? ` · ${cam.path}` : ''}`);
   if (!u) {
     lines.push('waiting for the first frame…');
   } else {

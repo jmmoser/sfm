@@ -112,7 +112,7 @@ export interface FrameInput {
   attitude?: AttitudeSample | null;
   /** MotionSensor calibration version the IMU samples were normalised with (-1: no motion). */
   imuCalibrationVersion?: number;
-  timeSource?: 'captureTime' | 'presentationTime' | 'callback';
+  timeSource?: 'captureTime' | 'presentationTime' | 'callback' | 'frameTimestamp';
 }
 
 export type KeyframeDecision = 'keyframe' | 'skip' | 'reject_blur' | 'reject_motion';

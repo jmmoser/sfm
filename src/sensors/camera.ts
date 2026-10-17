@@ -49,8 +49,11 @@ export interface FrameMeta {
   height: number;
   /** performance.now() when the callback ran. */
   callbackTime: number;
-  /** Which value the `t` argument of the frame callback was taken from. */
-  timeSource: 'captureTime' | 'presentationTime' | 'callback';
+  /**
+   * Which value the `t` argument of the frame callback was taken from ('frameTimestamp':
+   * VideoFrame.timestamp of the MediaStreamTrackProcessor path, src/sensors/mstp-camera.ts).
+   */
+  timeSource: 'captureTime' | 'presentationTime' | 'callback' | 'frameTimestamp';
   /** Increments whenever capture resumed after an interruption (start a new SfM segment). */
   segment: number;
 }

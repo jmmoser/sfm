@@ -3,10 +3,16 @@ import { parseBootParams, SIMULATED_FAILURE } from './boot-params';
 
 describe('parseBootParams', () => {
   it('defaults: real engine, no test hooks', () => {
-    expect(parseBootParams('', false)).toEqual({ mock: false, mockOptions: {}, screen: null });
+    expect(parseBootParams('', false)).toEqual({ mock: false, mockOptions: {}, screen: null, cameraPath: 'video' });
     expect(parseBootParams('?screen=diagnostics', false).screen).toBe('diagnostics');
     expect(parseBootParams('?screen=setup', true).screen).toBe('setup');
     expect(parseBootParams('?screen=javascript:alert(1)', true).screen).toBeNull();
+  });
+
+  it('camera=mstp selects the worker camera path; anything else keeps the <video> path', () => {
+    expect(parseBootParams('?camera=mstp', false).cameraPath).toBe('mstp');
+    expect(parseBootParams('?camera=MSTP', false).cameraPath).toBe('video');
+    expect(parseBootParams('?camera=', false).cameraPath).toBe('video');
   });
 
   it('mock* parameters only apply with mock', () => {

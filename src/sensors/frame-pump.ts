@@ -9,7 +9,8 @@
  *
  * Frames are skipped while the page is hidden, within `settleMs` (500 ms) of a UI rotation
  * (Safari 26.x transient mis-rotation) and when the bitmap aspect contradicts the UI rotation
- * (transient; re-baselined after 1.5 s of consistent contradiction).
+ * (transient; re-baselined after 1.5 s of consistent contradiction) — unless the camera reports
+ * `fixedOrientation` (raw sensor buffers, which never follow the UI rotation).
  * The consumer OWNS the bitmap (close or transfer it).
  */
 import type { GeoFix, ImuSample, Mat3, Vec3 } from '../core/types';
@@ -49,6 +50,11 @@ export interface FramePumpCamera {
   grabFrame(opts?: { maxSide?: number }): Promise<ImageBitmap>;
   /** CameraCapture.result: its `frameMaxSide` is used when `maxSide` is left undefined. */
   readonly result?: { frameMaxSide: number | null } | null;
+  /**
+   * Frames keep one orientation whatever the UI rotation (raw sensor buffers of the MSTP path,
+   * ./mstp-camera.ts): the aspect-vs-rotation check is skipped (the engine classifies them).
+   */
+  readonly fixedOrientation?: boolean;
 }
 export interface FramePumpMotion {
   drain(): ImuSample[];
@@ -270,7 +276,7 @@ export class FramePump {
         bitmap = null;
         return;
       }
-      if (!this.checkAspect(bitmap.width, bitmap.height, theta)) {
+      if (!this.o.camera.fixedOrientation && !this.checkAspect(bitmap.width, bitmap.height, theta)) {
         this.stats.skippedAspect++;
         bitmap.close();
         bitmap = null;
