@@ -150,7 +150,10 @@ export class SessionEngineStore implements EngineStore {
   ) {}
 
   static async open(sessionId: string, dbName?: string): Promise<SessionEngineStore> {
-    return new SessionEngineStore(await SessionStore.open(dbName), sessionId);
+    // Keyframe JPEGs are stored as ArrayBuffers from the start: iOS WebKit intermittently fails
+    // Blob writes from the worker ("UnknownError: Error preparing Blob/File data to be stored in
+    // object store") during a capture, losing that keyframe. Reads return Blobs either way.
+    return new SessionEngineStore(await SessionStore.open(dbName, { blobsAsArrayBuffers: true }), sessionId);
   }
 
   static isSupported(): boolean {

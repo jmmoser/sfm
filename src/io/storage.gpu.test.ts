@@ -158,6 +158,34 @@ describe('SessionStore (IndexedDB)', () => {
     expect(await store.sessionBytes(s.id)).toBe(6 + 2);
   });
 
+  it('a Blob refusal whose ArrayBuffer retry also fails reports both errors', async () => {
+    const store = await openFresh();
+    const s = await store.createSession();
+    const proto = IDBObjectStore.prototype;
+    const orig = proto.put;
+    let calls = 0;
+    proto.put = function (this: IDBObjectStore, ...args: Parameters<IDBObjectStore['put']>) {
+      if (this.name === 'frameData') {
+        calls++;
+        throw calls === 1
+          ? new DOMException('Error preparing Blob/File data to be stored in object store', 'UnknownError')
+          : new DOMException('Connection lost', 'InvalidStateError');
+      }
+      return orig.apply(this, args);
+    };
+    try {
+      const err = (await store.putFrame(s.id, 1, jpeg(1), { id: 1 }).catch((e: unknown) => e)) as Error;
+      expect(calls).toBe(2);
+      expect(err.name).toBe('UnknownError');
+      expect(err.message).toBe('Error preparing Blob/File data to be stored in object store (retry as ArrayBuffer: InvalidStateError: Connection lost)');
+    } finally {
+      proto.put = orig;
+    }
+    // Blob mode is kept: the next write stores a Blob again
+    await store.putFrame(s.id, 2, jpeg(2), { id: 2 });
+    expect(await bytesOf((await store.getFrame(s.id, 2))!.jpeg)).toEqual([0xff, 0xd8, 2, 3, 0xff, 0xd9]);
+  });
+
   it('maps QuotaExceededError to StorageQuotaError and leaves no partial writes', async () => {
     const store = await openFresh();
     const s = await store.createSession();
