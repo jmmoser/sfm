@@ -262,7 +262,9 @@ describe('camera timing probe (fake camera, real worker)', () => {
       expect(r.video.timeSource).toBe('captureTime');
       expect(r.timing.pairs).toBeGreaterThan(5);
       expect(r.timing.jitterStdMs).not.toBeNull();
-      expect(r.grab.syncMs!.n).toBeGreaterThan(5);
+      expect(r.grab.bitmap!.syncMs.n).toBeGreaterThan(1);
+      expect(r.grab.bitmapScaled!.syncMs.n).toBeGreaterThan(1);
+      expect(r.grab.videoFrame!.syncMs.n).toBeGreaterThan(1);
       expect(r.summary.length).toBeGreaterThan(0);
       expect(cam.track!.readyState).toBe('live'); // the probe leaves the camera running
     } finally {

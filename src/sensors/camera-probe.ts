@@ -1,19 +1,24 @@
 /**
- * Camera timing probe (Diagnostics): measures, on the device, whether reading camera frames with
- * MediaStreamTrackProcessor (docs/research/ios-camera.md §7 ladder step A) would improve on the
- * capture path in use (rVFC + createImageBitmap(<video>), ./camera.ts) — before building it.
+ * Camera timing probe (Diagnostics): measures, on the device, whether reading camera frames another
+ * way would improve on the capture path in use (rVFC + createImageBitmap(<video>), ./camera.ts)
+ * before building it (docs/research/ios-camera.md §7 ladder steps A/B).
  *
- * For `durationMs` it records, on the same camera track:
+ * After `warmupMs` (camera latency settles) it records for `durationMs`, on the same camera track:
  *  - every rVFC callback (captureTime / presentationTime, frame size, UI rotation θ);
  *  - every frame a clone of the track delivers to a MediaStreamTrackProcessor in a worker
  *    (src/workers/camera-probe.worker.ts): VideoFrame.timestamp (capture clock), arrival time,
  *    coded / display size, format. Frames are closed at once (nothing is converted);
- *  - createImageBitmap(<video>) at 10 Hz, as FramePump does: time spent synchronously on the
- *    main thread and until the bitmap resolves.
- * `analyzeCameraProbe` (pure) pairs rVFC frames with MSTP frames and reports how much rVFC
- * captureTime jitters and drifts against the capture clock (what MSTP timestamps would remove;
- * a CONSTANT lag is already absorbed by the engine's camera–IMU time-offset estimate), whether
- * MSTP buffers stay sensor-landscape in every UI rotation, and what the main-thread grab costs.
+ *  - 10 grabs per second (FramePump's rate), cycling through createImageBitmap(<video>) at full
+ *    size, the same downscaled to `scaledMaxSide`, and new VideoFrame(<video>) (step B: an
+ *    IOSurface reference handed to a worker): time on the main thread, until resolved, and the
+ *    size per θ (is a VideoFrame of the <video> a raw sensor-landscape buffer?).
+ *
+ * `analyzeCameraProbe` (pure) pairs rVFC frames with MSTP frames. Frames within ±500 ms of a UI
+ * rotation (which the engine drops anyway) are reported separately (dropped frames, wrongly
+ * oriented frames, worst timestamp error); on the rest it reports how much rVFC captureTime
+ * jitters and drifts against the capture clock — drift as one slope shared by the segments
+ * between rotations, so a step at a rotation is not mistaken for drift. A CONSTANT lag does not
+ * matter: the engine's camera–IMU time-offset estimate absorbs it; drift does, over a long scan.
  */
 import type { CameraCapture } from './camera';
 import { screenAngle } from './frame-orientation';
@@ -40,15 +45,23 @@ export interface ProbeMstpSample {
   format: string | null;
 }
 
+export type GrabKind = 'bitmap' | 'bitmapScaled' | 'videoFrame';
+
 export interface ProbeGrabSample {
-  /** Synchronous part of the createImageBitmap(<video>) call (main thread blocked). */
+  kind: GrabKind;
+  /** Synchronous part of the call (main thread blocked). */
   syncMs: number;
-  /** Until the bitmap resolved. */
+  /** Until the result was available. */
   totalMs: number;
+  /** Result size (VideoFrame: displayWidth × displayHeight). */
+  width: number;
+  height: number;
+  screenAngle: number;
 }
 
 export interface ProbeInput {
   durationMs: number;
+  warmupMs?: number;
   video: ProbeVideoSample[];
   mstp: ProbeMstpSample[];
   grabs: ProbeGrabSample[];
@@ -56,6 +69,8 @@ export interface ProbeInput {
   mstpError: string | null;
   /** 'track' = transferred to the worker (iOS), 'stream' = main-thread processor (Chromium). */
   mstpTransport: 'track' | 'stream' | null;
+  /** Grabs per second (default 10): for the main-thread share. */
+  grabHz?: number;
 }
 
 export interface Dist {
@@ -65,8 +80,15 @@ export interface Dist {
   max: number;
 }
 
+export interface GrabStats {
+  syncMs: Dist;
+  totalMs: Dist;
+  sizesByTheta: Record<string, string[]>;
+}
+
 export interface CameraProbeReport {
   durationMs: number;
+  warmupMs: number;
   video: { frames: number; fps: number; timeSource: 'captureTime' | 'presentationTime' | 'callback'; intervalMs: Dist | null; sizesByTheta: Record<string, string[]> };
   mstp: {
     available: boolean;
@@ -82,22 +104,45 @@ export interface CameraProbeReport {
     /** Arrival − capture time above its minimum: the jitter of "time the frame reached the page". */
     arrivalLatencyJitterMs: Dist | null;
   };
-  /** rVFC captureTime against the MSTP capture clock, over paired frames. */
+  /** rVFC captureTime against the MSTP capture clock, over paired frames away from rotations. */
   timing: {
     pairs: number;
+    /** Segments between UI rotations that contributed pairs. */
+    segments: number;
     /** Median (captureTime − timestamp) — an arbitrary constant; the spread around it matters. */
     offsetMedianMs: number | null;
-    /** Standard deviation of (captureTime − timestamp) around its drift line. */
+    /** Standard deviation of (captureTime − timestamp) around the drift line of its segment. */
     jitterStdMs: number | null;
     /** p95 − p5 of the same residuals. */
     jitterRangeMs: number | null;
-    /** Least-squares slope of (captureTime − timestamp) against time (ms per s). */
+    /** Slope of (captureTime − timestamp) against time shared by all segments (ms per s). */
     driftMsPerS: number | null;
   };
-  grab: { syncMs: Dist | null; totalMs: Dist | null };
+  /** Within ±ROTATION_WINDOW_MS of each UI rotation. */
+  rotation: {
+    changes: number;
+    /** Frames missing from the rVFC / MSTP sequences (gaps over 1.5 frame intervals). */
+    videoDropped: number;
+    mstpDropped: number;
+    /** rVFC frames whose aspect contradicts the UI rotation (all / away from rotations). */
+    videoMisoriented: number;
+    videoMisorientedSteady: number;
+    /** Largest |timestamp error| of paired frames near rotations, against the steady fit. */
+    maxErrorMs: number | null;
+  };
+  grab: Partial<Record<GrabKind, GrabStats>>;
   /** One-line conclusions for the UI. */
   summary: string[];
 }
+
+/** Frames this close to a UI rotation are treated as rotation transients (the engine drops them). */
+export const ROTATION_WINDOW_MS = 500;
+/** Grab cost on the main thread above which it is worth moving off it (ms per grab). */
+export const MATERIAL_GRAB_MS = 4;
+/** |drift| above which it matters over a scan (ms/s: 0.1 ⇒ 30 ms over 5 min). */
+export const MATERIAL_DRIFT_MS_PER_S = 0.1;
+/** p5–p95 timestamp spread above which MSTP timestamps would matter (ms). */
+export const MATERIAL_JITTER_MS = 5;
 
 function quantile(sorted: number[], q: number): number {
   if (sorted.length === 0) return NaN;
@@ -118,6 +163,36 @@ function diffs(a: number[]): number[] {
 }
 
 const round = (x: number, d = 2): number => Math.round(x * 10 ** d) / 10 ** d;
+const median = (xs: number[]): number =>
+  quantile(
+    [...xs].sort((a, b) => a - b),
+    0.5,
+  );
+
+/**
+ * Frames missing from a time sequence: gaps over 1.5 nominal intervals, counted in intervals. A
+ * sudden timestamp error above half an interval reads as a missing frame (indistinguishable).
+ */
+function missing(times: number[], period: number, keep: (t: number) => boolean = () => true): number {
+  let n = 0;
+  for (let i = 1; i < times.length; i++) {
+    const g = times[i] - times[i - 1];
+    if (g > 1.5 * period && (keep(times[i]) || keep(times[i - 1]))) n += Math.round(g / period) - 1;
+  }
+  return n;
+}
+
+function addSize(map: Record<string, string[]>, theta: number, w: number, h: number): void {
+  const sizes = (map[String(theta)] ??= []);
+  const size = `${w}x${h}`;
+  if (!sizes.includes(size)) sizes.push(size);
+}
+
+/** Aspect contradicts the UI rotation (portrait UI with a landscape frame or vice versa). */
+function misoriented(w: number, h: number, theta: number): boolean {
+  const portraitUI = ((((theta / 90) % 2) + 2) % 2) === 0;
+  return portraitUI ? w > h : h > w;
+}
 
 /** Pure analysis of the recorded samples (see the file header). */
 export function analyzeCameraProbe(inp: ProbeInput): CameraProbeReport {
@@ -130,24 +205,26 @@ export function analyzeCameraProbe(inp: ProbeInput): CameraProbeReport {
       : 'callback';
   const vt = v.map((s) => (timeSource === 'captureTime' ? s.captureTime! : timeSource === 'presentationTime' ? s.presentationTime! : s.callbackTime));
   const sizesByTheta: Record<string, string[]> = {};
-  for (const s of v) {
-    const sizes = (sizesByTheta[String(s.screenAngle)] ??= []);
-    const size = `${s.width}x${s.height}`;
-    if (!sizes.includes(size)) sizes.push(size);
-  }
+  for (const s of v) addSize(sizesByTheta, s.screenAngle, s.width, s.height);
+
+  // UI rotations: the frame time (same clock as the pairs' captureTime) of the first frame seen at a new θ
+  const changes: number[] = [];
+  for (let i = 1; i < v.length; i++) if (v[i].screenAngle !== v[i - 1].screenAngle) changes.push(vt[i]);
+  const nearRotation = (t: number): boolean => changes.some((c) => Math.abs(t - c) <= ROTATION_WINDOW_MS);
+  const segmentOf = (t: number): number => changes.filter((c) => c <= t).length;
 
   const m = inp.mstp;
   const mts = m.map((s) => s.timestampUs / 1000);
   const lat = m.map((s, i) => s.receivedMs - mts[i]);
   const minLat = lat.length ? Math.min(...lat) : NaN;
+  const mPeriod = dist(diffs(mts))?.p50 ?? 1000 / 30;
 
   // Pairing: a coarse offset o = median(captureTime − timestamp) over "arrived closest in time"
   // matches, then each rVFC frame is paired with the MSTP frame whose timestamp + o is nearest and
   // kept within half a frame interval (frames are ~33 ms apart, so the pairing is unambiguous for
-  // jitter below that; a pairing shifted by one frame for ALL frames only shifts the offset).
-  // Drift = least-squares slope of d = captureTime − timestamp over time; jitter = the residuals
-  // around that line (so drift is not counted twice).
-  const pairs: { t: number; d: number }[] = [];
+  // errors below that; a pairing shifted by one frame for ALL frames only shifts the offset).
+  type Pair = { t: number; d: number; ct: number };
+  let pairs: Pair[] = [];
   if (timeSource === 'captureTime' && m.length) {
     const coarse: number[] = [];
     let j = 0;
@@ -156,65 +233,99 @@ export function analyzeCameraProbe(inp: ProbeInput): CameraProbeReport {
       while (j + 1 < m.length && Math.abs(m[j + 1].receivedMs - ct) <= Math.abs(m[j].receivedMs - ct)) j++;
       coarse.push(ct - mts[j]);
     }
-    const halfFrame = 0.5 * (dist(diffs(mts))?.p50 ?? 1000 / 30);
-    const pairWith = (o: number): { t: number; d: number }[] => {
-      const out: { t: number; d: number }[] = [];
+    const halfFrame = 0.5 * mPeriod;
+    const pairWith = (o: number): Pair[] => {
+      const out: Pair[] = [];
       let k = 0;
       for (const s of v) {
-        const target = s.captureTime! - o;
+        const ct = s.captureTime!;
+        const target = ct - o;
         while (k + 1 < mts.length && Math.abs(mts[k + 1] - target) <= Math.abs(mts[k] - target)) k++;
-        if (Math.abs(mts[k] - target) < halfFrame) out.push({ t: mts[k], d: s.captureTime! - mts[k] });
+        if (Math.abs(mts[k] - target) < halfFrame) out.push({ t: mts[k], d: ct - mts[k], ct });
       }
       return out;
     };
-    const medianD = (ds: number[]): number =>
-      quantile(
-        [...ds].sort((a, b) => a - b),
-        0.5,
-      );
     // the coarse matches can straddle a frame boundary when the rVFC lag is near half a frame:
     // re-centre on the first pass's median, then keep whichever one-frame shift pairs the most
     // frames (a shift of the whole pairing changes only the arbitrary offset)
-    const first = pairWith(medianD(coarse));
+    const first = pairWith(median(coarse));
     if (first.length) {
-      const o = medianD(first.map((p) => p.d));
-      let best: { t: number; d: number }[] = [];
+      const o = median(first.map((p) => p.d));
       for (const c of [o, o - 2 * halfFrame, o + 2 * halfFrame]) {
         const ps = pairWith(c);
-        if (ps.length > best.length) best = ps;
+        if (ps.length > pairs.length) pairs = ps;
       }
-      pairs.push(...best);
     }
   }
+
+  // Drift: one slope shared by the segments between rotations (each segment centred on its own
+  // mean), fitted on the frames away from rotations; jitter = residuals around it.
+  const steady = pairs.filter((p) => !nearRotation(p.ct));
+  const bySeg = new Map<number, Pair[]>();
+  for (const p of steady) {
+    const k = segmentOf(p.ct);
+    if (!bySeg.has(k)) bySeg.set(k, []);
+    bySeg.get(k)!.push(p);
+  }
+  const segMean = new Map<number, { t: number; d: number }>();
+  let num = 0;
+  let den = 0;
+  for (const [k, ps] of bySeg) {
+    const mt = ps.reduce((a, p) => a + p.t, 0) / ps.length;
+    const md = ps.reduce((a, p) => a + p.d, 0) / ps.length;
+    segMean.set(k, { t: mt, d: md });
+    for (const p of ps) {
+      num += (p.t - mt) * (p.d - md);
+      den += (p.t - mt) ** 2;
+    }
+  }
+  const slope = den > 0 ? num / den : 0;
+  const residual = (p: Pair): number | null => {
+    const sm = segMean.get(segmentOf(p.ct));
+    return sm ? p.d - (sm.d + slope * (p.t - sm.t)) : null;
+  };
   let offsetMedianMs: number | null = null;
   let jitterStdMs: number | null = null;
   let jitterRangeMs: number | null = null;
   let driftMsPerS: number | null = null;
-  if (pairs.length >= 2) {
-    offsetMedianMs = round(
-      quantile(
-        pairs.map((p) => p.d).sort((a, b) => a - b),
-        0.5,
-      ),
-    );
-    const mt = pairs.reduce((a, p) => a + p.t, 0) / pairs.length;
-    const md = pairs.reduce((a, p) => a + p.d, 0) / pairs.length;
-    let num = 0;
-    let den = 0;
-    for (const p of pairs) {
-      num += (p.t - mt) * (p.d - md);
-      den += (p.t - mt) ** 2;
-    }
-    const slope = den > 0 ? num / den : 0;
-    driftMsPerS = round(slope * 1000, 3);
-    const res = pairs.map((p) => p.d - (md + slope * (p.t - mt))).sort((a, b) => a - b);
+  if (steady.length >= 2) {
+    offsetMedianMs = round(median(steady.map((p) => p.d)));
+    driftMsPerS = den > 0 ? round(slope * 1000, 3) : null;
+    const res = steady.map((p) => residual(p)!).sort((a, b) => a - b);
     jitterStdMs = round(Math.sqrt(res.reduce((a, r) => a + r * r, 0) / res.length));
     jitterRangeMs = round(quantile(res, 0.95) - quantile(res, 0.05));
+  }
+  const transientErrors = pairs
+    .filter((p) => nearRotation(p.ct))
+    .map((p) => residual(p))
+    .filter((r): r is number => r !== null)
+    .map(Math.abs);
+
+  const vPeriod = dist(diffs(vt))?.p50 ?? 1000 / 30;
+  // MSTP times are on the capture clock: map them onto the page timeline with the arrival offset
+  const toPage = Number.isFinite(minLat) ? minLat : 0;
+  const rotation: CameraProbeReport['rotation'] = {
+    changes: changes.length,
+    videoDropped: missing(vt, vPeriod, nearRotation),
+    mstpDropped: missing(mts, mPeriod, (t) => nearRotation(t + toPage)),
+    videoMisoriented: v.filter((s) => misoriented(s.width, s.height, s.screenAngle)).length,
+    videoMisorientedSteady: v.filter((s, i) => misoriented(s.width, s.height, s.screenAngle) && !nearRotation(vt[i])).length,
+    maxErrorMs: transientErrors.length ? round(Math.max(...transientErrors)) : null,
+  };
+
+  const grab: CameraProbeReport['grab'] = {};
+  for (const kind of ['bitmap', 'bitmapScaled', 'videoFrame'] as const) {
+    const gs = inp.grabs.filter((g) => g.kind === kind);
+    if (!gs.length) continue;
+    const sizes: Record<string, string[]> = {};
+    for (const g of gs) addSize(sizes, g.screenAngle, g.width, g.height);
+    grab[kind] = { syncMs: dist(gs.map((g) => g.syncMs))!, totalMs: dist(gs.map((g) => g.totalMs))!, sizesByTheta: sizes };
   }
 
   const codedSizes = [...new Set(m.map((s) => `${s.codedWidth}x${s.codedHeight}`))];
   const report: CameraProbeReport = {
     durationMs: inp.durationMs,
+    warmupMs: inp.warmupMs ?? 0,
     video: { frames: v.length, fps: round(v.length / secs, 1), timeSource, intervalMs: dist(diffs(vt)), sizesByTheta },
     mstp: {
       available: inp.mstpError === null,
@@ -228,31 +339,79 @@ export function analyzeCameraProbe(inp: ProbeInput): CameraProbeReport {
       alwaysLandscape: m.length ? m.every((s) => s.codedWidth > s.codedHeight) : null,
       arrivalLatencyJitterMs: dist(lat.map((l) => l - minLat)),
     },
-    timing: { pairs: pairs.length, offsetMedianMs, jitterStdMs, jitterRangeMs, driftMsPerS },
-    grab: { syncMs: dist(inp.grabs.map((g) => g.syncMs)), totalMs: dist(inp.grabs.map((g) => g.totalMs)) },
+    timing: { pairs: steady.length, segments: bySeg.size, offsetMedianMs, jitterStdMs, jitterRangeMs, driftMsPerS },
+    rotation,
+    grab,
     summary: [],
   };
-  report.summary = summarize(report);
+  report.summary = summarize(report, inp.grabHz ?? 10);
   return report;
 }
 
-function summarize(r: CameraProbeReport): string[] {
+const GRAB_LABEL: Record<GrabKind, string> = {
+  bitmap: 'createImageBitmap(<video>)',
+  bitmapScaled: 'createImageBitmap(<video>) downscaled',
+  videoFrame: 'new VideoFrame(<video>)',
+};
+
+function summarize(r: CameraProbeReport, grabHz: number): string[] {
   const out: string[] = [];
   if (!r.mstp.available) out.push(`MediaStreamTrackProcessor unavailable: ${r.mstp.error}`);
   else if (!r.mstp.frames) out.push('MediaStreamTrackProcessor delivered no frames.');
   const t = r.timing;
   if (t.jitterStdMs !== null) {
-    const material = (t.jitterRangeMs ?? 0) >= 5 || Math.abs(t.driftMsPerS ?? 0) >= 0.5;
+    const jitterMaterial = (t.jitterRangeMs ?? 0) >= MATERIAL_JITTER_MS;
     out.push(
-      `rVFC captureTime vs capture clock: σ ${t.jitterStdMs} ms, p5–p95 ${t.jitterRangeMs} ms, drift ${t.driftMsPerS} ms/s over ${t.pairs} frames — ` +
-        (material ? 'material: MSTP timestamps would help.' : 'small: MSTP timestamps would gain little.'),
+      `Timestamp jitter away from rotations: σ ${t.jitterStdMs} ms, p5–p95 ${t.jitterRangeMs} ms over ${t.pairs} frames — ` +
+        (jitterMaterial ? 'material: MSTP timestamps would help.' : 'small: MSTP timestamps would gain little.'),
     );
+    if (t.driftMsPerS !== null) {
+      const per5min = Math.abs(t.driftMsPerS) * 300;
+      out.push(
+        `Drift ${t.driftMsPerS} ms/s ≈ ${round(per5min, 0)} ms over a 5-minute scan — ` +
+          (Math.abs(t.driftMsPerS) >= MATERIAL_DRIFT_MS_PER_S
+            ? 'material: the engine models one constant camera–IMU offset per session.'
+            : 'small.') +
+          (r.durationMs < 30_000 ? ' (Run the 60 s still probe for a reliable drift.)' : ''),
+      );
+    }
   } else if (r.mstp.frames && r.video.timeSource !== 'captureTime') out.push(`rVFC gives no captureTime here (${r.video.timeSource}): MSTP timestamps would be the only capture clock.`);
+  const rot = r.rotation;
+  if (rot.changes) {
+    out.push(
+      `Around ${rot.changes} rotation(s): rVFC dropped ${rot.videoDropped} frame(s) (MSTP ${rot.mstpDropped}), ${rot.videoMisoriented} rVFC frame(s) had the wrong orientation` +
+        (rot.videoMisorientedSteady ? ` (${rot.videoMisorientedSteady} outside the ±${ROTATION_WINDOW_MS} ms window!)` : '') +
+        (rot.maxErrorMs !== null ? `, worst timestamp error ${rot.maxErrorMs} ms.` : '.'),
+    );
+  }
   if (r.mstp.alwaysLandscape !== null) out.push(r.mstp.alwaysLandscape ? `MSTP buffers stayed landscape (${r.mstp.codedSizes.join(', ')}).` : `MSTP buffers were NOT always landscape (${r.mstp.codedSizes.join(', ')}).`);
-  const angles = Object.keys(r.video.sizesByTheta);
-  if (angles.length < 2) out.push('Rotate the phone during the probe to test orientation.');
-  const g = r.grab.syncMs;
-  if (g) out.push(`createImageBitmap(<video>) blocks the main thread p50 ${round(g.p50)} ms / p95 ${round(g.p95)} ms (resolves p50 ${round(r.grab.totalMs!.p50)} ms).`);
+  if (Object.keys(r.video.sizesByTheta).length < 2 && r.durationMs < 30_000) out.push('Rotate the phone during the probe to test orientation.');
+  for (const kind of ['bitmap', 'bitmapScaled', 'videoFrame'] as const) {
+    const g = r.grab[kind];
+    if (!g) continue;
+    const share = round((g.syncMs.p50 * grabHz) / 10, 1); // % of the main thread at grabHz
+    out.push(
+      `${GRAB_LABEL[kind]}: main thread p50 ${round(g.syncMs.p50)} ms / p95 ${round(g.syncMs.p95)} ms (≈${share}% at ${grabHz} Hz) — ` +
+        (g.syncMs.p50 >= MATERIAL_GRAB_MS ? 'material.' : 'small.'),
+    );
+  }
+  // a VideoFrame of the <video> vs the <video> frames themselves (upright for the UI) at the same θ
+  const vf = r.grab.videoFrame;
+  if (vf) {
+    const landscape = (size: string): boolean => {
+      const [w, h] = size.split('x').map(Number);
+      return w > h;
+    };
+    for (const [theta, sizes] of Object.entries(vf.sizesByTheta)) {
+      const shown = r.video.sizesByTheta[theta] ?? [];
+      if (!shown.length || shown.every(landscape) !== shown.some(landscape)) continue; // mixed: a rotation
+      const differs = sizes.every((sz) => landscape(sz) !== landscape(shown[0]));
+      const same = sizes.every((sz) => landscape(sz) === landscape(shown[0]));
+      if (differs) out.push(`new VideoFrame(<video>) at θ ${theta}° is ${sizes.join(', ')} while the <video> shows ${shown[0]}: a raw sensor buffer (needs raw-frame handling).`);
+      else if (same) out.push(`new VideoFrame(<video>) at θ ${theta}° matches the <video> (${sizes.join(', ')}): upright for the UI.`);
+      if (theta === '0' || differs) break; // one line is enough
+    }
+  }
   return out;
 }
 
@@ -276,13 +435,46 @@ export interface ProbeWorker {
 
 export interface ProbeOptions {
   durationMs?: number;
-  /** createImageBitmap(<video>) rate (default 10 Hz, as FramePump). */
+  /** Wait this long before recording (camera latency settles; default 0). */
+  warmupMs?: number;
+  /** Grabs per second, cycling through the GrabKinds (default 10, as FramePump). */
   grabHz?: number;
+  /** maxSide of the downscaled createImageBitmap (default 1280, the 'fast' preset's). */
+  scaledMaxSide?: number;
   createWorker?: () => ProbeWorker;
-  /** Remaining ms, at each grab. */
-  onProgress?: (remainingMs: number) => void;
+  /** Phase and remaining ms of it, at each grab. */
+  onProgress?: (remainingMs: number, phase: 'warmup' | 'measure') => void;
   /** Stop early (e.g. the screen was left); the report covers the time measured. */
   isCancelled?: () => boolean;
+}
+
+type VideoWithRVFC = HTMLVideoElement & {
+  requestVideoFrameCallback?: (cb: (n: number, md: Record<string, number>) => void) => number;
+  cancelVideoFrameCallback?: (h: number) => void;
+};
+
+/** One grab of `kind` from the <video>: main-thread (sync) time, time to result, result size. */
+async function grabOnce(v: HTMLVideoElement, kind: GrabKind, scaledMaxSide: number): Promise<ProbeGrabSample | null> {
+  const theta = screenAngle();
+  const g0 = performance.now();
+  if (kind === 'videoFrame') {
+    const VF = (globalThis as { VideoFrame?: new (src: HTMLVideoElement) => { displayWidth: number; displayHeight: number; close(): void } }).VideoFrame;
+    if (typeof VF !== 'function') return null;
+    const f = new VF(v);
+    const dt = performance.now() - g0;
+    const sample: ProbeGrabSample = { kind, syncMs: dt, totalMs: dt, width: f.displayWidth, height: f.displayHeight, screenAngle: theta };
+    f.close();
+    return sample;
+  }
+  const w = v.videoWidth;
+  const h = v.videoHeight;
+  const s = kind === 'bitmapScaled' ? Math.min(1, scaledMaxSide / Math.max(w, h)) : 1;
+  const p = s < 1 ? createImageBitmap(v, { resizeWidth: Math.round(w * s), resizeHeight: Math.round(h * s), resizeQuality: 'medium' }) : createImageBitmap(v);
+  const g1 = performance.now();
+  const bmp = await p;
+  const sample: ProbeGrabSample = { kind, syncMs: g1 - g0, totalMs: performance.now() - g0, width: bmp.width, height: bmp.height, screenAngle: theta };
+  bmp.close();
+  return sample;
 }
 
 /**
@@ -291,8 +483,18 @@ export interface ProbeOptions {
  */
 export async function runCameraTimingProbe(camera: CameraCapture, opts: ProbeOptions = {}): Promise<CameraProbeReport> {
   const durationMs = opts.durationMs ?? 10_000;
+  const warmupMs = opts.warmupMs ?? 0;
+  const grabHz = opts.grabHz ?? 10;
   const track = camera.track;
   if (!track || track.readyState !== 'live') throw new Error('Camera timing probe: the camera is not running');
+
+  // warm-up: the camera's delivery latency settles after it was opened
+  const w0 = performance.now();
+  while (performance.now() - w0 < warmupMs && !opts.isCancelled?.()) {
+    opts.onProgress?.(Math.max(0, warmupMs - (performance.now() - w0)), 'warmup');
+    await sleep(Math.min(250, Math.max(0, warmupMs - (performance.now() - w0))));
+  }
+
   const video: ProbeVideoSample[] = [];
   const grabs: ProbeGrabSample[] = [];
   let mstpError: string | null = null;
@@ -347,8 +549,8 @@ export async function runCameraTimingProbe(camera: CameraCapture, opts: ProbeOpt
     clone?.stop();
   }
 
-  // main-thread side: rVFC samples and 10 Hz grabs, for durationMs
-  const v = camera.video as (HTMLVideoElement & { requestVideoFrameCallback?: (cb: (n: number, md: Record<string, number>) => void) => number; cancelVideoFrameCallback?: (h: number) => void }) | null;
+  // main-thread side: rVFC samples and grabs (cycling through the kinds), for durationMs
+  const v = camera.video as VideoWithRVFC | null;
   let rvfc = 0;
   let running = true;
   const onVideoFrame = (_now: number, md: Record<string, number>): void => {
@@ -364,23 +566,21 @@ export async function runCameraTimingProbe(camera: CameraCapture, opts: ProbeOpt
     });
   };
   if (v?.requestVideoFrameCallback) rvfc = v.requestVideoFrameCallback(onVideoFrame);
+  const kinds: GrabKind[] = ['bitmap', 'bitmapScaled', 'videoFrame'];
+  let next = 0;
   const t0 = performance.now();
-  const grabEvery = 1000 / (opts.grabHz ?? 10);
+  const grabEvery = 1000 / grabHz;
   while (performance.now() - t0 < durationMs && !opts.isCancelled?.()) {
-    if (v && v.readyState >= 2) {
-      const g0 = performance.now();
-      const p = createImageBitmap(v);
-      const g1 = performance.now();
+    if (v && v.readyState >= 2 && v.videoWidth) {
       try {
-        const bmp = await p;
-        grabs.push({ syncMs: g1 - g0, totalMs: performance.now() - g0 });
-        bmp.close();
+        const g = await grabOnce(v, kinds[next++ % kinds.length], opts.scaledMaxSide ?? 1280);
+        if (g) grabs.push(g);
       } catch {
         /* not counted */
       }
     }
-    opts.onProgress?.(Math.max(0, durationMs - (performance.now() - t0)));
-    await sleep(Math.max(0, grabEvery - (performance.now() - t0) % grabEvery));
+    opts.onProgress?.(Math.max(0, durationMs - (performance.now() - t0)), 'measure');
+    await sleep(Math.max(0, grabEvery - ((performance.now() - t0) % grabEvery)));
   }
   running = false;
   if (v?.cancelVideoFrameCallback) v.cancelVideoFrameCallback(rvfc);
@@ -395,7 +595,7 @@ export async function runCameraTimingProbe(camera: CameraCapture, opts: ProbeOpt
   }
   localClone?.stop();
   const measuredMs = Math.min(durationMs, performance.now() - t0);
-  return analyzeCameraProbe({ durationMs: measuredMs, video, mstp, grabs, mstpError, mstpTransport: mstpError === null ? transport : null });
+  return analyzeCameraProbe({ durationMs: measuredMs, warmupMs, video, mstp, grabs, mstpError, mstpTransport: mstpError === null ? transport : null, grabHz });
 }
 
 function defaultProbeWorker(): ProbeWorker {
