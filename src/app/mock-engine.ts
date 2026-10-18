@@ -64,8 +64,8 @@ interface Sizes {
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, Math.max(0, ms)));
 
 function frameSize(f: FrameInput): { w: number; h: number } {
-  const b = f.bitmap as { width?: number; height?: number };
-  return { w: b.width || 1280, h: b.height || 960 };
+  const b = f.bitmap as { width?: number; height?: number; displayWidth?: number; displayHeight?: number };
+  return { w: b.width || b.displayWidth || 1280, h: b.height || b.displayHeight || 960 };
 }
 
 export class MockEngine implements EngineLike {

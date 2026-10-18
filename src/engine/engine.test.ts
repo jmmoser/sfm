@@ -17,7 +17,7 @@ import { umeyama } from '../math/sim3';
 import { rotateImagePoint } from '../sensors/frame-orientation';
 import type { LiveUpdate } from '../workers/protocol';
 import { createCpuFeaturePipeline } from './cpu-pipeline';
-import { PhotogrammetryEngine } from './engine';
+import { PhotogrammetryEngine, frameToBitmap } from './engine';
 import { OrientationTracker, gravityDown, overlayPoints, prepareFrame } from './frame-ingest';
 import { ImuLog, classifyScene, handEyeCheck } from './live';
 import { MemoryEngineStore, packImu, packSparseModel, unpackImu, unpackSparseModel } from './persistence';
@@ -63,6 +63,81 @@ function compare(cap: SynthCapture, res: SparseResultEx): { s: number; R: Float6
 // ---------------------------------------------------------------------------------------------
 
 describe('frame ingest', () => {
+  it('a declared raw frame is upright for θ = 90 in every UI rotation and never changes the delivery-path state', () => {
+    // MSTP-free VideoFrame grab: landscape-90 → landscape-270 without a portrait frame in between
+    const o = new OrientationTracker(500);
+    expect(o.classify({ width: 640, height: 480, screenAngle: 90, t: 0, raw: true })).toMatchObject({ ok: true, effectiveTheta: 90, k: 0, raw: true });
+    expect(o.thetaSession).toBe(90);
+    expect(o.classify({ width: 640, height: 480, screenAngle: 270, t: 700, raw: true }).ok).toBe(false); // settling after the rotation
+    expect(o.classify({ width: 640, height: 480, screenAngle: 270, t: 1300, raw: true })).toMatchObject({ ok: true, effectiveTheta: 90, k: 0 });
+    o.classify({ width: 640, height: 480, screenAngle: 0, t: 1400, raw: true });
+    expect(o.classify({ width: 640, height: 480, screenAngle: 0, t: 2000, raw: true })).toMatchObject({ ok: true, effectiveTheta: 90, k: 0 });
+    expect(o.rawDelivery).toBeNull(); // per frame only: nothing persisted
+    expect(o.classify({ width: 480, height: 640, screenAngle: 0, t: 2100, raw: true }).ok).toBe(false); // portrait "raw" frame
+    // a session started in landscape-270 on the raw path is not ambiguous
+    const s = new OrientationTracker(500);
+    s.classify({ width: 640, height: 480, screenAngle: 270, t: 0, raw: true });
+    expect(s.thetaSession).toBe(90);
+    // resumed: captured with upright frames at θ₀ = 270 (rawDelivery false) → raw frames rotate in, state kept
+    const r = new OrientationTracker(500, 270);
+    r.rawDelivery = false;
+    expect(r.classify({ width: 640, height: 480, screenAngle: 270, t: 0, raw: true })).toMatchObject({ ok: true, effectiveTheta: 90, k: 2 });
+    expect(r.thetaSession).toBe(270);
+    expect(r.rawDelivery).toBe(false);
+    // ambiguous resumed session (θ₀ = 270, rawDelivery null): NOT re-interpreted by raw frames…
+    const a = new OrientationTracker(500, 270);
+    a.classify({ width: 640, height: 480, screenAngle: 270, t: 0, raw: true });
+    expect(a.thetaSession).toBe(270);
+    expect(a.rawDelivery).toBeNull();
+    // …and an upright frame of the <video> path at 270 afterwards is still upright for 270
+    expect(a.classify({ width: 640, height: 480, screenAngle: 270, t: 100 })).toMatchObject({ ok: true, effectiveTheta: 270, k: 0, raw: false });
+  });
+
+  it('frameToBitmap converts a VideoFrame input (downscaled to maxSide) and always closes it', async () => {
+    const g = globalThis as { VideoFrame?: unknown; createImageBitmap?: unknown };
+    const saved = { VideoFrame: g.VideoFrame, createImageBitmap: g.createImageBitmap };
+    class FakeVideoFrame {
+      closed = false;
+      constructor(
+        readonly displayWidth: number,
+        readonly displayHeight: number,
+      ) {}
+      close(): void {
+        this.closed = true;
+      }
+    }
+    let fail = false;
+    const calls: unknown[] = [];
+    g.VideoFrame = FakeVideoFrame;
+    g.createImageBitmap = (src: unknown, opts?: { resizeWidth?: number; resizeHeight?: number }) => {
+      calls.push(opts);
+      if (fail) return Promise.reject(new Error('decode failed'));
+      return Promise.resolve({ width: opts?.resizeWidth ?? 1920, height: opts?.resizeHeight ?? 1440, close() {} });
+    };
+    try {
+      const vf = new FakeVideoFrame(1920, 1440);
+      const base = { t: 1, screenAngle: 0 as const, imu: [], rawBuffer: true };
+      const out = await frameToBitmap({ ...base, bitmap: vf as unknown as VideoFrame, maxSide: 1280 });
+      expect([(out.bitmap as ImageBitmap).width, (out.bitmap as ImageBitmap).height]).toEqual([1280, 960]);
+      expect(out.rawBuffer).toBe(true);
+      expect(vf.closed).toBe(true);
+      const native = new FakeVideoFrame(1920, 1440);
+      await frameToBitmap({ ...base, bitmap: native as unknown as VideoFrame });
+      expect(calls[1]).toBeUndefined(); // no maxSide: native size
+      fail = true;
+      const bad = new FakeVideoFrame(1920, 1440);
+      await expect(frameToBitmap({ ...base, bitmap: bad as unknown as VideoFrame })).rejects.toThrow(/decode failed/);
+      expect(bad.closed).toBe(true); // the camera buffer is released on errors too
+      // an ImageBitmap / RGBA input passes through unchanged
+      const rgba = { width: 2, height: 2, data: new Uint8ClampedArray(16) };
+      const same = { ...base, bitmap: rgba };
+      expect(await frameToBitmap(same)).toBe(same);
+    } finally {
+      g.VideoFrame = saved.VideoFrame;
+      g.createImageBitmap = saved.createImageBitmap;
+    }
+  });
+
   it('fixes the canonical θ, drops frames after a rotation and detects raw sensor buffers', () => {
     const o = new OrientationTracker(500);
     // first frame: portrait UI, portrait bitmap

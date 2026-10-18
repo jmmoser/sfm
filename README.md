@@ -65,6 +65,15 @@ adjustment on the device and estimates scan times per quality preset.
 
 This is the data for deciding whether a different capture path is worth building.
 
+**VideoFrame grab (experimental)**, a switch under *Options* on the New scan screen, is the change
+those measurements pointed to. Grabbing a frame with `createImageBitmap(<video>)` blocks the main
+thread for about 15 ms on an iPhone, about 15% of it at the 10 grabs per second the app makes. With
+the switch on, the app takes a `VideoFrame` of the `<video>` instead, which costs 0–3 ms. The engine
+worker converts it, downscaled, and closes it straight away. On iOS these frames stay in the sensor's
+landscape orientation, so each one is marked raw for the engine; the mark applies to that frame
+only and is never saved with the session. The debug overlay shows the main-thread grab time and the
+worker's conversion time.
+
 ## Development
 
 ```sh

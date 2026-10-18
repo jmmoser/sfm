@@ -92,8 +92,12 @@ export interface AttitudeSample {
 }
 
 export interface FrameInput {
-  /** Full resolution, any UI orientation. Transferred to the worker (owned by the engine). */
-  bitmap: ImageBitmap | RGBAImage;
+  /**
+   * Full resolution, any UI orientation. Transferred to the worker (owned by the engine). A
+   * VideoFrame (the "VideoFrame grab" setting: `new VideoFrame(<video>)`, no copy on the main
+   * thread) is converted to an ImageBitmap by the engine — downscaled to `maxSide` — and closed.
+   */
+  bitmap: ImageBitmap | RGBAImage | VideoFrame;
   /** Capture time, ms (performance.now() domain). */
   t: number;
   /** θ of ARCHITECTURE §2 when the frame was captured. */
@@ -113,7 +117,17 @@ export interface FrameInput {
   /** MotionSensor calibration version the IMU samples were normalised with (-1: no motion). */
   imuCalibrationVersion?: number;
   timeSource?: 'captureTime' | 'presentationTime' | 'callback';
+  /**
+   * The pixels are a raw sensor-orientation buffer (a VideoFrame of the <video> on iOS): upright
+   * for θ = 90 in every UI rotation (src/engine/frame-ingest.ts). Per frame: never persisted.
+   */
+  rawBuffer?: boolean;
+  /** VideoFrame only: downscale so max(W, H) ≤ maxSide when converting (null/absent: native). */
+  maxSide?: number | null;
 }
+
+/** A FrameInput after the engine converted a VideoFrame (what the live session works on). */
+export type DecodedFrameInput = FrameInput & { bitmap: ImageBitmap | RGBAImage };
 
 export type KeyframeDecision = 'keyframe' | 'skip' | 'reject_blur' | 'reject_motion';
 export type Guidance = 'good' | 'move_slower' | 'more_texture' | 'translate_more' | 'tracking_lost' | 'initializing';

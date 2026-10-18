@@ -157,6 +157,7 @@ describe('raw sensor buffers (FrameOrientationTracker)', () => {
       let t = 0;
       let ui = [0, 90, 180, 270][Math.floor(rng.next() * 4)];
       const rawPath = rng.next() < 0.5;
+      const declared = rawPath && rng.next() < 0.5; // VideoFrame grab: FrameInput.rawBuffer
       for (let i = 0; i < 60; i++) {
         t += 50 + rng.next() * 400;
         if (rng.next() < 0.08) ui = [0, 90, 180, 270][Math.floor(rng.next() * 4)];
@@ -164,7 +165,7 @@ describe('raw sensor buffers (FrameOrientationTracker)', () => {
         // Delivery path: raw buffers are always landscape; upright frames follow the UI (plus rare glitches).
         let landscape = rawPath ? true : !portraitUI;
         if (rng.next() < 0.05) landscape = !landscape;
-        const f = { width: landscape ? 1920 : 1440, height: landscape ? 1440 : 1920, screenAngle: ui, t };
+        const f = { width: landscape ? 1920 : 1440, height: landscape ? 1440 : 1920, screenAngle: ui, t, raw: declared };
         const a = app.observe(f);
         const e = eng.classify(f);
         if (!e.ok) continue; // dropped by the engine: no overlay arrives for it

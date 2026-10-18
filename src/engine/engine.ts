@@ -28,6 +28,7 @@ import {
   type DenseOptions,
   type EngineOptions,
   type ExportFormat,
+  type DecodedFrameInput,
   type FrameInput,
   type InitResult,
   type LiveUpdate,
@@ -555,8 +556,21 @@ export class PhotogrammetryEngine {
       closeSource(f.bitmap);
       throw e;
     }
+    let input: DecodedFrameInput;
+    let convertMs: number | null = null;
     try {
-      return await live.processFrame(f);
+      const t0 = performance.now();
+      const c = await frameToBitmap(f);
+      if (c !== f) convertMs = performance.now() - t0;
+      input = c;
+    } catch (e) {
+      closeSource(f.bitmap);
+      throw e;
+    }
+    try {
+      const upd = await live.processFrame(input);
+      if (convertMs !== null) upd.timings.convert = convertMs;
+      return upd;
     } finally {
       this.armIdleRelease();
     }
@@ -1188,4 +1202,27 @@ function storageWriteError(e: unknown): Error {
   if (name === 'StorageQuotaError' || name === 'QuotaExceededError') return e as Error;
   const message = (e as { message?: string } | null)?.message ?? String(e);
   return namedError(ENGINE_ERRORS.storageWrite, name && name !== 'Error' ? `${name}: ${message}` : message, 'storage');
+}
+
+/**
+ * A VideoFrame input (FrameInput.bitmap) as an ImageBitmap, downscaled to `maxSide`; the frame is
+ * closed (it holds a camera buffer). Other inputs are returned unchanged.
+ */
+export async function frameToBitmap(f: FrameInput): Promise<DecodedFrameInput> {
+  const VF = (globalThis as { VideoFrame?: { new (...a: never[]): VideoFrame } }).VideoFrame;
+  if (!VF || !(f.bitmap instanceof VF)) return f as DecodedFrameInput;
+  const frame = f.bitmap;
+  try {
+    const w = frame.displayWidth;
+    const h = frame.displayHeight;
+    const ms = f.maxSide;
+    const s = ms && ms > 0 ? Math.min(1, ms / Math.max(w, h)) : 1;
+    const bitmap =
+      s < 1
+        ? await createImageBitmap(frame, { resizeWidth: Math.max(1, Math.round(w * s)), resizeHeight: Math.max(1, Math.round(h * s)), resizeQuality: 'medium' })
+        : await createImageBitmap(frame);
+    return { ...f, bitmap };
+  } finally {
+    frame.close();
+  }
 }

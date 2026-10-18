@@ -34,7 +34,7 @@ import { rsModelFromDevice, type RollingShutterModel } from '../sfm/rolling-shut
 import { intrinsicsFromFov, type MapperOptions } from '../sfm/mapper';
 import type { Reconstruction } from '../sfm/reconstruction';
 import { VocabularyIndex, type BowVector } from '../sfm/vocab';
-import type { CaptureMode, FrameInput, Guidance, LiveCamera, LiveDebug, LiveUpdate, QualityPreset, TrackingState } from '../workers/protocol';
+import type { CaptureMode, DecodedFrameInput as FrameInput, Guidance, LiveCamera, LiveDebug, LiveUpdate, QualityPreset, TrackingState } from '../workers/protocol';
 import {
   OrientationTracker,
   closeSource,
@@ -658,7 +658,7 @@ export class LiveSession {
       this.ref = null;
     }
     this.segment = seg;
-    const verdict = this.orientation.classify({ width: f.bitmap.width, height: f.bitmap.height, screenAngle: f.screenAngle, t: f.t });
+    const verdict = this.orientation.classify({ width: f.bitmap.width, height: f.bitmap.height, screenAngle: f.screenAngle, t: f.t, raw: f.rawBuffer === true });
     dbg.srcWidth = f.bitmap.width;
     dbg.srcHeight = f.bitmap.height;
     if (!verdict.ok) {

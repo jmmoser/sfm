@@ -65,6 +65,8 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   app.results.quality = cfg.quality;
 
   const camera = new CameraCapture();
+  /** The "VideoFrame grab" setting (where VideoFrame exists): no main-thread copy per grab. */
+  const frameGrab: 'bitmap' | 'videoFrame' = cfg.videoFrameGrab && typeof (globalThis as { VideoFrame?: unknown }).VideoFrame === 'function' ? 'videoFrame' : 'bitmap';
   const motion = MotionSensor.isSupported() ? new MotionSensor() : null;
   const compass = new CompassSensor();
   const geo = cfg.useGps && GeoSensor.isSupported() ? new GeoSensor() : null;
@@ -384,6 +386,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     const meta = inFlight;
     last = u;
     debugOverlay?.onLive(u);
+    if (pump) debugOverlay?.setGrabMs(pump.stats.grabMs);
     const prevKf = numKeyframes;
     numKeyframes = u.numKeyframes;
     kfCount.textContent = String(u.numKeyframes);
@@ -493,8 +496,10 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       attitude: f.attitude ? { t: f.attitude.t, R_world_device: f.attitude.R_world_device, absolute: f.attitude.absolute, yawAccuracyDeg: f.attitude.yawAccuracyDeg } : null,
       imuCalibrationVersion: f.imuCalibrationVersion,
       timeSource: f.timeSource,
+      rawBuffer: f.rawBuffer,
+      maxSide: f.maxSide,
     };
-    const upright = orientation.observe({ width: f.width, height: f.height, screenAngle: f.screenAngle, t: f.t });
+    const upright = orientation.observe({ width: f.width, height: f.height, screenAngle: f.screenAngle, t: f.t, raw: f.rawBuffer });
     inFlight = { width: f.width, height: f.height, screenAngle: f.screenAngle, upright };
     try {
       await app.engine.processFrame(input);
@@ -653,7 +658,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       return;
     }
     d.add(camera.onStateChange(onCameraState));
-    debugOverlay?.setCamera({ width: camRes.width, height: camRes.height, frameRate: camRes.frameRate, label: camRes.label, frameMaxSide: camRes.frameMaxSide });
+    debugOverlay?.setCamera({ width: camRes.width, height: camRes.height, frameRate: camRes.frameRate, label: camRes.label, frameMaxSide: camRes.frameMaxSide, grab: frameGrab });
     torchBtn.disabled = !camRes.torchAvailable;
     if (cfg.torch && camRes.torchAvailable) void toggleTorch(true);
     // Lock white balance after auto-WB settled (iOS supports manual WB only).
@@ -720,6 +725,9 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       geo,
       compass: compass.running ? compass : null,
       targetHz: 10,
+      grab: frameGrab,
+      // raw sensor-orientation VideoFrames are verified on iOS WebKit only (Diagnostics probe)
+      videoFrameOrientation: camRes?.apple ? 'raw' : 'upright',
       onError: (e) => console.warn('[capture] pump error', e),
     });
     pump.start();

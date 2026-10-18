@@ -15,6 +15,8 @@ export interface DebugCameraInfo {
   label: string;
   /** grabFrame({maxSide}) of the pump (null = native size). */
   frameMaxSide: number | null;
+  /** How the pump grabs frames. */
+  grab?: 'bitmap' | 'videoFrame';
 }
 
 export interface DebugSnapshot {
@@ -25,6 +27,8 @@ export interface DebugSnapshot {
   /** navigator.gpu exists on the page. */
   webgpuApi: boolean;
   logs: readonly LogMessage[];
+  /** Main-thread time of the pump's grab call (ms, moving average). */
+  grabMs?: number | null;
 }
 
 const MAX_LOGS = 6;
@@ -43,6 +47,10 @@ export function formatDebugLines(s: DebugSnapshot): string[] {
     `backend: ${d ? (d.backend === 'webgpu' ? 'WebGPU' : 'CPU') : '–'}${d?.fallbackReason ? ` (${d.fallbackReason})` : ''}${s.webgpuApi ? '' : ' · no navigator.gpu'}`,
   );
   if (cam) lines.push(`camera: ${cam.width}×${cam.height} @ ${num(cam.frameRate)} fps${cam.frameMaxSide ? ` → ≤${cam.frameMaxSide}px` : ''} · ${cam.label || 'unnamed'}`);
+  if (cam?.grab || typeof s.grabMs === 'number') {
+    const conv = s.update?.timings?.convert;
+    lines.push(`grab: ${cam?.grab === 'videoFrame' ? 'VideoFrame' : 'bitmap'} · main thread ${num(s.grabMs, 1)} ms${typeof conv === 'number' ? ` · worker convert ${num(conv, 1)} ms` : ''}`);
+  }
   if (!u) {
     lines.push('waiting for the first frame…');
   } else {
@@ -67,6 +75,7 @@ export function formatDebugLines(s: DebugSnapshot): string[] {
 export interface DebugOverlay {
   el: HTMLElement;
   setCamera(c: DebugCameraInfo | null): void;
+  setGrabMs(ms: number | null): void;
   onLive(u: LiveUpdate): void;
   onLog(l: LogMessage): void;
   text(): string;
@@ -78,13 +87,14 @@ export function createDebugOverlay(): DebugOverlay {
   const el = h('div', { class: 'debug-overlay', 'data-testid': 'debug-overlay' }, copyBtn, body);
   let update: LiveUpdate | null = null;
   let camera: DebugCameraInfo | null = null;
+  let grabMs: number | null = null;
   const logs: LogMessage[] = [];
   const times: number[] = [];
   let pending = false;
 
   const snapshot = (): DebugSnapshot => {
     const fps = times.length >= 2 ? ((times.length - 1) * 1000) / (times[times.length - 1] - times[0]) : NaN;
-    return { update, camera, fps, webgpuApi: typeof navigator !== 'undefined' && 'gpu' in navigator, logs };
+    return { update, camera, fps, webgpuApi: typeof navigator !== 'undefined' && 'gpu' in navigator, logs, grabMs };
   };
   const render = (): void => {
     pending = false;
@@ -111,6 +121,10 @@ export function createDebugOverlay(): DebugOverlay {
     el,
     setCamera(c) {
       camera = c;
+      schedule();
+    },
+    setGrabMs(ms) {
+      grabMs = ms;
       schedule();
     },
     onLive(u) {
