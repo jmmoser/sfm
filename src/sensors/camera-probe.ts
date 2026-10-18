@@ -11,7 +11,9 @@
  *  - 10 grabs per second (FramePump's rate), cycling through createImageBitmap(<video>) at full
  *    size, the same downscaled to `scaledMaxSide`, and new VideoFrame(<video>) (step B: an
  *    IOSurface reference handed to a worker): time on the main thread, until resolved, and the
- *    size per θ (is a VideoFrame of the <video> a raw sensor-landscape buffer?).
+ *    size per θ. For each VideoFrame a 32×32 thumbnail is also compared with one of the upright
+ *    <video> in all four quarter turns ({@link bestQuarterTurn}): how it is really rotated —
+ *    at landscape angles the size alone cannot tell a raw buffer from an upright one.
  *
  * `analyzeCameraProbe` (pure) pairs rVFC frames with MSTP frames. Frames within ±500 ms of a UI
  * rotation (which the engine drops anyway) are reported separately (dropped frames, wrongly
@@ -21,7 +23,7 @@
  * matter: the engine's camera–IMU time-offset estimate absorbs it; drift does, over a long scan.
  */
 import type { CameraCapture } from './camera';
-import { screenAngle } from './frame-orientation';
+import { canonicalRotation, screenAngle } from './frame-orientation';
 
 export interface ProbeVideoSample {
   /** rVFC captureTime (ms, performance.now()), when provided. */
@@ -57,6 +59,10 @@ export interface ProbeGrabSample {
   width: number;
   height: number;
   screenAngle: number;
+  /** performance.now() of the grab. */
+  t?: number;
+  /** VideoFrame only: clockwise quarter turns that make it match the upright <video> (null: unsure). */
+  turns?: number | null;
 }
 
 export interface ProbeInput {
@@ -84,6 +90,11 @@ export interface GrabStats {
   syncMs: Dist;
   totalMs: Dist;
   sizesByTheta: Record<string, string[]>;
+  /**
+   * VideoFrame only: per θ, the most common clockwise quarter turns to look upright, over the
+   * confident matches away from rotations (`agree` of `n` voted for it).
+   */
+  turnsByTheta?: Record<string, { turns: number; n: number; agree: number }>;
 }
 
 export interface CameraProbeReport {
@@ -117,6 +128,8 @@ export interface CameraProbeReport {
     jitterRangeMs: number | null;
     /** Slope of (captureTime − timestamp) against time shared by all segments (ms per s). */
     driftMsPerS: number | null;
+    /** Longest stretch of paired frames between rotations (s): drift needs a long one. */
+    longestSteadyS: number;
   };
   /** Within ±ROTATION_WINDOW_MS of each UI rotation. */
   rotation: {
@@ -143,6 +156,56 @@ export const MATERIAL_GRAB_MS = 4;
 export const MATERIAL_DRIFT_MS_PER_S = 0.1;
 /** p5–p95 timestamp spread above which MSTP timestamps would matter (ms). */
 export const MATERIAL_JITTER_MS = 5;
+/** Drift gets a verdict only from a still stretch at least this long (s). */
+export const MIN_DRIFT_STRETCH_S = 20;
+/** Thumbnail side for the VideoFrame rotation check. */
+export const TURN_THUMB = 32;
+/** Best minus second-best correlation needed to trust a rotation match. */
+export const TURN_MARGIN = 0.15;
+
+/**
+ * Clockwise quarter turns k (as displayed) that make the square gray thumbnail `src` (n×n, row
+ * major) look like `ref`, by zero-mean normalised correlation. Squashing both images to a square
+ * commutes with quarter turns, so 4:3 frames compare fine. `margin` = best − second best score.
+ */
+export function bestQuarterTurn(src: ArrayLike<number>, ref: ArrayLike<number>, n: number): { turns: number; margin: number } {
+  const norm = (a: ArrayLike<number>): Float64Array => {
+    const out = new Float64Array(n * n);
+    let mean = 0;
+    for (let i = 0; i < n * n; i++) mean += a[i];
+    mean /= n * n;
+    let ss = 0;
+    for (let i = 0; i < n * n; i++) {
+      out[i] = a[i] - mean;
+      ss += out[i] * out[i];
+    }
+    const sd = Math.sqrt(ss) || 1;
+    for (let i = 0; i < n * n; i++) out[i] /= sd;
+    return out;
+  };
+  const a = norm(src);
+  const b = norm(ref);
+  const scores: number[] = [];
+  for (let k = 0; k < 4; k++) {
+    let c = 0;
+    for (let y = 0; y < n; y++) {
+      for (let x = 0; x < n; x++) {
+        // pixel (x, y) of src turned k times clockwise: one turn maps out(x, y) = in(y, n−1−x)
+        let sx = x;
+        let sy = y;
+        for (let r = 0; r < k; r++) {
+          const nx = sy;
+          sy = n - 1 - sx;
+          sx = nx;
+        }
+        c += a[sy * n + sx] * b[y * n + x];
+      }
+    }
+    scores.push(c);
+  }
+  const order = scores.map((v, k) => [v, k]).sort((p, q) => q[0] - p[0]);
+  return { turns: order[0][1], margin: order[0][0] - order[1][0] };
+}
 
 function quantile(sorted: number[], q: number): number {
   if (sorted.length === 0) return NaN;
@@ -280,6 +343,8 @@ export function analyzeCameraProbe(inp: ProbeInput): CameraProbeReport {
     }
   }
   const slope = den > 0 ? num / den : 0;
+  let longestSteadyS = 0;
+  for (const ps of bySeg.values()) longestSteadyS = Math.max(longestSteadyS, (ps[ps.length - 1].t - ps[0].t) / 1000);
   const residual = (p: Pair): number | null => {
     const sm = segMean.get(segmentOf(p.ct));
     return sm ? p.d - (sm.d + slope * (p.t - sm.t)) : null;
@@ -320,6 +385,21 @@ export function analyzeCameraProbe(inp: ProbeInput): CameraProbeReport {
     const sizes: Record<string, string[]> = {};
     for (const g of gs) addSize(sizes, g.screenAngle, g.width, g.height);
     grab[kind] = { syncMs: dist(gs.map((g) => g.syncMs))!, totalMs: dist(gs.map((g) => g.totalMs))!, sizesByTheta: sizes };
+    if (kind === 'videoFrame') {
+      const votes = new Map<string, number[]>();
+      for (const g of gs) {
+        if (g.turns === null || g.turns === undefined || (g.t !== undefined && nearRotation(g.t))) continue;
+        const k = String(g.screenAngle);
+        if (!votes.has(k)) votes.set(k, [0, 0, 0, 0]);
+        votes.get(k)![g.turns]++;
+      }
+      const turnsByTheta: NonNullable<GrabStats['turnsByTheta']> = {};
+      for (const [k, c] of votes) {
+        const best = c.indexOf(Math.max(...c));
+        turnsByTheta[k] = { turns: best, n: c.reduce((a, b) => a + b, 0), agree: c[best] };
+      }
+      grab[kind]!.turnsByTheta = turnsByTheta;
+    }
   }
 
   const codedSizes = [...new Set(m.map((s) => `${s.codedWidth}x${s.codedHeight}`))];
@@ -339,7 +419,7 @@ export function analyzeCameraProbe(inp: ProbeInput): CameraProbeReport {
       alwaysLandscape: m.length ? m.every((s) => s.codedWidth > s.codedHeight) : null,
       arrivalLatencyJitterMs: dist(lat.map((l) => l - minLat)),
     },
-    timing: { pairs: steady.length, segments: bySeg.size, offsetMedianMs, jitterStdMs, jitterRangeMs, driftMsPerS },
+    timing: { pairs: steady.length, segments: bySeg.size, offsetMedianMs, jitterStdMs, jitterRangeMs, driftMsPerS, longestSteadyS: round(longestSteadyS, 1) },
     rotation,
     grab,
     summary: [],
@@ -365,14 +445,13 @@ function summarize(r: CameraProbeReport, grabHz: number): string[] {
       `Timestamp jitter away from rotations: σ ${t.jitterStdMs} ms, p5–p95 ${t.jitterRangeMs} ms over ${t.pairs} frames — ` +
         (jitterMaterial ? 'material: MSTP timestamps would help.' : 'small: MSTP timestamps would gain little.'),
     );
-    if (t.driftMsPerS !== null) {
+    if (t.driftMsPerS !== null && t.longestSteadyS < MIN_DRIFT_STRETCH_S) {
+      out.push(`Drift: not enough still time (longest stretch between rotations ${t.longestSteadyS} s) — run the Still probe.`);
+    } else if (t.driftMsPerS !== null) {
       const per5min = Math.abs(t.driftMsPerS) * 300;
       out.push(
         `Drift ${t.driftMsPerS} ms/s ≈ ${round(per5min, 0)} ms over a 5-minute scan — ` +
-          (Math.abs(t.driftMsPerS) >= MATERIAL_DRIFT_MS_PER_S
-            ? 'material: the engine models one constant camera–IMU offset per session.'
-            : 'small.') +
-          (r.durationMs < 30_000 ? ' (Run the 60 s still probe for a reliable drift.)' : ''),
+          (Math.abs(t.driftMsPerS) >= MATERIAL_DRIFT_MS_PER_S ? 'material: the engine models one constant camera–IMU offset per session.' : 'small.'),
       );
     }
   } else if (r.mstp.frames && r.video.timeSource !== 'captureTime') out.push(`rVFC gives no captureTime here (${r.video.timeSource}): MSTP timestamps would be the only capture clock.`);
@@ -395,22 +474,32 @@ function summarize(r: CameraProbeReport, grabHz: number): string[] {
         (g.syncMs.p50 >= MATERIAL_GRAB_MS ? 'material.' : 'small.'),
     );
   }
-  // a VideoFrame of the <video> vs the <video> frames themselves (upright for the UI) at the same θ
+  // How a VideoFrame of the <video> is rotated, from the thumbnail matches: a raw sensor buffer
+  // (upright for θ = 90) needs canonicalRotation(θ, 90) clockwise turns to look upright at θ.
   const vf = r.grab.videoFrame;
-  if (vf) {
-    const landscape = (size: string): boolean => {
-      const [w, h] = size.split('x').map(Number);
+  const turns = vf?.turnsByTheta ?? {};
+  const thetas = Object.keys(turns).sort((a, b) => Number(a) - Number(b));
+  if (thetas.length) {
+    const parts = thetas.map((th) => `θ ${th}° → ${turns[th].turns} (${turns[th].agree}/${turns[th].n})`);
+    const raw = thetas.filter((th) => turns[th].turns === canonicalRotation(Number(th), 90));
+    const upright = thetas.filter((th) => turns[th].turns === 0);
+    const verdict =
+      raw.length === thetas.length
+        ? `a raw sensor buffer (upright for 90°) at every angle measured${thetas.length < 3 ? ' — rotate to both landscape sides to cover all' : ''}.`
+        : upright.length === thetas.length
+          ? 'upright for the UI at every angle measured.'
+          : `NEITHER consistently raw nor upright: raw at ${raw.map((th) => `${th}°`).join(', ') || 'none'}.`;
+    out.push(`new VideoFrame(<video>) clockwise quarter turns to look upright: ${parts.join(', ')} — ${verdict}`);
+  } else if (vf) {
+    const portrait = [...(vf.sizesByTheta['0'] ?? []), ...(vf.sizesByTheta['180'] ?? [])];
+    const sideways = portrait.some((sz) => {
+      const [w, h] = sz.split('x').map(Number);
       return w > h;
-    };
-    for (const [theta, sizes] of Object.entries(vf.sizesByTheta)) {
-      const shown = r.video.sizesByTheta[theta] ?? [];
-      if (!shown.length || shown.every(landscape) !== shown.some(landscape)) continue; // mixed: a rotation
-      const differs = sizes.every((sz) => landscape(sz) !== landscape(shown[0]));
-      const same = sizes.every((sz) => landscape(sz) === landscape(shown[0]));
-      if (differs) out.push(`new VideoFrame(<video>) at θ ${theta}° is ${sizes.join(', ')} while the <video> shows ${shown[0]}: a raw sensor buffer (needs raw-frame handling).`);
-      else if (same) out.push(`new VideoFrame(<video>) at θ ${theta}° matches the <video> (${sizes.join(', ')}): upright for the UI.`);
-      if (theta === '0' || differs) break; // one line is enough
-    }
+    });
+    out.push(
+      `new VideoFrame(<video>) rotation unknown (no confident thumbnail match: point the camera at something textured)` +
+        (sideways ? `; it is ${portrait.join(', ')} in a portrait UI, i.e. sideways there.` : '.'),
+    );
   }
   return out;
 }
@@ -454,6 +543,24 @@ type VideoWithRVFC = HTMLVideoElement & {
 };
 
 /** One grab of `kind` from the <video>: main-thread (sync) time, time to result, result size. */
+/** Gray TURN_THUMB² thumbnail of an image source (squashed to a square), or null. */
+async function thumb(src: ImageBitmapSource): Promise<Float32Array | null> {
+  if (typeof OffscreenCanvas === 'undefined') return null;
+  const n = TURN_THUMB;
+  const bmp = await createImageBitmap(src, { resizeWidth: n, resizeHeight: n, resizeQuality: 'medium' });
+  const ctx = new OffscreenCanvas(n, n).getContext('2d');
+  if (!ctx) {
+    bmp.close();
+    return null;
+  }
+  ctx.drawImage(bmp, 0, 0, n, n);
+  bmp.close();
+  const d = ctx.getImageData(0, 0, n, n).data;
+  const out = new Float32Array(n * n);
+  for (let i = 0; i < n * n; i++) out[i] = 0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2];
+  return out;
+}
+
 async function grabOnce(v: HTMLVideoElement, kind: GrabKind, scaledMaxSide: number): Promise<ProbeGrabSample | null> {
   const theta = screenAngle();
   const g0 = performance.now();
@@ -462,8 +569,19 @@ async function grabOnce(v: HTMLVideoElement, kind: GrabKind, scaledMaxSide: numb
     if (typeof VF !== 'function') return null;
     const f = new VF(v);
     const dt = performance.now() - g0;
-    const sample: ProbeGrabSample = { kind, syncMs: dt, totalMs: dt, width: f.displayWidth, height: f.displayHeight, screenAngle: theta };
-    f.close();
+    const sample: ProbeGrabSample = { kind, syncMs: dt, totalMs: dt, width: f.displayWidth, height: f.displayHeight, screenAngle: theta, t: g0, turns: null };
+    try {
+      // rotation check (after the timing): thumbnails of this frame and of the upright <video>
+      const [a, b] = await Promise.all([thumb(f as unknown as ImageBitmapSource), thumb(v)]);
+      if (a && b) {
+        const m = bestQuarterTurn(a, b, TURN_THUMB);
+        if (m.margin >= TURN_MARGIN) sample.turns = m.turns;
+      }
+    } catch {
+      /* no rotation verdict for this frame */
+    } finally {
+      f.close();
+    }
     return sample;
   }
   const w = v.videoWidth;
@@ -472,7 +590,7 @@ async function grabOnce(v: HTMLVideoElement, kind: GrabKind, scaledMaxSide: numb
   const p = s < 1 ? createImageBitmap(v, { resizeWidth: Math.round(w * s), resizeHeight: Math.round(h * s), resizeQuality: 'medium' }) : createImageBitmap(v);
   const g1 = performance.now();
   const bmp = await p;
-  const sample: ProbeGrabSample = { kind, syncMs: g1 - g0, totalMs: performance.now() - g0, width: bmp.width, height: bmp.height, screenAngle: theta };
+  const sample: ProbeGrabSample = { kind, syncMs: g1 - g0, totalMs: performance.now() - g0, width: bmp.width, height: bmp.height, screenAngle: theta, t: g0 };
   bmp.close();
   return sample;
 }

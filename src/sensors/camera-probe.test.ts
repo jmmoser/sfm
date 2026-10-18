@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { analyzeCameraProbe, dist, type ProbeGrabSample, type ProbeMstpSample, type ProbeVideoSample } from './camera-probe';
+import { rotateRGBA90 } from '../features/image';
+import { analyzeCameraProbe, bestQuarterTurn, dist, TURN_THUMB, type ProbeGrabSample, type ProbeMstpSample, type ProbeVideoSample } from './camera-probe';
+import { canonicalRotation } from './frame-orientation';
 
 interface SynthOpts {
   /** Extra rVFC lag of frame i (ms). */
@@ -54,28 +56,89 @@ describe('analyzeCameraProbe', () => {
     expect(text).toMatch(/createImageBitmap\(<video>\): main thread p50 14 ms .*≈14% at 10 Hz\) — material/);
     expect(text).toMatch(/downscaled: main thread p50 6 ms .* — material/);
     expect(text).toMatch(/new VideoFrame\(<video>\): main thread p50 0.3 ms .* — small/);
-    expect(text).toMatch(/new VideoFrame\(<video>\) at θ 0° is 1920x1440 while the <video> shows 1440x1920: a raw sensor buffer/);
+    expect(text).toMatch(/rotation unknown \(no confident thumbnail match.*\); it is 1920x1440 in a portrait UI, i.e. sideways there/);
+    expect(text).toMatch(/Drift: not enough still time \(longest stretch between rotations 10 s\)/);
     expect(text).toMatch(/Rotate the phone/);
   });
 
-  it('a VideoFrame with the same aspect as the <video> is upright for the UI', () => {
-    const { video, mstp } = synth(30, { theta: () => 90 });
-    const r = analyzeCameraProbe({ durationMs: 1000, video, mstp, grabs: grabs('videoFrame', 0.2, 1920, 1440, 5, 90), mstpError: null, mstpTransport: 'track' });
-    expect(r.summary.join('\n')).toMatch(/at θ 90° matches the <video> \(1920x1440\): upright for the UI/);
+  it('bestQuarterTurn finds the clockwise turns of rotateRGBA90 (the engine convention), also for 4:3 frames squashed square', () => {
+    const n = TURN_THUMB;
+    // a textured, asymmetric 4:3 image (64×48), and its thumbnails squashed to n×n
+    const W = 64;
+    const H = 48;
+    const data = new Uint8ClampedArray(W * H * 4);
+    // smooth random texture (bilinear over a random 7×5 grid): asymmetric, and like a camera image at
+    // thumbnail scale (per-pixel noise would not survive the resampling)
+    let seed = 12345;
+    const grid = Array.from({ length: 35 }, () => {
+      seed = (seed * 1103515245 + 12345) >>> 0;
+      return seed >>> 24;
+    });
+    for (let y = 0; y < H; y++)
+      for (let x = 0; x < W; x++) {
+        const gx = (x / (W - 1)) * 6;
+        const gy = (y / (H - 1)) * 4;
+        const x0 = Math.min(5, Math.floor(gx));
+        const y0 = Math.min(3, Math.floor(gy));
+        const fx = gx - x0;
+        const fy = gy - y0;
+        const at = (i: number, j: number): number => grid[j * 7 + i];
+        const g = (1 - fy) * ((1 - fx) * at(x0, y0) + fx * at(x0 + 1, y0)) + fy * ((1 - fx) * at(x0, y0 + 1) + fx * at(x0 + 1, y0 + 1));
+        data.set([g, g, g, 255], 4 * (y * W + x));
+      }
+    const squash = (img: { width: number; height: number; data: ArrayLike<number> }): Float32Array => {
+      const out = new Float32Array(n * n);
+      for (let y = 0; y < n; y++)
+        for (let x = 0; x < n; x++) {
+          const sx = Math.floor(((x + 0.5) * img.width) / n);
+          const sy = Math.floor(((y + 0.5) * img.height) / n);
+          out[y * n + x] = img.data[4 * (sy * img.width + sx)];
+        }
+      return out;
+    };
+    const upright = squash({ width: W, height: H, data });
+    for (let k = 0; k < 4; k++) {
+      // the frame is the upright image turned k back (counter-clockwise): it needs k clockwise turns
+      const frame = squash(rotateRGBA90({ width: W, height: H, data }, -k));
+      const m = bestQuarterTurn(frame, upright, n);
+      expect(m.turns, `k=${k}`).toBe(k);
+      expect(m.margin).toBeGreaterThan(0.5);
+    }
+    // a flat image gives no margin
+    expect(bestQuarterTurn(new Float32Array(n * n).fill(7), upright, n).margin).toBe(0);
+  });
+
+  it('VideoFrame rotation per θ: raw sensor buffer, upright, and votes near rotations ignored', () => {
+    const { video, mstp } = synth(300, { theta: (i) => (i < 100 ? 0 : i < 200 ? 90 : 270) });
+    const vt = video.map((v) => v.captureTime!);
+    const vfGrab = (i: number, turns: number | null): ProbeGrabSample => ({ kind: 'videoFrame', syncMs: 0.2, totalMs: 0.2, width: 1920, height: 1440, screenAngle: video[i].screenAngle, t: vt[i], turns });
+    const rawTurns = (i: number): number => canonicalRotation(video[i].screenAngle, 90);
+    // raw buffers: θ0 → 1, θ90 → 0, θ270 → 2; one wrong vote right after the rotation at frame 100 is ignored
+    const raw = [5, 20, 50, 130, 150, 170, 230, 250, 280].map((i) => vfGrab(i, rawTurns(i)));
+    raw.push(vfGrab(101, 3));
+    const r = analyzeCameraProbe({ durationMs: 10_000, video, mstp, grabs: raw, mstpError: null, mstpTransport: 'track' });
+    expect(r.grab.videoFrame!.turnsByTheta).toEqual({ '0': { turns: 1, n: 3, agree: 3 }, '90': { turns: 0, n: 3, agree: 3 }, '270': { turns: 2, n: 3, agree: 3 } });
+    expect(r.summary.join('\n')).toMatch(/θ 0° → 1 \(3\/3\), θ 90° → 0 \(3\/3\), θ 270° → 2 \(3\/3\) — a raw sensor buffer \(upright for 90°\) at every angle measured\./);
+    // pixels rotated upright for the UI
+    const up = analyzeCameraProbe({ durationMs: 10_000, video, mstp, grabs: [5, 150, 250].map((i) => vfGrab(i, 0)), mstpError: null, mstpTransport: 'track' });
+    expect(up.summary.join('\n')).toMatch(/upright for the UI at every angle measured/);
+    // raw except at 270 (the dangerous case: a raw flag would turn it 180°)
+    const mixed = analyzeCameraProbe({ durationMs: 10_000, video, mstp, grabs: [vfGrab(5, 1), vfGrab(150, 0), vfGrab(250, 0)], mstpError: null, mstpTransport: 'track' });
+    expect(mixed.summary.join('\n')).toMatch(/NEITHER consistently raw nor upright: raw at 0°, 90°/);
   });
 
   it('measures jitter and drift against the capture clock', () => {
     // ±3 ms alternating jitter and 1 ms/s drift
-    const { video, mstp } = synth(300, { jitter: (i) => (i % 2 ? 3 : -3), driftMsPerS: 1 });
-    const r = analyzeCameraProbe({ durationMs: 10_000, video, mstp, grabs: [], mstpError: null, mstpTransport: 'track' });
-    expect(r.timing.pairs).toBe(300);
-    expect(r.timing.driftMsPerS!).toBeCloseTo(1, 1);
+    const { video, mstp } = synth(900, { jitter: (i) => (i % 2 ? 3 : -3), driftMsPerS: 0.5 });
+    const r = analyzeCameraProbe({ durationMs: 30_000, video, mstp, grabs: [], mstpError: null, mstpTransport: 'track' });
+    expect(r.timing.pairs).toBe(900);
+    expect(r.timing.longestSteadyS).toBeCloseTo(30, 0);
+    expect(r.timing.driftMsPerS!).toBeCloseTo(0.5, 1);
     expect(r.timing.jitterStdMs!).toBeCloseTo(3, 1); // the injected ±3 ms; drift is not counted again
     expect(r.timing.jitterRangeMs!).toBeCloseTo(6, 1);
     const text = r.summary.join('\n');
     expect(text).toMatch(/material: MSTP timestamps would help/);
-    expect(text).toMatch(/Drift 1\.\d+ ms\/s ≈ 30\d ms over a 5-minute scan — material/);
-    expect(text).toMatch(/Run the 60 s still probe/);
+    expect(text).toMatch(/Drift 0\.\d+ ms\/s ≈ 15\d ms over a 5-minute scan — material/);
   });
 
   it('a timestamp step and transients at a rotation are reported as rotation effects, not drift or jitter', () => {

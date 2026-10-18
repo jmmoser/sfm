@@ -57,10 +57,10 @@ The **Diagnostics** screen shows WebGPU limits, the camera list, IMU rate and si
 storage. It also has a **Run benchmark** button that times GPU SIFT, matching, PatchMatch and bundle
 adjustment on the device and estimates scan times per quality preset.
 
-**Camera timing** has two probes. **Quick** (10 s) is for orientation: rotate the phone once while it runs. **Still** (60 s after a 5 s warm-up, phone held still) is for drift. Each reports:
+**Camera timing** has two probes. **Quick** (15 s) is for orientation: point at something textured and turn the phone to both landscape sides and back while it runs. **Still** (60 s after a 5 s warm-up, phone held still) is for drift. Each reports:
 * how much rVFC `captureTime` jitters and drifts against the `MediaStreamTrackProcessor` capture clock, away from rotations;
 * what happens around rotations: dropped frames, wrongly oriented frames, and the worst timestamp error;
-* whether the processor's buffers stay sensor-landscape;
+* whether the processor's buffers stay sensor-landscape, and how a `VideoFrame` of the `<video>` is really rotated at each screen angle (thumbnail match against the upright `<video>`; size alone cannot tell at landscape angles);
 * how long `createImageBitmap(<video>)` (full size and downscaled) and `new VideoFrame(<video>)` block the main thread.
 
 This is the data for deciding whether a different capture path is worth building.
