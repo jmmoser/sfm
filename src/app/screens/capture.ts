@@ -39,7 +39,7 @@ import { icon, type IconName } from '../icons';
 import { frameErrorAction, isQuotaError, overlayMatchesView } from '../capture-policy';
 import { FrameOrientationTracker, mapOverlay } from '../overlay-map';
 import { createDebugOverlay } from '../debug-overlay';
-import { coverFovDeg, FollowView, quarterTurned } from '../follow-view';
+import { coverFovDeg, FollowView, medianDistance, quarterTurned } from '../follow-view';
 import { MIN_KEYFRAMES, type Route } from '../router';
 
 type Phase = 'starting' | 'running' | 'paused' | 'interrupted' | 'error' | 'finishing' | 'closed';
@@ -90,8 +90,9 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   let thumbDone = false;
   let latestSparse: { positions: Float32Array; colors: Uint8Array } | null = null;
   let latestCameras: LiveCamera[] | null = null;
-  /** R_cam_device of the poses in latestCameras (engine camera frame). */
+  /** R_cam_device of the poses in latestCameras (engine camera frame) and the engine's gyro bias. */
   let latestRcd: Float64Array | null = null;
+  let gyroBias: [number, number, number] | null = null;
   /** Bitmap size / UI rotation of the frame being processed and the θ its pixels are upright for. */
   let inFlight: FrameMeta | null = null;
   /** Raw sensor buffers vs upright frames — the engine's rule, to turn overlays onto the preview. */
@@ -120,8 +121,10 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     h('span', { class: 'stat' }, ptCount, h('span', { text: 'points' })),
   );
   const closeBtn = iconButton('close', 'Cancel scan', () => void cancel(), { variant: 'glass', testId: 'capture-cancel' });
-  const viewBtn = iconButton('cube', 'Show point cloud', () => setCloudView(!cloudView), { variant: 'glass', testId: 'cloud-toggle' });
+  const viewBtn = iconButton('cube', 'Point cloud view', () => setCloudView(!cloudView), { variant: 'glass', testId: 'cloud-toggle' });
   viewBtn.setAttribute('aria-pressed', 'false');
+  // no WebGL: no live 3D view to show instead of the camera
+  viewBtn.hidden = !app.env.webgl;
   const top = h(
     'div',
     { class: 'capture-top' },
@@ -342,8 +345,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
             if (!closed) scheduleViewer(true);
           },
           (e) => {
-            viewerFailed = true;
-            console.warn('[capture] live 3D view unavailable', e);
+            onViewerFailed(e);
           },
         );
       }
@@ -356,10 +358,20 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       viewer.setWorldUp('auto');
       viewer.setDisplay({ grid: false, edl: false, cameras: !cloudView, sparsePointSizePx: cloudView ? 3 : 2.5 });
     } catch (e) {
-      viewerFailed = true;
-      console.warn('[capture] live 3D view unavailable', e);
+      onViewerFailed(e);
     }
     return viewer;
+  }
+
+  /** The live 3D view cannot be shown: back to the camera preview (not saved), no toggle. */
+  function onViewerFailed(e: unknown): void {
+    viewerFailed = true;
+    console.warn('[capture] live 3D view unavailable', e);
+    viewBtn.hidden = true;
+    if (cloudView) {
+      setCloudView(false, false);
+      toast('The 3D view is not available on this device — showing the camera.', { tone: 'warn' });
+    }
   }
 
   function scheduleViewer(now = false): void {
@@ -392,9 +404,11 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
 
   // ---- cloud view (point cloud instead of the camera preview) ------------------------------------
   let cloudView = false;
-  const follow = new FollowView();
+  const follow = new FollowView(gyroRotation);
   let followRaf = 0;
   let lastFollow = 0;
+  /** Pose / field of view last given to the viewer (unchanged ⇒ no render). */
+  let lastViewKey = '';
 
   function setCloudView(v: boolean, save = true): void {
     cloudView = v;
@@ -405,7 +419,6 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     }
     el.classList.toggle('cloud-view', v);
     viewBtn.replaceChildren(icon(v ? 'camera' : 'cube', { size: 22 }));
-    viewBtn.setAttribute('aria-label', v ? 'Show camera' : 'Show point cloud');
     viewBtn.setAttribute('aria-pressed', String(v));
     mini.setAttribute('role', v ? 'img' : 'button');
     mini.tabIndex = v ? -1 : 0;
@@ -414,6 +427,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     viewer?.setDisplay({ cameras: !v, sparsePointSizePx: v ? 3 : 2.5 });
     if (v) {
       follow.reset();
+      lastViewKey = '';
       startFollow();
     } else {
       stopFollow();
@@ -441,21 +455,27 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     if (now - lastFollow < FOLLOW_FRAME_MS || !follow.hasAnchor) return;
     lastFollow = now;
     const theta = screenAngle();
-    const pose = follow.pose(now, gyroSinceAnchor(), theta);
+    // the last IMU sample (it stays put once the sensors stop: finishing ⇒ a still view)
+    const pose = follow.pose(now, motion ? motion.lastSampleTime : NaN, theta);
+    if (!pose) return;
     const intr = latestCameras?.[latestCameras.length - 1]?.intrinsics;
     const fov = intr ? coverFovDeg(intr, quarterTurned(latestRcd, theta), miniHost.clientWidth, miniHost.clientHeight) : NaN;
-    if (pose) viewer.setViewPose(pose, Number.isFinite(fov) ? fov : undefined);
+    const key = `${Array.from(pose.R, (x) => x.toFixed(6))}|${Array.from(pose.t, (x) => x.toPrecision(7))}|${fov.toFixed(3)}`;
+    if (key === lastViewKey) return;
+    lastViewKey = key;
+    viewer.setViewPose(pose, Number.isFinite(fov) ? fov : undefined);
   }
 
-  /** Device rotation R_{d(now)←d(t_anchor)} from the gyro; null when the IMU does not cover it. */
-  function gyroSinceAnchor(): Float64Array | null {
-    const t0 = follow.anchorTime;
-    if (!motion?.running || t0 === undefined || !Number.isFinite(t0)) return null;
-    const t1 = motion.lastSampleTime;
-    if (!(t1 >= t0)) return null;
-    const samples = motion.samplesBetween(t0, t1, { pad: true });
-    if (!samples.length || samples[0].t > t0 + 100) return null;
-    return integrateGyro(samples, t0, t1);
+  /** Device rotation R_{d(t1)←d(t0)} from the gyro (bias-corrected as the engine does); null when the IMU does not cover it. */
+  function gyroRotation(t0: number, t1: number): Float64Array | null {
+    if (!motion) return null;
+    const lo = Math.min(t0, t1),
+      hi = Math.max(t0, t1);
+    const samples = motion.samplesBetween(lo, hi, { pad: true });
+    if (!samples.length || samples[0].t > lo + 100 || samples[samples.length - 1].t < hi - 100) return null;
+    const b = gyroBias;
+    const s = b ? samples.map((x) => ({ ...x, gyro: [x.gyro[0] - b[0], x.gyro[1] - b[1], x.gyro[2] - b[2]] as [number, number, number] })) : samples;
+    return integrateGyro(s, t0, t1);
   }
 
   // ---- live updates ------------------------------------------------------------------------------
@@ -503,8 +523,11 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     if (u.cameras) {
       latestCameras = u.cameras;
       latestRcd = u.R_cam_device ? Float64Array.from(u.R_cam_device) : null;
+      if (u.gyroBias !== undefined) gyroBias = u.gyroBias;
       const newest = u.cameras[u.cameras.length - 1];
-      follow.setAnchor(newest ? { pose: newest.pose, t: newest.t } : null, latestRcd);
+      // a centre jump beyond half the scene depth is a re-initialised model (shown at once)
+      const depth = newest && latestSparse ? medianDistance(latestSparse.positions, cameraCentre(newest.pose)) : NaN;
+      follow.setAnchor(newest ? { pose: newest.pose, t: newest.t } : null, latestRcd, Number.isFinite(depth) ? 0.5 * depth : Infinity);
       viewerDirty = true;
     }
     if (viewerDirty) scheduleViewer();
@@ -1106,7 +1129,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       };
       d.listen(window, 'resize', onResize);
       d.listen(window, 'orientationchange', onResize);
-      if (cfg.cloudView) setCloudView(true, false);
+      if (cfg.cloudView && app.env.webgl) setCloudView(true, false);
       void start();
     },
     leave() {
@@ -1147,6 +1170,12 @@ function settledCamera(camera: CameraCapture, timeoutMs: number): Promise<boolea
 
 function capitalize(s: string): string {
   return s ? s[0].toUpperCase() + s.slice(1) : s;
+}
+
+function cameraCentre(p: { R: ArrayLike<number>; t: ArrayLike<number> }): number[] {
+  const R = p.R,
+    t = p.t;
+  return [-(R[0] * t[0] + R[3] * t[1] + R[6] * t[2]), -(R[1] * t[0] + R[4] * t[1] + R[7] * t[2]), -(R[2] * t[0] + R[5] * t[1] + R[8] * t[2])];
 }
 
 /** Evenly spread subset of at most `max` points. */

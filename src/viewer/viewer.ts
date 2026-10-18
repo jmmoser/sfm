@@ -639,7 +639,9 @@ export class Viewer {
       _q.copy(this.contentRoot.quaternion).invert().premultiply(q); // delta = q · q_old⁻¹
       this.camera.position.applyQuaternion(_q);
       this.controls?.target.applyQuaternion(_q);
-      if (!this.viewLocked) this.controls?.update();
+      // locked: the orbit controls do not re-aim the camera — turn it with the content
+      if (this.viewLocked) this.camera.quaternion.premultiply(_q);
+      else this.controls?.update();
     }
     for (const root of [this.contentRoot, this.overlayRoot, this.backgroundRoot]) {
       root.quaternion.copy(q);
@@ -822,7 +824,8 @@ export class Viewer {
 
   /** Frame the robust bounds of the content (points / mesh; cameras when nothing else). */
   fitToContent(animate = false): void {
-    if (this.disposed) return;
+    // locked to a camera pose (setViewPose): framing is the caller's, after unlocking
+    if (this.disposed || this.viewLocked) return;
     if (this.width === 0 || this.height === 0) {
       // Hidden / not laid out yet: the aspect ratio is unknown. Frame on the first real resize.
       this.pendingFit = true;

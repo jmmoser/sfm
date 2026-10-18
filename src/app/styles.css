@@ -1670,6 +1670,8 @@ h3 {
   background: #07090c;
   cursor: default;
   z-index: 1;
+  /* appear at once: the corner thumbnail cannot animate to full screen (top: auto) */
+  transition: none;
 }
 
 .capture.cloud-view .mini-view-empty {

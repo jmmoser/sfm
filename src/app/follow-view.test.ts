@@ -4,7 +4,7 @@ import { mat3Mul, mat3MulTranspose, mat3MulVec, mat3Transpose, mat3TransposeMul 
 import { rotationAngle, rotvecToMat3 } from '../math/rotation';
 import { cameraFromDevice, uiUpInDevice, type ScreenAngle } from '../sensors/frame-orientation';
 import { integrateGyro } from '../sensors/motion';
-import { coverFovDeg, followViewRotation, FollowView, quarterTurned } from './follow-view';
+import { coverFovDeg, followViewRotation, FollowView, medianDistance, quarterTurned } from './follow-view';
 
 const angle = (a: ArrayLike<number>, b: ArrayLike<number>): number => rotationAngle(mat3MulTranspose(a, b));
 
@@ -84,29 +84,71 @@ describe('FollowView', () => {
     const c = mat3MulVec(mat3Transpose(p.R), p.t);
     return [-c[0], -c[1], -c[2]];
   };
+  const noGyro = (): null => null;
 
   it('a new anchor does not jump: the difference decays', () => {
-    const f = new FollowView();
-    expect(f.pose(0, null, 0)).toBeNull();
+    const f = new FollowView(noGyro);
+    expect(f.pose(0, NaN, 0)).toBeNull();
     f.setAnchor({ pose: pose([0.1, 0.2, 0], [0, 0, 0]), t: 0 });
-    const a = f.pose(0, null, 0)!;
+    const a = f.pose(0, NaN, 0)!;
     f.setAnchor({ pose: pose([0.15, 0.2, 0], [0.3, 0, 0]), t: 500 });
-    const b = f.pose(0, null, 0)!;
+    const b = f.pose(0, NaN, 0)!;
     expect(angle(a.R, b.R)).toBeLessThan(1e-9);
     expect(Math.hypot(...centre(b).map((x, i) => x - centre(a)[i]))).toBeLessThan(1e-9);
-    const c = f.pose(2000, null, 0)!; // ≫ τ
+    const c = f.pose(2000, NaN, 0)!; // ≫ τ
     expect(angle(c.R, rotvecToMat3([0.15, 0.2, 0]))).toBeLessThan(1e-3);
     expect(centre(c)[0]).toBeCloseTo(0.3, 3);
-    expect(f.anchorTime).toBe(500);
   });
 
-  it('a re-initialised model (large jump) is shown at once', () => {
-    const f = new FollowView();
+  it('a re-initialised model (large rotation or centre jump) is shown at once', () => {
+    const f = new FollowView(noGyro);
     f.setAnchor({ pose: pose([0, 0, 0], [0, 0, 0]) });
-    f.pose(0, null, 0);
+    f.pose(0, NaN, 0);
     f.setAnchor({ pose: pose([0, 2, 0], [5, 0, 0]) });
-    const b = f.pose(16, null, 0)!;
+    const b = f.pose(16, NaN, 0)!;
     expect(angle(b.R, rotvecToMat3([0, 2, 0]))).toBeLessThan(1e-9);
     expect(centre(b)[0]).toBeCloseTo(5, 9);
+    // small rotation, but the centre moves beyond the jump limit
+    f.setAnchor({ pose: pose([0, 2.1, 0], [9, 0, 0]) }, null, 1);
+    const c = f.pose(32, NaN, 0)!;
+    expect(centre(c)[0]).toBeCloseTo(9, 9);
+  });
+
+  it('follows a pan exactly through keyframe changes (the jump is measured at one gyro time)', () => {
+    // phone panning at 1 rad/s about world up; keyframe poses exact, 300 ms apart, ~150 ms late
+    const att = (tms: number): Mat3 => mat3Mul(rotvecToMat3([0, 0, tms / 1000]), rotvecToMat3([Math.PI / 2, 0, 0]));
+    const gyro = (t0: number, t1: number): Mat3 => mat3TransposeMul(att(t1), att(t0));
+    const kfR = (tms: number): Mat3 => mat3MulTranspose(cameraFromDevice(0), att(tms)); // world = engine world
+    const f = new FollowView(gyro);
+    let maxErr = 0;
+    let anchorT = -1;
+    for (let now = 0; now <= 3000; now += 33) {
+      const kf = Math.floor(Math.max(0, now - 150) / 300) * 300;
+      if (kf !== anchorT) {
+        anchorT = kf;
+        f.setAnchor({ pose: { R: kfR(kf), t: new Float64Array(3) }, t: kf }, cameraFromDevice(0));
+      }
+      const p = f.pose(now, now, 0)!;
+      maxErr = Math.max(maxErr, angle(p.R, kfR(now)));
+    }
+    expect(maxErr).toBeLessThan(1e-6);
+  });
+
+  it('integrates only the new gyro samples', () => {
+    const calls: [number, number][] = [];
+    const f = new FollowView((t0, t1) => {
+      calls.push([t0, t1]);
+      return rotvecToMat3([0, 0, 0]);
+    });
+    f.setAnchor({ pose: pose([0, 0, 0], [0, 0, 0]), t: 0 });
+    for (let t = 1000; t <= 61_000; t += 1000) f.pose(t, t, 0);
+    expect(Math.max(...calls.slice(2).map(([a, b]) => b - a))).toBeLessThanOrEqual(1000);
+  });
+});
+
+describe('medianDistance', () => {
+  it('median distance of the points from a centre', () => {
+    expect(medianDistance(new Float32Array([1, 0, 0, 0, 2, 0, 0, 0, 3]), [0, 0, 0])).toBe(2);
+    expect(medianDistance(new Float32Array(0), [0, 0, 0])).toBeNaN();
   });
 });

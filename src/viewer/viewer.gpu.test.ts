@@ -364,6 +364,14 @@ describe('Viewer framing', () => {
     const after = v.worldToScreen([0.5, 0, 1.2])!;
     expect(after.x).toBeCloseTo(before.x, 6);
     expect(after.y).toBeCloseTo(before.y, 6);
+    // framing is off while locked, and an auto-up change turns the camera with the content
+    v.fitToContent(false);
+    expect(v.worldToScreen([0.5, 0, 1.2])!.x).toBeCloseTo(before.x, 6);
+    v.setWorldUp('auto');
+    v.setCameras(ringCameras(8, 3, 1).map(({ pose, intrinsics }) => ({ pose: { R: new Float64Array([pose.R[0], pose.R[2], -pose.R[1], pose.R[3], pose.R[5], -pose.R[4], pose.R[6], pose.R[8], -pose.R[7]]), t: pose.t }, intrinsics })));
+    const turned = v.worldToScreen([0.5, 0, 1.2])!;
+    expect(turned.x).toBeCloseTo(before.x, 3);
+    expect(turned.y).toBeCloseTo(before.y, 3);
     v.setViewPose(null);
     expect(v.controls.enabled).toBe(true);
     expect(v.camera.fov).toBe(50);

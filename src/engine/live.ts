@@ -1518,6 +1518,7 @@ export class LiveSession {
     }
     u.cameras = cams;
     u.R_cam_device = Float64Array.from(st.cameraFromDevice());
+    u.gyroBias = st.gyroBias ? [st.gyroBias[0], st.gyroBias[1], st.gyroBias[2]] : null;
     this.sentVersion = this.modelVersion;
   }
 

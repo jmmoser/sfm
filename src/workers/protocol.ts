@@ -160,6 +160,8 @@ export interface LiveUpdate {
   cameras?: LiveCamera[];
   /** With `cameras`: R_cam_device of the camera frame the poses use (v_cam = R · v_device). */
   R_cam_device?: Mat3;
+  /** With `cameras`: the engine's gyro bias estimate (rad/s, device frame, subtracted from ω); null = none yet. */
+  gyroBias?: [number, number, number] | null;
   timings: Record<string, number>;
   /** Per-frame diagnostics for the capture debug overlay. */
   debug?: LiveDebug;
