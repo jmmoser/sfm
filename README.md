@@ -53,7 +53,8 @@ and geolocation need a secure context.
    Tap the 3D thumbnail, or the cube button at the top right, to swap the camera preview for the
    live point cloud, full screen and seen from where the phone is. The view moves with every
    tracked frame, and the gyroscope keeps it turning smoothly in between. Drag to look around the
-   model from elsewhere; **Follow camera** brings the view back to the phone. The camera keeps
+   model from elsewhere, or tap **Overview** for the whole model framed from above; **Follow
+   camera** brings the view back to the phone. The camera keeps
    running underneath, and the app remembers the choice for the next scan.
 4. Processing builds the sparse model and aligns it to gravity, scale and north. In the viewer you
    can **Build dense cloud** and **Build mesh**, measure, and **Export**.

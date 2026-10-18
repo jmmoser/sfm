@@ -1653,20 +1653,26 @@ h3 {
   text-align: center;
 }
 
-.capture.cloud-view :is(.capture-flash, .capture-shade-top, .capture-shade-bottom, .capture-top, .guidance, .paused-label, .capture-controls, .follow-btn) {
+.capture.cloud-view :is(.capture-flash, .capture-shade-top, .capture-shade-bottom, .capture-top, .guidance, .paused-label, .capture-controls, .cloud-actions) {
   z-index: 2;
 }
 
-/* Cloud view detached from the camera (after a drag): back to the camera's viewpoint. */
-.follow-btn {
+/* Cloud view: Overview (the whole model from above) / Follow camera (after a drag or Overview). */
+.cloud-actions {
   position: absolute;
   left: 50%;
   bottom: calc(var(--safe-b) + 150px);
   transform: translateX(-50%);
+  display: none;
+  gap: 8px;
   white-space: nowrap;
 }
 
-.follow-btn[hidden] {
+.capture.cloud-view .cloud-actions {
+  display: flex;
+}
+
+.cloud-actions [hidden] {
   display: none;
 }
 
@@ -1930,7 +1936,7 @@ h3 {
     width: 148px;
     height: 112px;
   }
-  .follow-btn {
+  .cloud-actions {
     left: calc(50% - 64px - var(--safe-r) / 2);
     bottom: max(16px, var(--safe-b));
   }

@@ -114,6 +114,14 @@ try {
   await captureShot('06b-capture-cloud-free');
   await byTest('follow-camera').tap();
   await byTest('follow-camera').waitFor({ state: 'hidden', timeout: 5000 });
+
+  step('overview: the whole model from above, then back to the camera');
+  await byTest('cloud-overview').tap();
+  await byTest('follow-camera').waitFor({ state: 'visible', timeout: 5000 });
+  await sleep(900);
+  await captureShot('06c-capture-cloud-overview');
+  await byTest('follow-camera').tap();
+  await byTest('follow-camera').waitFor({ state: 'hidden', timeout: 5000 });
   await byTest('cloud-toggle').tap();
   await page.waitForFunction(() => !document.querySelector('.capture.cloud-view'));
   await sleep(500);

@@ -335,6 +335,24 @@ describe('Viewer framing', () => {
     expect(Array.from(v.getWorldUp())).toEqual([0, 0, 1]);
   });
 
+  it('fitToContent(overview) frames from above whatever the current view direction', () => {
+    const v = makeViewer();
+    v.setPointCloud(planeCloud(2, 0.25, 0, [200, 200, 200]));
+    v.fitToContent(false);
+    // look from the side (horizontal), then ask for the overview
+    v.camera.position.set(10, 0.01, 0);
+    v.controls.target.set(0, 0, 0);
+    v.controls.update();
+    v.fitToContent(false, true);
+    const d = v.camera.position.clone().sub(v.controls.target).normalize();
+    expect(d.y).toBeGreaterThan(0.3); // three's +Y = world up
+    // without it, the side view direction is kept
+    v.camera.position.set(10, 0.01, 0);
+    v.controls.update();
+    v.fitToContent(false);
+    expect(Math.abs(v.camera.position.clone().sub(v.controls.target).normalize().y)).toBeLessThan(0.01);
+  });
+
   it('setViewPose puts the view at a camera pose (x right, y down, z forward) and gives it back', async () => {
     const v = makeViewer();
     v.setPointCloud(planeCloud(2, 0.25, 0, [200, 200, 200]));

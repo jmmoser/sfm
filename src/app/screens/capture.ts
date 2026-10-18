@@ -142,8 +142,11 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   const miniEmpty = h('div', { class: 'mini-view-empty' }, icon('cube', { size: 22 }), miniEmptyLabel);
   const mini = h('div', { class: 'mini-view', role: 'button', tabindex: '0', 'aria-label': 'Show the point cloud from the camera', 'data-testid': 'mini-view' }, miniHost, miniEmpty);
   // Cloud view after a drag (free orbit): back to the camera's viewpoint.
-  const followBtn = button({ label: 'Follow camera', icon: 'camera', variant: 'secondary', size: 'md', className: 'follow-btn', testId: 'follow-camera', onClick: () => setFree(false) });
+  // Cloud view: the whole model framed from above (like the viewer), and back to the camera.
+  const overviewBtn = button({ label: 'Overview', icon: 'cube', variant: 'secondary', size: 'md', testId: 'cloud-overview', onClick: () => showOverview() });
+  const followBtn = button({ label: 'Follow camera', icon: 'camera', variant: 'secondary', size: 'md', testId: 'follow-camera', onClick: () => setFree(false) });
   followBtn.hidden = true;
+  const cloudActions = h('div', { class: 'cloud-actions' }, overviewBtn, followBtn);
 
   const torchBtn = iconButton('torchOff', 'Torch', () => void toggleTorch(), { variant: 'glass', className: 'ctl-side', testId: 'torch' });
   torchBtn.setAttribute('aria-pressed', 'false');
@@ -170,7 +173,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     guidance,
     pausedLabel,
     mini,
-    followBtn,
+    cloudActions,
     debugOverlay?.el ?? null,
     controls,
     card,
@@ -490,6 +493,13 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       lastViewKey = '';
       startFollow();
     }
+  }
+
+  /** Detach from the camera and frame the whole model from above (animated). */
+  function showOverview(): void {
+    if (!cloudView || !viewer) return;
+    if (!free) setFree(true);
+    viewer.fitToContent(true, true);
   }
 
   function startFollow(): void {

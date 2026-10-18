@@ -822,8 +822,12 @@ export class Viewer {
     return this.contentBounds;
   }
 
-  /** Frame the robust bounds of the content (points / mesh; cameras when nothing else). */
-  fitToContent(animate = false): void {
+  /**
+   * Frame the robust bounds of the content (points / mesh; cameras when nothing else). The view
+   * direction is kept, except on the first fit or with `overview`: then from above, on the side the
+   * photos were taken from.
+   */
+  fitToContent(animate = false, overview = false): void {
     // locked to a camera pose (setViewPose): framing is the caller's, after unlocking
     if (this.disposed || this.viewLocked) return;
     if (this.width === 0 || this.height === 0) {
@@ -847,7 +851,7 @@ export class Viewer {
     // Direction: keep the current one unless this is the first fit; prefer the
     // side the photos were taken from when the cameras are off-centre.
     const dir = new Vector3();
-    if (this.frames > 0 && !this.autoFitFirst) {
+    if (this.frames > 0 && !this.autoFitFirst && !overview) {
       dir.copy(this.camera.position).sub(this.controls.target);
     }
     if (dir.lengthSq() < 1e-20) {
