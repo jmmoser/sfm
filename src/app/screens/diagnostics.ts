@@ -36,7 +36,7 @@ import type { Route } from '../router';
 type ProbeMode = 'quick' | 'still';
 
 const PROBE_MODES: Record<ProbeMode, { durationMs: number; warmupMs: number; label: string; hint: string }> = {
-  quick: { durationMs: 10_000, warmupMs: 2_000, label: 'Quick probe (10 s, rotate once)', hint: 'Rotate the phone to landscape and back once while it measures.' },
+  quick: { durationMs: 15_000, warmupMs: 2_000, label: 'Quick probe (15 s, rotate)', hint: 'Point at something textured, then turn the phone to landscape, to the other landscape side, and back to portrait.' },
   still: { durationMs: 60_000, warmupMs: 5_000, label: 'Still probe (60 s, for drift)', hint: 'Hold the phone still (lean it against something) until it finishes.' },
 };
 
