@@ -1,9 +1,10 @@
 /**
  * Capture: full-bleed camera preview, keypoint overlay (object-fit: cover mapping), tracking
- * status / counters / elapsed time / GPS accuracy, guidance banner, collapsible live 3D view
- * (≤ 2 Hz, decimated), pause / finish / torch / cancel. A toggle swaps the camera preview for the
- * live point cloud full screen, seen from the phone (FollowView: newest keyframe + gyro); the
- * preview keeps playing underneath — frames are grabbed from it.
+ * status / counters / elapsed time / GPS accuracy, guidance banner, live 3D thumbnail (≤ 2 Hz,
+ * decimated), pause / finish / torch / cancel. The thumbnail or a toggle swaps the camera preview
+ * for the live point cloud full screen, seen from the phone (FollowView: newest posed frame +
+ * gyro); a drag detaches the view to orbit freely, "Follow camera" re-attaches it. The preview
+ * keeps playing underneath — frames are grabbed from it.
  *
  * Pipeline: CameraCapture → FramePump (≤ 10 Hz, back-pressure: the next frame is grabbed only
  * after engine.processFrame resolved) → engine. WakeLock while capturing (acquired in the Start
@@ -53,7 +54,7 @@ interface FrameMeta {
 }
 
 const MINI_POINTS = 20_000;
-const EXPANDED_POINTS = 50_000;
+const CLOUD_POINTS = 50_000;
 const MAX_CAMERAS = 80;
 /** Cloud view: pose updates at most this often (ms) — the viewer renders next to the engine's GPU work. */
 const FOLLOW_FRAME_MS = 30;
@@ -139,11 +140,10 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   const miniHost = h('div', { class: 'mini-view-canvas' });
   const miniEmptyLabel = h('span', { text: 'Live 3D' });
   const miniEmpty = h('div', { class: 'mini-view-empty' }, icon('cube', { size: 22 }), miniEmptyLabel);
-  const miniCollapse = iconButton('collapse', 'Collapse 3D view', (e) => {
-    e.stopPropagation();
-    setExpanded(false);
-  }, { variant: 'glass', className: 'mini-collapse' });
-  const mini = h('div', { class: 'mini-view', role: 'button', tabindex: '0', 'aria-label': 'Expand live 3D view', 'data-testid': 'mini-view' }, miniHost, miniEmpty, miniCollapse);
+  const mini = h('div', { class: 'mini-view', role: 'button', tabindex: '0', 'aria-label': 'Show the point cloud from the camera', 'data-testid': 'mini-view' }, miniHost, miniEmpty);
+  // Cloud view after a drag (free orbit): back to the camera's viewpoint.
+  const followBtn = button({ label: 'Follow camera', icon: 'camera', variant: 'secondary', size: 'md', className: 'follow-btn', testId: 'follow-camera', onClick: () => setFree(false) });
+  followBtn.hidden = true;
 
   const torchBtn = iconButton('torchOff', 'Torch', () => void toggleTorch(), { variant: 'glass', className: 'ctl-side', testId: 'torch' });
   torchBtn.setAttribute('aria-pressed', 'false');
@@ -170,6 +170,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     guidance,
     pausedLabel,
     mini,
+    followBtn,
     debugOverlay?.el ?? null,
     controls,
     card,
@@ -295,41 +296,49 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   // ---- mini 3D view ------------------------------------------------------------------------------
   let viewer: Viewer | null = null;
   let viewerFailed = false;
-  let expanded = false;
   let lastViewerUpdate = 0;
   let viewerTimer: ReturnType<typeof setTimeout> | null = null;
   let viewerDirty = false;
-  /** The user orbited the expanded view: stop re-framing it until it is collapsed. */
-  let userMovedView = false;
-  miniHost.addEventListener('pointerdown', () => {
-    if (expanded) userMovedView = true;
-  });
-
-  function setExpanded(v: boolean): void {
-    expanded = v;
-    userMovedView = false;
-    if (v) clearOverlay();
-    mini.classList.toggle('expanded', v);
-    // Collapsed it is a button; expanded it is a region holding the (separate) collapse button —
-    // never a button inside a button for VoiceOver.
-    mini.setAttribute('role', v ? 'region' : 'button');
-    mini.tabIndex = v ? -1 : 0;
-    mini.setAttribute('aria-label', v ? 'Live 3D view' : 'Expand live 3D view');
-    if (v) miniCollapse.focus({ preventScroll: true });
-    else if (mini.contains(document.activeElement)) mini.focus({ preventScroll: true });
-    el.classList.toggle('mini-expanded', v);
-    viewerDirty = true;
-    scheduleViewer(true);
-  }
+  // The thumbnail opens the cloud view (the same as the toggle).
   mini.addEventListener('click', () => {
-    if (!expanded && !cloudView) setExpanded(true);
+    if (!cloudView && canShowCloud()) setCloudView(true);
   });
   mini.addEventListener('keydown', (e: KeyboardEvent) => {
-    if ((e.key === 'Enter' || e.key === ' ') && !expanded && !cloudView) {
+    if ((e.key === 'Enter' || e.key === ' ') && !cloudView && canShowCloud()) {
       e.preventDefault();
-      setExpanded(true);
+      setCloudView(true);
     }
   });
+  // A drag in the cloud view detaches it from the camera; a tap does not. The view is unlocked on
+  // the press (capture phase: the orbit controls on the canvas must already be enabled when they
+  // see this pointerdown) and locked again on release unless it moved.
+  let press: { id: number; x: number; y: number } | null = null;
+  miniHost.addEventListener(
+    'pointerdown',
+    (e: PointerEvent) => {
+      if (!cloudView || free || !viewer || press) return;
+      press = { id: e.pointerId, x: e.clientX, y: e.clientY };
+      stopFollow();
+      viewer.setViewPose(null);
+    },
+    { capture: true },
+  );
+  miniHost.addEventListener('pointermove', (e: PointerEvent) => {
+    if (press && e.pointerId === press.id && Math.hypot(e.clientX - press.x, e.clientY - press.y) > 8) {
+      press = null;
+      setFree(true);
+    }
+  });
+  const endPress = (e: PointerEvent): void => {
+    if (!press || e.pointerId !== press.id) return;
+    press = null;
+    if (cloudView && !free) {
+      lastViewKey = '';
+      startFollow();
+    }
+  };
+  miniHost.addEventListener('pointerup', endPress);
+  miniHost.addEventListener('pointercancel', endPress);
 
   let ViewerCtor: typeof Viewer | null = null;
   let viewerLoading = false;
@@ -400,7 +409,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     if (!v) return;
     viewerDirty = false;
     lastViewerUpdate = performance.now();
-    const max = expanded || cloudView ? EXPANDED_POINTS : MINI_POINTS;
+    const max = cloudView ? CLOUD_POINTS : MINI_POINTS;
     const { positions, colors } = decimate(latestSparse.positions, latestSparse.colors, max);
     if (cloudView) {
       // world-sized splats (Eye-Dome Lighting on): surfaces seen from the camera, not a starfield
@@ -414,12 +423,14 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     }
     if (latestCameras?.length) v.setCameras(decimateCameras(latestCameras, MAX_CAMERAS), true);
     if (cloudView) startFollow();
-    else if (!userMovedView) v.fitToContent(false);
+    else v.fitToContent(false);
     miniEmpty.hidden = true;
   }
 
   // ---- cloud view (point cloud instead of the camera preview) ------------------------------------
   let cloudView = false;
+  /** Cloud view detached from the camera (the user orbits it). */
+  let free = false;
   const follow = new FollowView(gyroRotation);
   let followRaf = 0;
   let lastFollow = 0;
@@ -430,19 +441,23 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   /** Median distance of the live points from the newest camera (NaN = unknown). */
   let sceneDepth = NaN;
 
+  function canShowCloud(): boolean {
+    return app.env.webgl && !viewerFailed;
+  }
+
   function setCloudView(v: boolean, save = true): void {
     cloudView = v;
+    free = false;
+    press = null;
+    followBtn.hidden = true;
     if (save) app.saveConfig({ cloudView: v });
-    if (v) {
-      if (expanded) setExpanded(false);
-      clearOverlay();
-    }
+    if (v) clearOverlay();
     el.classList.toggle('cloud-view', v);
     viewBtn.replaceChildren(icon(v ? 'camera' : 'cube', { size: 22 }));
     viewBtn.setAttribute('aria-pressed', String(v));
     mini.setAttribute('role', v ? 'img' : 'button');
     mini.tabIndex = v ? -1 : 0;
-    mini.setAttribute('aria-label', v ? 'Live point cloud, seen from the camera' : 'Expand live 3D view');
+    mini.setAttribute('aria-label', v ? 'Live point cloud, seen from the camera' : 'Show the point cloud from the camera');
     miniEmptyLabel.textContent = v ? 'The point cloud appears once tracking starts' : 'Live 3D';
     viewer?.setDisplay({ cameras: !v, edl: v });
     if (v) {
@@ -458,8 +473,27 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     scheduleViewer(true);
   }
 
+  /** Detach the cloud view from the camera (orbit it from where it is) or follow the camera again. */
+  function setFree(v: boolean): void {
+    if (!cloudView) return;
+    free = v;
+    followBtn.hidden = !v;
+    el.classList.toggle('cloud-free', v);
+    mini.setAttribute('aria-label', v ? 'Live point cloud' : 'Live point cloud, seen from the camera');
+    // the camera trajectory shows where the phone is while orbiting
+    viewer?.setDisplay({ cameras: v });
+    if (v) {
+      stopFollow();
+      viewer?.setViewPose(null);
+    } else {
+      follow.reset();
+      lastViewKey = '';
+      startFollow();
+    }
+  }
+
   function startFollow(): void {
-    if (!followRaf && cloudView && !closed && viewer) followRaf = requestAnimationFrame(followFrame);
+    if (!followRaf && cloudView && !free && !closed && viewer) followRaf = requestAnimationFrame(followFrame);
   }
 
   function stopFollow(): void {
@@ -470,7 +504,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   /** Put the viewer camera where the phone is now (rAF, ≤ 1000 / FOLLOW_FRAME_MS Hz). */
   function followFrame(now: number): void {
     followRaf = 0;
-    if (closed || !cloudView || !viewer) return;
+    if (closed || !cloudView || free || !viewer) return;
     followRaf = requestAnimationFrame(followFrame);
     if (now - lastFollow < FOLLOW_FRAME_MS || !follow.hasAnchor) return;
     lastFollow = now;
@@ -526,7 +560,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       guidance.querySelector('.guidance-icon')!.replaceChildren(icon(g.tone === 'good' ? 'check' : g.tone === 'bad' ? 'warning' : g.tone === 'info' ? 'info' : 'warning', { size: 18 }));
     }
     const live = phase === 'running';
-    if (meta && u.overlay && live && !expanded && !cloudView) drawOverlay(u.overlay, meta);
+    if (meta && u.overlay && live && !cloudView) drawOverlay(u.overlay, meta);
     if (live && u.decision === 'keyframe' && u.numKeyframes > prevKf) {
       flash.classList.remove('pulse');
       void flash.offsetWidth; // restart the animation

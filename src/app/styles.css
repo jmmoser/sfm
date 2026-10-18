@@ -1607,25 +1607,12 @@ h3 {
     background-color 0.32s;
 }
 
-.mini-view.expanded {
-  top: calc(var(--safe-t) + 104px);
-  left: max(12px, var(--safe-l));
-  right: max(12px, var(--safe-r));
-  bottom: calc(var(--safe-b) + 140px);
-  width: auto;
-  height: auto;
-  border-radius: 24px;
-  background: rgba(10, 12, 16, 0.86);
-  cursor: default;
-  z-index: 3;
-}
-
 .mini-view-canvas {
   position: absolute;
   inset: 0;
 }
 
-.mini-view:not(.expanded) .mini-view-canvas canvas {
+.capture:not(.cloud-view) .mini-view-canvas canvas {
   pointer-events: none;
 }
 
@@ -1643,20 +1630,6 @@ h3 {
   pointer-events: none;
 }
 
-.mini-collapse {
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  display: none;
-}
-
-.mini-view.expanded .mini-collapse {
-  display: inline-flex;
-}
-
-.capture.mini-expanded .guidance {
-  display: none;
-}
 
 /* Cloud view: the live point cloud full screen, over the camera preview (which keeps playing —
    frames are grabbed from it) and under the HUD. */
@@ -1680,8 +1653,21 @@ h3 {
   text-align: center;
 }
 
-.capture.cloud-view :is(.capture-flash, .capture-shade-top, .capture-shade-bottom, .capture-top, .guidance, .paused-label, .capture-controls) {
+.capture.cloud-view :is(.capture-flash, .capture-shade-top, .capture-shade-bottom, .capture-top, .guidance, .paused-label, .capture-controls, .follow-btn) {
   z-index: 2;
+}
+
+/* Cloud view detached from the camera (after a drag): back to the camera's viewpoint. */
+.follow-btn {
+  position: absolute;
+  left: 50%;
+  bottom: calc(var(--safe-b) + 150px);
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+
+.follow-btn[hidden] {
+  display: none;
 }
 
 /* The "Memory full" chip sits under the counters: the guidance moves below it. */
@@ -1895,10 +1881,6 @@ h3 {
   background: rgba(12, 14, 18, 0.72);
 }
 
-.capture .mini-view.expanded {
-  background: rgba(12, 14, 18, 0.96);
-}
-
 .capture .capture-card-host {
   background: rgba(5, 6, 8, 0.78);
 }
@@ -1948,11 +1930,9 @@ h3 {
     width: 148px;
     height: 112px;
   }
-  .mini-view.expanded {
-    /* Below the close button / status pill / counters: Cancel must stay reachable. */
-    top: calc(var(--safe-t) + 100px);
-    bottom: max(12px, var(--safe-b));
-    right: calc(var(--safe-r) + 136px);
+  .follow-btn {
+    left: calc(50% - 64px - var(--safe-r) / 2);
+    bottom: max(16px, var(--safe-b));
   }
 }
 
