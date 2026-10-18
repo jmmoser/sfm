@@ -51,6 +51,8 @@ export interface CaptureConfig {
    * camera timing probe); off elsewhere.
    */
   videoFrameGrab: boolean;
+  /** Capture shows the live point cloud full screen, following the phone, instead of the camera preview. */
+  cloudView: boolean;
   /**
    * Version of the stored defaults. Options saved before version 2 kept `videoFrameGrab: false`
    * from when it was opt-in: they get the current default once.

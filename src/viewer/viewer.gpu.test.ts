@@ -334,6 +334,40 @@ describe('Viewer framing', () => {
     v.setWorldUp('z');
     expect(Array.from(v.getWorldUp())).toEqual([0, 0, 1]);
   });
+
+  it('setViewPose puts the view at a camera pose (x right, y down, z forward) and gives it back', async () => {
+    const v = makeViewer();
+    v.setPointCloud(planeCloud(2, 0.25, 0, [200, 200, 200]));
+    // camera at (0, −3, 1) looking along +Y (world), image x = +X, image y = −Z (down), rolled 30° about its axis
+    const C = [0, -3, 1];
+    const a = Math.PI / 6;
+    const R0 = [1, 0, 0, 0, 0, -1, 0, 1, 0]; // rows: x_cam = X, y_cam = −Z, z_cam = Y
+    const Rroll = [Math.cos(a), -Math.sin(a), 0, Math.sin(a), Math.cos(a), 0, 0, 0, 1];
+    const R = new Float64Array(9);
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) for (let k = 0; k < 3; k++) R[3 * i + j] += Rroll[3 * i + k] * R0[3 * k + j];
+    const t = new Float64Array(3);
+    for (let i = 0; i < 3; i++) t[i] = -(R[3 * i] * C[0] + R[3 * i + 1] * C[1] + R[3 * i + 2] * C[2]);
+    v.setViewPose({ R, t }, 60);
+    // project X through the pinhole of (R, t, f from the vertical FOV): the viewer must agree
+    const f = H / 2 / Math.tan(Math.PI / 6);
+    for (const X of [[0, 0, 1], [0.5, 0, 1.2], [-0.4, 0.5, 0.6], [1, 1, 0]]) {
+      const xc = [0, 1, 2].map((i) => R[3 * i] * X[0] + R[3 * i + 1] * X[1] + R[3 * i + 2] * X[2] + t[i]);
+      const s = v.worldToScreen(X)!;
+      expect(s.x).toBeCloseTo(W / 2 + (f * xc[0]) / xc[2], 3);
+      expect(s.y).toBeCloseTo(H / 2 + (f * xc[1]) / xc[2], 3);
+    }
+    // the orbit controls are off while locked: rendering frames keep the pose (and its roll)
+    expect(v.controls.enabled).toBe(false);
+    const before = v.worldToScreen([0.5, 0, 1.2])!;
+    await nextFrame();
+    await nextFrame();
+    const after = v.worldToScreen([0.5, 0, 1.2])!;
+    expect(after.x).toBeCloseTo(before.x, 6);
+    expect(after.y).toBeCloseTo(before.y, 6);
+    v.setViewPose(null);
+    expect(v.controls.enabled).toBe(true);
+    expect(v.camera.fov).toBe(50);
+  });
 });
 
 describe('Viewer picking / measuring', () => {

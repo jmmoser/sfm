@@ -93,6 +93,23 @@ try {
   await page.locator('.mini-collapse').tap();
   await sleep(500);
 
+  step('cloud view (point cloud instead of the camera preview)');
+  await byTest('cloud-toggle').tap();
+  await page.waitForSelector('.capture.cloud-view');
+  const kfAtToggle = Number(await byTest('kf-count').textContent());
+  await page.waitForFunction((k) => Number(document.querySelector('[data-testid="kf-count"]')?.textContent) > k, kfAtToggle, { timeout: 30000 });
+  await sleep(1200);
+  const cover = await page.evaluate(() => {
+    const r = document.querySelector('[data-testid="mini-view"]').getBoundingClientRect();
+    return r.left <= 0 && r.top <= 0 && r.right >= innerWidth && r.bottom >= innerHeight;
+  });
+  check(cover, 'cloud view covers the screen');
+  check((await byTest('cloud-toggle').getAttribute('aria-pressed')) === 'true', 'cloud toggle pressed');
+  await captureShot('06b-capture-cloud');
+  await byTest('cloud-toggle').tap();
+  await page.waitForFunction(() => !document.querySelector('.capture.cloud-view'));
+  await sleep(500);
+
   step('finish');
   await byTest('finish').tap();
   await page.waitForSelector('.processing', { timeout: 20000 });

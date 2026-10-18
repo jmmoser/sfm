@@ -50,6 +50,10 @@ and geolocation need a secure context.
    * **Quality**: *Fast / Balanced / Max* trades processing time and memory for resolution.
 3. Tap **Start**. iOS asks for motion access, then camera, then location. Follow the on-screen
    guidance, and tap **Finish** when the live model covers what you need.
+   The cube button at the top right swaps the camera preview for the live point cloud, full
+   screen and seen from where the phone is. Between keyframes the gyroscope keeps the view turning
+   with the phone. The camera keeps running underneath, and the app remembers the choice for the
+   next scan.
 4. Processing builds the sparse model and aligns it to gravity, scale and north. In the viewer you
    can **Build dense cloud** and **Build mesh**, measure, and **Export**.
 

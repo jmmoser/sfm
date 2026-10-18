@@ -1,7 +1,9 @@
 /**
  * Capture: full-bleed camera preview, keypoint overlay (object-fit: cover mapping), tracking
  * status / counters / elapsed time / GPS accuracy, guidance banner, collapsible live 3D view
- * (≤ 2 Hz, decimated), pause / finish / torch / cancel.
+ * (≤ 2 Hz, decimated), pause / finish / torch / cancel. A toggle swaps the camera preview for the
+ * live point cloud full screen, seen from the phone (FollowView: newest keyframe + gyro); the
+ * preview keeps playing underneath — frames are grabbed from it.
  *
  * Pipeline: CameraCapture → FramePump (≤ 10 Hz, back-pressure: the next frame is grabbed only
  * after engine.processFrame resolved) → engine. WakeLock while capturing (acquired in the Start
@@ -20,7 +22,7 @@ import { CameraCapture, type CameraStartResult, type CameraState } from '../../s
 import { CompassSensor } from '../../sensors/orientation';
 import { FramePump } from '../../sensors/frame-pump';
 import { GeoSensor } from '../../sensors/geolocation';
-import { MotionSensor } from '../../sensors/motion';
+import { integrateGyro, MotionSensor } from '../../sensors/motion';
 import { screenAngle, type ScreenAngle } from '../../sensors/frame-orientation';
 import type { CapturePermissionStatus } from '../../sensors/permissions';
 import type { Viewer } from '../../viewer';
@@ -37,6 +39,7 @@ import { icon, type IconName } from '../icons';
 import { frameErrorAction, isQuotaError, overlayMatchesView } from '../capture-policy';
 import { FrameOrientationTracker, mapOverlay } from '../overlay-map';
 import { createDebugOverlay } from '../debug-overlay';
+import { coverFovDeg, FollowView, quarterTurned } from '../follow-view';
 import { MIN_KEYFRAMES, type Route } from '../router';
 
 type Phase = 'starting' | 'running' | 'paused' | 'interrupted' | 'error' | 'finishing' | 'closed';
@@ -52,6 +55,8 @@ interface FrameMeta {
 const MINI_POINTS = 20_000;
 const EXPANDED_POINTS = 50_000;
 const MAX_CAMERAS = 80;
+/** Cloud view: pose updates at most this often (ms) — the viewer renders next to the engine's GPU work. */
+const FOLLOW_FRAME_MS = 30;
 /** Below this much free origin quota a capture starts with a warning. */
 const LOW_STORAGE_BYTES = 300e6;
 
@@ -85,6 +90,8 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   let thumbDone = false;
   let latestSparse: { positions: Float32Array; colors: Uint8Array } | null = null;
   let latestCameras: LiveCamera[] | null = null;
+  /** R_cam_device of the poses in latestCameras (engine camera frame). */
+  let latestRcd: Float64Array | null = null;
   /** Bitmap size / UI rotation of the frame being processed and the θ its pixels are upright for. */
   let inFlight: FrameMeta | null = null;
   /** Raw sensor buffers vs upright frames — the engine's rule, to turn overlays onto the preview. */
@@ -113,10 +120,12 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     h('span', { class: 'stat' }, ptCount, h('span', { text: 'points' })),
   );
   const closeBtn = iconButton('close', 'Cancel scan', () => void cancel(), { variant: 'glass', testId: 'capture-cancel' });
+  const viewBtn = iconButton('cube', 'Show point cloud', () => setCloudView(!cloudView), { variant: 'glass', testId: 'cloud-toggle' });
+  viewBtn.setAttribute('aria-pressed', 'false');
   const top = h(
     'div',
     { class: 'capture-top' },
-    h('div', { class: 'capture-top-row' }, closeBtn, statusPill, h('div', { class: 'capture-top-right' }, gpsChip)),
+    h('div', { class: 'capture-top-row' }, closeBtn, statusPill, h('div', { class: 'capture-top-right' }, gpsChip, viewBtn)),
     stats,
     memChip,
   );
@@ -125,7 +134,8 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   const guidance = h('div', { class: 'guidance', role: 'status', 'aria-live': 'polite', hidden: true, 'data-testid': 'guidance' }, h('span', { class: 'guidance-icon' }), h('span', { class: 'guidance-text' }, guidanceTitle, guidanceDetail));
 
   const miniHost = h('div', { class: 'mini-view-canvas' });
-  const miniEmpty = h('div', { class: 'mini-view-empty' }, icon('cube', { size: 22 }), h('span', { text: 'Live 3D' }));
+  const miniEmptyLabel = h('span', { text: 'Live 3D' });
+  const miniEmpty = h('div', { class: 'mini-view-empty' }, icon('cube', { size: 22 }), miniEmptyLabel);
   const miniCollapse = iconButton('collapse', 'Collapse 3D view', (e) => {
     e.stopPropagation();
     setExpanded(false);
@@ -309,10 +319,10 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     scheduleViewer(true);
   }
   mini.addEventListener('click', () => {
-    if (!expanded) setExpanded(true);
+    if (!expanded && !cloudView) setExpanded(true);
   });
   mini.addEventListener('keydown', (e: KeyboardEvent) => {
-    if ((e.key === 'Enter' || e.key === ' ') && !expanded) {
+    if ((e.key === 'Enter' || e.key === ' ') && !expanded && !cloudView) {
       e.preventDefault();
       setExpanded(true);
     }
@@ -344,7 +354,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       // WebGL rendering continuously next to the camera preview and the engine's GPU work.
       viewer = new ViewerCtor(miniHost, { background: 'transparent', autoFit: 'off', maxPixelRatio: 2, fovDeg: 55 });
       viewer.setWorldUp('auto');
-      viewer.setDisplay({ grid: false, edl: false, cameras: true, sparsePointSizePx: 2.5 });
+      viewer.setDisplay({ grid: false, edl: false, cameras: !cloudView, sparsePointSizePx: cloudView ? 3 : 2.5 });
     } catch (e) {
       viewerFailed = true;
       console.warn('[capture] live 3D view unavailable', e);
@@ -371,12 +381,81 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     if (!v) return;
     viewerDirty = false;
     lastViewerUpdate = performance.now();
-    const max = expanded ? EXPANDED_POINTS : MINI_POINTS;
+    const max = expanded || cloudView ? EXPANDED_POINTS : MINI_POINTS;
     const { positions, colors } = decimate(latestSparse.positions, latestSparse.colors, max);
     v.setSparsePoints(positions, colors);
     if (latestCameras?.length) v.setCameras(decimateCameras(latestCameras, MAX_CAMERAS), true);
-    if (!userMovedView) v.fitToContent(false);
+    if (cloudView) startFollow();
+    else if (!userMovedView) v.fitToContent(false);
     miniEmpty.hidden = true;
+  }
+
+  // ---- cloud view (point cloud instead of the camera preview) ------------------------------------
+  let cloudView = false;
+  const follow = new FollowView();
+  let followRaf = 0;
+  let lastFollow = 0;
+
+  function setCloudView(v: boolean, save = true): void {
+    cloudView = v;
+    if (save) app.saveConfig({ cloudView: v });
+    if (v) {
+      if (expanded) setExpanded(false);
+      clearOverlay();
+    }
+    el.classList.toggle('cloud-view', v);
+    viewBtn.replaceChildren(icon(v ? 'camera' : 'cube', { size: 22 }));
+    viewBtn.setAttribute('aria-label', v ? 'Show camera' : 'Show point cloud');
+    viewBtn.setAttribute('aria-pressed', String(v));
+    mini.setAttribute('role', v ? 'img' : 'button');
+    mini.tabIndex = v ? -1 : 0;
+    mini.setAttribute('aria-label', v ? 'Live point cloud, seen from the camera' : 'Expand live 3D view');
+    miniEmptyLabel.textContent = v ? 'The point cloud appears once tracking starts' : 'Live 3D';
+    viewer?.setDisplay({ cameras: !v, sparsePointSizePx: v ? 3 : 2.5 });
+    if (v) {
+      follow.reset();
+      startFollow();
+    } else {
+      stopFollow();
+      viewer?.setViewPose(null);
+      if (viewer) viewer.fitToContent(false);
+    }
+    viewerDirty = true;
+    scheduleViewer(true);
+  }
+
+  function startFollow(): void {
+    if (!followRaf && cloudView && !closed && viewer) followRaf = requestAnimationFrame(followFrame);
+  }
+
+  function stopFollow(): void {
+    if (followRaf) cancelAnimationFrame(followRaf);
+    followRaf = 0;
+  }
+
+  /** Put the viewer camera where the phone is now (rAF, ≤ 1000 / FOLLOW_FRAME_MS Hz). */
+  function followFrame(now: number): void {
+    followRaf = 0;
+    if (closed || !cloudView || !viewer) return;
+    followRaf = requestAnimationFrame(followFrame);
+    if (now - lastFollow < FOLLOW_FRAME_MS || !follow.hasAnchor) return;
+    lastFollow = now;
+    const theta = screenAngle();
+    const pose = follow.pose(now, gyroSinceAnchor(), theta);
+    const intr = latestCameras?.[latestCameras.length - 1]?.intrinsics;
+    const fov = intr ? coverFovDeg(intr, quarterTurned(latestRcd, theta), miniHost.clientWidth, miniHost.clientHeight) : NaN;
+    if (pose) viewer.setViewPose(pose, Number.isFinite(fov) ? fov : undefined);
+  }
+
+  /** Device rotation R_{d(now)←d(t_anchor)} from the gyro; null when the IMU does not cover it. */
+  function gyroSinceAnchor(): Float64Array | null {
+    const t0 = follow.anchorTime;
+    if (!motion?.running || t0 === undefined || !Number.isFinite(t0)) return null;
+    const t1 = motion.lastSampleTime;
+    if (!(t1 >= t0)) return null;
+    const samples = motion.samplesBetween(t0, t1, { pad: true });
+    if (!samples.length || samples[0].t > t0 + 100) return null;
+    return integrateGyro(samples, t0, t1);
   }
 
   // ---- live updates ------------------------------------------------------------------------------
@@ -407,7 +486,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       guidance.querySelector('.guidance-icon')!.replaceChildren(icon(g.tone === 'good' ? 'check' : g.tone === 'bad' ? 'warning' : g.tone === 'info' ? 'info' : 'warning', { size: 18 }));
     }
     const live = phase === 'running';
-    if (meta && u.overlay && live && !expanded) drawOverlay(u.overlay, meta);
+    if (meta && u.overlay && live && !expanded && !cloudView) drawOverlay(u.overlay, meta);
     if (live && u.decision === 'keyframe' && u.numKeyframes > prevKf) {
       flash.classList.remove('pulse');
       void flash.offsetWidth; // restart the animation
@@ -423,6 +502,9 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     }
     if (u.cameras) {
       latestCameras = u.cameras;
+      latestRcd = u.R_cam_device ? Float64Array.from(u.R_cam_device) : null;
+      const newest = u.cameras[u.cameras.length - 1];
+      follow.setAnchor(newest ? { pose: newest.pose, t: newest.t } : null, latestRcd);
       viewerDirty = true;
     }
     if (viewerDirty) scheduleViewer();
@@ -1024,6 +1106,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       };
       d.listen(window, 'resize', onResize);
       d.listen(window, 'orientationchange', onResize);
+      if (cfg.cloudView) setCloudView(true, false);
       void start();
     },
     leave() {
@@ -1032,6 +1115,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       stopSensors();
       if (viewerTimer) clearTimeout(viewerTimer);
       if (overlayClearTimer) clearTimeout(overlayClearTimer);
+      stopFollow();
       viewer?.dispose();
       viewer = null;
       d.dispose();

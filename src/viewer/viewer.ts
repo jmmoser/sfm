@@ -268,6 +268,8 @@ export class Viewer {
   private clipSphere: Sphere | null = null;
   private contentBounds: RobustBounds | null = null;
   private autoFitArmed = true;
+  /** setViewPose(): the camera is placed from outside, the orbit controls are off. */
+  private viewLocked = false;
   private autoFitFirst = true;
   private viewAnim: { fromPos: Vector3; toPos: Vector3; fromTarget: Vector3; toTarget: Vector3; t0: number } | null = null;
   private gridActive = false;
@@ -637,7 +639,7 @@ export class Viewer {
       _q.copy(this.contentRoot.quaternion).invert().premultiply(q); // delta = q · q_old⁻¹
       this.camera.position.applyQuaternion(_q);
       this.controls?.target.applyQuaternion(_q);
-      this.controls?.update();
+      if (!this.viewLocked) this.controls?.update();
     }
     for (const root of [this.contentRoot, this.overlayRoot, this.backgroundRoot]) {
       root.quaternion.copy(q);
@@ -921,7 +923,7 @@ export class Viewer {
     this.rafId = 0;
     if (this.disposed || this.contextLost) return;
     const anim = this.targetAnim.step(now) || this.stepViewAnim(now);
-    const moved = this.controls.update(); // applies damping; emits 'change' → requestRender while moving
+    const moved = this.viewLocked ? false : this.controls.update(); // applies damping; emits 'change' → requestRender while moving
     this.renderFrame(anim || moved || this.interacting);
     if (anim) this.requestRender();
   };
@@ -1547,13 +1549,54 @@ export class Viewer {
   };
 
   private readonly onDoubleTap = (t: TapInfo): void => {
-    if (this.measure.active) return;
+    if (this.measure.active || this.viewLocked) return;
     const p = this.pickPoint(t);
     if (!p) return;
     _v.set(p[0], p[1], p[2]);
     this.contentRoot.localToWorld(_v);
     this.focusOn(_v.clone(), true);
   };
+
+  /**
+   * Lock the view to a WORLD camera pose (world-to-camera, x right / y down / z forward on the
+   * screen; e.g. following the capturing phone), with an optional vertical field of view. The orbit
+   * controls are off while locked; null hands the view back to them (looking where it looked).
+   */
+  setViewPose(pose: Pose | null, fovDeg?: number): void {
+    if (this.disposed) return;
+    if (!pose) {
+      if (!this.viewLocked) return;
+      this.viewLocked = false;
+      this.controls.enabled = true;
+      if (this.camera.fov !== this.opts.fovDeg) {
+        this.camera.fov = this.opts.fovDeg;
+        this.camera.updateProjectionMatrix();
+      }
+      this.controls.update();
+      this.requestRender();
+      return;
+    }
+    this.viewLocked = true;
+    this.controls.enabled = false;
+    this.viewAnim = null;
+    this.targetAnim.cancel();
+    const R = pose.R;
+    const c = cameraCenter(pose);
+    this.camera.position.set(c[0], c[1], c[2]);
+    this.contentRoot.localToWorld(this.camera.position);
+    // three's camera axes in the world: right = row 0 of R, up = −row 1, backward = −row 2.
+    _m.set(R[0], -R[3], -R[6], 0, R[1], -R[4], -R[7], 0, R[2], -R[5], -R[8], 0, 0, 0, 0, 1);
+    this.camera.quaternion.setFromRotationMatrix(_m).premultiply(this.contentRoot.quaternion);
+    // Orbit target ahead of the camera: clip planes, headlight, and the view after unlocking.
+    this.recomputeBounds();
+    const ahead = Math.max(1e-6, 0.5 * (this.contentBounds?.radius ?? 1));
+    this.controls.target.copy(this.camera.position).addScaledVector(_v.set(0, 0, -1).applyQuaternion(this.camera.quaternion), ahead);
+    if (fovDeg !== undefined && Number.isFinite(fovDeg) && fovDeg > 0 && Math.abs(fovDeg - this.camera.fov) > 1e-3) {
+      this.camera.fov = fovDeg;
+      this.camera.updateProjectionMatrix();
+    }
+    this.requestRender();
+  }
 
   /** Set the orbit target (three-space) — animated by default. */
   private focusOn(target: Vector3, animate: boolean): void {
