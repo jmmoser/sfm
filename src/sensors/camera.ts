@@ -1032,6 +1032,22 @@ export class CameraCapture {
     return createImageBitmap(v);
   }
 
+  /**
+   * The current video frame as a VideoFrame (synchronous, ~0 ms: a reference to the camera buffer,
+   * no pixel copy). On iOS it keeps the SENSOR orientation (landscape in every UI rotation —
+   * Diagnostics camera timing probe). The caller owns it and must close it promptly (it holds a
+   * capture buffer). Throws without a frame or VideoFrame support.
+   */
+  grabVideoFrame(): VideoFrame {
+    const v = this.videoEl;
+    const VF = (globalThis as { VideoFrame?: new (src: HTMLVideoElement) => VideoFrame }).VideoFrame;
+    if (typeof VF !== 'function') throw new Error('CameraCapture.grabVideoFrame: VideoFrame is not supported');
+    if (!v || !this.mediaStream || v.readyState < 2 || !v.videoWidth || !v.videoHeight) {
+      throw new Error('CameraCapture.grabVideoFrame: no video frame available');
+    }
+    return new VF(v);
+  }
+
   // ---- controls -----------------------------------------------------------------------------
 
   /** Current track settings (plain object). */

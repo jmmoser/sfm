@@ -5,6 +5,7 @@
 import { afterAll, describe, expect, it } from 'vitest';
 import { CameraCapture, type FrameMeta } from './camera';
 import { runCameraTimingProbe } from './camera-probe';
+import { frameToBitmap } from '../engine/engine';
 import { collectDiagnostics } from './diagnostics';
 import { ScreenAngleTracker, screenAngle } from './frame-orientation';
 import { FramePump, type PumpFrame } from './frame-pump';
@@ -267,6 +268,50 @@ describe('camera timing probe (fake camera, real worker)', () => {
       expect(r.grab.videoFrame!.syncMs.n).toBeGreaterThan(1);
       expect(r.summary.length).toBeGreaterThan(0);
       expect(cam.track!.readyState).toBe('live'); // the probe leaves the camera running
+    } finally {
+      cam.stop();
+    }
+  });
+});
+
+describe('VideoFrame grab (fake camera)', () => {
+  it('the pump delivers VideoFrames of the <video> and the engine converts them, downscaled', async () => {
+    const video = document.createElement('video');
+    document.body.appendChild(video);
+    videos.push(video);
+    const cam = new CameraCapture();
+    await cam.start(video, { quality: 'fast' });
+    try {
+      const vf = cam.grabVideoFrame();
+      expect(vf.displayWidth).toBeGreaterThan(0);
+      vf.close();
+      const frames: PumpFrame[] = [];
+      const pump = new FramePump({
+        camera: cam,
+        grab: 'videoFrame',
+        videoFrameOrientation: 'upright', // Chromium: VideoFrames are upright like the <video>
+        consumer: (f) => void frames.push(f),
+        targetHz: 30,
+        maxSide: 320,
+        angleTracker: new ScreenAngleTracker({ read: () => 0 }),
+        isHidden: () => false,
+      });
+      pump.start();
+      const t0 = performance.now();
+      while (frames.length < 3 && performance.now() - t0 < 5000) await sleep(20);
+      pump.stop();
+      expect(frames.length).toBeGreaterThanOrEqual(3);
+      expect(pump.stats.errors).toBe(0);
+      for (const f of frames) {
+        expect(f.rawBuffer).toBe(false);
+        expect(f.maxSide).toBe(320);
+        expect(typeof (f.bitmap as VideoFrame).displayWidth).toBe('number');
+        const out = await frameToBitmap({ bitmap: f.bitmap, t: f.t, screenAngle: f.screenAngle, imu: [], rawBuffer: f.rawBuffer, maxSide: f.maxSide });
+        const bmp = out.bitmap as ImageBitmap;
+        expect(Math.max(bmp.width, bmp.height)).toBe(320);
+        bmp.close();
+        expect(() => (f.bitmap as VideoFrame).clone()).toThrow(); // closed by the conversion
+      }
     } finally {
       cam.stop();
     }

@@ -183,6 +183,68 @@ describe('FramePump', () => {
     pump.stop();
   });
 
+  it("grab 'videoFrame': delivers the camera's VideoFrame as a raw buffer in every UI rotation, drops portrait ones", async () => {
+    class FakeVideoFrame {
+      closed = false;
+      constructor(
+        readonly displayWidth: number,
+        readonly displayHeight: number,
+      ) {}
+      close(): void {
+        this.closed = true;
+      }
+    }
+    const cam = new FakeCamera();
+    const vfs: FakeVideoFrame[] = [];
+    let portrait = false;
+    const camera = Object.assign(cam, {
+      result: { frameMaxSide: 1280 },
+      grabVideoFrame: (): VideoFrame => {
+        const f = portrait ? new FakeVideoFrame(1440, 1920) : new FakeVideoFrame(1920, 1440);
+        vfs.push(f);
+        return f as unknown as VideoFrame;
+      },
+    });
+    let angle: ScreenAngle = 0;
+    const tracker = new ScreenAngleTracker({ read: () => angle });
+    const frames: PumpFrame[] = [];
+    const pump = new FramePump({ camera, grab: 'videoFrame', angleTracker: tracker, targetHz: 1000, isHidden: () => false, consumer: (f) => void frames.push(f) });
+    pump.start();
+    cam.emit(1);
+    await sleep(0);
+    angle = 90;
+    tracker.poll();
+    (tracker as unknown as { changeT: number }).changeT = -1e9;
+    cam.emit(2);
+    await sleep(0);
+    expect(frames.map((f) => [f.width, f.height, f.screenAngle, f.rawBuffer, f.maxSide])).toEqual([
+      [1920, 1440, 0, true, 1280],
+      [1920, 1440, 90, true, 1280],
+    ]);
+    expect(frames[0].bitmap).toBe(vfs[0]);
+    expect(cam.grabs).toHaveLength(0); // never createImageBitmap(<video>)
+    expect(pump.stats.grabMs).toBeGreaterThanOrEqual(0);
+    portrait = true;
+    cam.emit(3);
+    await sleep(0);
+    expect(frames).toHaveLength(2);
+    expect(pump.stats.skippedAspect).toBe(1);
+    expect(vfs[2].closed).toBe(true); // a dropped VideoFrame releases its camera buffer
+    pump.stop();
+    // 'upright' VideoFrames (Chromium): not raw, aspect checked like bitmaps
+    const up: PumpFrame[] = [];
+    portrait = false;
+    angle = 0;
+    tracker.poll();
+    (tracker as unknown as { changeT: number }).changeT = -1e9;
+    const pump2 = new FramePump({ camera, grab: 'videoFrame', videoFrameOrientation: 'upright', angleTracker: tracker, targetHz: 1000, isHidden: () => false, consumer: (f) => void up.push(f) });
+    pump2.start();
+    cam.emit(10);
+    await sleep(0);
+    expect(up.map((f) => [f.rawBuffer, f.maxSide])).toEqual([[false, 1280]]);
+    pump2.stop();
+  });
+
   it('skips while hidden', async () => {
     const cam = new FakeCamera();
     let hidden = true;

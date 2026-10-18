@@ -99,6 +99,17 @@ export function createSetupScreen(app: App): Screen {
       app.saveConfig({ debugOverlay: v });
     },
   });
+  const grabRow = switchRow({
+    label: 'VideoFrame grab (experimental)',
+    description: 'Hand camera frames to the engine without copying them on the main thread — smoother preview',
+    icon: 'camera',
+    checked: cfg.videoFrameGrab,
+    testId: 'toggle-videoframe',
+    onChange: (v) => {
+      cfg.videoFrameGrab = v;
+      app.saveConfig({ videoFrameGrab: v });
+    },
+  });
   const denseRow = switchRow({
     label: 'Dense model after capture',
     description: 'Build the detailed point cloud right away',
@@ -196,7 +207,7 @@ export function createSetupScreen(app: App): Screen {
       { class: 'content content-cta' },
       section('What are you scanning?', modeList, tipsHost),
       section('Quality', quality.el, qualityNote),
-      section('Options', group(gpsRow.el, torchRow.el, denseRow.el, debugRow.el)),
+      section('Options', group(gpsRow.el, torchRow.el, denseRow.el, debugRow.el, grabRow.el)),
     ),
     h(
       'div',

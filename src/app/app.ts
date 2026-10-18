@@ -42,6 +42,11 @@ export interface CaptureConfig {
   autoDense: boolean;
   /** Show the engine diagnostics panel while capturing. */
   debugOverlay: boolean;
+  /**
+   * Grab camera frames as VideoFrames (no main-thread copy; the engine converts them) instead of
+   * createImageBitmap(<video>), which blocks the main thread ~15 ms per grab on iOS. Experimental.
+   */
+  videoFrameGrab: boolean;
 }
 
 /** Large data shared between screens (kept out of the reactive store). */
@@ -74,7 +79,7 @@ export interface AppOptions {
 
 const CONFIG_KEY = 'sfm.captureConfig.v1';
 
-const DEFAULT_CONFIG: CaptureConfig = { mode: 'object', quality: 'balanced', useGps: false, torch: false, autoDense: true, debugOverlay: false };
+const DEFAULT_CONFIG: CaptureConfig = { mode: 'object', quality: 'balanced', useGps: false, torch: false, autoDense: true, debugOverlay: false, videoFrameGrab: false };
 
 function loadConfig(): CaptureConfig {
   try {
@@ -88,6 +93,7 @@ function loadConfig(): CaptureConfig {
         torch: false, // never start with the torch on
         autoDense: typeof c.autoDense === 'boolean' ? c.autoDense : DEFAULT_CONFIG.autoDense,
         debugOverlay: typeof c.debugOverlay === 'boolean' ? c.debugOverlay : DEFAULT_CONFIG.debugOverlay,
+        videoFrameGrab: typeof c.videoFrameGrab === 'boolean' ? c.videoFrameGrab : DEFAULT_CONFIG.videoFrameGrab,
       };
     }
   } catch {

@@ -12,6 +12,10 @@
  *    for θ = 90 — it is treated as captured at θ = 90. A portrait bitmap in a landscape UI is
  *    not explained by any delivery path (transient) and is dropped. The remaining ambiguity
  *    (raw buffer vs upright frame in landscape-270) is resolved by the engine's hand-eye check.
+ *  - A frame DECLARED raw (`FrameInput.rawBuffer`) is upright for θ = 90 whatever the UI rotation.
+ *    The declaration describes that frame only: it does not change the delivery-path state
+ *    (`rawDelivery`, persisted with the session) — a session resumed on the other path must keep
+ *    classifying its frames as before.
  *
  * Image preparation (ENGINE.md "Frame flow"): a ≤ 640 px RGBA copy (per-feature colours +
  * sharpness), the feature input (ImageBitmap / rotated OffscreenCanvas for the GPU SIFT, a gray
@@ -92,12 +96,18 @@ export class OrientationTracker {
     this.rawDelivery = raw;
   }
 
-  /** Decide for one frame (`width`/`height` = bitmap size as submitted). */
-  classify(f: { width: number; height: number; screenAngle: number; t: number }): OrientationVerdict {
+  /** Decide for one frame (`width`/`height` = bitmap size as submitted; `raw` = declared raw buffer). */
+  classify(f: { width: number; height: number; screenAngle: number; t: number; raw?: boolean }): OrientationVerdict {
     const ui = snap(f.screenAngle);
     if (this.lastUI !== null && ui !== this.lastUI) this.changeT = f.t;
     this.lastUI = ui;
     if (Number.isFinite(f.t) && f.t - this.changeT < this.settleMs) return { ok: false, reason: `within ${this.settleMs} ms of a UI rotation` };
+    if (f.raw) {
+      // stateless: no rawDelivery / θ₀ re-interpretation (see the header)
+      if (f.height > f.width) return { ok: false, reason: `portrait ${f.width}x${f.height} frame declared raw` };
+      if (this.thetaSession === null) this.thetaSession = 90;
+      return { ok: true, effectiveTheta: 90, k: canonicalRotation(this.thetaSession, 90), raw: true };
+    }
     const portraitUI = ui === 0 || ui === 180;
     const landscapeBitmap = f.width > f.height;
     const portraitBitmap = f.height > f.width;
@@ -351,7 +361,7 @@ function prepareBitmap(bitmap: ImageBitmap, k: QuarterTurns, smallMaxSide: numbe
 }
 
 /** Close a frame source that will not be processed. */
-export function closeSource(source: FrameSource | null | undefined): void {
+export function closeSource(source: FrameSource | VideoFrame | null | undefined): void {
   if (!source || isRGBAImage(source)) return;
   try {
     (source as ImageBitmap).close?.();

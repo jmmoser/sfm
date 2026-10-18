@@ -11,6 +11,16 @@
  * (Safari 26.x transient mis-rotation) and when the bitmap aspect contradicts the UI rotation
  * (transient; re-baselined after 1.5 s of consistent contradiction).
  * The consumer OWNS the bitmap (close or transfer it).
+ *
+ * `grab: 'videoFrame'` (the "VideoFrame grab" setting): instead of createImageBitmap(<video>),
+ * which blocks the main thread ~15 ms per grab on iOS (Diagnostics camera timing probe), the pump
+ * takes `camera.grabVideoFrame()` (~0 ms: a reference to the camera buffer) and delivers it as
+ * `bitmap` with `rawBuffer` (on iOS it keeps the sensor orientation in every UI rotation; the
+ * engine treats it as upright for θ = 90 and converts it, downscaled to `maxSide`). Its aspect
+ * does not follow the UI, so the aspect check is replaced by "a raw frame must be landscape".
+ * Elsewhere (`videoFrameOrientation: 'upright'`, e.g. Chromium) VideoFrames are upright like the
+ * <video>: not raw, and checked like bitmaps.
+ * `stats.grabMs` = main-thread time of the grab call, whichever path.
  */
 import type { GeoFix, ImuSample, Mat3, Vec3 } from '../core/types';
 import type { FrameCallback, FrameMeta } from './camera';
@@ -20,8 +30,11 @@ import type { AttitudeReading, HeadingReading } from './orientation';
 export interface PumpFrame {
   /** 0-based index of delivered frames. */
   index: number;
-  /** Full-resolution frame (or ≤ maxSide), upright for `screenAngle`. Owned by the consumer. */
-  bitmap: ImageBitmap;
+  /**
+   * Full-resolution frame (or ≤ maxSide), upright for `screenAngle` — or, with `grab:
+   * 'videoFrame'`, a VideoFrame in sensor orientation (`rawBuffer`). Owned by the consumer.
+   */
+  bitmap: ImageBitmap | VideoFrame;
   width: number;
   height: number;
   /** Best capture-time estimate (ms, performance.now() domain). */
@@ -42,11 +55,17 @@ export interface PumpFrame {
   gravityDevice: Vec3 | null;
   /** Camera capture segment (changes after an interruption ⇒ relocalise / new segment). */
   segment: number;
+  /** `bitmap` is a raw sensor-orientation VideoFrame (upright for θ = 90 in any UI rotation). */
+  rawBuffer: boolean;
+  /** VideoFrame only: the size to downscale to when converting (null = native). */
+  maxSide: number | null;
 }
 
 export interface FramePumpCamera {
   onFrame(cb: FrameCallback): () => void;
   grabFrame(opts?: { maxSide?: number }): Promise<ImageBitmap>;
+  /** The current frame as a VideoFrame (synchronous; throws without a frame or VideoFrame support). */
+  grabVideoFrame?(): VideoFrame;
   /** CameraCapture.result: its `frameMaxSide` is used when `maxSide` is left undefined. */
   readonly result?: { frameMaxSide: number | null } | null;
 }
@@ -73,6 +92,13 @@ export interface FramePumpOptions {
   compass?: FramePumpCompass | null;
   /** Max delivery rate (default 10 Hz). */
   targetHz?: number;
+  /** 'bitmap' (default): createImageBitmap(<video>); 'videoFrame': camera.grabVideoFrame(). */
+  grab?: 'bitmap' | 'videoFrame';
+  /**
+   * How the VideoFrames are oriented: 'raw' (default; iOS WebKit, verified by the Diagnostics probe:
+   * sensor orientation in every UI rotation) or 'upright' (like the <video>: e.g. Chromium).
+   */
+  videoFrameOrientation?: 'raw' | 'upright';
   /**
    * Downscale grabbed frames so max(W,H) ≤ maxSide. undefined (default) = the camera's
    * suggestion (`CameraStartResult.frameMaxSide`, e.g. 1280 for the 'fast' preset on iOS where
@@ -101,6 +127,8 @@ export interface FramePumpStats {
   errors: number;
   /** Exponential moving average of the consumer time (ms). */
   consumerMs: number;
+  /** Exponential moving average of the main-thread time of the grab call (ms). */
+  grabMs: number;
   /** Estimated camera frame period (ms). */
   framePeriodMs: number;
 }
@@ -131,6 +159,7 @@ export class FramePump {
     aspectRebaselines: 0,
     errors: 0,
     consumerMs: 0,
+    grabMs: 0,
     framePeriodMs: 1000 / 30,
   };
 
@@ -216,16 +245,20 @@ export class FramePump {
     this.busyFlag = true;
     // Counted at the attempt so that failing grabs are retried at targetHz, not on every frame.
     this.lastDeliveredT = t;
-    // grabFrame() is invoked synchronously here (async functions run until their first await),
-    // so the bitmap is the frame this callback reported.
-    let grab: Promise<ImageBitmap>;
+    // grabFrame() / grabVideoFrame() are invoked synchronously here (async functions run until
+    // their first await), so the frame is the one this callback reported.
+    let grab: Promise<ImageBitmap | VideoFrame>;
+    const ms = this.o.maxSide === undefined ? (this.o.camera.result?.frameMaxSide ?? null) : this.o.maxSide;
+    const g0 = performance.now();
     try {
-      const ms = this.o.maxSide === undefined ? (this.o.camera.result?.frameMaxSide ?? null) : this.o.maxSide;
-      grab = this.o.camera.grabFrame(ms ? { maxSide: ms } : undefined);
+      const cam = this.o.camera;
+      grab = this.o.grab === 'videoFrame' && cam.grabVideoFrame ? Promise.resolve(cam.grabVideoFrame()) : cam.grabFrame(ms ? { maxSide: ms } : undefined);
     } catch (e) {
       grab = Promise.reject(e);
     }
-    void this.deliver(grab, t, meta.timeSource, meta.segment, theta, this.runGen);
+    const gms = performance.now() - g0;
+    st.grabMs = st.grabMs === 0 ? gms : st.grabMs + 0.2 * (gms - st.grabMs);
+    void this.deliver(grab, t, meta.timeSource, meta.segment, theta, this.runGen, ms);
   };
 
   private checkAspect(w: number, h: number, theta: number): boolean {
@@ -253,14 +286,15 @@ export class FramePump {
   }
 
   private async deliver(
-    grab: Promise<ImageBitmap>,
+    grab: Promise<ImageBitmap | VideoFrame>,
     t: number,
     timeSource: FrameMeta['timeSource'],
     segment: number,
     theta: ScreenAngle,
     gen: number,
+    maxSide: number | null,
   ): Promise<void> {
-    let bitmap: ImageBitmap | null = null;
+    let bitmap: ImageBitmap | VideoFrame | null = null;
     let handedOut = false;
     try {
       bitmap = await grab;
@@ -270,7 +304,12 @@ export class FramePump {
         bitmap = null;
         return;
       }
-      if (!this.checkAspect(bitmap.width, bitmap.height, theta)) {
+      const b = bitmap;
+      const raw = isVideoFrame(b) && (this.o.videoFrameOrientation ?? 'raw') === 'raw';
+      const w = isVideoFrame(b) ? b.displayWidth : b.width;
+      const h = isVideoFrame(b) ? b.displayHeight : b.height;
+      // a raw buffer never follows the UI rotation: it must be (sensor-)landscape instead
+      if (raw ? h > w : !this.checkAspect(w, h, theta)) {
         this.stats.skippedAspect++;
         bitmap.close();
         bitmap = null;
@@ -287,8 +326,8 @@ export class FramePump {
       const frame: PumpFrame = {
         index: this.idx++,
         bitmap,
-        width: bitmap.width,
-        height: bitmap.height,
+        width: w,
+        height: h,
         t,
         timeSource,
         screenAngle: theta,
@@ -300,6 +339,8 @@ export class FramePump {
         attitude: c?.attitudeAt ? c.attitudeAt(t) : null,
         gravityDevice: m?.gravityAt ? m.gravityAt(t) : null,
         segment,
+        rawBuffer: raw,
+        maxSide: isVideoFrame(b) ? maxSide : null,
       };
       this.stats.delivered++;
       const t0 = performance.now();
@@ -328,4 +369,8 @@ export class FramePump {
       this.busyFlag = false;
     }
   }
+}
+
+function isVideoFrame(b: ImageBitmap | VideoFrame): b is VideoFrame {
+  return typeof (b as VideoFrame).displayWidth === 'number' && typeof (b as ImageBitmap).width !== 'number';
 }
