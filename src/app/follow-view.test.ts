@@ -4,7 +4,7 @@ import { mat3Mul, mat3MulTranspose, mat3MulVec, mat3Transpose, mat3TransposeMul 
 import { rotationAngle, rotvecToMat3 } from '../math/rotation';
 import { cameraFromDevice, uiUpInDevice, type ScreenAngle } from '../sensors/frame-orientation';
 import { integrateGyro } from '../sensors/motion';
-import { coverFovDeg, followViewRotation, FollowView, medianDistance, quarterTurned } from './follow-view';
+import { coverFovDeg, followViewRotation, FollowView, medianDistance, quarterTurned, splatRadii } from './follow-view';
 
 const angle = (a: ArrayLike<number>, b: ArrayLike<number>): number => rotationAngle(mat3MulTranspose(a, b));
 
@@ -150,5 +150,18 @@ describe('medianDistance', () => {
   it('median distance of the points from a centre', () => {
     expect(medianDistance(new Float32Array([1, 0, 0, 0, 2, 0, 0, 0, 3]), [0, 0, 0])).toBe(2);
     expect(medianDistance(new Float32Array(0), [0, 0, 0])).toBeNaN();
+  });
+});
+
+describe('splatRadii', () => {
+  it('0.5 × the nearest-neighbour distance, clamped; isolated points get the minimum', () => {
+    // a row 0.1 apart, a close pair, and an outlier far away
+    const p = new Float32Array([0, 0, 0, 0.1, 0, 0, 0.2, 0, 0, 1, 1, 1, 1.01, 1, 1, 50, 50, 50]);
+    const r = splatRadii(p, 0.5, 0.01);
+    expect(r[0]).toBeCloseTo(0.05, 5);
+    expect(r[1]).toBeCloseTo(0.05, 5);
+    expect(r[3]).toBeCloseTo(0.01, 5); // 0.5 × 0.01 below the minimum
+    expect(r[5]).toBeCloseTo(0.01, 6);
+    expect(splatRadii(new Float32Array([0, 0, 0, 0.4, 0, 0]), 0.2, 0.01)[0]).toBeCloseTo(0.01, 6); // nearest beyond the cell
   });
 });

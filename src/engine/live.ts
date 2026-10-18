@@ -18,6 +18,7 @@
 import type { CameraIntrinsics, CancelToken, FeatureSet, FrameInfo, GeoFix, ImuSample, Mat3, MatchPairs, Pose, TwoViewGeometry } from '../core/types';
 import type { FeaturePipeline } from '../features/extractor';
 import { deserializeFeatureSet, serializeFeatureSet } from '../io/serialize';
+import { solvePnPRansac } from '../geometry/pnp';
 import { estimateTwoViewGeometry } from '../geometry/twoview';
 import { mat3Mul, mat3MulTranspose } from '../math/mat3';
 import { rotationAngle } from '../math/rotation';
@@ -756,10 +757,16 @@ export class LiveSession {
         this.ref = null;
       }
       const ref = this.ref;
+      let framePose: Pose | null = null;
       if (ref && fs.count > 0 && ref.fs.count > 0) {
         const tm = now();
         const tr = await this.trackAgainst(ref, fs, f.t, timings);
         trackGeom = tr.geom;
+        if (tr.geom) {
+          const tp = now();
+          framePose = this.framePose(ref.id, tr.geom.inliers, fs);
+          timings.framePose = now() - tp;
+        }
         cand.numMatchesToLastKF = tr.numMatches;
         cand.numInliersToLastKF = tr.numInliers;
         cand.medianParallaxPx = tr.parallax;
@@ -842,12 +849,52 @@ export class LiveSession {
       }
       const u = this.baseUpdate(frameIndex, decision.decision, this.mapGuidance(decision.guidance), timings);
       u.overlay = overlay;
+      if (framePose) {
+        u.framePose = { pose: framePose, t: f.t + (st.timeOffsetMs ?? 0) };
+        u.R_cam_device = Float64Array.from(st.cameraFromDevice());
+      }
       if (this.inline && this.modelVersion !== this.sentVersion) this.attachModel(u);
       return finish(u);
     } finally {
       if (!handedOff) prep.release();
     }
   }
+
+  /**
+   * Pose of a tracked frame in the live model (the "camera view" of the capture screen): PnP on its
+   * tracking inliers whose reference-keyframe feature has a triangulated point. Null while the
+   * reference keyframe is not registered (mapping behind) or the fit is weak.
+   */
+  private framePose(refId: number, inliers: MatchPairs, fs: FeatureSet): Pose | null {
+    const rec = this.mapper.reconstruction;
+    const img = rec.images.get(refId);
+    const cam = img && img.registered ? rec.cameras.get(img.cameraId) : undefined;
+    if (!img || !cam) return null;
+    const m = inliers.length >> 1;
+    const X = new Float64Array(3 * m),
+      uv = new Float64Array(2 * m);
+    const kp = fs.keypoints;
+    let n = 0;
+    for (let i = 0; i < m; i++) {
+      const pid = img.point3D[inliers[2 * i]];
+      const p = pid >= 0 ? rec.points.get(pid) : undefined;
+      if (!p) continue;
+      const j = inliers[2 * i + 1];
+      X[3 * n] = p.xyz[0];
+      X[3 * n + 1] = p.xyz[1];
+      X[3 * n + 2] = p.xyz[2];
+      uv[2 * n] = kp[4 * j];
+      uv[2 * n + 1] = kp[4 * j + 1];
+      n++;
+    }
+    if (n < LiveSession.FRAME_POSE_MIN_POINTS) return null;
+    const res = solvePnPRansac(X, uv, n, cam, { maxErrorPx: 6, minInliers: LiveSession.FRAME_POSE_MIN_POINTS, maxIterations: 300 });
+    if (!res || res.numInliers < 0.5 * n) return null;
+    return res.pose;
+  }
+
+  /** Minimum 2D–3D correspondences (and PnP inliers) for a frame pose. */
+  private static readonly FRAME_POSE_MIN_POINTS = 15;
 
   /** Diagnostics of a frame before it is analysed (filled in as processing goes). */
   private newDebug(): LiveDebug {

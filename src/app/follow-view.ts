@@ -1,12 +1,13 @@
 /**
  * Point-cloud capture view (CaptureConfig.cloudView): the live 3D viewer's camera follows the phone.
  *
- * The anchor is the newest registered keyframe (its world-to-camera pose from the live model and
- * its capture time on the IMU clock). Between keyframes the gyro carries its rotation to now:
+ * The anchor is the newest posed frame: every tracked frame's pose in the live model (the engine's
+ * frame PnP), or a keyframe's when that is newer, with its capture time on the IMU clock. Until the
+ * next one the gyro carries its rotation to now:
  *   R_view = R_cd(θ_ui) · G · R_cd(engine)ᵀ · R_k,   G = R_{d(now)←d(t_k)}   (src/sensors/motion.ts)
  * where R_cd(θ_ui) = cameraFromDevice(θ_ui) is the rear camera upright for the current UI rotation,
- * i.e. the screen's x right / y down / z forward frame the viewer expects. The position stays at
- * the keyframe's centre: the engine estimates no pose for the frames between keyframes.
+ * i.e. the screen's x right / y down / z forward frame the viewer expects. The position is the
+ * anchor's centre (updated with every tracked frame).
  *
  * G is integrated incrementally (only the samples since the last view update). A new anchor (or a
  * model update that moves it) would make the view jump: the old and the new anchor are compared at
@@ -19,7 +20,7 @@ import { mat3ToRotvec, rotvecToMat3 } from '../math/rotation';
 import { cameraFromDevice, type ScreenAngle } from '../sensors/frame-orientation';
 
 /** Time constant of the decay of an anchor jump (ms). */
-const TAU_MS = 250;
+const TAU_MS = 150;
 
 /**
  * Device rotation R_{d(t1)←d(t0)} from the gyro (t1 < t0: the inverse), null when the IMU does not
@@ -182,4 +183,51 @@ export function medianDistance(positions: ArrayLike<number>, c: ArrayLike<number
   for (let i = 0; i < n; i += step) d.push(Math.hypot(positions[3 * i] - c[0], positions[3 * i + 1] - c[1], positions[3 * i + 2] - c[2]));
   d.sort((a, b) => a - b);
   return d[d.length >> 1];
+}
+
+/**
+ * Per-point splat radius (world units) so the sparse cloud reads as surfaces: 0.5 × the distance to
+ * the nearest neighbour (hash grid of `cell`), clamped to [rMin, cell]; isolated points get rMin.
+ */
+export function splatRadii(positions: ArrayLike<number>, cell: number, rMin: number): Float32Array {
+  const n = Math.floor(positions.length / 3);
+  const out = new Float32Array(n);
+  if (!(cell > 0)) return out.fill(rMin);
+  const inv = 1 / cell;
+  const key = (x: number, y: number, z: number): number => ((x * 73856093) ^ (y * 19349663) ^ (z * 83492791)) | 0;
+  const grid = new Map<number, number[]>();
+  const ix = new Int32Array(n),
+    iy = new Int32Array(n),
+    iz = new Int32Array(n);
+  for (let i = 0; i < n; i++) {
+    ix[i] = Math.floor(positions[3 * i] * inv);
+    iy[i] = Math.floor(positions[3 * i + 1] * inv);
+    iz[i] = Math.floor(positions[3 * i + 2] * inv);
+    const k = key(ix[i], iy[i], iz[i]);
+    const c = grid.get(k);
+    if (c) c.push(i);
+    else grid.set(k, [i]);
+  }
+  for (let i = 0; i < n; i++) {
+    const px = positions[3 * i],
+      py = positions[3 * i + 1],
+      pz = positions[3 * i + 2];
+    let best = cell * cell;
+    for (let dx = -1; dx <= 1; dx++)
+      for (let dy = -1; dy <= 1; dy++)
+        for (let dz = -1; dz <= 1; dz++) {
+          const c = grid.get(key(ix[i] + dx, iy[i] + dy, iz[i] + dz));
+          if (!c) continue;
+          for (const j of c) {
+            if (j === i) continue;
+            const ex = positions[3 * j] - px,
+              ey = positions[3 * j + 1] - py,
+              ez = positions[3 * j + 2] - pz;
+            const d2 = ex * ex + ey * ey + ez * ez;
+            if (d2 < best) best = d2;
+          }
+        }
+    out[i] = best < cell * cell ? Math.min(cell, Math.max(rMin, 0.5 * Math.sqrt(best))) : rMin;
+  }
+  return out;
 }

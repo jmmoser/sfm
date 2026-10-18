@@ -39,7 +39,7 @@ import { icon, type IconName } from '../icons';
 import { frameErrorAction, isQuotaError, overlayMatchesView } from '../capture-policy';
 import { FrameOrientationTracker, mapOverlay } from '../overlay-map';
 import { createDebugOverlay } from '../debug-overlay';
-import { coverFovDeg, FollowView, medianDistance, quarterTurned } from '../follow-view';
+import { coverFovDeg, FollowView, medianDistance, quarterTurned, splatRadii } from '../follow-view';
 import { MIN_KEYFRAMES, type Route } from '../router';
 
 type Phase = 'starting' | 'running' | 'paused' | 'interrupted' | 'error' | 'finishing' | 'closed';
@@ -356,7 +356,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       // WebGL rendering continuously next to the camera preview and the engine's GPU work.
       viewer = new ViewerCtor(miniHost, { background: 'transparent', autoFit: 'off', maxPixelRatio: 2, fovDeg: 55 });
       viewer.setWorldUp('auto');
-      viewer.setDisplay({ grid: false, edl: false, cameras: !cloudView, sparsePointSizePx: cloudView ? 3 : 2.5 });
+      viewer.setDisplay({ grid: false, edl: cloudView, cameras: !cloudView, sparsePointSizePx: 2.5 });
     } catch (e) {
       onViewerFailed(e);
     }
@@ -364,6 +364,13 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   }
 
   /** The live 3D view cannot be shown: back to the camera preview (not saved), no toggle. */
+  /** A posed frame / keyframe becomes the view's anchor. */
+  function setAnchor(pose: LiveCamera['pose'], t: number | undefined): void {
+    anchorT = t ?? -Infinity;
+    // a centre jump beyond half the scene depth is a re-initialised model (shown at once)
+    follow.setAnchor({ pose, t }, latestRcd, Number.isFinite(sceneDepth) ? 0.5 * sceneDepth : Infinity);
+  }
+
   function onViewerFailed(e: unknown): void {
     viewerFailed = true;
     console.warn('[capture] live 3D view unavailable', e);
@@ -395,7 +402,16 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     lastViewerUpdate = performance.now();
     const max = expanded || cloudView ? EXPANDED_POINTS : MINI_POINTS;
     const { positions, colors } = decimate(latestSparse.positions, latestSparse.colors, max);
-    v.setSparsePoints(positions, colors);
+    if (cloudView) {
+      // world-sized splats (Eye-Dome Lighting on): surfaces seen from the camera, not a starfield
+      const depth = Number.isFinite(sceneDepth) ? sceneDepth : 1;
+      const radii = splatRadii(positions, 0.015 * depth, 0.0015 * depth);
+      v.setSparsePoints(new Float32Array(0), new Uint8Array(0));
+      v.setPointCloud({ count: positions.length / 3, positions, colors, radii });
+    } else {
+      v.setPointCloud(null);
+      v.setSparsePoints(positions, colors);
+    }
     if (latestCameras?.length) v.setCameras(decimateCameras(latestCameras, MAX_CAMERAS), true);
     if (cloudView) startFollow();
     else if (!userMovedView) v.fitToContent(false);
@@ -409,6 +425,10 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   let lastFollow = 0;
   /** Pose / field of view last given to the viewer (unchanged ⇒ no render). */
   let lastViewKey = '';
+  /** IMU-clock time of the follow anchor (a newer posed frame / keyframe replaces it). */
+  let anchorT = -Infinity;
+  /** Median distance of the live points from the newest camera (NaN = unknown). */
+  let sceneDepth = NaN;
 
   function setCloudView(v: boolean, save = true): void {
     cloudView = v;
@@ -424,7 +444,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     mini.tabIndex = v ? -1 : 0;
     mini.setAttribute('aria-label', v ? 'Live point cloud, seen from the camera' : 'Expand live 3D view');
     miniEmptyLabel.textContent = v ? 'The point cloud appears once tracking starts' : 'Live 3D';
-    viewer?.setDisplay({ cameras: !v, sparsePointSizePx: v ? 3 : 2.5 });
+    viewer?.setDisplay({ cameras: !v, edl: v });
     if (v) {
       follow.reset();
       lastViewKey = '';
@@ -525,10 +545,17 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       latestRcd = u.R_cam_device ? Float64Array.from(u.R_cam_device) : null;
       if (u.gyroBias !== undefined) gyroBias = u.gyroBias;
       const newest = u.cameras[u.cameras.length - 1];
-      // a centre jump beyond half the scene depth is a re-initialised model (shown at once)
-      const depth = newest && latestSparse ? medianDistance(latestSparse.positions, cameraCentre(newest.pose)) : NaN;
-      follow.setAnchor(newest ? { pose: newest.pose, t: newest.t } : null, latestRcd, Number.isFinite(depth) ? 0.5 * depth : Infinity);
+      if (newest && latestSparse) sceneDepth = medianDistance(latestSparse.positions, cameraCentre(newest.pose));
+      // the newest keyframe anchors the view unless a later frame already does
+      if (!newest) {
+        follow.setAnchor(null);
+        anchorT = -Infinity;
+      } else if (newest.t === undefined || !(newest.t <= anchorT)) setAnchor(newest.pose, newest.t);
       viewerDirty = true;
+    }
+    if (u.framePose && !(u.framePose.t <= anchorT)) {
+      if (u.R_cam_device) latestRcd = Float64Array.from(u.R_cam_device);
+      setAnchor(u.framePose.pose, u.framePose.t);
     }
     if (viewerDirty) scheduleViewer();
     // The engine marks every frame after its capture memory cap (in case the event was missed).
