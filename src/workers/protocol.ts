@@ -136,6 +136,8 @@ export type TrackingState = 'initializing' | 'tracking' | 'lost';
 export interface LiveCamera {
   pose: Pose;
   intrinsics: CameraIntrinsics;
+  /** Capture time of the keyframe on the IMU clock (camera time + estimated camera–IMU offset), ms. */
+  t?: number;
 }
 
 export interface LiveUpdate {
@@ -156,6 +158,10 @@ export interface LiveUpdate {
   /** Present when the sparse model changed (decimated to ≤ 50k points). */
   sparse?: { positions: Float32Array; colors: Uint8Array };
   cameras?: LiveCamera[];
+  /** With `cameras`: R_cam_device of the camera frame the poses use (v_cam = R · v_device). */
+  R_cam_device?: Mat3;
+  /** With `cameras`: the engine's gyro bias estimate (rad/s, device frame, subtracted from ω); null = none yet. */
+  gyroBias?: [number, number, number] | null;
   timings: Record<string, number>;
   /** Per-frame diagnostics for the capture debug overlay. */
   debug?: LiveDebug;

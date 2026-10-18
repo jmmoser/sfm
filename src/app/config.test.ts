@@ -21,6 +21,12 @@ describe('parseConfig', () => {
     expect(parseConfig(old, false).videoFrameGrab).toBe(false);
   });
 
+  it('the cloud view (point cloud instead of the camera preview) is off by default and remembered', () => {
+    expect(parseConfig(null, true).cloudView).toBe(false);
+    expect(parseConfig(JSON.stringify({ ...defaultConfig(true), cloudView: true }), true).cloudView).toBe(true);
+    expect(parseConfig(JSON.stringify({ ...defaultConfig(true), cloudView: 'yes' }), true).cloudView).toBe(false);
+  });
+
   it('invalid values fall back to the defaults and the torch never starts on', () => {
     expect(parseConfig('{not json', true)).toEqual(defaultConfig(true));
     expect(parseConfig('null', false)).toEqual(defaultConfig(false));

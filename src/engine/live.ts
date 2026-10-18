@@ -1508,12 +1508,17 @@ export class LiveSession {
       u.sparse = { positions: pos, colors: col };
     } else u.sparse = { positions: snap.points, colors: snap.colors };
     const rec = this.mapper.reconstruction;
+    const st = this.state;
+    const offset = st.timeOffsetMs ?? 0;
     const cams: LiveCamera[] = [];
     for (const { id, pose } of snap.poses.sort((a, b) => a.id - b.id)) {
       const cam = rec.cameras.get(rec.images.get(id)!.cameraId)!;
-      cams.push({ pose, intrinsics: { ...cam } });
+      const r = st.records.get(id);
+      cams.push({ pose, intrinsics: { ...cam }, ...(r ? { t: r.t + offset } : {}) });
     }
     u.cameras = cams;
+    u.R_cam_device = Float64Array.from(st.cameraFromDevice());
+    u.gyroBias = st.gyroBias ? [st.gyroBias[0], st.gyroBias[1], st.gyroBias[2]] : null;
     this.sentVersion = this.modelVersion;
   }
 

@@ -1334,6 +1334,9 @@ h3 {
 
 .capture-top-right {
   justify-self: end;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 /* After the engine's capture memory cap: no new keyframes (tracking only). */
@@ -1653,6 +1656,32 @@ h3 {
 
 .capture.mini-expanded .guidance {
   display: none;
+}
+
+/* Cloud view: the live point cloud full screen, over the camera preview (which keeps playing —
+   frames are grabbed from it) and under the HUD. */
+.capture.cloud-view .mini-view {
+  inset: 0;
+  width: auto;
+  height: auto;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: #07090c;
+  cursor: default;
+  z-index: 1;
+  /* appear at once: the corner thumbnail cannot animate to full screen (top: auto) */
+  transition: none;
+}
+
+.capture.cloud-view .mini-view-empty {
+  font-size: 14px;
+  padding: 0 32px;
+  text-align: center;
+}
+
+.capture.cloud-view :is(.capture-flash, .capture-shade-top, .capture-shade-bottom, .capture-top, .guidance, .paused-label, .capture-controls) {
+  z-index: 2;
 }
 
 /* The "Memory full" chip sits under the counters: the guidance moves below it. */
