@@ -5,6 +5,8 @@
  */
 import type { PointCloud, TriangleMesh } from '../core/types';
 import { SessionStore, type SessionMeta, type SessionPatch } from '../io/storage';
+import { isAppleMobileWebKit } from '../sensors/camera';
+import { parseConfig } from './config';
 import { requestCapturePermissions, type CapturePermissionStatus } from '../sensors/permissions';
 import { WakeLock } from '../sensors/wakelock';
 import type { CaptureMode, LiveCamera, QualityPreset, SparseResult } from '../workers/protocol';
@@ -44,9 +46,16 @@ export interface CaptureConfig {
   debugOverlay: boolean;
   /**
    * Grab camera frames as VideoFrames (no main-thread copy; the engine converts them) instead of
-   * createImageBitmap(<video>), which blocks the main thread ~15 ms per grab on iOS. Experimental.
+   * createImageBitmap(<video>), which blocks the main thread ~6–16 ms per grab on iOS. Default ON
+   * on iOS WebKit, where the raw sensor orientation of these frames is verified (Diagnostics
+   * camera timing probe); off elsewhere.
    */
   videoFrameGrab: boolean;
+  /**
+   * Version of the stored defaults. Options saved before version 2 kept `videoFrameGrab: false`
+   * from when it was opt-in: they get the current default once.
+   */
+  configVersion: number;
 }
 
 /** Large data shared between screens (kept out of the reactive store). */
@@ -79,27 +88,14 @@ export interface AppOptions {
 
 const CONFIG_KEY = 'sfm.captureConfig.v1';
 
-const DEFAULT_CONFIG: CaptureConfig = { mode: 'object', quality: 'balanced', useGps: false, torch: false, autoDense: true, debugOverlay: false, videoFrameGrab: false };
-
 function loadConfig(): CaptureConfig {
+  let raw: string | null = null;
   try {
-    const raw = localStorage.getItem(CONFIG_KEY);
-    if (raw) {
-      const c = JSON.parse(raw) as Partial<CaptureConfig>;
-      return {
-        mode: c.mode === 'object' || c.mode === 'scene' || c.mode === 'auto' ? c.mode : DEFAULT_CONFIG.mode,
-        quality: c.quality === 'fast' || c.quality === 'balanced' || c.quality === 'max' ? c.quality : DEFAULT_CONFIG.quality,
-        useGps: typeof c.useGps === 'boolean' ? c.useGps : DEFAULT_CONFIG.useGps,
-        torch: false, // never start with the torch on
-        autoDense: typeof c.autoDense === 'boolean' ? c.autoDense : DEFAULT_CONFIG.autoDense,
-        debugOverlay: typeof c.debugOverlay === 'boolean' ? c.debugOverlay : DEFAULT_CONFIG.debugOverlay,
-        videoFrameGrab: typeof c.videoFrameGrab === 'boolean' ? c.videoFrameGrab : DEFAULT_CONFIG.videoFrameGrab,
-      };
-    }
+    raw = localStorage.getItem(CONFIG_KEY);
   } catch {
     /* storage unavailable */
   }
-  return { ...DEFAULT_CONFIG };
+  return parseConfig(raw, isAppleMobileWebKit());
 }
 
 function newSessionId(): string {

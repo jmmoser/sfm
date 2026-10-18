@@ -100,8 +100,8 @@ export function createSetupScreen(app: App): Screen {
     },
   });
   const grabRow = switchRow({
-    label: 'VideoFrame grab (experimental)',
-    description: 'Hand camera frames to the engine without copying them on the main thread — smoother preview',
+    label: 'VideoFrame grab',
+    description: 'Hand camera frames to the engine without copying them on the main thread — smoother preview (on by default on iPhone)',
     icon: 'camera',
     checked: cfg.videoFrameGrab,
     testId: 'toggle-videoframe',
