@@ -10,9 +10,11 @@
  * (text + JSON). CPU-only results without WebGPU. `?benchScale=small` = CI-sized inputs. The run
  * is cancelled when the page is hidden (iOS drops GPU work in the background) or the screen left.
  *
- * "Camera timing probe": opens the camera from the tap and runs src/sensors/camera-probe.ts for
- * 10 s (rVFC captureTime vs MediaStreamTrackProcessor timestamps, MSTP buffer orientation, the
- * main-thread cost of createImageBitmap(<video>)); the report is part of "Copy".
+ * "Camera timing": opens the camera from the tap and runs src/sensors/camera-probe.ts — a quick
+ * 10 s run (rotate the phone once: orientation and rotation transients) or a 60 s still run
+ * (drift) — rVFC captureTime vs MediaStreamTrackProcessor timestamps, buffer orientation, and the
+ * main-thread cost of createImageBitmap(<video>) (full / downscaled) and new VideoFrame(<video>).
+ * The report is part of "Copy".
  */
 import { startBenchmark, type BenchRun } from '../bench/bench';
 import { STATUS_LABEL, estimateLine, formatMs, qualityName, reportClipboardText, verdict } from '../bench/report';
@@ -31,14 +33,21 @@ import { icon } from '../icons';
 import { formatBytes, formatDuration, type Tone } from '../format';
 import type { Route } from '../router';
 
+type ProbeMode = 'quick' | 'still';
+
+const PROBE_MODES: Record<ProbeMode, { durationMs: number; warmupMs: number; label: string; hint: string }> = {
+  quick: { durationMs: 10_000, warmupMs: 2_000, label: 'Quick probe (10 s, rotate once)', hint: 'Rotate the phone to landscape and back once while it measures.' },
+  still: { durationMs: 60_000, warmupMs: 5_000, label: 'Still probe (60 s, for drift)', hint: 'Hold the phone still (lean it against something) until it finishes.' },
+};
+
 interface CameraProbeState {
   state: 'idle' | 'running' | 'done' | 'error';
+  mode?: ProbeMode;
+  phase?: 'warmup' | 'measure';
   remainingMs?: number;
   report?: CameraProbeReport;
   error?: string;
 }
-
-const PROBE_MS = 10_000;
 
 interface MotionTest {
   state: 'idle' | 'running' | 'done' | 'denied' | 'unsupported';
@@ -387,10 +396,13 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
     });
   }
 
-  function runProbe(): void {
+  function runProbe(mode: ProbeMode): void {
     if (probe.state === 'running') return;
+    const cfg = PROBE_MODES[mode];
     probe.state = 'running';
-    probe.remainingMs = PROBE_MS;
+    probe.mode = mode;
+    probe.phase = 'warmup';
+    probe.remainingMs = cfg.warmupMs;
     probe.report = undefined;
     probe.error = undefined;
     render();
@@ -401,11 +413,12 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
       .start(probeVideo, { quality: 'balanced' })
       .then(() =>
         runCameraTimingProbe(cam, {
-          durationMs: PROBE_MS,
+          durationMs: cfg.durationMs,
+          warmupMs: cfg.warmupMs,
           isCancelled: () => closed,
-          onProgress: (ms) => {
-            const sec = Math.ceil(ms / 1000);
-            if (sec !== Math.ceil((probe.remainingMs ?? 0) / 1000)) {
+          onProgress: (ms, phase) => {
+            if (phase !== probe.phase || Math.ceil(ms / 1000) !== Math.ceil((probe.remainingMs ?? 0) / 1000)) {
+              probe.phase = phase;
               probe.remainingMs = ms;
               if (!closed) render();
             }
@@ -432,33 +445,44 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
   function probeSection(): HTMLElement {
     const rows: HTMLElement[] = [];
     const r = probe.report;
-    if (probe.state === 'running') rows.push(h('p', { class: 'muted', text: 'Hold the phone still, then rotate it once to landscape and back.' }), probeVideo);
+    const running = probe.state === 'running';
+    if (running && probe.mode) rows.push(h('p', { class: 'muted', text: PROBE_MODES[probe.mode].hint }), probeVideo);
     if (probe.state === 'error') rows.push(kvRow('Probe', chip(probe.error ?? 'Failed', 'bad')));
     if (r) {
       const t = r.timing;
+      const rot = r.rotation;
+      const mono = (text: string): HTMLElement => h('span', { class: 'mono', text });
+      const grabRow = (title: string, g: CameraProbeReport['grab']['bitmap']): HTMLElement =>
+        kvRow(title, mono(g ? `p50 ${formatMs(g.syncMs.p50)} · p95 ${formatMs(g.syncMs.p95)}` : '–'));
       rows.push(
         group(
-          kvRow('rVFC frames', h('span', { class: 'mono', text: `${r.video.frames} (${r.video.fps} fps, ${r.video.timeSource})` })),
-          kvRow('MSTP frames', r.mstp.available ? h('span', { class: 'mono', text: `${r.mstp.frames} (${r.mstp.fps} fps, ${r.mstp.transport ?? '?'})` }) : chip('Unavailable', 'warn')),
-          kvRow('Timestamp jitter', h('span', { class: 'mono', text: t.jitterStdMs === null ? '–' : `σ ${t.jitterStdMs} ms · p5–p95 ${t.jitterRangeMs} ms` })),
-          kvRow('Timestamp drift', h('span', { class: 'mono', text: t.driftMsPerS === null ? '–' : `${t.driftMsPerS} ms/s (${t.pairs} pairs)` })),
-          kvRow('MSTP buffers', h('span', { class: 'mono', text: r.mstp.codedSizes.join(', ') || '–' })),
-          kvRow('Grab blocks main', h('span', { class: 'mono', text: r.grab.syncMs ? `p50 ${formatMs(r.grab.syncMs.p50)} · p95 ${formatMs(r.grab.syncMs.p95)}` : '–' })),
+          kvRow('Measured', mono(`${formatMs(r.durationMs)} after ${formatMs(r.warmupMs)} warm-up`)),
+          kvRow('rVFC frames', mono(`${r.video.frames} (${r.video.fps} fps, ${r.video.timeSource})`)),
+          kvRow('MSTP frames', r.mstp.available ? mono(`${r.mstp.frames} (${r.mstp.fps} fps, ${r.mstp.transport ?? '?'})`) : chip('Unavailable', 'warn')),
+          kvRow('Timestamp jitter', mono(t.jitterStdMs === null ? '–' : `σ ${t.jitterStdMs} ms · p5–p95 ${t.jitterRangeMs} ms`)),
+          kvRow('Timestamp drift', mono(t.driftMsPerS === null ? '–' : `${t.driftMsPerS} ms/s (${t.pairs} frames, ${t.segments} segment${t.segments === 1 ? '' : 's'})`)),
+          kvRow('Rotations', mono(rot.changes ? `${rot.changes} · dropped ${rot.videoDropped} / MSTP ${rot.mstpDropped} · misoriented ${rot.videoMisoriented}` : 'none')),
+          kvRow('MSTP buffers', mono(r.mstp.codedSizes.join(', ') || '–')),
+          grabRow('Bitmap, full', r.grab.bitmap),
+          grabRow('Bitmap, downscaled', r.grab.bitmapScaled),
+          grabRow('VideoFrame', r.grab.videoFrame),
         ),
         ...r.summary.map((s) => h('p', { class: 'muted', text: s })),
       );
     }
-    const btn = button({
-      label: probe.state === 'running' ? `Measuring… ${Math.ceil((probe.remainingMs ?? 0) / 1000)} s` : r ? 'Run probe again' : 'Run camera timing probe',
-      icon: 'camera',
-      variant: 'secondary',
-      size: 'md',
-      block: true,
-      disabled: probe.state === 'running',
-      testId: 'diag-camera-probe',
-      onClick: runProbe,
-    });
-    return section('Camera timing', ...rows, btn);
+    const buttons = (['quick', 'still'] as const).map((mode) =>
+      button({
+        label: running && probe.mode === mode ? `${probe.phase === 'warmup' ? 'Warming up' : 'Measuring'}… ${Math.ceil((probe.remainingMs ?? 0) / 1000)} s` : PROBE_MODES[mode].label,
+        icon: 'camera',
+        variant: 'secondary',
+        size: 'md',
+        block: true,
+        disabled: running,
+        testId: `diag-camera-probe-${mode}`,
+        onClick: () => runProbe(mode),
+      }),
+    );
+    return section('Camera timing', ...rows, ...buttons);
   }
 
   function render(): void {
