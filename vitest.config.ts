@@ -1,8 +1,10 @@
 import { defineConfig } from 'vitest/config';
 import { playwright } from '@vitest/browser-playwright';
 
-// Two test projects:
+// Three test projects:
 //  - unit: pure TypeScript logic, runs in Node (fast). Files: src/**/*.test.ts
+//  - slow: Node tests that run the whole pipeline (SfM / BA / PatchMatch on synthetic
+//          captures) and take seconds to tens of seconds each. Files: src/**/*.slow.test.ts
 //  - gpu:  WebGPU / DOM code, runs in headless Chromium with SwiftShader WebGPU.
 //          Files: src/**/*.gpu.test.ts
 export default defineConfig({
@@ -13,7 +15,15 @@ export default defineConfig({
           name: 'unit',
           environment: 'node',
           include: ['src/**/*.test.ts'],
-          exclude: ['src/**/*.gpu.test.ts', 'node_modules/**'],
+          exclude: ['src/**/*.gpu.test.ts', 'src/**/*.slow.test.ts', 'node_modules/**'],
+          testTimeout: 120_000,
+        },
+      },
+      {
+        test: {
+          name: 'slow',
+          environment: 'node',
+          include: ['src/**/*.slow.test.ts'],
           testTimeout: 120_000,
         },
       },

@@ -109,6 +109,8 @@ docs/                    this file, research notes
 ```
 
 Tests: `*.test.ts` next to the code (Node, `npx vitest run --project unit <path>`),
+`*.slow.test.ts` for Node tests that run the pipeline end to end and take seconds each
+(`npx vitest run --project slow <path>`; kept out of `npm test`, run in CI),
 `*.gpu.test.ts` for WebGPU/DOM code (headless Chromium + SwiftShader,
 `npx vitest run --project gpu <path>`). SwiftShader is slow: keep GPU test images
 small (≤ 640 px).

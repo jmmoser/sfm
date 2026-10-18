@@ -12,8 +12,10 @@ import { lookAt, pinholeIntrinsics, renderSynthetic, type SynthScene } from '../
 import { rotateRGBA90 } from '../features/image';
 import { mat3TransposeMul, mat3Transpose } from '../math/mat3';
 import { mat3ToRotvec } from '../math/rotation';
+import { umeyama } from '../math/sim3';
 import { cameraFromDevice } from '../sensors/frame-orientation';
 import type { FrameInput, ScreenAngle } from '../workers/protocol';
+import type { SparseResultEx } from './types';
 
 export function objectScene(): SynthScene {
   const c = 6;
@@ -199,4 +201,29 @@ export function centre(p: Pose): Float64Array {
   const R = p.R,
     t = p.t;
   return Float64Array.of(-(R[0] * t[0] + R[3] * t[1] + R[6] * t[2]), -(R[1] * t[0] + R[4] * t[1] + R[7] * t[2]), -(R[2] * t[0] + R[5] * t[1] + R[8] * t[2]));
+}
+
+/** Sim3 (result → GT) from camera centres, ATE (m), max gravity error (deg). */
+export function compareWithGT(cap: SynthCapture, res: SparseResultEx): { s: number; R: Float64Array; t: Float64Array; ate: number; gravityDeg: number } {
+  const n = res.cameras.length;
+  const src = new Float64Array(3 * n);
+  const dst = new Float64Array(3 * n);
+  let g = 0;
+  res.cameras.forEach((c, i) => {
+    const gt = cap.frames[c.frameIndex!].pose;
+    src.set(centre(c.pose), 3 * i);
+    dst.set(centre(gt), 3 * i);
+    // world +Z expressed in the camera frame: result vs GT
+    const d = c.pose.R[2] * gt.R[2] + c.pose.R[5] * gt.R[5] + c.pose.R[8] * gt.R[8];
+    g = Math.max(g, Math.acos(Math.min(1, d)) / (Math.PI / 180));
+  });
+  const sim = umeyama(src, dst, n, true)!;
+  let e = 0;
+  for (let i = 0; i < n; i++) {
+    for (let r = 0; r < 3; r++) {
+      const p = sim.s * (sim.R[3 * r] * src[3 * i] + sim.R[3 * r + 1] * src[3 * i + 1] + sim.R[3 * r + 2] * src[3 * i + 2]) + sim.t[r];
+      e += (p - dst[3 * i + r]) ** 2;
+    }
+  }
+  return { s: sim.s, R: sim.R, t: sim.t, ate: Math.sqrt(e / n), gravityDeg: g };
 }

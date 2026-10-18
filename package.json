@@ -10,6 +10,8 @@
     "preview": "vite preview --host",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run --project unit",
+    "test:slow": "vitest run --project slow",
+    "test:node": "vitest run --project unit --project slow",
     "test:gpu": "vitest run --project gpu",
     "test:all": "vitest run",
     "test:watch": "vitest --project unit",

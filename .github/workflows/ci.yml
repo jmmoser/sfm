@@ -22,6 +22,6 @@ jobs:
         # Timing assertions in perf tests are relaxed on shared CI runners.
         env:
           PERF_SLACK: '4'
-        run: npx vitest run --project unit
+        run: npx vitest run --project unit --project slow
       - name: Build
         run: npx vite build

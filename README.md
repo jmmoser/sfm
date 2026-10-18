@@ -90,7 +90,9 @@ blank, and the engine falls back to the slower grayscale input for the whole ses
 npm install
 npm run dev          # Vite dev server (desktop: http://localhost:5173; ?mock=1 = mock engine)
 npm run build        # typecheck + production build into dist/
-npm test             # unit tests (Node)
+npm test             # fast unit tests (Node)
+npm run test:slow    # end-to-end pipeline tests on synthetic captures (Node, a few minutes)
+npm run test:node    # both of the above (what CI runs)
 npm run test:gpu     # WebGPU / DOM tests in headless Chromium (SwiftShader)
 ```
 
