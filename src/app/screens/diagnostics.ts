@@ -9,11 +9,17 @@
  * checks (pass / fail chips), scan-time estimates per quality preset, Cancel, "Copy report"
  * (text + JSON). CPU-only results without WebGPU. `?benchScale=small` = CI-sized inputs. The run
  * is cancelled when the page is hidden (iOS drops GPU work in the background) or the screen left.
+ *
+ * "Camera timing probe": opens the camera from the tap and runs src/sensors/camera-probe.ts for
+ * 10 s (rVFC captureTime vs MediaStreamTrackProcessor timestamps, MSTP buffer orientation, the
+ * main-thread cost of createImageBitmap(<video>)); the report is part of "Copy".
  */
 import { startBenchmark, type BenchRun } from '../bench/bench';
 import { STATUS_LABEL, estimateLine, formatMs, qualityName, reportClipboardText, verdict } from '../bench/report';
 import { describeTest } from '../bench/scales';
 import { BENCH_TESTS, type BenchReport, type BenchScale, type BenchStatus, type BenchTestId, type BenchTestResult } from '../bench/types';
+import { CameraCapture } from '../../sensors/camera';
+import { runCameraTimingProbe, type CameraProbeReport } from '../../sensors/camera-probe';
 import { MotionSensor } from '../../sensors/motion';
 import { collectDiagnostics, diagnosticsReportJSON, type SensorDiagnostics } from '../../sensors/diagnostics';
 import type { App, Screen } from '../app';
@@ -24,6 +30,15 @@ import { Disposer, h, replaceChildren } from '../dom';
 import { icon } from '../icons';
 import { formatBytes, formatDuration, type Tone } from '../format';
 import type { Route } from '../router';
+
+interface CameraProbeState {
+  state: 'idle' | 'running' | 'done' | 'error';
+  remainingMs?: number;
+  report?: CameraProbeReport;
+  error?: string;
+}
+
+const PROBE_MS = 10_000;
 
 interface MotionTest {
   state: 'idle' | 'running' | 'done' | 'denied' | 'unsupported';
@@ -65,6 +80,9 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
   let diag: SensorDiagnostics | null = null;
   let closed = false;
   const motionTest: MotionTest = { state: 'idle' };
+  const probe: CameraProbeState = { state: 'idle' };
+  const probeVideo = h('video', { class: 'probe-video', playsinline: true, muted: true, autoplay: true, 'aria-label': 'Camera preview' });
+  let probeCamera: CameraCapture | null = null;
   const body = h('div', { class: 'diag-body' }, h('div', { class: 'list-loading' }, spinner('md', 'Collecting diagnostics')));
   const copyBtn = button({ label: 'Copy', icon: 'copy', variant: 'ghost', size: 'sm', testId: 'diag-copy', onClick: () => void copy() });
   copyBtn.disabled = true;
@@ -88,6 +106,7 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
       app: { mock: app.mock, engine: app.store.get().engine, env: app.env, version: import.meta.env?.MODE ?? '' },
       diagnostics: diag,
       motionTest,
+      cameraProbe: probe.report ?? (probe.error ? { error: probe.error } : null),
     };
   }
 
@@ -368,6 +387,80 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
     });
   }
 
+  function runProbe(): void {
+    if (probe.state === 'running') return;
+    probe.state = 'running';
+    probe.remainingMs = PROBE_MS;
+    probe.report = undefined;
+    probe.error = undefined;
+    render();
+    const cam = new CameraCapture();
+    probeCamera = cam;
+    // start() inside the tap: iOS asks for (or reuses) the camera grant from the gesture
+    void cam
+      .start(probeVideo, { quality: 'balanced' })
+      .then(() =>
+        runCameraTimingProbe(cam, {
+          durationMs: PROBE_MS,
+          isCancelled: () => closed,
+          onProgress: (ms) => {
+            const sec = Math.ceil(ms / 1000);
+            if (sec !== Math.ceil((probe.remainingMs ?? 0) / 1000)) {
+              probe.remainingMs = ms;
+              if (!closed) render();
+            }
+          },
+        }),
+      )
+      .then(
+        (r) => {
+          probe.report = r;
+          probe.state = 'done';
+        },
+        (e) => {
+          probe.error = (e as Error)?.message ?? String(e);
+          probe.state = 'error';
+        },
+      )
+      .finally(() => {
+        cam.stop();
+        if (probeCamera === cam) probeCamera = null;
+        if (!closed) render();
+      });
+  }
+
+  function probeSection(): HTMLElement {
+    const rows: HTMLElement[] = [];
+    const r = probe.report;
+    if (probe.state === 'running') rows.push(h('p', { class: 'muted', text: 'Hold the phone still, then rotate it once to landscape and back.' }), probeVideo);
+    if (probe.state === 'error') rows.push(kvRow('Probe', chip(probe.error ?? 'Failed', 'bad')));
+    if (r) {
+      const t = r.timing;
+      rows.push(
+        group(
+          kvRow('rVFC frames', h('span', { class: 'mono', text: `${r.video.frames} (${r.video.fps} fps, ${r.video.timeSource})` })),
+          kvRow('MSTP frames', r.mstp.available ? h('span', { class: 'mono', text: `${r.mstp.frames} (${r.mstp.fps} fps, ${r.mstp.transport ?? '?'})` }) : chip('Unavailable', 'warn')),
+          kvRow('Timestamp jitter', h('span', { class: 'mono', text: t.jitterStdMs === null ? '–' : `σ ${t.jitterStdMs} ms · p5–p95 ${t.jitterRangeMs} ms` })),
+          kvRow('Timestamp drift', h('span', { class: 'mono', text: t.driftMsPerS === null ? '–' : `${t.driftMsPerS} ms/s (${t.pairs} pairs)` })),
+          kvRow('MSTP buffers', h('span', { class: 'mono', text: r.mstp.codedSizes.join(', ') || '–' })),
+          kvRow('Grab blocks main', h('span', { class: 'mono', text: r.grab.syncMs ? `p50 ${formatMs(r.grab.syncMs.p50)} · p95 ${formatMs(r.grab.syncMs.p95)}` : '–' })),
+        ),
+        ...r.summary.map((s) => h('p', { class: 'muted', text: s })),
+      );
+    }
+    const btn = button({
+      label: probe.state === 'running' ? `Measuring… ${Math.ceil((probe.remainingMs ?? 0) / 1000)} s` : r ? 'Run probe again' : 'Run camera timing probe',
+      icon: 'camera',
+      variant: 'secondary',
+      size: 'md',
+      block: true,
+      disabled: probe.state === 'running',
+      testId: 'diag-camera-probe',
+      onClick: runProbe,
+    });
+    return section('Camera timing', ...rows, btn);
+  }
+
   function render(): void {
     if (!diag) return;
     const g = diag;
@@ -479,6 +572,7 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
       onClick: testMotion,
     });
     sections.push(section('Motion', group(...motionRows), motionBtn));
+    sections.push(probeSection());
 
     const s = g.storage;
     sections.push(
@@ -526,6 +620,7 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
     leave() {
       closed = true;
       benchRun?.cancel('Diagnostics was closed');
+      probeCamera?.stop();
       if (benchTimer) clearInterval(benchTimer);
       d.dispose();
     },

@@ -4,6 +4,7 @@
  */
 import { afterAll, describe, expect, it } from 'vitest';
 import { CameraCapture, type FrameMeta } from './camera';
+import { runCameraTimingProbe } from './camera-probe';
 import { collectDiagnostics } from './diagnostics';
 import { ScreenAngleTracker, screenAngle } from './frame-orientation';
 import { FramePump, type PumpFrame } from './frame-pump';
@@ -242,5 +243,30 @@ describe('misc browser glue', () => {
     tr.start();
     expect(tr.angle).toBe(screenAngle());
     tr.stop();
+  });
+});
+
+describe('camera timing probe (fake camera, real worker)', () => {
+  it('records rVFC and MSTP frames on the same track, pairs them and times the grabs', async () => {
+    const video = document.createElement('video');
+    document.body.appendChild(video);
+    videos.push(video);
+    const cam = new CameraCapture();
+    await cam.start(video, { quality: 'fast' });
+    try {
+      const r = await runCameraTimingProbe(cam, { durationMs: 1500 });
+      expect(r.mstp.error).toBeNull();
+      expect(r.mstp.transport).toBe('stream'); // Chromium: tracks are not transferable
+      expect(r.mstp.frames).toBeGreaterThan(10);
+      expect(r.video.frames).toBeGreaterThan(10);
+      expect(r.video.timeSource).toBe('captureTime');
+      expect(r.timing.pairs).toBeGreaterThan(5);
+      expect(r.timing.jitterStdMs).not.toBeNull();
+      expect(r.grab.syncMs!.n).toBeGreaterThan(5);
+      expect(r.summary.length).toBeGreaterThan(0);
+      expect(cam.track!.readyState).toBe('live'); // the probe leaves the camera running
+    } finally {
+      cam.stop();
+    }
   });
 });

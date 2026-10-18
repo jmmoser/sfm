@@ -55,7 +55,11 @@ and geolocation need a secure context.
 
 The **Diagnostics** screen shows WebGPU limits, the camera list, IMU rate and sign checks, and
 storage. It also has a **Run benchmark** button that times GPU SIFT, matching, PatchMatch and bundle
-adjustment on the device and estimates scan times per quality preset.
+adjustment on the device and estimates scan times per quality preset. **Run camera timing probe**
+records the camera for 10 s (rotate the phone once meanwhile) and reports how much rVFC
+`captureTime` jitters and drifts against the `MediaStreamTrackProcessor` capture clock, whether
+those buffers stay sensor-landscape, and how long `createImageBitmap(<video>)` blocks the main thread —
+the data for deciding whether a worker capture path is worth building.
 
 ## Development
 
