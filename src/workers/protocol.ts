@@ -158,7 +158,12 @@ export interface LiveUpdate {
   /** Present when the sparse model changed (decimated to ≤ 50k points). */
   sparse?: { positions: Float32Array; colors: Uint8Array };
   cameras?: LiveCamera[];
-  /** With `cameras`: R_cam_device of the camera frame the poses use (v_cam = R · v_device). */
+  /**
+   * Pose of THIS frame in the live model (tracked against a registered keyframe), and its capture
+   * time on the IMU clock (camera time + estimated camera–IMU offset), ms. Absent when not tracked.
+   */
+  framePose?: { pose: Pose; t: number };
+  /** With `cameras` / `framePose`: R_cam_device of the camera frame the poses use (v_cam = R · v_device). */
   R_cam_device?: Mat3;
   /** With `cameras`: the engine's gyro bias estimate (rad/s, device frame, subtracted from ω); null = none yet. */
   gyroBias?: [number, number, number] | null;

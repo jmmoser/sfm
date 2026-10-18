@@ -252,6 +252,45 @@ describe('engine: synthetic orbit, CPU path', () => {
     expect(engine.liveSession!.state.cameraTheta).toBe(0);
   }, 300_000);
 
+  it('poses tracked frames in the live model (the camera view of the capture screen)', () => {
+    const posed = updates.filter((u) => u.framePose);
+    // most frames after initialisation are posed, not only keyframes
+    expect(posed.length).toBeGreaterThan(0.5 * updates.filter((u) => u.tracking === 'tracking').length);
+    expect(posed.length).toBeGreaterThan(updates.filter((u) => u.decision === 'keyframe').length);
+    for (const u of posed) expect(u.R_cam_device).toBeDefined();
+    // up to the live model's similarity: rotations and centres agree with the ground truth
+    const n = posed.length;
+    const src = new Float64Array(3 * n),
+      dst = new Float64Array(3 * n);
+    posed.forEach((u, i) => {
+      src.set(centre(u.framePose!.pose), 3 * i);
+      dst.set(centre(cap.frames.find((f) => f.index === u.frameIndex)!.pose), 3 * i);
+    });
+    const sim = umeyama(src, dst, n, true)!;
+    let worst = 0,
+      ate = 0,
+      radius = 0;
+    posed.forEach((u, i) => {
+      const gt = cap.frames.find((f) => f.index === u.frameIndex)!.pose;
+      // R_est · Rsimᵀ ≈ R_gt
+      const Re = u.framePose!.pose.R;
+      let tr = 0;
+      for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) {
+        let v = 0;
+        for (let k = 0; k < 3; k++) v += Re[3 * r + k] * sim.R[3 * c + k];
+        tr += v * gt.R[3 * r + c];
+      }
+      worst = Math.max(worst, Math.acos(Math.min(1, Math.max(-1, (tr - 1) / 2))) / DEG);
+      for (let r = 0; r < 3; r++) {
+        const p = sim.s * (sim.R[3 * r] * src[3 * i] + sim.R[3 * r + 1] * src[3 * i + 1] + sim.R[3 * r + 2] * src[3 * i + 2]) + sim.t[r];
+        ate += (p - dst[3 * i + r]) ** 2;
+      }
+      radius = Math.max(radius, Math.hypot(dst[3 * i], dst[3 * i + 1], dst[3 * i + 2]));
+    });
+    expect(worst).toBeLessThan(1.5);
+    expect(Math.sqrt(ate / n)).toBeLessThan(0.01 * radius);
+  });
+
   it('refines: all keyframes registered, self-calibrated focal, metric gravity-aligned world', async () => {
     await engine.finishCapture();
     const stages = new Set<string>();

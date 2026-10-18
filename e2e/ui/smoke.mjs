@@ -86,15 +86,8 @@ try {
   await byTest('pause').tap();
   await page.waitForFunction(() => document.querySelector('.capture')?.getAttribute('data-phase') === 'running');
 
-  step('expand live 3D');
+  step('cloud view from the thumbnail (point cloud seen from the camera)');
   await byTest('mini-view').tap();
-  await sleep(1200);
-  await captureShot('06-capture-3d');
-  await page.locator('.mini-collapse').tap();
-  await sleep(500);
-
-  step('cloud view (point cloud instead of the camera preview)');
-  await byTest('cloud-toggle').tap();
   await page.waitForSelector('.capture.cloud-view');
   const kfAtToggle = Number(await byTest('kf-count').textContent());
   await page.waitForFunction((k) => Number(document.querySelector('[data-testid="kf-count"]')?.textContent) > k, kfAtToggle, { timeout: 30000 });
@@ -105,7 +98,30 @@ try {
   });
   check(cover, 'cloud view covers the screen');
   check((await byTest('cloud-toggle').getAttribute('aria-pressed')) === 'true', 'cloud toggle pressed');
-  await captureShot('06b-capture-cloud');
+  check(await byTest('follow-camera').isHidden(), 'following the camera: no "Follow camera" button');
+  await captureShot('06-capture-cloud');
+
+  step('drag: orbit the cloud freely, then follow the camera again');
+  const cloudBox = await byTest('mini-view').boundingBox();
+  const cx = cloudBox.x + cloudBox.width / 2,
+    cy = cloudBox.y + cloudBox.height / 2;
+  await page.mouse.move(cx, cy);
+  await page.mouse.down();
+  for (let i = 1; i <= 10; i++) await page.mouse.move(cx + i * 12, cy + i * 3);
+  await page.mouse.up();
+  await byTest('follow-camera').waitFor({ state: 'visible', timeout: 5000 });
+  await sleep(600);
+  await captureShot('06b-capture-cloud-free');
+  await byTest('follow-camera').tap();
+  await byTest('follow-camera').waitFor({ state: 'hidden', timeout: 5000 });
+
+  step('overview: the whole model from above, then back to the camera');
+  await byTest('cloud-overview').tap();
+  await byTest('follow-camera').waitFor({ state: 'visible', timeout: 5000 });
+  await sleep(900);
+  await captureShot('06c-capture-cloud-overview');
+  await byTest('follow-camera').tap();
+  await byTest('follow-camera').waitFor({ state: 'hidden', timeout: 5000 });
   await byTest('cloud-toggle').tap();
   await page.waitForFunction(() => !document.querySelector('.capture.cloud-view'));
   await sleep(500);

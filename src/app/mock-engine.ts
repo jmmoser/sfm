@@ -297,6 +297,8 @@ export class MockEngine implements EngineLike {
       };
       // Overlay: projections of the visible scene into the current (true) camera.
       upd.overlay = this.overlay(pose, cam, rng);
+      // the real engine poses every tracked frame (frame PnP in the live model)
+      if (tracking === 'tracking' && decision !== 'reject_blur' && decision !== 'reject_motion') upd.framePose = { pose, t: f.t };
       if (decision === 'keyframe' && k >= 2 && k !== this.lastSparseKf) {
         this.lastSparseKf = k;
         upd.sparse = this.liveSparse(k);
