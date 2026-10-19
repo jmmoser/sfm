@@ -2453,6 +2453,21 @@ h3 {
   margin: 8px 0;
 }
 
+.probe-videos {
+  display: flex;
+  gap: 8px;
+}
+
+.probe-videos .probe-video {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.row-actions {
+  display: inline-flex;
+  gap: 8px;
+}
+
 .feature-grid {
   display: flex;
   flex-wrap: wrap;

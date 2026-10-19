@@ -71,6 +71,21 @@ adjustment on the device and estimates scan times per quality preset.
 
 This is the data for deciding whether a different capture path is worth building.
 
+**Lens & photo probe** (about 30 s, phone held still and pointed at something textured) answers two
+questions: would full-resolution still photos help, and can the app use more than one rear camera?
+It reports:
+* each camera's name, zoom range, minimum focus distance and largest size;
+* `ImageCapture.takePhoto()` on the running camera: the photo size actually delivered (and whether
+  asking for the largest size changes it), latency, JPEG size, the EXIF focal length and 35 mm
+  equivalent, exposure and ISO, and whether the video stalls or drops frames around each shot;
+* one `grabFrame()` for comparison;
+* whether a second rear camera (the ultra-wide first) can run while the first does, or whether
+  opening it stops the first, and whether the first recovers when the second is closed;
+* one photo from each physical rear lens, with its focal length and field of view from EXIF.
+
+The page cannot detect a shutter sound, so afterwards the section asks whether you heard one. The
+answer goes into the copied report.
+
 **VideoFrame grab**, a switch under *Options* on the New scan screen, is the change those
 measurements pointed to. It is **on by default on iPhone and iPad** and off elsewhere.
 Grabbing a frame with `createImageBitmap(<video>)` blocks the main thread for about 6–16 ms per grab

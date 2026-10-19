@@ -15,6 +15,11 @@
  * (drift) — rVFC captureTime vs MediaStreamTrackProcessor timestamps, buffer orientation, and the
  * main-thread cost of createImageBitmap(<video>) (full / downscaled) and new VideoFrame(<video>).
  * The report is part of "Copy".
+ *
+ * "Lenses & photos": runs src/sensors/lens-probe.ts on a camera opened from the tap — the rear
+ * lenses and their capabilities, takePhoto() size / latency / EXIF and whether the video stalls
+ * meanwhile, whether a second rear camera can run at the same time, and one photo per lens. The
+ * page cannot hear a shutter sound, so the section asks afterwards. Also part of "Copy".
  */
 import { startBenchmark, type BenchRun } from '../bench/bench';
 import { STATUS_LABEL, estimateLine, formatMs, qualityName, reportClipboardText, verdict } from '../bench/report';
@@ -22,6 +27,7 @@ import { describeTest } from '../bench/scales';
 import { BENCH_TESTS, type BenchReport, type BenchScale, type BenchStatus, type BenchTestId, type BenchTestResult } from '../bench/types';
 import { CameraCapture } from '../../sensors/camera';
 import { runCameraTimingProbe, type CameraProbeReport } from '../../sensors/camera-probe';
+import { runLensProbe, type LensProbeReport, type LensProbeStep } from '../../sensors/lens-probe';
 import { MotionSensor } from '../../sensors/motion';
 import { collectDiagnostics, diagnosticsReportJSON, type SensorDiagnostics } from '../../sensors/diagnostics';
 import type { App, Screen } from '../app';
@@ -47,6 +53,16 @@ interface CameraProbeState {
   remainingMs?: number;
   report?: CameraProbeReport;
   error?: string;
+}
+
+interface LensProbeState {
+  state: 'idle' | 'running' | 'done' | 'error';
+  step?: LensProbeStep;
+  detail?: string;
+  report?: LensProbeReport;
+  error?: string;
+  /** Asked after the run: the page cannot detect it. */
+  shutterSound?: boolean;
 }
 
 interface MotionTest {
@@ -92,6 +108,10 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
   const probe: CameraProbeState = { state: 'idle' };
   const probeVideo = h('video', { class: 'probe-video', playsinline: true, muted: true, autoplay: true, 'aria-label': 'Camera preview' });
   let probeCamera: CameraCapture | null = null;
+  const lensProbe: LensProbeState = { state: 'idle' };
+  const lensVideo = h('video', { class: 'probe-video', playsinline: true, muted: true, autoplay: true, 'aria-label': 'Camera preview' });
+  const lensVideo2 = h('video', { class: 'probe-video', playsinline: true, muted: true, 'aria-label': 'Second camera preview' });
+  let lensCamera: CameraCapture | null = null;
   const body = h('div', { class: 'diag-body' }, h('div', { class: 'list-loading' }, spinner('md', 'Collecting diagnostics')));
   const copyBtn = button({ label: 'Copy', icon: 'copy', variant: 'ghost', size: 'sm', testId: 'diag-copy', onClick: () => void copy() });
   copyBtn.disabled = true;
@@ -116,6 +136,7 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
       diagnostics: diag,
       motionTest,
       cameraProbe: probe.report ?? (probe.error ? { error: probe.error } : null),
+      lensProbe: lensProbe.report ? { ...lensProbe.report, shutterSound: lensProbe.shutterSound ?? null } : lensProbe.error ? { error: lensProbe.error } : null,
     };
   }
 
@@ -397,7 +418,7 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
   }
 
   function runProbe(mode: ProbeMode): void {
-    if (probe.state === 'running') return;
+    if (probe.state === 'running' || lensProbe.state === 'running') return;
     const cfg = PROBE_MODES[mode];
     probe.state = 'running';
     probe.mode = mode;
@@ -477,12 +498,112 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
         variant: 'secondary',
         size: 'md',
         block: true,
-        disabled: running,
+        disabled: running || lensProbe.state === 'running',
         testId: `diag-camera-probe-${mode}`,
         onClick: () => runProbe(mode),
       }),
     );
     return section('Camera timing', ...rows, ...buttons);
+  }
+
+  function runLensPhotoProbe(): void {
+    if (lensProbe.state === 'running' || probe.state === 'running') return;
+    Object.assign(lensProbe, { state: 'running', step: 'lenses', detail: 'Opening the camera', report: undefined, error: undefined, shutterSound: undefined });
+    render();
+    const cam = new CameraCapture();
+    lensCamera = cam;
+    // start() inside the tap; no restart: opening a second camera may end this one's track
+    void cam
+      .start(lensVideo, { quality: 'balanced', restartOnInterruption: false })
+      .then(() =>
+        runLensProbe(cam, {
+          secondVideo: lensVideo2,
+          isCancelled: () => closed,
+          onProgress: (step, detail) => {
+            lensProbe.step = step;
+            lensProbe.detail = detail;
+            if (!closed) render();
+          },
+        }),
+      )
+      .then(
+        (r) => {
+          lensProbe.report = r;
+          lensProbe.state = 'done';
+        },
+        (e) => {
+          lensProbe.error = (e as Error)?.message ?? String(e);
+          lensProbe.state = 'error';
+        },
+      )
+      .finally(() => {
+        cam.stop();
+        if (lensCamera === cam) lensCamera = null;
+        if (!closed) render();
+      });
+  }
+
+  function lensProbeSection(): HTMLElement {
+    const rows: HTMLElement[] = [];
+    const r = lensProbe.report;
+    const running = lensProbe.state === 'running';
+    const mono = (text: string): HTMLElement => h('span', { class: 'mono', text });
+    if (running) {
+      rows.push(h('p', { class: 'muted', text: 'Hold the phone still, pointed at something textured, and listen: does it play a shutter sound?' }));
+      const second = lensProbe.step === 'concurrent' || lensProbe.step === 'perLens';
+      // the second camera's preview stays on screen: WebKit may pause a muted off-screen video
+      rows.push(h('div', { class: 'probe-videos' }, ...(lensProbe.step === 'perLens' ? [] : [lensVideo]), ...(second ? [lensVideo2] : [])));
+    }
+    if (lensProbe.state === 'error') rows.push(kvRow('Probe', chip(lensProbe.error ?? 'Failed', 'bad')));
+    if (r) {
+      const p = r.photo;
+      const c = r.concurrent;
+      const verdict: Record<typeof c.verdict, [string, Tone]> = {
+        'both-ran': ['Yes', 'good'],
+        'first-stopped': ['No: the first stopped', 'warn'],
+        'second-failed': ['Second failed to open', 'warn'],
+        'second-no-frames': ['Second gave no frames', 'warn'],
+        'not-run': ['Not tested', 'neutral'],
+      };
+      const gaps = p.shots.map((s) => s.videoMaxGapMs).filter((g): g is number => g !== null);
+      rows.push(
+        group(
+          kvRow('Rear cameras', mono(String(r.lenses.filter((l) => l.facing === 'back').length))),
+          kvRow('Photo size', p.available ? mono(p.sizes.join(', ') || '–') : chip('Unavailable', 'warn')),
+          kvRow('Photo latency', mono(p.latencyMs ? `p50 ${formatMs(p.latencyMs.p50)} · max ${formatMs(p.latencyMs.max)}` : '–')),
+          kvRow('Video gap during photos', mono(gaps.length ? formatMs(Math.max(...gaps)) : '–')),
+          kvRow('Two cameras at once', chip(...verdict[c.verdict])),
+        ),
+        ...r.summary.map((s) => h('p', { class: 'muted', text: s })),
+      );
+      if (p.shots.some((s) => !s.error)) {
+        const answer = (yes: boolean): HTMLElement =>
+          button({
+            label: yes ? 'Yes' : 'No',
+            variant: lensProbe.shutterSound === yes ? 'primary' : 'secondary',
+            size: 'sm',
+            testId: `diag-lens-shutter-${yes ? 'yes' : 'no'}`,
+            onClick: () => {
+              lensProbe.shutterSound = yes;
+              render();
+            },
+          });
+        rows.push(kvRow('Did you hear a shutter sound?', h('span', { class: 'row-actions' }, answer(true), answer(false))));
+      }
+    }
+    rows.push(
+      button({
+        label: running ? `${lensProbe.detail ?? 'Running'}…` : 'Lens & photo probe (≈30 s)',
+        icon: 'camera',
+        variant: 'secondary',
+        size: 'md',
+        block: true,
+        disabled: running || probe.state === 'running',
+        testId: 'diag-lens-probe',
+        onClick: runLensPhotoProbe,
+      }),
+    );
+    return section('Lenses & photos', ...rows);
   }
 
   function render(): void {
@@ -597,6 +718,7 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
     });
     sections.push(section('Motion', group(...motionRows), motionBtn));
     sections.push(probeSection());
+    sections.push(lensProbeSection());
 
     const s = g.storage;
     sections.push(
@@ -645,6 +767,7 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
       closed = true;
       benchRun?.cancel('Diagnostics was closed');
       probeCamera?.stop();
+      lensCamera?.stop();
       if (benchTimer) clearInterval(benchTimer);
       d.dispose();
     },

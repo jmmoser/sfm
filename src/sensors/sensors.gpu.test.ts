@@ -5,6 +5,7 @@
 import { afterAll, describe, expect, it } from 'vitest';
 import { CameraCapture, type FrameMeta } from './camera';
 import { runCameraTimingProbe } from './camera-probe';
+import { runLensProbe } from './lens-probe';
 import { frameToBitmap } from '../engine/engine';
 import { collectDiagnostics } from './diagnostics';
 import { ScreenAngleTracker, screenAngle } from './frame-orientation';
@@ -271,6 +272,31 @@ describe('camera timing probe (fake camera, real worker)', () => {
     } finally {
       cam.stop();
     }
+  });
+});
+
+describe('lens & photo probe (fake camera)', () => {
+  it('takes photos on the running track, reads their size and stops the camera', async () => {
+    const video = document.createElement('video');
+    document.body.appendChild(video);
+    videos.push(video);
+    const cam = new CameraCapture();
+    await cam.start(video, { quality: 'fast', restartOnInterruption: false });
+    const steps: string[] = [];
+    const r = await runLensProbe(cam, { shots: 2, concurrentMs: 500, onProgress: (step) => steps.push(step) });
+    expect(r.lenses.length).toBeGreaterThan(0);
+    expect(r.photo.videoFps).toBeGreaterThan(5);
+    if (typeof (globalThis as { ImageCapture?: unknown }).ImageCapture === 'function') {
+      expect(r.photo.available).toBe(true);
+      const ok = r.photo.shots.filter((s) => !s.error);
+      expect(ok.length, JSON.stringify(r.photo.shots)).toBeGreaterThan(0);
+      expect(ok[0].size, JSON.stringify(r.photo.shots)).toMatch(/^\d+x\d+$/); // parsed from the JPEG's SOF
+      expect(ok[0].videoMaxGapMs).not.toBeNull();
+    }
+    expect(steps).toContain('photos');
+    expect(r.summary.length).toBeGreaterThan(1);
+    expect(cam.track).toBeNull(); // the probe stops the camera
+    expect(document.querySelectorAll('video').length).toBe(videos.length); // its second <video> is gone
   });
 });
 
