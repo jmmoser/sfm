@@ -432,106 +432,110 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   let done = resumePass * ordered.length;
   let skipped = 0;
   const tDepth = now();
-  for (let pass = resumePass; pass < passes; pass++) {
-    await setProgress(pass);
-    cur = new EngineDepthStore(backend, `pm${pass}`, 0);
-    const have = new Set(persistent && pass === resumePass ? await cur.scan() : []);
-    // last reference (index in `ordered`) that reads each previous-pass map
-    const lastUse = new Map<number, number>();
-    if (pass > 0) ordered.forEach((g, i) => [g.id, ...sel.get(g.id)!.sources].forEach((id) => lastUse.set(id, i)));
-    const releasePrev = async (i: number): Promise<void> => {
-      if (!prev) return;
-      const gi = ordered[i];
-      const ids = [gi.id, ...sel.get(gi.id)!.sources];
-      for (const id of ids) {
-        if (lastUse.get(id) !== i) continue;
-        srcDepth.delete(id);
-        await prev.delete(id);
-      }
-    };
-    for (let i = 0; i < ordered.length; i++) {
-      const g = ordered[i];
-      check('depth_maps');
-      if (have.has(g.id)) {
-        skipped++;
-        done++;
-        await releasePrev(i);
-        continue;
-      }
-      const s = sel.get(g.id)!;
-      const ref = await loadView(g.id);
-      const srcs: DenseView[] = [];
-      for (const sid of s.sources) srcs.push(await loadView(sid));
-      const range = { min: s.depthMin, max: s.depthMax };
-      let geometric: { prior: DepthMap; sourceDepths: DepthMap[] } | undefined;
-      if (pass > 0 && prev) {
-        const prior = await prev.get(g.id);
-        if (!prior) {
+  try {
+    for (let pass = resumePass; pass < passes; pass++) {
+      await setProgress(pass);
+      cur = new EngineDepthStore(backend, `pm${pass}`, 0);
+      const have = new Set(persistent && pass === resumePass ? await cur.scan() : []);
+      // last reference (index in `ordered`) that reads each previous-pass map
+      const lastUse = new Map<number, number>();
+      if (pass > 0) ordered.forEach((g, i) => [g.id, ...sel.get(g.id)!.sources].forEach((id) => lastUse.set(id, i)));
+      const releasePrev = async (i: number): Promise<void> => {
+        if (!prev) return;
+        const gi = ordered[i];
+        const ids = [gi.id, ...sel.get(gi.id)!.sources];
+        for (const id of ids) {
+          if (lastUse.get(id) !== i) continue;
+          srcDepth.delete(id);
+          await prev.delete(id);
+        }
+      };
+      for (let i = 0; i < ordered.length; i++) {
+        const g = ordered[i];
+        check('depth_maps');
+        if (have.has(g.id)) {
+          skipped++;
+          done++;
           await releasePrev(i);
           continue;
         }
-        const sourceDepths: DepthMap[] = [];
-        const p0 = prev;
-        for (const sid of s.sources) {
-          const d = await srcDepth.getOrLoad(sid, async () => depthOnly(await p0.get(sid)));
-          sourceDepths.push(d.width > 0 ? d : emptyDepth());
-        }
-        geometric = { prior, sourceDepths };
-      }
-      const pmOpts =
-        pass === 0
-          ? { ...(preset.patchMatch ?? {}), iterations: preset.iterations }
-          : { ...(preset.patchMatch ?? {}), geometric: true, geometricIterations: preset.geometricIterations };
-      let dm: DepthMap;
-      const tv = now();
-      if (pm) {
-        await deps.waitVisible();
-        try {
-          const inst: PatchMatchGPU = pm;
-          dm = await deps.gpuLock(() => inst.compute(ref, srcs, range, pmOpts, geometric));
-        } catch (e) {
-          if (!isDeviceLost(e)) throw e;
-          deps.log('warn', `PatchMatchGPU: device lost — recreating (${(e as Error)?.message ?? e})`);
-          deps.holder.reset();
-          pm = await deps.holder.get();
-          if (!pm) {
-            const err = new Error(`GPU device lost during dense reconstruction: ${(e as Error)?.message ?? e}`) as Error & { code?: string };
-            err.name = 'GPUDeviceLostError';
-            err.code = 'gpu-lost';
-            throw err;
+        const s = sel.get(g.id)!;
+        const ref = await loadView(g.id);
+        const srcs: DenseView[] = [];
+        for (const sid of s.sources) srcs.push(await loadView(sid));
+        const range = { min: s.depthMin, max: s.depthMax };
+        let geometric: { prior: DepthMap; sourceDepths: DepthMap[] } | undefined;
+        if (pass > 0 && prev) {
+          const prior = await prev.get(g.id);
+          if (!prior) {
+            await releasePrev(i);
+            continue;
           }
-          const inst: PatchMatchGPU = pm;
-          dm = await deps.gpuLock(() => inst.compute(ref, srcs, range, pmOpts, geometric));
+          const sourceDepths: DepthMap[] = [];
+          const p0 = prev;
+          for (const sid of s.sources) {
+            const d = await srcDepth.getOrLoad(sid, async () => depthOnly(await p0.get(sid)));
+            sourceDepths.push(d.width > 0 ? d : emptyDepth());
+          }
+          geometric = { prior, sourceDepths };
         }
-      } else {
-        dm = patchMatchCPU(ref, srcs, range, pmOpts, geometric);
-      }
-      geometric = undefined;
-      if (halo && pass === passes - 1) {
-        try {
-          const skyUp = skyUpOf(g.id, g.pose);
-          dm = skyUp ? halo(dm, ref.image, ref.cam, { skyUp }) : halo(dm, ref.image, ref.cam);
-        } catch (e) {
-          deps.log('warn', `depth halo filter failed: ${(e as Error)?.message ?? e}`);
+        const pmOpts =
+          pass === 0
+            ? { ...(preset.patchMatch ?? {}), iterations: preset.iterations }
+            : { ...(preset.patchMatch ?? {}), geometric: true, geometricIterations: preset.geometricIterations };
+        let dm: DepthMap;
+        const tv = now();
+        if (pm) {
+          await deps.waitVisible();
+          try {
+            const inst: PatchMatchGPU = pm;
+            dm = await deps.gpuLock(() => inst.compute(ref, srcs, range, pmOpts, geometric));
+          } catch (e) {
+            if (!isDeviceLost(e)) throw e;
+            deps.log('warn', `PatchMatchGPU: device lost — recreating (${(e as Error)?.message ?? e})`);
+            deps.holder.reset();
+            pm = await deps.holder.get();
+            if (!pm) {
+              const err = new Error(`GPU device lost during dense reconstruction: ${(e as Error)?.message ?? e}`) as Error & { code?: string };
+              err.name = 'GPUDeviceLostError';
+              err.code = 'gpu-lost';
+              throw err;
+            }
+            const inst: PatchMatchGPU = pm;
+            dm = await deps.gpuLock(() => inst.compute(ref, srcs, range, pmOpts, geometric));
+          }
+        } else {
+          dm = patchMatchCPU(ref, srcs, range, pmOpts, geometric);
         }
+        geometric = undefined;
+        if (halo && pass === passes - 1) {
+          try {
+            const skyUp = skyUpOf(g.id, g.pose);
+            dm = skyUp ? halo(dm, ref.image, ref.cam, { skyUp }) : halo(dm, ref.image, ref.cam);
+          } catch (e) {
+            deps.log('warn', `depth halo filter failed: ${(e as Error)?.message ?? e}`);
+          }
+        }
+        await cur.put(g.id, dm);
+        await releasePrev(i);
+        done++;
+        report('depth_maps', done / total, `${pass === 0 ? 'photometric' : `geometric ${pass}`} ${done}/${total} (${Math.round(now() - tv)} ms)`);
+        await tick();
       }
-      await cur.put(g.id, dm);
-      await releasePrev(i);
-      done++;
-      report('depth_maps', done / total, `${pass === 0 ? 'photometric' : `geometric ${pass}`} ${done}/${total} (${Math.round(now() - tv)} ms)`);
-      await tick();
+      if (prev) await prev.clear();
+      srcDepth.clear();
+      prev = cur;
     }
-    if (prev) await prev.clear();
-    srcDepth.clear();
-    prev = cur;
+  } finally {
+    // PatchMatchGPU's buffers (≈ 32 B per reference px + 5 B per source px: ~140 MB at 1600 px) are
+    // not needed for fusion / meshing, nor kept after a cancel or failure: free them (recreated by
+    // the next densify)
+    if (pm) deps.holder.reset();
   }
   if (skipped) stats.denseResumedMaps = skipped;
   stats.depthMapsMs = Math.round(now() - tDepth);
   const finalStore = cur!;
   cache.clear();
-  // PatchMatchGPU's buffers (≈ 32 B per reference px + 5 B per source px: ~140 MB at 1600 px) are
-  // not needed for fusion / meshing: free them (recreated by the next densify)
-  if (pm) deps.holder.reset();
   await setProgress(passes);
 
   // ---- fusion
