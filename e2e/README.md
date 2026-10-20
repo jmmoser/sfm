@@ -1625,6 +1625,13 @@ thread) plus the extra pipelines.
   tree crowns and the ground behind the fence from +1.5 m). Depth supervision closes ≈ 0.5–0.9 dB of the yard's
   8.3–11 dB height gap; it cannot invent unseen surfaces.
 
+End-to-end check with the new default (`E2E_GPU=host node e2e/run-e2e.mjs object-real --engine worker --splat --tag
+gr-final`: a fresh non-persistent run, depth maps from the scratch IndexedDB store): "geometry targets for 40 of 90
+views (1/2 size) in 1114 ms", splat stage 60.3 s (prepare 12.4 + train 47.7 s at 64.1 it/s), memory plan 863 MB
+(GPU 353 MB; 811 / 301 MB in the "Splat stage in the engine" run), every enforced check passes. Splat full-frame PSNR:
+held-out 31.30, −5 / +5 / +12 / +25 cm 30.47 / 28.91 / 27.16 / 22.40 dB (that section's run: 31.29; 30.20 / 28.63 /
+26.80 / 22.14 dB).
+
 Reproduce (after the two `gr-base` runs above; ≈ 5 min per variant and scene with all six sets):
 
 ```sh
