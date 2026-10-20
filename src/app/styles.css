@@ -2332,6 +2332,108 @@ h3 {
   color: var(--text-2);
 }
 
+/* Photoreal build progress (same place as the resume cards; hidden while measuring). */
+.viewer-job {
+  position: absolute;
+  top: calc(var(--safe-t) + 70px);
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: min(440px, calc(100vw - 24px));
+  padding: 10px 8px 10px 14px;
+  border-radius: 20px;
+  background: var(--glass-strong);
+  -webkit-backdrop-filter: blur(24px);
+  backdrop-filter: blur(24px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.viewer-screen.measuring .viewer-job {
+  display: none;
+}
+
+.viewer-job-icon {
+  display: inline-flex;
+  flex: none;
+  color: var(--accent);
+}
+
+.viewer-job-text {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  flex: 1;
+  min-width: 0;
+}
+
+.viewer-job-title {
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.viewer-job-sub {
+  font-size: 12.5px;
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Layer pill (Splats / Points / Mesh) above the toolbar. */
+.layer-switch {
+  position: absolute;
+  left: 50%;
+  bottom: calc(var(--safe-b) + 14px + 84px);
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 17px;
+  background: var(--glass-strong);
+  -webkit-backdrop-filter: blur(24px) saturate(1.5);
+  backdrop-filter: blur(24px) saturate(1.5);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: var(--shadow-1);
+}
+
+.layer-switch .segmented {
+  min-width: calc(var(--seg-count) * 82px);
+  padding: 0;
+  background: transparent;
+}
+
+.layer-switch .segmented::before {
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: calc(100% / var(--seg-count));
+  border-radius: 13px;
+}
+
+.layer-switch .segment {
+  border-radius: 13px;
+  font-size: 14px;
+}
+
+.layer-status {
+  display: none;
+  padding: 0 8px 0 4px;
+}
+
+.layer-switch.loading .layer-status {
+  display: inline-flex;
+}
+
+.section-note {
+  margin: 8px 4px 0;
+  font-size: 13px;
+  color: var(--text-3);
+}
+
 .row-note {
   min-height: 0;
   padding-top: 0;

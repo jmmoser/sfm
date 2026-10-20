@@ -116,6 +116,8 @@ export class MockEngine implements EngineLike {
   private splatOut: { model: SplatModel; info: SplatResult } | null = null;
   /** A splat run was cancelled at this iteration: the next one resumes there (stats.splatResumableIteration). */
   private splatResumable: number | null = null;
+  /** Quality of that run (stats.splatResumableQuality; another quality starts over). */
+  private splatResumableQuality: QualityPreset | null = null;
   private sessionId: string | null = null;
   private sessionName = 'Mock scan';
   private readonly live = new Emitter<LiveUpdate>();
@@ -199,6 +201,7 @@ export class MockEngine implements EngineLike {
     this.meshModel = null;
     this.splatOut = null;
     this.splatResumable = null;
+    this.splatResumableQuality = null;
     this.cancelled = false;
     this.memoryLimitHit = false;
     this.denseResumablePass = null;
@@ -493,6 +496,7 @@ export class MockEngine implements EngineLike {
       this.denseResumableQuality = null;
       this.splatOut = null; // … and the splats
       this.splatResumable = null;
+      this.splatResumableQuality = null;
       return this.sparse;
     });
   }
@@ -574,13 +578,16 @@ export class MockEngine implements EngineLike {
         this.progressE.emit(e);
       };
       await this.stage(SPLAT_STAGES.prepare, 700, onProgress, 'initial Gaussians');
-      const start = options?.restart ? 0 : (this.splatResumable ?? 0);
+      // like the engine's run key: only the same settings resume
+      const sameRun = !this.splatResumableQuality || this.splatResumableQuality === q;
+      const start = options?.restart || !sameRun ? 0 : (this.splatResumable ?? 0);
       const ms = (2600 * (q === 'fast' ? 0.6 : q === 'max' ? 1.6 : 1)) / this.speed;
       let elapsed = (ms * start) / iterations;
       let it = start;
       while (it < iterations) {
         if (this.cancelled) {
           this.splatResumable = it;
+          this.splatResumableQuality = q;
           throw namedError(ENGINE_ERRORS.cancelled, 'Cancelled');
         }
         if (this.disposed) throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');
@@ -592,23 +599,49 @@ export class MockEngine implements EngineLike {
         emit({ stage: SPLAT_STAGES.training, progress: it / iterations, message: `iteration ${it}/${iterations}`, detail: { iteration: it, iterations, loss, itPerSec: Math.round((1000 * iterations) / ms), gaussians: 20_000 + Math.round(it * 10) } });
       }
       this.splatResumable = null;
+      this.splatResumableQuality = null;
       // like the engine: a cancel arriving now is ignored (the training is complete)
       emit({ stage: SPLAT_STAGES.finishing, progress: 0, message: 'saving' });
       await sleep(300 / this.speed);
       emit({ stage: SPLAT_STAGES.finishing, progress: 1 });
       const model = this.mockSplats(this.denseCloud ?? this.sparse.points);
-      const info: SplatResult = {
-        count: model.count,
-        iterations,
-        ms: Math.round(performance.now() - t0),
-        shDegree: 0,
-        bytes: 56 * model.count,
-        antialiased: true,
-        stats: { splatViews: this.sparse.cameras.length, splatIterations: iterations, splatItPerSec: 40, ...(start ? { splatResumedFrom: start } : {}) },
-      };
+      const info = this.splatInfo(model, iterations, Math.round(performance.now() - t0));
+      if (start) info.stats.splatResumedFrom = start;
       this.splatOut = { model, info };
       return info;
     });
+  }
+
+  private splatInfo(model: SplatModel, iterations: number, ms: number): SplatResult {
+    return {
+      count: model.count,
+      iterations,
+      ms,
+      shDegree: model.shDegree,
+      bytes: 56 * model.count,
+      antialiased: true,
+      stats: { splatViews: this.sparse?.cameras.length ?? 0, splatIterations: iterations, splatItPerSec: 40, splatTrainMs: ms },
+    };
+  }
+
+  /**
+   * Test hook (e2e/ui/splat-shots.mjs): make session `id` hold REAL models — e.g. an e2e run's
+   * sparse / dense / mesh / splats decoded in the page — so the viewer screen shows them (the
+   * next loadSession(id) returns them as the in-memory session).
+   */
+  injectSession(id: string, o: { name: string; mode: 'object' | 'scene'; sparse: SparseResult; dense: PointCloud | null; mesh: TriangleMesh | null; splat: SplatModel | null }): void {
+    this.options = { mode: o.mode, quality: 'fast', sessionId: id, persist: true };
+    this.sessionId = id;
+    this.reset(o.mode, 'fast');
+    this.keyframes = o.sparse.cameras.map((c, i) => ({ s: i / Math.max(1, o.sparse.cameras.length - 1), pose: { pose: c.pose, intrinsics: c.intrinsics } }));
+    this.captureDone = true;
+    this.sparse = o.sparse;
+    this.denseCloud = o.dense;
+    this.meshModel = o.mesh;
+    this.splatOut = o.splat ? { model: o.splat, info: this.splatInfo(o.splat, 3000, 0) } : null;
+    this.splatResumable = null;
+    this.sessionName = o.name;
+    this.setState('ready');
   }
 
   /** One isotropic Gaussian per point (σ from the point radius, else 0.4 % of the scene). */
@@ -768,6 +801,17 @@ export class MockEngine implements EngineLike {
         if (st === 'sparse' || st === 'dense' || st === 'meshed') this.sparse = this.buildSparse(kf, {});
         if (st === 'dense' || st === 'meshed') this.denseCloud = scene.dense(this.sizes.dense);
         if (st === 'meshed') this.meshModel = scene.mesh();
+        // the splats persist like the engine's splat/model (the app records their size)
+        const sg = meta.stats?.splatGaussians;
+        if (typeof sg === 'number' && sg > 0 && this.sparse) {
+          const it = meta.stats?.splatIterations;
+          const model = this.mockSplats(this.denseCloud ?? this.sparse.points);
+          this.splatOut = { model, info: this.splatInfo(model, typeof it === 'number' ? it : 3000, 0) };
+        }
+        const sr = meta.stats?.splatResumableIteration;
+        if (typeof sr === 'number' && this.sparse) this.splatResumable = sr;
+        const sq = meta.stats?.splatResumableQuality;
+        if (sq === 'fast' || sq === 'balanced' || sq === 'max') this.splatResumableQuality = sq;
         const rp = meta.stats?.denseResumablePass;
         if (typeof rp === 'number' && this.sparse && !this.denseCloud) this.denseResumablePass = rp;
         const rq = meta.stats?.denseResumableQuality;
@@ -792,6 +836,7 @@ export class MockEngine implements EngineLike {
         stats: {
           ...(this.sparse?.stats ?? {}),
           ...(this.splatResumable !== null ? { splatResumableIteration: this.splatResumable } : {}),
+          ...(this.splatResumable !== null && this.splatResumableQuality ? { splatResumableQuality: this.splatResumableQuality } : {}),
           ...(this.denseResumablePass !== null ? { denseResumablePass: this.denseResumablePass } : {}),
           ...(this.denseResumablePass !== null && this.denseResumableQuality ? { denseResumableQuality: this.denseResumableQuality } : {}),
         },
@@ -856,6 +901,7 @@ export class MockEngine implements EngineLike {
     this.meshModel = null;
     this.splatOut = null;
     this.splatResumable = null;
+    this.splatResumableQuality = null;
     this.denseResumablePass = null;
     this.denseResumableQuality = null;
   }
