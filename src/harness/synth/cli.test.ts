@@ -25,6 +25,10 @@ describe('generate-synth CLI', () => {
     // defaults
     c = sceneConfig('object', parseArgs(['object']));
     expect([c.frames, c.duration, c.fps]).toEqual([200, 25, 8]);
+    // --duration 0 would give fps = Infinity (every frame at t = 0), a negative one a single frame
+    expect(parseArgs(['--duration', '10']).duration).toBe(10);
+    expect(() => parseArgs(['object', '--frames', '50', '--duration', '0'])).toThrow(CliError);
+    expect(() => parseArgs(['object', '--duration', '-5'])).toThrow(CliError);
   });
 
   it('options map onto SynthConfig (incl. --set dotted paths) and resolve cleanly', () => {

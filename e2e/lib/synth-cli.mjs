@@ -89,6 +89,7 @@ export function parseArgs(argv) {
   }
   if (o.frames !== undefined && !(o.frames >= 1)) throw new CliError('--frames must be ≥ 1');
   if (o.fps !== undefined && !(o.fps > 0)) throw new CliError('--fps must be > 0');
+  if (o.duration !== undefined && !(o.duration > 0)) throw new CliError('--duration must be > 0 (s)');
   if (o.rsReadoutMs !== undefined && !(o.rsReadoutMs >= 0)) throw new CliError('--rs-readout must be ≥ 0 (ms)');
   if (o.rsBands !== undefined && !(o.rsBands >= 1)) throw new CliError('--rs-bands must be ≥ 1');
   if (o.focusBreathing !== undefined && !(o.focusBreathing >= 0 && o.focusBreathing < 0.1)) throw new CliError('--focus-breathing must be in [0, 0.1) (0.006 = ±0.6 %)');

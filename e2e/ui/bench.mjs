@@ -21,6 +21,14 @@ const argv = process.argv.slice(2);
 const scaleIdx = argv.indexOf('--scale');
 const scale = scaleIdx >= 0 ? argv[scaleIdx + 1] : 'small';
 const args = argv.filter((a, i) => !a.startsWith('--') && argv[i - 1] !== '--scale');
+const SCENARIOS = ['run', 'cancel', 'no-webgpu', 'loaded'];
+// A misspelled name (or `full` without --scale) would run nothing and still pass.
+const unknown = args.filter((a) => !SCENARIOS.includes(a));
+if (unknown.length || !['small', 'full'].includes(scale)) {
+  if (unknown.length) console.error(`[bench] unknown scenario(s): ${unknown.join(', ')}\n[bench] known: ${SCENARIOS.join(', ')}`);
+  else console.error(`[bench] --scale must be small | full, got ${scale}`);
+  process.exit(2);
+}
 const want = (n) => !args.length || args.includes(n);
 const { newPage, close, consoleErrors, base } = await launch({ verbose: argv.includes('--verbose') });
 const failures = [];
@@ -35,6 +43,7 @@ const url = (extra = '') => `${base}?mock=1&screen=diagnostics&benchScale=${scal
 const TIMEOUT = scale === 'full' ? 3_600_000 : 900_000;
 
 async function scenario(name, fn) {
+  if (!SCENARIOS.includes(name)) throw new Error(`scenario ${name} is missing from SCENARIOS`);
   if (!want(name)) return;
   console.log(`[bench] — ${name}`);
   try {

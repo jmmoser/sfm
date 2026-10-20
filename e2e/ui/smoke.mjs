@@ -273,5 +273,9 @@ try {
 const errs = consoleErrors.filter((e) => !/favicon/i.test(e));
 check(errs.length === 0, `no console errors (got ${errs.length}: ${errs.slice(0, 5).join(' | ')})`);
 step(failures.length ? `FAILED (${failures.length})` : 'OK');
-if (!process.argv.includes('--keep-open')) await close();
+if (process.argv.includes('--keep-open')) {
+  console.log(`[ui] --keep-open: dev server at ${base} (Ctrl+C to quit)`);
+  await new Promise((res) => process.once('SIGINT', res));
+}
+await close();
 process.exit(failures.length ? 1 : 0);
