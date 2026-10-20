@@ -49,6 +49,8 @@ export interface NvsPageView {
   camera: CameraIntrinsics;
   /** Camera angular velocity (rad/s, camera frame) for the rolling-shutter correction. */
   omega: number[] | null;
+  /** Translational term of that correction (camera-frame velocity / depth, 1/s); null = rotation only. */
+  nu?: number[] | null;
 }
 
 export interface NvsSetupResult {
@@ -188,7 +190,7 @@ async function view(v: NvsPageView): Promise<NvsViewResult> {
   const rgba = await decodeJPEG(`${cfg.dataBase}${v.file}`);
   // exactly the engine's dense view (src/engine/dense.ts denseViewImage): undistort, then RS-correct
   const und = undistortImage(rgba, v.camera, cfg.maxSize);
-  const gt = cfg.rs && v.omega ? rsCorrectPinholeImage(und.image, und.cam, v.omega, cfg.rs) : und.image;
+  const gt = cfg.rs && v.omega ? rsCorrectPinholeImage(und.image, und.cam, v.omega, cfg.rs, v.nu ?? null) : und.image;
   const { width: W, height: H } = und.cam;
   const cam: NvsCamera = { width: W, height: H, fx: und.cam.f, fy: und.cam.f, cx: und.cam.cx, cy: und.cam.cy, R: v.pose.R, t: v.pose.t };
   const res: NvsViewResult = {

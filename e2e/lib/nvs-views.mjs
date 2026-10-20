@@ -15,8 +15,10 @@
 //      'relative' (default): the nearest keyframe's refined per-image focal × f_f^gt / f_k^gt (GT
 //        focus breathing of the -real sets; ratio 1 without per-frame GT focal);
 //      'keyframe': the nearest keyframe's refined per-image focal;  'shared': the run's camera f;
-//  - the camera angular velocity (gyro at the true frame time, camera frame: ω_cam = R_cam_device·ω_dev)
-//    for the rolling-shutter correction of the ground-truth image.
+//  - the rolling-shutter motion of the ground-truth image: camera angular velocity (gyro at the true
+//    frame time, camera frame: ω_cam = R_cam_device·ω_dev) and, with a GT focus distance (-real
+//    sets), the translational term ν = camera-frame velocity of the centre (central difference of the
+//    neighbouring GT frames) / focus distance — the engine corrects its dense views with both.
 import { mat3Mul, mat3T, mat3Vec, umeyama } from './linalg.mjs';
 
 export function cameraCenter(pose) {
@@ -114,6 +116,24 @@ export function cameraOmega(meta, imu, frame) {
 }
 
 /**
+ * Translational rolling-shutter term of a frame (`rsCorrectPinholeImage`'s ν, 1/s): camera-frame
+ * velocity of the camera centre (central difference of the neighbouring GT frames) divided by the
+ * frame's GT focus distance (the AF depth: median z of the central image region). Null without a
+ * focus distance or neighbours.
+ */
+export function cameraNu(framesByIndex, frame) {
+  const a = framesByIndex.get(frame.index - 1) ?? frame,
+    b = framesByIndex.get(frame.index + 1) ?? frame;
+  if (a === b || !(frame.focusDistance > 0)) return null;
+  const dt = ((b.tTrue ?? b.t) - (a.tTrue ?? a.t)) / 1000;
+  if (!(dt > 0)) return null;
+  const ca = cameraCenter(a.pose),
+    cb = cameraCenter(b.pose);
+  const vc = mat3Vec(frame.pose.R, [(cb[0] - ca[0]) / dt, (cb[1] - ca[1]) / dt, (cb[2] - ca[2]) / dt]);
+  return vc.map((v) => v / frame.focusDistance);
+}
+
+/**
  * Rolling-shutter model ({ axis: 'rows' | 'cols', readoutMs signed along +v / +u }) of the run
  * (`sparse.stats.rollingShutter`, e.g. "cols -21.5 ms"); null when it estimated none.
  */
@@ -151,9 +171,9 @@ export function denseImageSize(result) {
 /**
  * Test views of a run. dataset: { meta, frames, imu? }; result: the run's result.json.
  * opts: { views = 24, pose = 'relative' | 'sim3', focal = 'relative' | 'keyframe' | 'shared',
- *         keepBlurred = false, frames?: number[] (explicit frame indices) }.
+ *         keepBlurred = false, frames?: number[] (explicit frame indices), rsTranslation = true }.
  * Returns { sim3, candidates, views: [{ index, file, tTrue, nearestKeyframe, gap, pose: {R, t},
- *   camera: {f, cx, cy, k1, k2, width, height}, omega, gt: {f, gain, wb, rsPx, blurPx, omega} }] }.
+ *   camera: {f, cx, cy, k1, k2, width, height}, omega, nu, gt: {f, gain, wb, rsPx, blurPx, omega} }] }.
  */
 export function testViews(dataset, result, opts = {}) {
   const { meta, frames, imu } = dataset;
@@ -182,6 +202,7 @@ export function testViews(dataset, result, opts = {}) {
     if (focalMode === 'keyframe') fx = keyFocal(k);
     else if (focalMode === 'relative') fx = keyFocal(k) * (f.f > 0 && gk.f > 0 ? f.f / gk.f : 1);
     const omega = imu ? cameraOmega(meta, imu, f) : null;
+    const nu = opts.rsTranslation === false ? null : cameraNu(byIndex, f);
     return {
       index: f.index,
       file: f.file,
@@ -191,6 +212,7 @@ export function testViews(dataset, result, opts = {}) {
       pose,
       camera: { f: fx, cx: intr.cx, cy: intr.cy, k1: intr.k1 ?? 0, k2: intr.k2 ?? 0, width: W, height: H },
       omega,
+      nu,
       gt: { f: f.f ?? meta.intrinsics?.f ?? null, gain: f.gain ?? null, wb: f.wb ?? null, rsPx: f.rsPx ?? null, blurPx: f.blurPx ?? null, omega: f.omega ?? null },
     };
   });

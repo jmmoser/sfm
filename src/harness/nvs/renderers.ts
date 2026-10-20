@@ -117,17 +117,67 @@ export class ViewerRenderers {
  * where `ply` is the run's splats.ply (INRIA 3DGS layout: x y z nx ny nz f_dc_0..2 f_rest_*
  * opacity scale_0..2 rot_0..3, in the run's world frame) and `render(cam)` returns RGBA8 rows top
  * to bottom with premultiplied alpha (accumulated opacity), at cam.width × cam.height (the test
- * camera's pinhole fx, fy, cx, cy and world-to-camera R, t). Absent module ⇒ the 'splat' renderer
- * is skipped with a reason. `import.meta.glob` resolves to an empty map when the file does not
- * exist, so this compiles and runs without it.
+ * camera's pinhole fx, fy, cx, cy and world-to-camera R, t). Without it, an adapter tries the
+ * module's public API as drafted (`src/splat/index.ts`: `SplatRenderer.create(gpu, opts)`,
+ * `setModel`, `render(cam, { background })` → RGBA float with the transmittance in A, and
+ * `decodeSplatPLY`). Neither ⇒ the 'splat' renderer is skipped with a reason.
+ * `import.meta.glob` resolves to an empty map when a file does not exist, so this compiles and runs
+ * without src/splat.
  */
-const SPLAT_MODULES = import.meta.glob('../../splat/nvs.ts');
+const SPLAT_MODULES = import.meta.glob(['../../splat/nvs.ts', '../../splat/index.ts']);
+
+type NvsFactory = (input: { ply: ArrayBuffer; width: number; height: number }) => Promise<NvsRenderer>;
+
+interface SplatModuleAPI {
+  SplatRenderer?: {
+    create(gpu: unknown, opts: { shDegree?: number; antialiased?: boolean; maxWidth: number; maxHeight: number }): Promise<{
+      setModel(model: unknown): void;
+      render(cam: NvsCamera, o?: { background?: ArrayLike<number> }): Promise<{ width: number; height: number; data: Float32Array }>;
+      destroy?(): void;
+    }>;
+  };
+  decodeSplatPLY?: (data: Uint8Array, maxDegree?: number) => { model: { shDegree: number }; antialiased: boolean };
+}
+
+/** NvsRenderer over the drafted src/splat API (see the hook comment); null when it does not match. */
+async function adaptSplatModule(mod: SplatModuleAPI, ply: ArrayBuffer, width: number, height: number): Promise<NvsRenderer | null> {
+  if (!mod.SplatRenderer?.create || !mod.decodeSplatPLY) return null;
+  const { getGPU } = await import('../../gpu/device');
+  const gpu = await getGPU();
+  if (!gpu) throw new Error('no WebGPU device');
+  const { model, antialiased } = mod.decodeSplatPLY(new Uint8Array(ply), 3);
+  const r = await mod.SplatRenderer.create(gpu, { shDegree: model.shDegree, antialiased, maxWidth: width, maxHeight: height });
+  r.setModel(model);
+  return {
+    name: 'splat',
+    async render(cam) {
+      // black background ⇒ colour = premultiplied radiance; alpha = 1 − transmittance
+      const img = await r.render(cam, { background: [0, 0, 0] });
+      const n = img.width * img.height;
+      const out = new Uint8Array(4 * n);
+      const q = (v: number) => Math.max(0, Math.min(255, Math.round(255 * v)));
+      for (let i = 0; i < n; i++) {
+        out[4 * i] = q(img.data[4 * i]);
+        out[4 * i + 1] = q(img.data[4 * i + 1]);
+        out[4 * i + 2] = q(img.data[4 * i + 2]);
+        out[4 * i + 3] = q(1 - img.data[4 * i + 3]);
+      }
+      return out;
+    },
+    dispose: () => r.destroy?.(),
+  };
+}
 
 export async function loadSplatRenderer(ply: ArrayBuffer, width: number, height: number): Promise<NvsRenderer | { skipped: string }> {
-  const load = SPLAT_MODULES['../../splat/nvs.ts'];
-  if (!load) return { skipped: 'src/splat/nvs.ts not found (splat stage not built)' };
-  const mod = (await load()) as { createNvsRenderer?: (input: { ply: ArrayBuffer; width: number; height: number }) => Promise<NvsRenderer> };
-  if (typeof mod.createNvsRenderer !== 'function') return { skipped: 'src/splat/nvs.ts does not export createNvsRenderer' };
-  const r = await mod.createNvsRenderer({ ply, width, height });
-  return { name: 'splat', render: (cam) => r.render(cam), dispose: () => r.dispose?.() };
+  const nvs = SPLAT_MODULES['../../splat/nvs.ts'];
+  if (nvs) {
+    const mod = (await nvs()) as { createNvsRenderer?: NvsFactory };
+    if (typeof mod.createNvsRenderer !== 'function') return { skipped: 'src/splat/nvs.ts does not export createNvsRenderer' };
+    const r = await mod.createNvsRenderer({ ply, width, height });
+    return { name: 'splat', render: (cam) => r.render(cam), dispose: () => r.dispose?.() };
+  }
+  const index = SPLAT_MODULES['../../splat/index.ts'];
+  if (!index) return { skipped: 'src/splat not found (splat stage not built)' };
+  const r = await adaptSplatModule((await index()) as SplatModuleAPI, ply, width, height);
+  return r ?? { skipped: 'src/splat has neither nvs.ts (createNvsRenderer) nor SplatRenderer + decodeSplatPLY' };
 }

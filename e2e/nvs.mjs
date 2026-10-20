@@ -82,7 +82,7 @@ export async function runNvs(o, { log = (m) => console.log(`[nvs] ${m}`) } = {})
   const imu = (await exists(join(dsDir, 'imu.json'))) ? await readJSON(join(dsDir, 'imu.json')) : null;
   const result = await readJSON(join(runDir, 'result.json'));
 
-  const tv = testViews({ meta, frames, imu }, result, { views: o.views, frames: o.frames ?? undefined, pose: o.pose, focal: o.focal, keepBlurred: o.keepBlurred });
+  const tv = testViews({ meta, frames, imu }, result, { views: o.views, frames: o.frames ?? undefined, pose: o.pose, focal: o.focal, keepBlurred: o.keepBlurred, rsTranslation: o.rsTranslation });
   const maxSize = o.maxSize === 'full' ? 0 : o.maxSize === 'dense' ? (denseImageSize(result) ?? 0) : o.maxSize;
   let rs = null;
   if (o.rs === 'auto' || o.rs === 'run') {
@@ -99,7 +99,7 @@ export async function runNvs(o, { log = (m) => console.log(`[nvs] ${m}`) } = {})
   if (!renderers.length) throw new Error(`nothing to render in ${runDir} (no dense.ply, mesh.ply or splats.ply)`);
   log(
     `${meta.name}: ${tv.views.length} of ${tv.candidates} held-out frames (${result.images?.length ?? 0} registered), Sim3 s ${tv.sim3.s.toFixed(4)}, ` +
-      `pose ${o.pose}, focal ${o.focal}, max size ${maxSize || 'full'}, RS ${rs ? `${rs.axis} ${rs.readoutMs} ms` : 'none'}; renderers ${renderers.join(', ')}`,
+      `pose ${o.pose}, focal ${o.focal}, max size ${maxSize || 'full'}, RS ${rs ? `${rs.axis} ${rs.readoutMs} ms${o.rsTranslation ? ' + translation' : ' (rotation only)'}` : 'none'}; renderers ${renderers.join(', ')}`,
   );
   if (o.saveImages) await mkdir(outDir, { recursive: true });
 
@@ -165,7 +165,7 @@ export async function runNvs(o, { log = (m) => console.log(`[nvs] ${m}`) } = {})
     log(`setup: dense ${setup.points} points, mesh ${setup.triangles} triangles${setup.gl ? `; WebGL ${setup.gl}` : ''}`);
     const views = [];
     for (const [k, v] of tv.views.entries()) {
-      const r = await page.evaluate((x) => window.nvsView(x), { index: v.index, file: v.file, pose: v.pose, camera: v.camera, omega: v.omega });
+      const r = await page.evaluate((x) => window.nvsView(x), { index: v.index, file: v.file, pose: v.pose, camera: v.camera, omega: v.omega, nu: v.nu });
       views.push({ index: v.index, nearestKeyframe: v.nearestKeyframe, gap: v.gap, gt: v.gt, ...r });
       const s = Object.entries(r.scores).map(([n, x]) => `${n} ${f2(x.full.psnr)}/${f2(x.covered.psnr)} dB cov ${f2(x.coverage, 2)}`);
       log(`view ${k + 1}/${tv.views.length} frame ${v.index} (gap ${v.gap}): ${s.join(', ')}${Object.keys(r.errors).length ? `; errors ${JSON.stringify(r.errors)}` : ''}`);
@@ -183,7 +183,7 @@ export async function runNvs(o, { log = (m) => console.log(`[nvs] ${m}`) } = {})
       datasetDir: dsDir,
       runDir,
       createdAt: new Date().toISOString(),
-      options: { views: o.views, frames: o.frames, renderers, maxSize, pose: o.pose, focal: o.focal, rs: o.rs, keepBlurred: o.keepBlurred, background: o.background, ssim: o.ssim },
+      options: { views: o.views, frames: o.frames, renderers, maxSize, pose: o.pose, focal: o.focal, rs: o.rs, rsTranslation: o.rsTranslation, keepBlurred: o.keepBlurred, background: o.background, ssim: o.ssim },
       definitions: {
         psnr: '10·log10(255²/MSE), MSE over RGB of the scored pixels, 8-bit sRGB; mean over views',
         ssim: '11×11 Gaussian (σ 1.5), K1 0.01, K2 0.03, per RGB channel then averaged; windows restricted to the scored mask (normalised convolution)',

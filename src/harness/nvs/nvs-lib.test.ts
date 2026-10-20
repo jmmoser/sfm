@@ -20,6 +20,7 @@ import {
 } from '../../../e2e/lib/nvs-metrics.mjs';
 import {
   cameraCenter,
+  cameraNu,
   cameraOmega,
   denseImageSize,
   gtRollingShutter,
@@ -322,6 +323,13 @@ describe('nvs views', () => {
     expect(gyroAt(imu, 5)).toEqual([0.5, 1, 1.5]);
     expect(gyroAt(imu, 11)).toBeNull();
     expect(cameraOmega(meta, imu, { tTrue: 10 })).toEqual([1, -2, -3]);
+    // ν: camera moving along its own +x at 0.5 m/s, focus distance 2 m → (0.25, 0, 0) / s
+    const Rc = [0, 1, 0, 0, 0, -1, -1, 0, 0]; // camera x = world y
+    const fr = [0, 1, 2].map((i) => ({ index: i, file: '', tTrue: 100 * i, focusDistance: 2, pose: { R: Rc, t: mat3Vec(Rc, [0, 0.05 * i, 0]).map((v) => -v) } })); // centre (0, 0.05·i, 0)
+    const nu = cameraNu(new Map(fr.map((f) => [f.index, f])), fr[1])!;
+    for (let k = 0; k < 3; k++) expect(nu[k]).toBeCloseTo([0.25, 0, 0][k], 12);
+    expect(cameraNu(new Map([[1, fr[1]]]), fr[1])).toBeNull();
+    expect(cameraNu(new Map(fr.map((f) => [f.index, f])), { ...fr[1], focusDistance: undefined })).toBeNull();
     expect(runRollingShutter({ sparse: { stats: { rollingShutter: 'cols -21.5 ms' } } })).toEqual({ axis: 'cols', readoutMs: -21.5 });
     expect(runRollingShutter({ sparse: { stats: { rollingShutter: 'none' } } })).toBeNull();
     expect(gtRollingShutter({ captureArtefacts: { rollingShutter: { axis: 'cols', readoutMs: 22, firstLine: 'right column (u = W-1)' } } })).toEqual({ axis: 'cols', readoutMs: -22 });

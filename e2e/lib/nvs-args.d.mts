@@ -11,6 +11,7 @@ export interface NvsArgs {
   pose: 'relative' | 'sim3';
   focal: 'relative' | 'keyframe' | 'shared';
   rs: 'auto' | 'run' | 'gt' | 'none';
+  rsTranslation: boolean;
   keepBlurred: boolean;
   background: number[];
   ssim: boolean;

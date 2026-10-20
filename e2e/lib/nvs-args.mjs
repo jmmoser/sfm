@@ -13,6 +13,7 @@ export const NVS_USAGE = `usage: node e2e/nvs.mjs <dataset> <runDir> [options]
   --pose relative|sim3      held-out pose: nearest keyframe ∘ GT relative motion (default) or global Sim3
   --focal relative|keyframe|shared   test focal (default relative: nearest keyframe's × GT focal ratio)
   --rs auto|run|gt|none     rolling-shutter correction of the GT images (default auto = the run's model)
+  --rs-rotation-only        no translational term in that correction
   --keep-blurred            also score frames the capture rejected as blurred
   --background R,G,B        full-frame background (default 0,0,0)
   --no-ssim                 skip SSIM (faster)
@@ -22,7 +23,7 @@ export const NVS_USAGE = `usage: node e2e/nvs.mjs <dataset> <runDir> [options]
 
 export class NvsArgError extends Error {}
 
-/** Parse argv → { dataset, runDir, renderers|null, views, frames|null, maxSize, pose, focal, rs, keepBlurred, background, ssim, saveImages, out, verbose, headed, help }. */
+/** Parse argv → { dataset, runDir, renderers|null, views, frames|null, maxSize, pose, focal, rs, rsTranslation, keepBlurred, background, ssim, saveImages, out, verbose, headed, help }. */
 export function parseNvsArgs(argv) {
   const o = {
     dataset: null,
@@ -34,6 +35,7 @@ export function parseNvsArgs(argv) {
     pose: 'relative',
     focal: 'relative',
     rs: 'auto',
+    rsTranslation: true,
     keepBlurred: false,
     background: [0, 0, 0],
     ssim: true,
@@ -89,6 +91,7 @@ export function parseNvsArgs(argv) {
       case '--pose': o.pose = oneOf(['relative', 'sim3']); break;
       case '--focal': o.focal = oneOf(['relative', 'keyframe', 'shared']); break;
       case '--rs': o.rs = oneOf(['auto', 'run', 'gt', 'none']); break;
+      case '--rs-rotation-only': o.rsTranslation = false; break;
       case '--keep-blurred': o.keepBlurred = true; break;
       case '--background': {
         const v = next();
