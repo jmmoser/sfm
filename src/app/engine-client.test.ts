@@ -181,3 +181,58 @@ describe('EngineClient: superseded init / loadSession', () => {
     expect(statuses.filter((s) => s.state === 'ready')).toHaveLength(1);
   });
 });
+
+describe('EngineClient: closeSession of a scan being loaded', () => {
+  it('a load answered after the close (its engine was disposed) does not set ready', async () => {
+    const { c, workers } = client();
+    const load = c.loadSession('A').catch((e: Error) => e);
+    await flush();
+    const close = c.closeSession('A');
+    await flush();
+    expect(workers[0].methods).toEqual(['loadSession', 'close']);
+    workers[0].reply('close', true);
+    await close;
+    expect(c.status).toMatchObject({ state: 'idle', reason: 'closed' });
+    workers[0].reply('loadSession', { id: 'A' });
+    await load;
+    expect(c.status).toMatchObject({ state: 'idle', reason: 'closed' });
+  });
+
+  it('a replay of the closed scan answered after the close does not set ready', async () => {
+    const { c, workers } = client();
+    const load = c.loadSession('A');
+    await flush();
+    workers[0].reply('loadSession', { id: 'A' });
+    await load;
+    workers[0].gpuLost(); // worker 2 replays loadSession(A)
+    await flush();
+    expect(workers[1].methods).toEqual(['loadSession']);
+    const close = c.closeSession('A');
+    await flush();
+    workers[1].reply('close', true);
+    await close;
+    workers[1].reply('loadSession', { id: 'A' });
+    await flush();
+    expect(c.status).toMatchObject({ state: 'idle', reason: 'closed' });
+  });
+
+  it('a replay superseded by a newer init leaves the status to that init, also when it fails', async () => {
+    const { c, workers } = client();
+    const load = c.loadSession('A');
+    await flush();
+    workers[0].reply('loadSession', { id: 'A' });
+    await load;
+    workers[0].gpuLost(); // worker 2 replays loadSession(A)
+    await flush();
+    const init = c.init({ mode: 'object', quality: 'fast', sessionId: 'B' }).catch((e: Error) => e);
+    await flush();
+    expect(workers[1].methods).toEqual(['loadSession', 'init']);
+    workers[1].reply('loadSession', { id: 'A' }); // the replay ends after the newer init started
+    await flush();
+    expect(c.status.state).toBe('starting');
+    const req = workers[1].posted.filter((r) => r.method === 'init').at(-1)!;
+    workers[1].emit({ id: req.id, ok: false, error: { name: 'Error', message: 'compile failed' } });
+    expect(await init).toMatchObject({ message: 'compile failed' });
+    expect(c.status).toMatchObject({ state: 'idle', reason: 'compile failed' });
+  });
+});

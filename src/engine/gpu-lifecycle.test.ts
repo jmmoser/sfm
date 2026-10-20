@@ -186,6 +186,19 @@ describe('dispose() during init()', () => {
     expect(e.releasePipeline()).toBeNull();
   });
 
+  it('a loadSession overtaken by dispose() (a worker close / re-init) rejects and closes the store it opened', async () => {
+    const store = new MemoryEngineStore('late');
+    await store.ensureSession({ mode: 'object', quality: 'fast', name: 'Late' });
+    const close = vi.spyOn(store, 'close');
+    vi.spyOn(SessionEngineStore, 'isSupported').mockReturnValue(true);
+    vi.spyOn(SessionEngineStore, 'open').mockResolvedValue(store as unknown as SessionEngineStore);
+    const e = new PhotogrammetryEngine({ mode: 'object', quality: 'fast', persist: true, sessionId: 'late' }, { featureBackend: 'cpu' });
+    const run = e.loadSession('late');
+    e.dispose();
+    await expect(run).rejects.toMatchObject({ name: ENGINE_ERRORS.crashed });
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
   it('dispose(): a failed scratch-session delete is not an unhandled rejection', async () => {
     const e = new PhotogrammetryEngine({ ...OPTS });
     const close = vi.fn();

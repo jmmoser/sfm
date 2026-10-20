@@ -187,6 +187,24 @@ describe('MockEngine', () => {
     await expect(e.refine()).rejects.toMatchObject({ name: 'EngineNotInitializedError' });
   });
 
+  it('closeSession during the init or load of that scan ends it, like the worker (its engine is disposed)', async () => {
+    const meta = { id: 's1', name: 'Vase', createdAt: 1, updatedAt: 2, mode: 'object' as const, status: 'dense' as const, numFrames: 20 };
+    const e = new MockEngine({ speed: 4, sessions: async () => ({ getSession: async () => meta }) as never });
+    const init = e.init({ mode: 'object', quality: 'fast', sessionId: 'A' }).catch((err: Error) => err);
+    await e.closeSession('A');
+    expect(await init).toMatchObject({ name: 'EngineCrashedError', message: 'Engine disposed' });
+    expect(e.status).toMatchObject({ state: 'idle', reason: 'closed' });
+    const load = e.loadSession('s1').catch((err: Error) => err);
+    await e.closeSession('s1');
+    expect(await load).toMatchObject({ name: 'EngineCrashedError' });
+    expect(e.status).toMatchObject({ state: 'idle', reason: 'closed' });
+    // a close of another scan does not end an init
+    const b = e.init({ mode: 'object', quality: 'fast', sessionId: 'B' });
+    await e.closeSession('A');
+    await b;
+    expect(e.status.state).toBe('ready');
+  });
+
   it('memoryLimitKeyframes: one out-of-memory event, then tracking only (no new keyframes)', async () => {
     const e = new MockEngine({ speed: 60, memoryLimitKeyframes: 3, sessions: async () => null });
     await e.init({ mode: 'object', quality: 'fast' });

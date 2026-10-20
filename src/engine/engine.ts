@@ -470,11 +470,11 @@ export class PhotogrammetryEngine {
     if (this.disposed) throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');
     const o = this.options;
     await this.openStore(o.sessionId);
-    this.stopInitIfDisposed();
+    this.stopIfDisposed();
     // a stored session to resume whose record is gone was deleted (a respawn replaying the init of
     // a discarded scan): it must not be re-created
     const deleted = !!o.resume && this.store!.persistent && (await this.store!.getSessionMeta().catch(() => undefined)) === null;
-    this.stopInitIfDisposed();
+    this.stopIfDisposed();
     if (deleted) throw namedError('SessionNotFoundError', `Session not found: ${o.sessionId}`);
     try {
       await this.store!.ensureSession({ mode: o.mode, quality: o.quality });
@@ -482,9 +482,9 @@ export class PhotogrammetryEngine {
       this.log('warn', `could not create the session record: ${(e as Error)?.message ?? e}`);
       this.emitError(e instanceof Error ? e : new Error(String(e)), false, 'storage');
     }
-    this.stopInitIfDisposed();
+    this.stopIfDisposed();
     const pipeline = await this.ensurePipeline();
-    this.stopInitIfDisposed();
+    this.stopIfDisposed();
     this.live = this.createLive();
     let resumed = 0;
     if (o.resume) {
@@ -505,7 +505,7 @@ export class PhotogrammetryEngine {
         }
       }
     }
-    this.stopInitIfDisposed();
+    this.stopIfDisposed();
     this.initialized = true;
     this.persistState();
     let adapter: string | undefined;
@@ -518,7 +518,7 @@ export class PhotogrammetryEngine {
         /* ignore */
       }
     } else await this.ensureDeviceBudget();
-    this.stopInitIfDisposed();
+    this.stopIfDisposed();
     const res: InitResult = { gpu: pipeline.gpu };
     if (adapter) res.adapter = adapter;
     if (!pipeline.gpu && pipeline.fallbackReason) res.fallbackReason = pipeline.fallbackReason;
@@ -526,10 +526,10 @@ export class PhotogrammetryEngine {
   }
 
   /**
-   * init() after an await: when the engine was disposed meanwhile (worker re-init), close what
-   * init opened since — dispose() could not — and stop.
+   * init() / loadSession() after an await: when the engine was disposed meanwhile (worker re-init,
+   * a 'close'), close what they opened since — dispose() could not — and stop.
    */
-  private stopInitIfDisposed(): void {
+  private stopIfDisposed(): void {
     if (!this.disposed) return;
     this.live?.dispose();
     this.live = null;
@@ -1161,9 +1161,12 @@ export class PhotogrammetryEngine {
     Object.assign(this.options, options, { sessionId: id });
     if (options.persist === undefined && !this.config.store) this.options.persist = true;
     await this.openStore(id);
+    this.stopIfDisposed();
     const meta = await this.store!.getSessionMeta();
+    this.stopIfDisposed();
     if (!meta) throw namedError('SessionNotFoundError', `Session not found: ${id}`);
     const st = await this.store!.getValue<EngineStateRecord>('engine/state').catch(() => null);
+    this.stopIfDisposed();
     if (st) {
       // values of a damaged / foreign record are ignored (defaults stay)
       if (!options.mode && (st.mode === 'object' || st.mode === 'scene' || st.mode === 'auto')) this.options.mode = st.mode;
@@ -1179,9 +1182,12 @@ export class PhotogrammetryEngine {
     this.sessionName = meta.name;
     if (!this.model) await this.loadResults(st);
     else await this.reloadResults();
+    // (a superseded load reads nothing more: its reads fail once the store is closed, and are caught)
+    this.stopIfDisposed();
     const status = this.hasMesh ? 'meshed' : this.hasDense ? 'dense' : this.sparse ? 'sparse' : st?.captureFinished ? 'captured' : meta.status;
     // a densify interrupted by a kill / cancel can resume from its stored depth maps
     const prog = this.store!.persistent ? await this.store!.getValue<{ pass?: number; quality?: string }>('dense/progress').catch(() => null) : null;
+    this.stopIfDisposed();
     const extra: Record<string, number | string> = {};
     if (prog && typeof prog.pass === 'number') {
       extra.denseResumablePass = prog.pass;
