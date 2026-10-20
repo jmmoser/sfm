@@ -105,6 +105,31 @@ describe('feature pipeline recovery and hand-over', () => {
     expect(p.destroy).not.toHaveBeenCalled();
   });
 
+  it('overlapping recoveries (two losses in a row) each destroy the pipeline they replace', async () => {
+    const ps = [fakeGpuPipeline(), fakeGpuPipeline(), fakeGpuPipeline()];
+    const g = gate();
+    h.create = async () => {
+      const i = h.calls - 1;
+      if (i === 1) await g.wait;
+      return ps[i];
+    };
+    const e = new PhotogrammetryEngine({ ...OPTS });
+    await e.init();
+    const first = e.recoverGPU();
+    await vi.waitFor(() => expect(h.calls).toBe(2));
+    const gpuJobs = vi.spyOn(e as unknown as { gpu: (fn: () => Promise<unknown>) => Promise<unknown> }, 'gpu');
+    // a second loss while the first recovery compiles: its compile is queued behind the first one
+    const second = e.recoverGPU();
+    await vi.waitFor(() => expect(gpuJobs).toHaveBeenCalled());
+    g.open();
+    expect(await Promise.all([first, second])).toEqual([true, true]);
+    expect(ps[0].destroy).toHaveBeenCalledTimes(1);
+    expect(ps[1].destroy).toHaveBeenCalledTimes(1);
+    expect(ps[2].destroy).not.toHaveBeenCalled();
+    expect(e.releasePipeline()?.pipeline).toBe(ps[2]);
+    e.dispose();
+  });
+
   it('a recovery overtaken by dispose() destroys its new pipeline, not the one handed to the successor', async () => {
     const p1 = fakeGpuPipeline();
     const p2 = fakeGpuPipeline();
