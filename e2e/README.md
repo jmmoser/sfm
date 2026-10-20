@@ -1176,3 +1176,31 @@ part), and the residual rolling shutter of the first-order correction. So 30 dB 
 ceiling, but the reachable PSNR is well below that of clean renders. The yard keeps a 0.3–0.5 px
 residual shift even on training views, so it comes from the reconstruction or the reference, not
 from the held-out pose mapping.
+
+### Splat stage in the engine (2026-10, Metal)
+
+`E2E_GPU=host node e2e/run-e2e.mjs object-real --engine worker --splat --nvs --tag int-object` (fast preset: 3 000
+iterations, ≤ 200 000 Gaussians, every registered keyframe as a training view at the 600×800 dense size; M4, host load
+4–6 from other apps; 207 s for the whole run, every enforced check passes). The splat stage took 60.3 s: prepare
+12.6 s (initial Gaussians: 90 113 from the fused cloud's footprint LOD + 12 316 sparse points in 1.1 s; 90 view
+decodes / uploads 11.5 s), training 47.5 s (64.6 it/s over the ¼ → ½ → full schedule, 53.8 it/s at full resolution;
+6 checkpoints of 22 MB, 168 ms each), finishing 0.1 s; final 200 000 Gaussians, `splats.ply` 13.0 MB. Memory plan
+(engine log `splat memory plan`): peak ≈ 811 MB of the 1.2 GB budget, GPU 301 MB. Novel views, same run, 24 held-out
+frames:
+
+| renderer | coverage | full PSNR / SSIM | covered PSNR / SSIM | cc full PSNR / SSIM | cc covered PSNR | shift px |
+|---|---|---|---|---|---|---|
+| `points` | 0.763 | 10.39 / 0.475 | 24.02 / 0.755 | 10.41 / 0.478 | 24.52 | 0.19 |
+| `points-edl` | 0.763 | 9.61 / 0.239 | 15.51 / 0.332 | 10.10 / 0.308 | 18.71 | 0.22 |
+| `mesh-lit` (app default) | 0.610 | 8.65 / 0.530 | 23.55 / 0.877 | 8.68 / 0.529 | 25.50 | 0.13 |
+| `mesh-unlit` | 0.610 | 8.71 / 0.552 | 28.65 / 0.915 | 8.72 / 0.553 | 30.00 | 0.08 |
+| **`splat`** | **0.999** | **31.24 / 0.958** | **30.62 / 0.950** | **33.74 / 0.959** | **33.44** | 0.08 |
+
+* The points / mesh rows reproduce the baselines above within 0.3 dB.
+* Splats fill the frame (coverage 0.999 vs 0.61–0.76) — +22.6 dB full-frame PSNR over the lit mesh — and also beat the
+  unlit mesh on covered pixels by 2.0 dB. Per view the splat full PSNR ranges 23.4–35.1 dB (median 31.1).
+* Caveat (see "Held-out frames are nearly training views"): the test frames sit 1–3 frames from a training keyframe,
+  which favours an image-fitted representation like splats even more than the mesh; an off-trajectory test set would
+  measure extrapolation.
+* A 300-iteration smoke run of the same pipeline (`--splat-iterations 300 --no-mesh`, 6 views) already reaches 25.0 dB
+  full frame.

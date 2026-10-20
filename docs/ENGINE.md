@@ -179,6 +179,10 @@ stored plan; `loadSession` reports `stats.splatResumableIteration` / `splatResum
 splats and checkpoints (new poses); densify / mesh leave them. Without WebGPU (`preferGPU: false`, CPU tier) `splat`
 rejects with `NotSupportedError` (code 'no-webgpu').
 
+Measured (object-real, fast, worker engine, M4 / Metal): 60 s for 3 000 iterations / 200 k Gaussians on 90 views at
+600×800 (prepare 12.6 s, 64.6 it/s), memory plan peak ≈ 811 MB; held-out novel views 31.2 dB full-frame PSNR vs 8.7 dB
+for the lit mesh (ARCHITECTURE §6 "Splat stage in the engine", e2e/README.md).
+
 ## 3. Worker protocol (`src/workers/protocol.ts`)
 
 Request/response RPC with ids, plus unsolicited events:

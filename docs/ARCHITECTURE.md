@@ -3119,8 +3119,8 @@ Every web platform API, JS built-in, CSS feature, WGSL construct and WebAssembly
 
 On-device 3DGS training seeded from the metric SfM + MVS reconstruction, written from the papers (3DGS,
 EWA splatting, Mip-Splatting, 3DGS-MCMC, Taming-3DGS / Brush / gsplat design notes, all Apache-2.0 or
-papers); no INRIA-derived code. Not yet wired into the engine, viewer or exports (next workstream);
-measured with `e2e/run-splat-gt.mjs` (GT poses, e2e/README.md).
+papers); no INRIA-derived code. Engine stage, exports and the NVS renderer: "Splat stage in the engine" below
+(the viewer is not wired yet); measured with `e2e/run-splat-gt.mjs` (GT poses, e2e/README.md).
 
 * **Files**: `types.ts` (constants, `SplatModel`, `SplatCamera`, memory plan), `layout.ts` (GPU parameter
   layout), `cpu-reference.ts` (f64 forward / backward / loss), `wgsl/{common,sort,raster,backward,loss}.ts`,
@@ -3220,11 +3220,106 @@ measured with `e2e/run-splat-gt.mjs` (GT poses, e2e/README.md).
   regulariser is divided by the scene extent; Adam updates only Gaussians projected into the frame; the SSIM uses
   zero padding (its own adjoint); the projection Jacobian is evaluated at the frustum-clamped point (gsplat); the
   backward groups 2 × 32 pixels per workgroup (measured best), not one 256-thread workgroup per tile.
-* **Open issues / next steps**: engine integration (an `engine.splat()` long run after densify: views from the
-  RS-corrected undistorted keyframes, cloud from fusion + sparse points + shell, checkpointing of parameters, Adam
-  moments and colour matrices to IndexedDB, WorkStamp dropped-work detection, cancellation between `step` calls);
-  viewer (WebGL2 splat renderer or Spark) and a splat export choice in the UI; iPhone measurements (an iteration is
+* **Open issues / next steps**: engine integration done (below); viewer (WebGL2 splat renderer or Spark) and a
+  splat export choice in the UI; iPhone measurements (an iteration is
   one ~20 ms command buffer on the M4 — split forward / backward if it exceeds ~30 ms on a phone); depth-sorting only
   the visible Gaussians and 16-bit depth keys; f16 Adam moments; an off-trajectory test set to settle the colour
   correction trade-off (raw held-out PSNR is 1.2 dB higher without it, colour-fit PSNR 0.5 dB lower); MVS depth /
   normal supervision.
+
+### `src/engine` + `src/splat` — Splat stage in the engine (2026-10; amends the `src/splat` and `src/engine` notes above)
+
+`PhotogrammetryEngine.splat()` trains the `src/splat` Gaussians as a long engine stage after densify (or after refine
+without a dense cloud); protocol and UI contract in ENGINE.md §2 "Splat" / §3 "Splat protocol".
+
+* **Files**: `src/engine/splat.ts` (`runSplat`, run key, checkpoints), `presets.ts` (`SPLAT_PRESETS`,
+  `resolveSplatPreset`), `memory.ts` (`planSplat`, `fitSplatPlan`), `persistence.ts` (`SplatMetaRecord`,
+  `SplatProgressRecord`, `packSplatModel` / `packSplatParams` / `packSplatMoments`), `engine.ts` (`splat`,
+  `splatModel`, `splatResult`, refine invalidation, `loadSession`), `export.ts` ('ply-splat'), `dense.ts`
+  (`loadDenseViewImage`, shared by PatchMatch and the splat views), protocol / worker / `EngineClient` / `MockEngine`;
+  `src/splat/nvs.ts` (NVS harness renderer). Trainer additions: optional view images + `setViewImage`, dropped-work
+  stamps + `SplatWorkDroppedError`, `readState` / `readMoments` / `restore(state, moments, params?)`, section-wise
+  `readModel`, `simulateDroppedWork` (test hook).
+* **Views**: every registered keyframe with a stored photo (evenly spread to the preset's `maxViews`: 120 / 160 /
+  200), built exactly like the dense views (`loadDenseViewImage` → `denseViewImage`: decoded at the undistorted size,
+  undistorted, rolling-shutter corrected to the frame-stamp pose) at the preset's long side (800 / 1024 / 1280 px,
+  never above the dense size). Uploaded one at a time, so the host never holds them all. All keyframes rather than
+  the dense subset (40 at fast): more viewpoints is what novel views need, and at 600×800 an image is only 1.9 MB of
+  GPU memory.
+* **Initialisation**: the fused dense cloud through the footprint LOD (`footprintDownsample`, ½ of the Gaussian cap:
+  keeps the screen-space density of the MVS cloud instead of a random subset), the sparse SfM points (they reach the
+  walls / far structure MVS misses), `initFromPointCloud` on the union (3-NN scales, at least the fusion radius,
+  normal-oriented discs); scene captures (or `SplatOptions.backgroundShell`) add `backgroundShell` (20 k / 20 k / 30 k
+  Gaussians, radius max(20 × camera extent, 3 × the 98th-percentile sparse-point distance from the cameras' centre),
+  coloured from 160 px thumbnails of the training views). The dense cloud is read from the store for this only when
+  it is not resident and dropped after the LOD.
+* **Memory plan** (`planSplat`): stage 'prepare' (cloud as stored + decoded 55 B / point, LOD scratch 32 B / point,
+  initialisation 120 B per seeded point, thumbnails) and 'training' (`SplatTrainer.memoryEstimate` — the GPU buffers
+  count against the same iOS process — plus the largest host transient: decoding one view, a checkpoint ≈ 3 × 56 B +
+  16 B per Gaussian, or the final model); peak = max + 250 MB reserve + resident engine data. `fitSplatPlan` lowers,
+  until it fits, the training images or the Gaussians (whichever uses more GPU memory) down to soft floors (½ the views,
+  ½ the Gaussians, ¾ of the size), then to hard floors (16 views, 480 px, 50 k), and keeps the largest buffer ≤
+  `maxStorageBufferBindingSize`. Examples (90 keyframes / 160 / 300, 40 MB resident): fast fits 1.2 GB / 850 MB
+  unchanged (GPU 301 MB, peak 626 MB) and 600 MB with 64–73 views; balanced 1.2 GB keeps 160 views at 1024 px (GPU
+  689 MB, peak 1032 MB), 850 MB → 97 views; max 1.2 GB → ≈ 100 views at 1280 px, 500 k (peak ≈ 1.19 GB), 850 MB →
+  45–100 views, 1037–1280 px, 250–361 k Gaussians. Logged as `splat memory plan (…)`.
+* **iOS rules**: pipelines compiled at stage start (`SplatTrainer.create`); one command buffer per iteration, awaited
+  (`inFlight` 1); ≤ 25 iterations per GPU-lock hold (cancel / visibility latency ≈ 0.5 s on the M4); the engine waits
+  while the page is hidden before every chunk and upload; PatchMatchGPU, feature caches, capture state and (persistent
+  sessions) the dense colour views are released first.
+* **Dropped work**: every iteration writes a per-trainer submission counter (`ColourCfg.stamp`, f32-exact < 2²⁴) into
+  its stats slot, every MCMC relocation copies its own counter into slot 64 (`copyBufferToBuffer` of its uniform);
+  `step` reads the 65 slots once and throws `SplatWorkDroppedError` when a stamp of its last ≤ 64 iterations or of its
+  relocation is missing. A dropped relocation would leave grown slots uninitialised (zero log-scale = 1 world unit),
+  so the engine rolls back to the last checkpoint in place (`restore(state, moments, params)`: the view images stay on
+  the GPU) rather than counting lost iterations. A device loss (`waitGPU` / readback race `device.lost`) destroys the
+  trainer, takes the new device (`getGPU`), recompiles, re-uploads the views and restores the checkpoint; twice at
+  most, then `GPUDeviceLostError` 'gpu-lost' (the worker posts it fatal, the client respawns).
+* **Checkpoints**: every 500 iterations (and at iteration 0 = the initial Gaussians; on cancel when ≥ 100 iterations
+  old): `splat/ckpt<slot>/params` (f32, exact), `/m`, `/v` (bf16: the f32 exponent range — second moments reach 1e-15,
+  float16 would flush them to zero and blow up the next update — at 0.4 % precision), `/colour` (f32) and
+  `splat/progress` (key, iteration, count, slot, background, MCMC counters, intersection high-water mark, plan) in
+  the session store (persistent) or the scratch store; two slots, the progress record written last, so a kill
+  mid-write keeps the previous checkpoint. 112 B per Gaussian: 22 MB at 200 k, measured 168 ms each (Chromium,
+  scratch IndexedDB). The run key hashes poses, cameras, sparse points, rolling shutter, the dense cloud's identity,
+  preset, options and trainer overrides; the fitted plan (view ids in order, size, cap) is stored with the checkpoint
+  and reused on resume (unless it no longer fits while a fresh plan would), so a different resident set after a
+  reload does not prevent the resume. Restore reseeds the view order / MCMC sampling from the iteration.
+* **Persistence / viewer / export**: `splat/model` = f32 means + f16 log-scales, unit quaternions, opacity logits, SH
+  (34 B per Gaussian: 6.8 MB at 200 k) + `splat/meta`; never kept in engine memory; `splatModel()` decodes it into a
+  transferable `SplatModelPayload`, `exportModel('ply-splat')` encodes the INRIA PLY (68 B per Gaussian). The model is
+  appearance-normalised before it is stored. `refine` deletes splats and checkpoints; densify / mesh keep them.
+* **NVS renderer** (`src/splat/nvs.ts`): `SplatRenderer` over a black background — the colour channels are the
+  premultiplied sRGB radiance (the model is fitted to the sRGB images, no transfer function), alpha = 1 − T; GPU test:
+  centroid error ≤ 0.004 px against the pinhole projection.
+* **Tests**: `src/engine/splat-plan.test.ts` (presets, plan = trainer estimate, degradation, encodings incl. bf16
+  range, run key, 'ply-splat' export), `mock-engine.test.ts` (stages, detail, resumable cancel, export),
+  `src/engine/splat-engine.gpu.test.ts` (E2E_GPU=host: persistent session densify → splat cancelled at 160 → engine
+  dropped → new engine reports `splatResumableIteration` 100, resumes at 120, persists, clears checkpoints, exports;
+  in-memory session without dense cloud + sky shell: a simulated drop rolls back, `device.destroy()` at 140 rebuilds),
+  `src/splat/trainer.gpu.test.ts` (restore round trip, drop detection), `src/splat/nvs.gpu.test.ts`.
+* **Measured** (`E2E_GPU=host node e2e/run-e2e.mjs object-real --engine worker --splat --nvs --tag int-object`,
+  fast, M4 / Metal, headless Chrome, host load 4–6 from other apps): every enforced check passes (ATE 2.89e-4 of the
+  extent, dense completeness 0.997); splat stage 60.3 s = prepare 12.6 s (initial Gaussians 1.1 s: 90 113 dense +
+  12 316 sparse; 90 view uploads 11.5 s) + training 47.5 s (3 000 iterations, 64.6 it/s over the coarse-to-fine
+  schedule, 53.8 it/s at full 600×800 resolution at the end, 6 checkpoints ≈ 1.0 s) + finishing 0.1 s; 200 000
+  Gaussians, loss 0.0148; memory plan peak ≈ 811 MB of 1.2 GB (training 336 MB: GPU 301 MB — images 165, pixels 40,
+  intersections 37, Adam 24 — + host 35 MB; resident 225 MB in this non-persistent run). Novel views (24 held-out
+  frames at 600×800, `nvs.mjs` defaults, same run):
+
+  | renderer | coverage | full PSNR / SSIM | covered PSNR / SSIM | cc full PSNR | cc covered PSNR | shift px |
+  |---|---|---|---|---|---|---|
+  | `points` | 0.763 | 10.39 / 0.475 | 24.02 / 0.755 | 10.41 | 24.52 | 0.19 |
+  | `mesh-lit` (app default) | 0.610 | 8.65 / 0.530 | 23.55 / 0.877 | 8.68 | 25.50 | 0.13 |
+  | `mesh-unlit` | 0.610 | 8.71 / 0.552 | 28.65 / 0.915 | 8.72 | 30.00 | 0.08 |
+  | **`splat`** | **0.999** | **31.24 / 0.958** | **30.62 / 0.950** | **33.74** | **33.44** | 0.08 |
+
+  Splat full-frame PSNR per view: median 31.13, min 23.36, max 35.14 dB. The splats fill the frame (the walls and
+  floor the mesh cuts away) and beat the best covered-pixel renderer (unlit mesh) by 2 dB on its own pixels. Not
+  directly comparable with the GT-pose `run-splat-gt` table above (other test frames: here held-out frames 1–3 frames
+  from a keyframe; 90 SfM-posed training views; 200 k Gaussians).
+* **Open issues**: view preparation runs on the engine thread (≈ 128 ms per 600×800 view: JPEG decode, undistortion,
+  rolling-shutter remap — 19 % of the fast stage; on a phone more): decode / remap on the CPU helper workers
+  (`cpu-pool.ts`) or reuse the dense stage's undistorted views; no iPhone measurement (iteration time, IndexedDB
+  checkpoint writes of 22–56 MB every 500 iterations, budget headroom of `max`); 'auto' mode without a resolved mode
+  gets no sky shell; the shell radius is a heuristic; the viewer / app UI (next workstream: ENGINE.md §3).
