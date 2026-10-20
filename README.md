@@ -123,6 +123,7 @@ npm run e2e:dense-gt -- all          # dense MVS alone, with ground-truth poses
 node e2e/run-splat-gt.mjs object-real --cloud <dense-gt ply> --sparse 20000   # Gaussian-splat training (src/splat), GT poses
 npm run ui:smoke                     # full UI flow with the mock engine at iPhone size
 node e2e/ui/states.mjs               # UI edge states; also e2e/ui/layouts.mjs (sizes), bench.mjs
+E2E_GPU=host node e2e/ui/splat-shots.mjs <e2e run dir>   # viewer screenshots of a real run: splats / points / mesh
 ```
 
 See [`e2e/README.md`](e2e/README.md) for options, dataset layout, metrics and recorded results.

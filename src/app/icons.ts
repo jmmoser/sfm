@@ -22,6 +22,7 @@ const P = {
   layers: '<path d="M12 3l9 5-9 5-9-5 9-5z"/><path d="M3 13l9 5 9-5"/>',
   points: '<circle cx="6" cy="7" r="1.3" fill="currentColor"/><circle cx="12" cy="5" r="1.3" fill="currentColor"/><circle cx="18" cy="8" r="1.3" fill="currentColor"/><circle cx="8" cy="13" r="1.3" fill="currentColor"/><circle cx="15" cy="13" r="1.3" fill="currentColor"/><circle cx="5" cy="18" r="1.3" fill="currentColor"/><circle cx="12" cy="19" r="1.3" fill="currentColor"/><circle cx="19" cy="17" r="1.3" fill="currentColor"/>',
   mesh: '<path d="M4 18L12 4l8 14H4z"/><path d="M8 11h8M12 18l-4-7M12 18l4-7"/>',
+  splats: '<ellipse cx="9" cy="9.5" rx="5.5" ry="3.4" transform="rotate(-28 9 9.5)"/><ellipse cx="15.5" cy="14.5" rx="4.6" ry="2.8" transform="rotate(32 15.5 14.5)"/><circle cx="7.5" cy="17" r="2.3"/><circle cx="17.5" cy="6" r="1.5" fill="currentColor" stroke="none"/>',
   frustum: '<path d="M4 6h7v6H4zM11 7.5l8-3.5v10l-8-3.5"/><path d="M4 16h16" stroke-dasharray="2 2.4"/>',
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
   ruler: '<path d="M3 16.5L16.5 3 21 7.5 7.5 21 3 16.5z"/><path d="M7 12.5l2 2M10 9.5l1.5 1.5M13 6.5l2 2M5.5 15l1 1M8.5 12l1 1M11.5 9l1 1"/>',

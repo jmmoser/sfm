@@ -1053,8 +1053,8 @@ Individual squares are within 0.2 px; the spread comes from MSAA.
 |---|---|
 | `points` | the app's `Viewer` drawing `dense.ply` as the viewer screen does: round splats sized by the per-point radius, EDL off |
 | `points-edl` | the same with Eye-Dome Lighting, the app default when there is no mesh |
-| `mesh-lit` | the `Viewer` drawing `mesh.ply` with vertex colours under the hemisphere light and headlight, the app default |
-| `mesh-unlit` | the same unlit (vertex colours only) |
+| `mesh-lit` | the `Viewer` drawing `mesh.ply` with vertex colours under the hemisphere light and headlight (the app default until the unlit switch below) |
+| `mesh-unlit` | the same unlit (vertex colours only), the app default since 2026-10 (Display sheet "Mesh lighting" off) |
 | `splat` | `splats.ply` (INRIA 3DGS PLY layout: `x y z nx ny nz f_dc_0..2 f_rest_* opacity scale_0..2 rot_0..3`, run world frame), drawn by `src/splat/nvs.ts` |
 
 The splat module plugs in through
@@ -1124,7 +1124,8 @@ shift is the median residual render → GT translation in px.
   the TSDF is cut at 2× the median depth), and the sky, distant houses and holes (yard). Exposure
   compensation changes it by less than 0.5 dB. Filling the frame is where a splat stage can win
   the most.
-* **One-line fixes, measured here, defaults unchanged.**
+* **One-line fixes, measured here** (the unlit mesh is now the default, and the GLB export is unlit too: ARCHITECTURE §6
+  "Splat layer in the viewer").
   * Unlit instead of lit mesh: covered +5.1 dB / +0.039 SSIM on object-real, +3.8 dB / +0.032 on
     yard-real. Full frame +0.06 / +0.10 dB. The lighting is not affine, so the colour fit recovers
     only part of it (cc covered 25.5 vs 30.1 dB).
@@ -1204,3 +1205,32 @@ frames:
   measure extrapolation.
 * A 300-iteration smoke run of the same pipeline (`--splat-iterations 300 --no-mesh`, 6 views) already reaches 25.0 dB
   full frame.
+
+### Viewer splat layer (2026-10, Metal)
+
+`e2e/ui/splat-shots.mjs` opens an e2e run directory (`run-e2e.mjs … --splat`: `result.json`, `sparse.ply`,
+`dense.ply`, `mesh.ply`, `splats.ply`) in the app's viewer at iPhone size (393×852 @3x, the UI harness): the page
+decodes the files, `MockEngine.injectSession` serves them as the scan's models, and the layer pill is tapped through
+Splats / Points / Mesh at the same viewpoints — 'open' (the app's default view of splats: from the middle photo,
+pulled back 15 %), 'orbit' (that view orbited 40° about the vertical: off the photo path) and 'overview' (the whole
+content from above, the viewer's fit). Full-page PNGs go to `--out` (default `/tmp/sfm-viewer-shots/`), plus
+`<name>-stats.json` with the splat layer's frame time while orbiting and its GPU memory. Needs a hardware adapter
+(the viewer refuses SwiftShader for splats):
+
+```sh
+E2E_GPU=host node e2e/run-e2e.mjs yard-real --engine worker --splat --tag viewer-yard     # 170 s, every check passes
+E2E_GPU=host node e2e/ui/splat-shots.mjs e2e/out/e2e/yard-real-viewer-yard --name yard-real
+E2E_GPU=host node e2e/ui/splat-shots.mjs e2e/out/e2e/object-real-int-object --name object-real
+```
+
+| run (fast preset, 200 k Gaussians) | splat canvas | frame median / p90 (submit → done) | intersections | layer GPU |
+|---|---|---|---|---|
+| object-real `int-object` (90 views 600×800) | 786×1704 | 16.3 / 22.5 ms | 0.93 M | 107 MB |
+| yard-real `viewer-yard` (81 views 800×600, sky shell 8 886 Gaussians at r = 160 m; splat stage 42.6 s: prepare 12.9 s, training 29.5 s at 105 it/s) | 786×1704 | 12.7 / 18.1 ms | 0.34 M | 107 MB |
+
+M4, headless Chrome, host load 5–8. Seen side by side, the splats at 'open' and 'orbit' are photoreal and complete
+(walls, floor, sky) where the mesh has holes and the points show their splat texture; the overview from far outside
+the capture shows floaters and the sky shell as blurred blobs — why the app starts from the photos. The splats and
+the unlit mesh line up pixel for pixel at the same pose (the GPU test measures ≤ 0.06 px between Gaussian centroids
+and three.js's projection of their means).
+

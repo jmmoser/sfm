@@ -122,7 +122,9 @@ export async function buildExport(format: ExportFormat, src: ExportSources): Pro
     case 'glb': {
       const points = src.mesh ? undefined : (src.dense ?? src.sparse ?? undefined);
       if (!src.mesh && (!points || points.count === 0)) throw new Error('Nothing to export yet (run refine first)');
-      return new Blob([encodeGLB({ mesh: src.mesh ?? undefined, points, extras: { name: src.name } })], { type: 'model/gltf-binary' });
+      // unlit (KHR_materials_unlit): the vertex colours are photo colours that already contain the
+      // shading; lit, viewers shade them twice (−5 dB held-out PSNR in the app's viewer)
+      return new Blob([encodeGLB({ mesh: src.mesh ?? undefined, points, unlitMesh: true, extras: { name: src.name } })], { type: 'model/gltf-binary' });
     }
     case 'colmap-zip': {
       if (!src.model) throw new Error('No sparse model yet (run refine first)');

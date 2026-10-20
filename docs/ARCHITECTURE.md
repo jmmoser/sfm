@@ -3220,8 +3220,8 @@ papers); no INRIA-derived code. Engine stage, exports and the NVS renderer: "Spl
   regulariser is divided by the scene extent; Adam updates only Gaussians projected into the frame; the SSIM uses
   zero padding (its own adjoint); the projection Jacobian is evaluated at the frustum-clamped point (gsplat); the
   backward groups 2 × 32 pixels per workgroup (measured best), not one 256-thread workgroup per tile.
-* **Open issues / next steps**: engine integration done (below); viewer (WebGL2 splat renderer or Spark) and a
-  splat export choice in the UI; iPhone measurements (an iteration is
+* **Open issues / next steps**: engine integration, viewer and UI done (below: "Splat stage in the engine",
+  "Splat layer in the viewer"); iPhone measurements (an iteration is
   one ~20 ms command buffer on the M4 — split forward / backward if it exceeds ~30 ms on a phone); depth-sorting only
   the visible Gaussians and 16-bit depth keys; f16 Adam moments; an off-trajectory test set to settle the colour
   correction trade-off (raw held-out PSNR is 1.2 dB higher without it, colour-fit PSNR 0.5 dB lower); MVS depth /
@@ -3322,4 +3322,80 @@ without a dense cloud); protocol and UI contract in ENGINE.md §2 "Splat" / §3 
   rolling-shutter remap — 19 % of the fast stage; on a phone more): decode / remap on the CPU helper workers
   (`cpu-pool.ts`) or reuse the dense stage's undistorted views; no iPhone measurement (iteration time, IndexedDB
   checkpoint writes of 22–56 MB every 500 iterations, budget headroom of `max`); 'auto' mode without a resolved mode
-  gets no sky shell; the shell radius is a heuristic; the viewer / app UI (next workstream: ENGINE.md §3).
+  gets no sky shell; the shell radius is a heuristic. Viewer / app UI: "Splat layer in the viewer" below.
+
+### `src/viewer` + `src/app` — Splat layer in the viewer, photoreal UI, unlit mesh (2026-10; amends the `src/viewer`, `src/app` and splat notes above)
+
+The viewer shows the trained Gaussians with the trainer's own forward kernels (so it shows exactly what was trained);
+the app builds them from the viewer screen. UI contract: ENGINE.md §3 "Splat protocol".
+
+* **Files**: `src/viewer/splat-layer.ts` (`SplatLayer`, a lazy chunk of ≈ 43 kB loaded by the first `setSplats`),
+  `src/viewer/splat-camera.ts` (pure: three camera → `SplatCamera`, canvas / frame sizes), `src/splat/present.ts`
+  (`SplatPresenter`), `SplatRenderer.encodeFrame` / `setMaxSize` / `reserveIntersections` / `gpuBytes`;
+  `src/app/screens/viewer.ts`, `model-info.ts` (splat resume / progress helpers), `mock-engine.ts`.
+* **Stacking**: a WebGPU canvas (`canvas.viewer-splats`, `pointer-events: none`) is inserted under the WebGL canvas.
+  While the splats are shown (`DisplayOptions.splats`, default true, and the layer is ready) the WebGL frame clears to
+  alpha 0 and draws only the overlay scene (camera frustums, measure markers; no depth to test against, so always on
+  top); points, mesh and grid are hidden. The WebGL context is now always created with `alpha: true` (every viewer
+  shader writes alpha 1; an opaque background clears with alpha 1, so nothing else changes). Transparent viewer
+  backgrounds get a premultiplied splat canvas (alpha = 1 − T).
+* **Camera**: `splatCameraFromView(camera.matrixWorldInverse × worldRoot.matrixWorld, camera.projectionMatrix, W, H,
+  near)`: rows 1 and 2 of the view change sign (three looks down −z, +y up); fx = W/2·P₀₀, fy = H/2·P₁₁,
+  cx = W/2·(1 − P₀₂) − 0.5, cy = H/2·(1 + P₁₂) − 0.5 (NDC ±1 = image edges −0.5 / W − 0.5), so fov, aspect, zoom and
+  view offsets carry over. Unit test against three's projection: < 1e-3 px over 40 random cameras / roots; GPU test:
+  Gaussian centroids on `worldToScreen` of their means within 0.06 px. Near plane = min(clip near, 0.05 × target
+  distance).
+* **Frames**: `draw(view)` from every viewer frame, skipped when the signature (view, projection, sizes, near, model
+  version, background) equals the last frame's — the canvas keeps the last presented image, so a still view costs
+  nothing. One command buffer per frame (forward + present + a 4-byte intersection-count copy, no image readback),
+  at most one in flight: a view asked for meanwhile is drawn when the frame's count map resolves (latest view
+  wins). Overflow (count > reservation, the farthest intersections were dropped) grows the reservation ×1.25 (start
+  max(1 M, 16 × N), cap 6 M = 96 MB) and redraws.
+* **Pixel budget**: canvas = CSS size × min(devicePixelRatio, `maxPixelRatio` 2, √(2 MP / CSS area)) — 786×1704 =
+  1.34 MP on a 393×852 iPhone (DPR 3), ≤ 2 MP on large windows. While the view moves (damping, gestures) and the
+  last full frame took > 16 ms, frames are rendered at ≤ 0.5 MP and upscaled bilinearly by the presenter; the
+  still view is drawn at full size. The per-pixel buffers follow the canvas (reallocated when it does not fit or is
+  > 2× too big).
+* **iOS rules**: pipelines (forward, cached per device; present) compiled in `setModel` before the first frame;
+  nothing is submitted while `document.hidden` and the frame is redrawn on `visibilitychange` (dropped work);
+  device loss (`device.lost`) → state 'lost' (the points show), rebuilt on the new `getGPU()` device from the host
+  copy of the model (kept, not copied: ≈ 56 B / Gaussian), twice, then 'unavailable'. Software adapters
+  (SwiftShader) are refused — pipeline compilation falls back to synchronous after 30 s and would block the page
+  for minutes (`splatAllowSoftware` for tests). GPU memory (`getStats().splatLayer.gpuMB`): parameters 64 B,
+  projection / sort 80 B, intersections 16 B × reservation per Gaussian, 20 B per canvas pixel.
+* **Framing**: splats are photoreal near the photos and show unconstrained floaters / the sky shell far outside the
+  capture (e2e/README.md "Viewer splat layer": the from-above overview of yard-real is a blur). `viewFromCamera(i?,
+  { pullBack, animate })` looks along capture camera i (default: the middle one) at the median depth of the content
+  samples inside its image, the eye pulled back 15 % of that depth, orbit controls on. The app opens a scan with
+  splats this way (and "Reset view" on the splat layer does it), with the camera frustums off by default (no depth
+  to hide behind, they would cover the view near the photos).
+* **Measured** (`e2e/ui/splat-shots.mjs`, E2E_GPU=host, M4 / Metal, iPhone emulation 393×852 @3x → splat canvas
+  786×1704 = 1.34 MP, 200 k Gaussians, host load 5–8): submit → done per full-size frame while orbiting, median /
+  p90 16.3 / 22.5 ms on object-real (0.93 M intersections), 12.7 / 18.1 ms on yard-real (0.34 M); splat layer GPU
+  memory 107 MB (reservation 3.2 M intersections = 51 MB, pixels 27 MB). No iPhone measurement yet: a full frame
+  there is expected to take several times longer, which is what the 0.5 MP interactive frames are for.
+* **Picking**: while the splats are shown, `pickPoints` / the CPU picker use the dense / sparse points AND the mesh
+  (hidden; the surfaces the splats were initialised from) regardless of the display flags; measuring and double-tap
+  focus work unchanged (GPU test: 1.0438 measured vs 1.0440).
+* **App** (viewer screen): Build sheet item "Photoreal model" (needs a sparse model and WebGPU in the browser; "Needs
+  WebGPU" otherwise) runs `engine.splat({ quality })` ON the viewer: progress card (prepare ≈ 8 %, training ≈ 89 %,
+  finishing ≈ 3 % of the bar; "1,250 / 3,000 iterations · ~2 min left" from `SplatTrainingDetail`), Cancel (confirm →
+  `abortLongOperation` with 8 s grace), wake lock, `App.busy` makes leaving the page ask, Back asks and stops it,
+  the other builds wait. Done: `results.splat`, session stats `splatGaussians` / `splatIterations` / `splatQuality` /
+  timings, `engine.splatModel()` → `Viewer.setSplats` → shown. Cancelled / failed: "Photoreal model interrupted ·
+  Resume" card + Build-sheet Resume (engine `splatResumableIteration` / `Quality` or the app's own marker); refine
+  clears the splats. Layer pill above the toolbar (and in the Display sheet): Splats / Points / Mesh, one at a time;
+  a scan with splats opens on them (the points while they load; header counts the shown layer); 'unavailable' falls
+  back to mesh / points with a toast. Export sheet: "Gaussian splats (.ply)". `App.debug.viewer` exposes the 3D view
+  to e2e scripts.
+* **Unlit mesh** (measured quick win, e2e/README.md "Baselines"): `DisplayOptions.unlit` defaults to true (vertex
+  colours are photo colours that already contain the shading; lit, they are shaded twice: covered PSNR 23.6 → 28.7 dB
+  object-real, 23.1 → 26.9 dB yard-real); the Display sheet's "Mesh lighting" switch (off) brings the lighting back.
+  The GLB export marks the mesh material `KHR_materials_unlit`. Points keep EDL.
+* **Tests**: `src/viewer/splat-camera.test.ts` (projection vs three, sizes), `src/viewer/splat-layer.gpu.test.ts`
+  (E2E_GPU=host: centroids, overlays-only transparency, measuring on hidden points, redraw only on change, pixel
+  budget, setSplats(null) / dispose, screenshot compositing), `model-info.test.ts`, `mock-engine.test.ts` (persisted
+  splats, `injectSession`), `engine.test.ts` (unlit GLB); `e2e/ui/smoke.mjs` (build in the viewer, measure on the
+  splats, layer pill, splat PLY export, reopened scan on its splats) and `e2e/ui/states.mjs` `splat-build` /
+  `splat-no-webgpu`; screenshots of real runs: `e2e/ui/splat-shots.mjs` (e2e/README.md "Viewer splat layer").
+

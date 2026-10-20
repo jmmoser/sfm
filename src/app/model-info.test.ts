@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { SparseResult } from '../workers/protocol';
-import { builtQuality, clearDenseResume, denseResumable, denseResumeQuality, memoryStatRows, northInfo } from './model-info';
+import { builtQuality, clearDenseResume, clearSplatResume, denseResumable, denseResumeQuality, memoryStatRows, northInfo, splatProgressView, splatResumable, splatResumeQuality } from './model-info';
 
 const sparse = { points: { count: 0, positions: new Float32Array(0), colors: new Uint8Array(0) }, cameras: [], stats: {} } as unknown as SparseResult;
 const cloud = { count: 1, positions: new Float32Array(3), colors: new Uint8Array(3) };
@@ -82,5 +82,38 @@ describe('memoryStatRows', () => {
       ['Fusion pixel step', '2 (memory)'],
     ]);
     expect(memoryStatRows({ denseMaxSize: 1280, denseMaxSizeRequested: 1280, fusionStep: 1, memoryMB: 'n/a' })).toEqual([['Dense image size', '1280 px']]);
+  });
+});
+
+describe('splat resume / progress', () => {
+  it('engine checkpoint (loadSession) or an interrupted build of this app; needs a sparse model', () => {
+    expect(splatResumable({ sparse, stats: { splatResumableIteration: 500 } })).toBe(true);
+    expect(splatResumable({ sparse, stats: { splatResumableIteration: 0 } })).toBe(true);
+    expect(splatResumable({ sparse, stats: { splatInterrupted: 1 } })).toBe(true);
+    expect(splatResumable({ sparse, stats: {} })).toBe(false);
+    expect(splatResumable({ sparse: null, stats: { splatResumableIteration: 500 } })).toBe(false);
+  });
+  it('resume quality: app marker first, then the engine’s; clear drops every marker', () => {
+    expect(splatResumeQuality({ stats: { splatResumableQuality: 'max' } })).toBe('max');
+    expect(splatResumeQuality({ stats: { splatInterruptedQuality: 'fast', splatResumableQuality: 'max' } })).toBe('fast');
+    expect(splatResumeQuality({ stats: {} })).toBeNull();
+    const st: Record<string, number | string> = { splatResumableIteration: 5, splatResumableQuality: 'max', splatInterrupted: 1, splatInterruptedQuality: 'fast', keyframes: 3 };
+    clearSplatResume(st);
+    expect(st).toEqual({ keyframes: 3 });
+  });
+  it('built quality of the splats', () => {
+    expect(builtQuality({ quality: 'balanced', stats: { splatQuality: 'fast' } }, 'splat')).toBe('fast');
+    expect(builtQuality({ quality: 'max', stats: {} }, 'splat')).toBe('max');
+  });
+  it('progress card: stage weights, iterations, speed and time left', () => {
+    expect(splatProgressView({ stage: 'splat_prepare', progress: 0.5 })).toEqual({ progress: 0.04, text: 'Preparing the photos' });
+    expect(splatProgressView({ stage: 'splat_prepare', progress: -1 }).progress).toBe(-1);
+    const t = splatProgressView({ stage: 'splat_training', progress: 0.5, detail: { iteration: 1500, iterations: 3000, loss: 0.02, itPerSec: 25, gaussians: 1e5 } });
+    expect(t.progress).toBeCloseTo(0.08 + 0.89 * 0.5, 9);
+    expect(t.text).toBe('1,500 / 3,000 iterations · ~1 min left');
+    expect(splatProgressView({ stage: 'splat_training', progress: 0.9, detail: { iteration: 2900, iterations: 3000, loss: 0, itPerSec: 6.5, gaussians: 1 } }).text).toBe(
+      '2,900 / 3,000 iterations · < 1 min left',
+    );
+    expect(splatProgressView({ stage: 'splat_finishing', progress: 1 })).toEqual({ progress: 1, text: 'Saving the model' });
   });
 });

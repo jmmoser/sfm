@@ -32,6 +32,11 @@
  *   dense-resume-quality  the interrupted run used another preset than the scan (stats
  *                    denseResumableQuality): the resume uses that preset
  *   info-sheet       Model info: magnetic-north note for compass yaw, engine memory section
+ *   splat-build      "Photoreal model" from the viewer's Build sheet: progress card, Cancel →
+ *                    "Photoreal model interrupted" card → Resume continues → layer pill offers Splats,
+ *                    the export sheet the Gaussian-splat PLY; after a reload the scan reopens with its
+ *                    splats (E2E_GPU=host: shown by default; SwiftShader: refused, points shown)
+ *   splat-no-webgpu  no WebGPU in the browser: the photoreal build is disabled with an explanation
  * Usage: node e2e/ui/states.mjs [name ...] [--verbose]
  */
 import { launch, layoutAudit, shot, sleep } from './lib.mjs';
@@ -624,6 +629,102 @@ await scenario('info-sheet', async () => {
   await page.locator('.section-title', { hasText: 'Memory' }).scrollIntoViewIfNeeded();
   await sleep(300);
   await shot(page, 'state-info-sheet-memory');
+  await context.close();
+});
+
+await scenario('splat-build', async () => {
+  const hostGpu = process.env.E2E_GPU === 'host';
+  const { page, context } = await newPage();
+  // slow stages: Cancel lands during the training
+  await page.goto(`${base}?mock=1&mockSpeed=0.25`);
+  await by(page, 'new-scan').waitFor();
+  await page.evaluate(async () => {
+    const { SessionStore } = await import('/src/io/storage.ts');
+    const s = await SessionStore.open();
+    await s.createSession({ id: 'seed-splat', name: 'Garden bench', mode: 'object', status: 'dense', stats: { quality: 'fast', keyframes: 24 } });
+  });
+  await page.reload();
+  await by(page, 'session-item').first().tap();
+  await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  check(await by(page, 'layer-switch').isHidden(), 'no layer pill with points only');
+  await by(page, 'tool-build').tap();
+  await by(page, 'build-splat').waitFor({ timeout: 5000 });
+  check(/Gaussian splats trained on your photos/.test((await by(page, 'sheet-build').textContent()) ?? ''), 'Build sheet explains the photoreal model');
+  await sleep(300);
+  await shot(page, 'state-splat-build-sheet');
+  await audit(page, 'splat build sheet');
+  await by(page, 'build-splat').tap();
+  await by(page, 'splat-progress').waitFor({ state: 'visible', timeout: 10000 });
+  await page.waitForFunction(() => /iterations/.test(document.querySelector('[data-testid="splat-progress-text"]')?.textContent ?? ''), null, { timeout: 30000 });
+  await sleep(400);
+  await shot(page, 'state-splat-progress');
+  await audit(page, 'splat progress');
+  // the other builds wait while it runs
+  await by(page, 'tool-build').tap();
+  await by(page, 'sheet-build').waitFor();
+  check(await by(page, 'build-mesh').isDisabled(), 'mesh build disabled while the photoreal model trains');
+  await page.keyboard.press('Escape');
+  await by(page, 'sheet-build').waitFor({ state: 'detached' });
+  await by(page, 'splat-cancel').tap();
+  await by(page, 'dialog-confirm').tap();
+  await by(page, 'splat-progress').waitFor({ state: 'hidden', timeout: 15000 });
+  await by(page, 'splat-resume').waitFor({ state: 'visible', timeout: 5000 });
+  check(true, 'a cancelled build offers "Photoreal model interrupted · Resume"');
+  await sleep(300);
+  await shot(page, 'state-splat-resume');
+  await audit(page, 'splat resume');
+  await by(page, 'tool-build').tap();
+  check(/Resume/.test((await by(page, 'build-splat').textContent()) ?? ''), 'Build sheet: Resume at the interrupted quality');
+  await page.keyboard.press('Escape');
+  await by(page, 'sheet-build').waitFor({ state: 'detached' });
+  await by(page, 'splat-resume-button').tap();
+  await by(page, 'splat-progress').waitFor({ state: 'visible', timeout: 10000 });
+  const firstText = await page.waitForFunction(() => {
+    const t = document.querySelector('[data-testid="splat-progress-text"]')?.textContent ?? '';
+    return /iterations/.test(t) ? t : null;
+  }, null, { timeout: 30000 });
+  const it0 = Number(((await firstText.jsonValue()) ?? '').replace(/,/g, '').match(/^(\d+)/)?.[1] ?? 0);
+  check(it0 > 0, `the resumed run continues (first progress at iteration ${it0})`);
+  await by(page, 'splat-progress').waitFor({ state: 'hidden', timeout: 90000 });
+  check(await by(page, 'splat-resume').isHidden(), 'no resume card once the model exists');
+  await by(page, 'layer-switch').waitFor({ state: 'visible', timeout: 15000 });
+  const segs = await page.locator('[data-testid="layer-switch"] .segment').evaluateAll((els) => els.map((e) => e.dataset.value));
+  if (hostGpu) {
+    check(segs.join(',') === 'splats,points', `layer pill Splats / Points (got ${segs})`);
+    await page.waitForFunction(() => document.querySelector('[data-testid="layer-switch"]')?.dataset.layer === 'splats', null, { timeout: 30000 });
+    await sleep(500);
+    await shot(page, 'state-splat-shown');
+    await audit(page, 'splats shown');
+  } else console.log(`[states] software adapter: layer pill ${segs}`);
+  await by(page, 'tool-export').tap();
+  await by(page, 'export-ply-splat').waitFor();
+  check(!(await by(page, 'export-ply-splat').getAttribute('class'))?.includes('disabled'), 'export sheet offers the Gaussian-splat PLY');
+  await page.keyboard.press('Escape');
+  // reopened later: the stored splats come back (and are the default view)
+  await page.reload();
+  await by(page, 'session-item').first().tap();
+  await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  if (hostGpu) {
+    await page.waitForFunction(() => document.querySelector('[data-testid="layer-switch"]')?.dataset.layer === 'splats' && document.querySelector('.viewer-screen')?.dataset.splats === 'ready', null, { timeout: 60000 });
+    check(true, 'the reopened scan shows its splats');
+  } else {
+    await page.waitForFunction(() => !!document.querySelector('.viewer-screen')?.dataset.splats, null, { timeout: 60000 });
+    check(true, 'the reopened scan loads its splat model');
+  }
+  await context.close();
+});
+
+await scenario('splat-no-webgpu', async () => {
+  const { page, context } = await newPage({ initScript: () => Object.defineProperty(Navigator.prototype, 'gpu', { get: () => undefined, configurable: true }) });
+  await page.goto(`${base}?mock=1`);
+  await by(page, 'new-scan').waitFor();
+  await seedMeshed(page);
+  await by(page, 'session-item').first().tap();
+  await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  await by(page, 'tool-build').tap();
+  await by(page, 'build-splat').waitFor({ timeout: 5000 });
+  check(await by(page, 'build-splat').isDisabled(), 'photoreal build disabled without WebGPU');
+  check(/Needs WebGPU/.test((await by(page, 'sheet-build').textContent()) ?? ''), 'the item says it needs WebGPU');
   await context.close();
 });
 

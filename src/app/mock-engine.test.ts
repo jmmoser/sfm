@@ -219,7 +219,7 @@ describe('MockEngine', () => {
       }
     });
     await expect(s).rejects.toMatchObject({ name: 'CancelledError' });
-    expect((await e.loadSession('s1')).stats.splatResumableIteration).toBe(cancelAt);
+    expect((await e.loadSession('s1')).stats).toMatchObject({ splatResumableIteration: cancelAt, splatResumableQuality: 'fast' });
     const stages: string[] = [];
     const details: Record<string, number>[] = [];
     const info = await e.splat(undefined, (p) => {
@@ -256,6 +256,34 @@ describe('MockEngine', () => {
     expect(sum.sparse).not.toBeNull();
     expect(sum.dense).not.toBeNull();
     expect(sum.mesh).toBeNull();
+    expect(sum.splat).toBeNull();
     await expect(e.loadSession('nope')).rejects.toThrow(/not found/);
+  });
+
+  it('loadSession restores the splats recorded in the session stats (and a resumable run)', async () => {
+    const meta = { id: 's2', name: 'Vase', createdAt: 1, updatedAt: 2, mode: 'object' as const, status: 'dense' as const, numFrames: 20, stats: { splatGaussians: 5000, splatIterations: 5000, splatResumableIteration: 700, splatResumableQuality: 'max' } };
+    const e = new MockEngine({ speed: 50, sessions: async () => ({ getSession: async (id: string) => (id === 's2' ? meta : null) }) as never });
+    const sum = await e.loadSession('s2');
+    expect(sum.splat).toMatchObject({ iterations: 5000, antialiased: true });
+    expect(sum.stats).toMatchObject({ splatResumableIteration: 700, splatResumableQuality: 'max' });
+    const payload = await e.splatModel();
+    expect(payload!.model.count).toBe(sum.splat!.count);
+    // another quality starts over (the resume needs the interrupted run's settings)
+    const info = await e.splat({ quality: 'fast', iterations: 200 });
+    expect(info.stats.splatResumedFrom).toBeUndefined();
+  });
+
+  it('injectSession serves real models as the in-memory session (screenshot harness)', async () => {
+    const e = new MockEngine({ speed: 50, sessions: async () => null });
+    const cloud = { count: 2, positions: new Float32Array([0, 0, 0, 1, 1, 1]), colors: new Uint8Array(6) };
+    const cam = { width: 64, height: 48, f: 50, cx: 31.5, cy: 23.5, k1: 0, k2: 0 };
+    const sparse = { points: cloud, cameras: [{ id: 0, pose: { R: new Float64Array([1, 0, 0, 0, 1, 0, 0, 0, 1]), t: new Float64Array(3) }, intrinsics: cam }], metric: { metric: true, gravityAligned: true, northAligned: false, source: 'imu', relativeUncertainty: 0.02, originLatLonAlt: null }, stats: {} };
+    const m = { count: 1, shDegree: 0 as const, means: new Float32Array(3), logScales: new Float32Array(3), quats: new Float32Array([1, 0, 0, 0]), opacities: new Float32Array(1), sh: new Float32Array(3) };
+    e.injectSession('real', { name: 'Real run', mode: 'object', sparse: sparse as never, dense: cloud, mesh: null, splat: m });
+    const sum = await e.loadSession('real');
+    expect(sum.name).toBe('Real run');
+    expect(sum.dense).toBe(cloud);
+    expect(sum.splat?.count).toBe(1);
+    expect((await e.splatModel())!.model.count).toBe(1);
   });
 });
