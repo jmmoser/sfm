@@ -77,7 +77,10 @@ export interface MapperOptions {
   initFallback: boolean;
   initFallbackMinTriAngleDeg: number;
   initFallbackMaxForwardMotion: number;
-  /** Fixed initial pair (optional): `runIncrementalSfM` attempts one model from it, no other pair. */
+  /**
+   * Fixed initial pair (optional): `runIncrementalSfM` builds one model from it (retried at the
+   * relaxed levels while it fails), from no other pair.
+   */
   initImagePair?: [number, number];
   // ---- registration
   absPoseMaxErrorPx: number;
@@ -1821,8 +1824,9 @@ export async function runIncrementalSfM(
         // discard: release the registrations of this attempt
         for (const id of rec.registeredImageIds()) mapper.deregisterImage(id);
       }
-      // a given initial pair is attempted once (as COLMAP): later levels would rebuild the same model
-      if ((!o.multipleModels && models.length > 0) || o.initImagePair) {
+      // a given initial pair gives one model (later levels would rebuild it); while it fails, the
+      // relaxed levels retry it with a lower minimum point angle (as COLMAP's relaxations)
+      if ((!o.multipleModels || o.initImagePair) && models.length > 0) {
         done = true;
         break;
       }
