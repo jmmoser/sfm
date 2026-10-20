@@ -2,10 +2,11 @@
  * The Viewer's splat layer (WebGPU canvas under the WebGL canvas): Gaussians land where the three.js
  * camera projects their means (world root, aspect, pinhole conversion), the WebGL canvas turns
  * transparent except for the overlays, measuring picks the hidden points, frames are drawn only when
- * the view changes, the pixel budget holds, and dispose / setSplats(null) remove the layer.
+ * the view changes, the pixel budget holds, dispose / setSplats(null) remove the layer, and a
+ * disposed viewer is garbage-collected (the shared device's `lost` promise does not keep it).
  */
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
-import type { PointCloud } from '../core/types';
+import type { PointCloud, TriangleMesh } from '../core/types';
 import { pipelineCompileLimits } from '../features/gpu-common';
 import { getGPU } from '../gpu/device';
 import { lookAt } from '../splat/testutil';
@@ -202,5 +203,42 @@ describe('Viewer splat layer', () => {
     let red = 0;
     for (let i = 0; i < d.length; i += 4) if (d[i] > 150 && d[i + 1] < 60 && d[i + 3] === 255) red++;
     expect(red).toBeGreaterThan(5);
+  });
+
+  it('a disposed viewer with splats is garbage-collected: the shared device does not keep it (review)', async () => {
+    const gc = (globalThis as { gc?: () => void }).gc;
+    if (!gc) {
+      console.warn('[splat-layer] gc() not exposed (--js-flags=--expose-gc): leak check skipped');
+      return;
+    }
+    /** A viewer with a mesh and splats whose onSplatState captures a "screen scope", disposed. */
+    const disposed = async (): Promise<{ viewer: WeakRef<object>; mesh: WeakRef<object>; scope: WeakRef<object> }> => {
+      const el = document.createElement('div');
+      el.style.cssText = 'position:fixed;left:0;top:0;width:160px;height:120px';
+      document.body.appendChild(el);
+      const scope = { exports: new Uint8Array(1 << 20) };
+      const v = new Viewer(el, { background: '#000000', maxPixelRatio: 1, splatAllowSoftware: true, onSplatState: () => void scope.exports.length });
+      const n = 3000;
+      const mesh: TriangleMesh = {
+        vertexCount: n,
+        triangleCount: n / 3,
+        positions: Float32Array.from({ length: 3 * n }, (_, i) => Math.sin(i) * 0.5),
+        normals: new Float32Array(3 * n).fill(0.577),
+        colors: new Uint8Array(3 * n).fill(180),
+        indices: Uint32Array.from({ length: n }, (_, i) => i),
+      };
+      v.setMesh(mesh);
+      expect(await v.setSplats({ model: dots(PTS, COLS) })).toBe(true);
+      const refs = { viewer: new WeakRef(v), mesh: new WeakRef(mesh.positions), scope: new WeakRef(scope) };
+      v.dispose();
+      el.remove();
+      return refs;
+    };
+    const refs = await disposed();
+    for (let i = 0; i < 6; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      gc();
+    }
+    expect({ viewer: !!refs.viewer.deref(), mesh: !!refs.mesh.deref(), scope: !!refs.scope.deref() }).toEqual({ viewer: false, mesh: false, scope: false });
   });
 });

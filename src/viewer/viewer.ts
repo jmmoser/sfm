@@ -1288,10 +1288,17 @@ export class Viewer {
     this.controls.removeEventListener('start', this.onControlsStart);
     this.controls.removeEventListener('end', this.onControlsEnd);
     this.controls.dispose();
+    // (detached as well: geometry.dispose frees the GL buffers only, the scene graph would keep the arrays)
     this.disposeDense();
-    if (this.sparse) this.sparse.geometry.dispose();
+    if (this.sparse) {
+      this.contentRoot.remove(this.sparse.points);
+      this.sparse.geometry.dispose();
+    }
     this.sparse = null;
-    if (this.meshLayer) this.meshLayer.geometry.dispose();
+    if (this.meshLayer) {
+      this.contentRoot.remove(this.meshLayer.mesh);
+      this.meshLayer.geometry.dispose();
+    }
     this.meshLayer = null;
     if (this.grid) {
       this.grid.geometry.dispose();
@@ -1309,6 +1316,7 @@ export class Viewer {
     this.splatToken++;
     this.splatLayer?.dispose();
     this.splatLayer = null;
+    this.opts.onSplatState = undefined;
     this.renderer.dispose();
     try {
       this.renderer.forceContextLoss();

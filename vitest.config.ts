@@ -35,6 +35,8 @@ export default defineConfig({
                       args: [
                         '--enable-unsafe-webgpu',
                         '--ignore-gpu-blocklist',
+                        // gc() for the leak tests (splat-layer.gpu.test.ts)
+                        '--js-flags=--expose-gc',
                         '--use-fake-ui-for-media-stream',
                         '--use-fake-device-for-media-stream',
                         '--autoplay-policy=no-user-gesture-required',
@@ -43,6 +45,7 @@ export default defineConfig({
                   : {
                       args: [
                         '--enable-unsafe-webgpu',
+                        '--js-flags=--expose-gc',
                         '--enable-features=Vulkan',
                         '--use-vulkan=swiftshader',
                         '--use-webgpu-adapter=swiftshader',

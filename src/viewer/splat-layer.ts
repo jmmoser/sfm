@@ -400,10 +400,14 @@ export class SplatLayer {
   // ---------------------------------------------------------------- device loss
 
   private watchDevice(device: GPUDevice): void {
+    // The reaction stays attached to the shared device's `lost` promise for the page's lifetime
+    // (pending until a loss): it must not keep a disposed layer — and through its callbacks the
+    // Viewer and its screen — reachable.
+    const ref = new WeakRef(this);
     void device.lost.then((info) => {
-      if (this.disposed || this.gpu.device !== device) return;
-      if (info.reason === 'destroyed' && this.disposed) return;
-      void this.recover(info.message || String(info.reason));
+      const layer = ref.deref();
+      if (!layer || layer.disposed || layer.gpu.device !== device) return;
+      void layer.recover(info.message || String(info.reason));
     });
   }
 
@@ -440,6 +444,10 @@ export class SplatLayer {
     if (this.disposed) return;
     this.disposed = true;
     document.removeEventListener('visibilitychange', this.onVisibility);
+    this.opts.onState = undefined;
+    this.opts.onInvalidate = undefined;
+    this.lastView = null;
+    this.pending = null;
     this.renderer?.destroy();
     this.presenter?.destroy();
     this.countBuf?.destroy();
