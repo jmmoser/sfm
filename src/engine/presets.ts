@@ -8,6 +8,7 @@
 import { DENSE_PRESETS } from '../dense/presets';
 import type { KeyframeSelectorOptions } from '../sfm/keyframes';
 import type { CaptureMode, QualityPreset } from '../workers/protocol';
+import type { SplatTrainerOptions } from '../splat/trainer';
 
 export interface FeaturePresetConfig {
   /** SIFT working resolution (long side, px). */
@@ -262,12 +263,25 @@ export interface SplatPresetConfig {
   checkpointEvery: number;
   /** Iterations per trainer step call: cancel / page-hidden latency (≤ 64: the dropped-work check window). */
   chunk: number;
+  /**
+   * Trainer defaults of the stage (`SplatTrainerOptions` fields; `EngineConfig.splat.trainer`
+   * overrides them field by field), e.g. the geometry supervision from the dense depth maps and
+   * the per-view colour correction (ARCHITECTURE "Geometry supervision … off-trajectory").
+   */
+  trainer: Partial<SplatTrainerOptions>;
 }
 
+/**
+ * Trainer defaults of every splat preset (see `SplatPresetConfig.trainer`): inverse-depth
+ * supervision from the dense stage's filtered depth maps during the first 30 % of the iterations
+ * (`DEFAULT_SPLAT_GEOMETRY`; only when the session has them). Per-view colour correction stays on.
+ */
+export const SPLAT_TRAINER_DEFAULTS: Readonly<Partial<SplatTrainerOptions>> = Object.freeze({ geometry: {} });
+
 export const SPLAT_PRESETS: Readonly<Record<QualityPreset, SplatPresetConfig>> = Object.freeze({
-  fast: { iterations: 3000, maxGaussians: 200_000, maxImageSize: 800, maxViews: 120, denseInitFraction: 0.5, shellCount: 20_000, shDegree: 0, checkpointEvery: 500, chunk: 25 },
-  balanced: { iterations: 5000, maxGaussians: 300_000, maxImageSize: 1024, maxViews: 160, denseInitFraction: 0.5, shellCount: 20_000, shDegree: 0, checkpointEvery: 500, chunk: 25 },
-  max: { iterations: 7000, maxGaussians: 500_000, maxImageSize: 1280, maxViews: 200, denseInitFraction: 0.5, shellCount: 30_000, shDegree: 0, checkpointEvery: 500, chunk: 25 },
+  fast: { iterations: 3000, maxGaussians: 200_000, maxImageSize: 800, maxViews: 120, denseInitFraction: 0.5, shellCount: 20_000, shDegree: 0, checkpointEvery: 500, chunk: 25, trainer: SPLAT_TRAINER_DEFAULTS },
+  balanced: { iterations: 5000, maxGaussians: 300_000, maxImageSize: 1024, maxViews: 160, denseInitFraction: 0.5, shellCount: 20_000, shDegree: 0, checkpointEvery: 500, chunk: 25, trainer: SPLAT_TRAINER_DEFAULTS },
+  max: { iterations: 7000, maxGaussians: 500_000, maxImageSize: 1280, maxViews: 200, denseInitFraction: 0.5, shellCount: 30_000, shDegree: 0, checkpointEvery: 500, chunk: 25, trainer: SPLAT_TRAINER_DEFAULTS },
 });
 
 /** The splat preset: table ← EngineConfig.splat overrides; the image size never exceeds the dense size. */

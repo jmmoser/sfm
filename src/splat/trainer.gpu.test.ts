@@ -7,6 +7,7 @@ import { SplatRenderer } from './renderer';
 import { cloneModel, lookAt, randomScene, testCamera } from './testutil';
 import type { RGBAImage } from '../core/types';
 import { SplatTrainer, SplatWorkDroppedError, type SplatTrainingView as TrainerView } from './trainer';
+import { geometryLossCPU, packDepthTarget, type DepthMapLike } from './depth-target';
 
 type SplatTrainingView = TrainerView & { image: RGBAImage };
 import type { SplatCamera, SplatModel } from './types';
@@ -99,6 +100,250 @@ describe('SplatTrainer backward (GPU) vs CPU reference', () => {
     expect(Math.abs(r.l1 / n - ref.l1)).toBeLessThan(1e-5);
     expect(Math.abs(r.ssim / n - ref.ssim)).toBeLessThan(1e-4);
     expect(relErr(r.dLdC, ref.grad)).toBeLessThan(1e-3);
+  });
+});
+
+describe('SplatTrainer geometry channels (GPU) vs CPU reference', () => {
+  for (const deg of [0, 1] as const) {
+    it(`rendered inverse depth / normal and parameter gradients match, SH degree ${deg}`, async () => {
+      const m = randomScene({ count: 300, seed: 131 + deg, shDegree: deg });
+      const cam = testCamera(120, 100);
+      const t = await trainer(m, [viewOf(cam)], { geometry: { normal: [0.1, 0.01] } });
+      const rng = new Rng(19);
+      const w = new Float32Array(3 * cam.width * cam.height).map(() => rng.uniform(-1, 1));
+      const wG = new Float32Array(4 * cam.width * cam.height).map((_, i) => rng.uniform(-1, 1) * (i % 4 === 0 ? 3 : 1));
+      const wA = new Float32Array(cam.width * cam.height).map(() => rng.uniform(-1, 1));
+      const g = await t.debugGradients(cam, w, wG, wA);
+      const c = backwardCPU(m, cam, w, { geometry: true }, undefined, wG, wA);
+      expect(c.grad2d.stride).toBe(13);
+      const e = {
+        geo: relErr(g.geo!, c.fwd.geo!),
+        grad2d: relErr(g.grad2d, c.grad2d.g),
+        means: relErr(g.grads.means, c.grads.means),
+        logScales: relErr(g.grads.logScales, c.grads.logScales),
+        quats: relErr(g.grads.quats, c.grads.quats),
+        opacities: relErr(g.grads.opacities, c.grads.opacities),
+        sh: relErr(g.grads.sh, c.grads.sh),
+      };
+      console.log(`[splat] geometry parity deg${deg}`, JSON.stringify(e));
+      for (const v of Object.values(e)) expect(v).toBeLessThan(2e-3);
+      // the geometry part alone (colour weights 0) also matches: the depth / normal gradients reach the means and quaternions
+      const z = new Float32Array(w.length);
+      const g0 = await t.debugGradients(cam, z, wG, wA);
+      const c0 = backwardCPU(m, cam, z, { geometry: true }, undefined, wG, wA);
+      expect(relErr(g0.grads.means, c0.grads.means)).toBeLessThan(2e-3);
+      expect(relErr(g0.grads.quats, c0.grads.quats)).toBeLessThan(2e-3);
+      expect(relErr(g0.grads.sh, c0.grads.sh)).toBe(0);
+    });
+  }
+
+  it('depth-only kernels (normal weights 0): inverse depth and gradients match, 10 accumulators', async () => {
+    const m = randomScene({ count: 300, seed: 135 });
+    const cam = testCamera(120, 100);
+    const t = await trainer(m, [viewOf(cam)], { geometry: { normal: [0, 0] } });
+    const rng = new Rng(29);
+    const px = cam.width * cam.height;
+    const w = new Float32Array(3 * px).map(() => rng.uniform(-1, 1));
+    const wG = new Float32Array(4 * px).map((_, i) => (i % 4 === 0 ? 3 * rng.uniform(-1, 1) : 0));
+    const wA = new Float32Array(px).map(() => rng.uniform(-1, 1));
+    const g = await t.debugGradients(cam, w, wG, wA);
+    const c = backwardCPU(m, cam, w, { geometry: true }, undefined, wG, wA);
+    expect(g.grad2d.length).toBe(10 * m.count);
+    const cpu2d = new Float64Array(10 * m.count);
+    for (let i = 0; i < m.count; i++) cpu2d.set(c.grad2d.g.subarray(13 * i, 13 * i + 10), 10 * i);
+    const invD = (a: ArrayLike<number>): Float64Array => Float64Array.from({ length: px }, (_, i) => a[4 * i]);
+    const e = {
+      invDepth: relErr(invD(g.geo!), invD(c.fwd.geo!)),
+      grad2d: relErr(g.grad2d, cpu2d),
+      means: relErr(g.grads.means, c.grads.means),
+      quats: relErr(g.grads.quats, c.grads.quats),
+      opacities: relErr(g.grads.opacities, c.grads.opacities),
+    };
+    console.log('[splat] depth-only parity', JSON.stringify(e));
+    for (const v of Object.values(e)) expect(v).toBeLessThan(2e-3);
+    for (let i = 0; i < px; i++) expect(g.geo![4 * i + 1]).toBe(0);
+  });
+
+  it('geometry loss kernel matches the CPU reference (levels 1, 2, 4)', async () => {
+    const m = randomScene({ count: 250, seed: 141, opacity: [0.6, 0.95] });
+    const cam = testCamera(96, 80);
+    // target: the CPU render of a perturbed copy (depth from the blended inverse depth)
+    const pert = cloneModel(m);
+    const rng = new Rng(23);
+    for (let i = 0; i < pert.means.length; i++) pert.means[i] += rng.uniform(-0.05, 0.05);
+    const r = renderCPU(pert, cam, { geometry: true });
+    const px = cam.width * cam.height;
+    const map: DepthMapLike = { width: cam.width, height: cam.height, depth: new Float32Array(px), normal: new Float32Array(3 * px), cost: new Float32Array(px) };
+    for (let i = 0; i < px; i++) {
+      const a = 1 - r.T[i];
+      if (a < 0.5) continue;
+      (map.depth as Float32Array)[i] = a / r.geo![4 * i];
+      const n = [r.geo![4 * i + 1], r.geo![4 * i + 2], r.geo![4 * i + 3]];
+      const l = Math.hypot(n[0], n[1], n[2]);
+      if (l > 0) (map.normal as Float32Array).set(n.map((v) => v / l), 3 * i);
+      (map.cost as Float32Array)[i] = rng.uniform(0, 0.8);
+    }
+    const pin = { width: cam.width, height: cam.height, f: cam.fx, cx: cam.cx, cy: cam.cy };
+    const target = packDepthTarget(map, pin, pin, { factor: 2 });
+    expect(target.valid).toBeGreaterThan(200);
+    const view = viewOf({ ...cam, fy: cam.fx });
+    const t = await trainer(m, [view], { geometry: { depth: [0.8, 0.8], normal: [0.3, 0.3], factor: 2 } });
+    t.setViewDepth(0, target);
+    expect(t.depthViews).toBe(1);
+    for (const level of [1, 2, 4]) {
+      const g = await t.debugGeoLoss(0, level);
+      const ref = geometryLossCPU(g.geo, g.alpha, g.width, g.height, level, target, 0.8, 0.3);
+      const e = Math.max(relErr(g.grad, ref.grad), relErr(g.gradA, ref.gradA));
+      console.log(`[splat] geometry loss level ${level}: GPU sums ${g.sums.map((v) => v.toFixed(4)).join(' ')} | CPU ${ref.depth.toFixed(4)} ${ref.normal.toFixed(4)} ${ref.valid} ${ref.weight.toFixed(4)}; grad rel err ${e.toExponential(2)}`);
+      expect(g.sums[2]).toBe(ref.valid);
+      expect(Math.abs(g.sums[0] - ref.depth)).toBeLessThan(1e-4 * Math.max(1, ref.depth));
+      expect(Math.abs(g.sums[1] - ref.normal)).toBeLessThan(1e-4 * Math.max(1, ref.normal));
+      expect(e).toBeLessThan(1e-5);
+    }
+    // weights decay and stop at `until`
+    expect(t.geometryWeightsAt(0)).toEqual([0.8, 0.3]);
+  });
+
+  it('depth supervision pulls the Gaussians onto the target depth while the photometric fit still improves', async () => {
+    const gt = randomScene({ count: 200, seed: 151, opacity: [0.6, 0.95], logScale: [-3, -2] });
+    const W = 64;
+    const H = 48;
+    const views: SplatTrainingView[] = [];
+    const maps: DepthMapLike[] = [];
+    const cams: SplatCamera[] = [];
+    for (let k = 0; k < 8; k++) {
+      const a = (2 * Math.PI * k) / 8;
+      const { R, t } = lookAt([2.4 * Math.sin(a), -2.4 * Math.cos(a), 0.4], [0, 0, 0]);
+      const cam: SplatCamera = { width: W, height: H, fx: 70, fy: 70, cx: 31.5, cy: 23.5, R, t };
+      const r = renderCPU(gt, cam, { geometry: true });
+      const img = new Uint8ClampedArray(4 * W * H);
+      const map: DepthMapLike = { width: W, height: H, depth: new Float32Array(W * H), normal: new Float32Array(3 * W * H), cost: new Float32Array(W * H) };
+      for (let i = 0; i < W * H; i++) {
+        for (let c = 0; c < 3; c++) img[4 * i + c] = Math.round(255 * r.color[3 * i + c]);
+        img[4 * i + 3] = 255;
+        const al = 1 - r.T[i];
+        if (al > 0.5) {
+          (map.depth as Float32Array)[i] = al / r.geo![4 * i];
+          const n = [r.geo![4 * i + 1], r.geo![4 * i + 2], r.geo![4 * i + 3]];
+          const l = Math.hypot(n[0], n[1], n[2]) || 1;
+          (map.normal as Float32Array).set(n.map((v) => v / l), 3 * i);
+        }
+      }
+      cams.push(cam);
+      views.push(viewOf(cam, img, k));
+      maps.push(map);
+    }
+    // perturb the means along the depth direction of view 0 (photometrically ambiguous)
+    const init = cloneModel(gt);
+    const rng = new Rng(152);
+    const R0 = cams[0].R;
+    for (let i = 0; i < init.count; i++) {
+      const dz = rng.uniform(-0.15, 0.15);
+      for (let c = 0; c < 3; c++) init.means[3 * i + c] += dz * R0[6 + c];
+    }
+    const opts = { iterations: 400, colourCorrection: false as const, resolution: [], mcmc: false as const, lr: { mean: 1e-3, meanFinal: 1e-4 } };
+    const depthErr = async (t: SplatTrainer): Promise<number> => {
+      let s = 0;
+      let w = 0;
+      for (let k = 0; k < 8; k++) {
+        const g = await t.debugGeoLoss(k, 1, 0);
+        s += g.sums[0];
+        w += g.sums[3];
+      }
+      return s / w;
+    };
+    const pin = { width: W, height: H, f: 70, cx: 31.5, cy: 23.5 };
+    // same run with the losses switched off (weights 0: the kernel writes zero gradients)
+    const run = async (weight: number): Promise<{ e0: number; e1: number; loss: number }> => {
+      const t = await trainer(init, views, { ...opts, geometry: { depth: [weight, weight / 10], normal: [0, 0], factor: 1, until: 1 } });
+      maps.forEach((mp, k) => t.setViewDepth(k, packDepthTarget(mp, pin, pin, { factor: 1 })));
+      const e0 = await depthErr(t);
+      const r = await t.step(400);
+      return { e0, e1: await depthErr(t), loss: r.loss };
+    };
+    const off = await run(0);
+    const on = await run(1);
+    console.log(`[splat] depth supervision: mean |D·z_t − 1| ${on.e0.toFixed(4)} → ${on.e1.toFixed(4)} (without: → ${off.e1.toFixed(4)}), photometric loss ${on.loss.toFixed(4)} (without ${off.loss.toFixed(4)})`);
+    expect(on.e1).toBeLessThan(0.75 * off.e1);
+    expect(on.e1).toBeLessThan(0.75 * on.e0);
+    expect(on.loss).toBeLessThan(0.1);
+  });
+
+  for (const normal of [[0.1, 0.01], [0, 0]] as [number, number][]) it(`geometry losses that end early (\`until\`) switch to the plain kernels of the same layout${normal[0] ? '' : ' (depth only)'}`, async () => {
+    const gt = randomScene({ count: 150, seed: 171, opacity: [0.5, 0.9] });
+    const W = 48;
+    const H = 40;
+    const views: SplatTrainingView[] = [];
+    for (let k = 0; k < 4; k++) {
+      const { R, t } = lookAt([2.4 * Math.sin(k), -2.4 * Math.cos(k), 0.5], [0, 0, 0]);
+      const cam: SplatCamera = { width: W, height: H, fx: 50, fy: 50, cx: 23.5, cy: 19.5, R, t };
+      const r = renderCPU(gt, cam, { geometry: true });
+      const img = new Uint8ClampedArray(4 * W * H);
+      const map: DepthMapLike = { width: W, height: H, depth: new Float32Array(W * H), normal: new Float32Array(3 * W * H), cost: new Float32Array(W * H) };
+      for (let i = 0; i < W * H; i++) {
+        for (let c = 0; c < 3; c++) img[4 * i + c] = Math.round(255 * r.color[3 * i + c]);
+        img[4 * i + 3] = 255;
+        if (1 - r.T[i] > 0.5) {
+          (map.depth as Float32Array)[i] = (1 - r.T[i]) / r.geo![4 * i];
+          (map.normal as Float32Array).set([0, 0, -1], 3 * i);
+        }
+      }
+      views.push({ ...viewOf(cam, img, k), map } as SplatTrainingView & { map: DepthMapLike });
+    }
+    const t = await trainer(gt, views, { iterations: 100, resolution: [], mcmc: { start: 20, stop: 60, refineEvery: 20 }, geometry: { until: 0.5, normal } });
+    views.forEach((v, k) => t.setViewDepth(k, packDepthTarget((v as unknown as { map: DepthMapLike }).map, { f: 50, cx: 23.5, cy: 19.5 }, { width: W, height: H, f: 50, cx: 23.5, cy: 19.5 })));
+    await t.step(40);
+    expect(t.geometryActive).toBe(true);
+    const r = await t.step(30);
+    expect(t.geometryActive).toBe(false);
+    expect(Number.isFinite(r.loss)).toBe(true);
+    // the plain forward on the wide layout renders exactly what SplatRenderer renders
+    const cam = { width: W, height: H, fx: 50, fy: 50, cx: 23.5, cy: 19.5, ...lookAt([0.3, -2.5, 0.6], [0, 0, 0]) };
+    const a = await t.render(cam);
+    const rr = await SplatRenderer.create(ctx, { maxWidth: W, maxHeight: H });
+    rr.setModel(await t.readModel());
+    const b = await rr.render(cam);
+    rr.destroy();
+    let d = 0;
+    for (let i = 0; i < a.data.length; i++) d = Math.max(d, Math.abs(a.data[i] - b.data[i]));
+    expect(d).toBeLessThan(1e-6);
+    // a rollback before `until` brings the geometry kernels back
+    const st = await t.readState();
+    t.restore({ ...st, iteration: 10 }, null, await t.readModel());
+    await t.step(5);
+    expect(t.geometryActive).toBe(true);
+  });
+
+  it('flatten and anisotropy regularisers shrink the smallest axis and cap the elongation', async () => {
+    const gt = randomScene({ count: 120, seed: 161, opacity: [0.6, 0.9], logScale: [-3, -2] });
+    // needles: one long axis
+    for (let i = 0; i < gt.count; i++) gt.logScales.set([-1.2, -3.2, -3.0], 3 * i);
+    // views of the scene itself (the photometric loss starts at its optimum: the regularisers act alone)
+    const views = Array.from({ length: 4 }, (_, k) => {
+      const { R, t } = lookAt([2.4 * Math.sin(k), -2.4 * Math.cos(k), 0.5], [0, 0, 0]);
+      const cam: SplatCamera = { width: 40, height: 32, fx: 45, fy: 45, cx: 19.5, cy: 15.5, R, t };
+      const r = renderCPU(gt, cam);
+      const img = new Uint8ClampedArray(4 * 40 * 32);
+      for (let i = 0; i < 40 * 32; i++) {
+        for (let c = 0; c < 3; c++) img[4 * i + c] = Math.round(255 * r.color[3 * i + c]);
+        img[4 * i + 3] = 255;
+      }
+      return viewOf(cam, img, k);
+    });
+    const tiny = 1e-12;
+    const t = await trainer(gt, views, { iterations: 300, colourCorrection: false, resolution: [], mcmc: false, flatten: 50, anisotropy: { maxRatio: 3, weight: 1 }, lr: { mean: tiny, meanFinal: tiny, quat: tiny, opacity: tiny, sh0: tiny } });
+    await t.step(300);
+    const m = await t.readModel();
+    let ratio = 0;
+    let flat = 0;
+    for (let i = 0; i < m.count; i++) {
+      const ls = Array.from(m.logScales.subarray(3 * i, 3 * i + 3)).sort((a, b) => a - b);
+      ratio += Math.exp(ls[2] - ls[1]) / m.count;
+      flat += (ls[0] - Math.min(...gt.logScales.subarray(3 * i, 3 * i + 3))) / m.count;
+    }
+    console.log(`[splat] shape regularisers: mean max/mid ratio ${ratio.toFixed(2)} (start ${Math.exp(-1.2 + 3.0).toFixed(2)}), smallest log-scale change ${flat.toFixed(3)}`);
+    expect(ratio).toBeLessThan(4);
+    expect(flat).toBeLessThan(-0.2);
   });
 });
 

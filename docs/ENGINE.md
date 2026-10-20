@@ -161,7 +161,11 @@ densify — or after refine when there is no dense cloud. One long operation wit
    (`initFromPointCloud`: 3-NN scales, normal-oriented discs), plus for scene captures (or
    `SplatOptions.backgroundShell`) a far shell coloured from 160 px view thumbnails (`backgroundShell`, radius
    max(20 × camera extent, 3 × the 98th-percentile sparse-point distance)). Pipelines compiled
-   (`SplatTrainer.create`), views uploaded one at a time (`setViewImage`).
+   (`SplatTrainer.create`), views uploaded one at a time (`setViewImage`). Training views that are dense views
+   get an inverse-depth target from the dense stage's fusion-filtered depth map (½ size, 8 B per pixel,
+   `setViewDepth`): the preset's trainer default `geometry` supervises the rendered depth during the first 30 % of
+   the iterations (ARCHITECTURE §6 "Geometry supervision … off-trajectory views"; off without depth maps or with
+   `EngineConfig.splat.trainer.geometry: false`).
 2. `splat_training`: `trainer.step(chunk)` (25 iterations) under the engine's GPU lock, waiting while the page is
    hidden; `ProgressEvent.detail` = `SplatTrainingDetail` {iteration, iterations, loss, itPerSec, gaussians}.
    Cancel is checked between chunks. Every `checkpointEvery` iterations a checkpoint — f32 parameters, bf16 Adam

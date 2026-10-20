@@ -1498,3 +1498,148 @@ E2E_GPU=host node e2e/generate-synth.mjs yard-real --name yard-real-up75 --depth
 E2E_GPU=host node e2e/nvs.mjs object-real e2e/out/e2e/object-real-final --test-dataset object-real-up12 --common \
   --renderers points,mesh-lit,mesh-unlit,splat                            # → <run>/nvs-object-real-up12/nvs.json
 ```
+
+## Splat-stage experiments on a frozen session (`splat-replay.mjs`)
+
+Re-runs only the engine's splat stage (`runSplat`, the function `PhotogrammetryEngine.splat` runs) on the inputs of
+one e2e run, once per variant, and scores every variant on the held-out frames and the off-trajectory test sets.
+SfM, dense and mesh are not repeated, so a variant costs one splat stage (≈ 40–60 s on the M4) plus ≈ 35 s per
+test set; all variants of a scene share exactly the same poses, dense cloud and depth maps.
+
+```sh
+# once per scene: an e2e run that writes its session store to <run>/session/ after mesh (keyframe JPEGs + records,
+# sparse model, dense cloud, fusion-filtered depth maps; ≈ 310–330 MB)
+E2E_GPU=host node e2e/run-e2e.mjs object-real --engine worker --splat --tag gr-base --set persist=true --set dumpSession=true
+# variants = SplatTrainerOptions overrides (EngineConfig.splat.trainer, on top of the preset's trainer defaults)
+E2E_GPU=host node e2e/splat-replay.mjs e2e/out/e2e/object-real-gr-base --out e2e/out/replay/object \
+  --variant before='{"colourCorrection":{},"geometry":false}' --variant ccoff='{"colourCorrection":false}'
+#   --variants FILE (name → overrides JSON), --tests held,sim3,<test datasets> (default: held, sim3 and every
+#   e2e/data/<dataset>-* set), --skip-nvs (train only), --nvs-only (score what is missing; resumes), --repeat N
+```
+
+* **Faithfulness**: the page (`harness.html`, `window.replaySplat`, src/harness/engine/replay.ts) loads the dump into
+  in-memory engine stores and calls `runSplat` with the run's quality and mode, a 1200 MB budget, the dense cloud
+  and the depth maps; the trained model goes through the engine's stored f16 encoding and 'ply-splat' export. A
+  replay of the unchanged stage reproduced the engine run: object-real held-out 31.32 dB (engine run 31.29),
+  stage 59.8 s (59.7 s).
+* **Output**: `<out>/<variant>/{splats.ply, result.json (copied from the run), replay.json, nvs*/nvs.json}` and
+  `<out>/summary.json`; the script prints full-frame PSNR per test set, the off-trajectory mean and the stage times.
+  `profile: true` in a variant adds per-pass GPU ms per iteration.
+* **Noise**: five replays of the unchanged stage spread 0.11 dB held-out (object 31.21–31.32, yard 31.07–31.14),
+  up to 0.2 dB on single off-trajectory sets (yard +0.75 m: 20.48–20.68) and 0.05 (object) / 0.09 dB (yard) in the
+  off-trajectory means (the GPU's float CAS adds make runs non-deterministic). Stage times are only comparable within a sequential run (see below): the
+  quality sweeps ran two to four jobs at once.
+* **Killed browsers**: on this host the installed Chrome was killed from outside every 10–20 min (both instances at
+  once); the script times out the stuck evaluation (150 s per test set, 15 min per training) and retries.
+
+### Geometry supervision, shape regularisers, colour correction (2026-10-20, M4 / Metal, fast preset)
+
+Sessions: `object-real-gr-base` / `yard-real-gr-base` (this branch, worker engine, persistent session; 90 / 81
+training views 600×800 / 800×600, 40 dense views with filtered depth maps each, 200 000 Gaussians, 3 000 iterations).
+Every variant was trained on the same frozen inputs and scored with `nvs.mjs` (full-frame PSNR, splat renderer, 24
+views per set): held-out (relative pose), held-out through the Sim3, the four off-trajectory sets of each scene
+(Sim3 pose), and two **drift-free** sets per scene generated for this experiment (below). Variant names are
+`SplatTrainerOptions` overrides; "until" = fraction of the iterations the geometry loss runs for (weights decay
+0.5 → 0.05 for depth, 0.1 → 0.01 for normals over that fraction unless noted), "grazing 2" = target weight × cos²
+between MVS normal and ray. Rows with several runs are means; the five "before" runs spread 31.21–31.32 dB held-out
+(object) and 22.78–22.87 dB off-trajectory mean (yard).
+
+| variant (runs) | object held / Sim3 | object −5 / +5 / +12 / +25 cm | object off mean (Δ) | yard held / Sim3 | yard in / out 1.5 m / +0.75 / +1.5 m | yard off mean (Δ) | off mean Δ both | drift-free object path / +12 cm, yard path / +0.75 m |
+|---|---|---|---|---|---|---|---|---|
+| before (CC on, no geometry) (5) | 31.28 / 30.19 | 30.27 / 28.72 / 26.99 / 22.43 | 27.10 (+0.00) | 31.10 / 29.23 | 25.08 / 27.95 / 20.59 / 17.72 | 22.83 (+0.00) | +0.00 | 32.53 / 27.81, 30.27 / 20.62 |
+| geo: depth + normal, whole run (1) | 31.30 / 30.21 | 30.29 / 28.85 / 26.89 / 21.94 | 26.99 (-0.11) | 30.84 / 29.12 | 23.39 / 28.09 / 21.32 / 17.80 | 22.65 (-0.19) | -0.15 | — / —, — / — |
+| depth only, whole run (1) | 31.30 / 30.20 | 30.34 / 28.76 / 26.81 / 21.82 | 26.93 (-0.17) | 30.89 / 29.15 | 23.55 / 28.10 / 21.53 / 18.38 | 22.89 (+0.06) | -0.06 | — / —, — / — |
+| depth + normal, until 0.5 (1) | 31.33 / 30.23 | 30.36 / 28.82 / 27.11 / 22.15 | 27.11 (+0.01) | 30.99 / 29.20 | 24.78 / 28.07 / 21.36 / 18.51 | 23.18 (+0.35) | +0.18 | — / —, — / — |
+| depth only, until 0.5 (1) | 31.31 / 30.24 | 30.36 / 28.86 / 27.02 / 22.13 | 27.09 (-0.01) | 31.04 / 29.21 | 24.82 / 28.07 / 21.40 / 18.54 | 23.21 (+0.37) | +0.18 | — / —, — / — |
+| depth + normal, until 0.3 (1) | 31.27 / 30.18 | 30.30 / 28.80 / 27.05 / 22.25 | 27.10 (-0.00) | 30.99 / 29.18 | 25.32 / 28.02 / 21.28 / 18.64 | 23.31 (+0.48) | +0.24 | 32.56 / 27.87, 30.26 / 21.32 |
+| **depth only, until 0.3 (new default)** (3) | 31.37 / 30.27 | 30.35 / 28.88 / 27.24 / 22.54 | 27.25 (+0.15) | 31.01 / 29.19 | 25.58 / 28.02 / 21.08 / 18.58 | 23.31 (+0.48) | +0.31 | 32.62 / 28.09, 30.25 / 21.12 |
+| depth only, until 0.2 (1) | 31.30 / 30.23 | 30.31 / 28.77 / 27.05 / 22.24 | 27.09 (-0.01) | 30.91 / 29.11 | 25.61 / 27.98 / 21.00 / 18.53 | 23.28 (+0.44) | +0.22 | — / —, — / — |
+| depth only 1 → 0.1, until 0.3 (1) | 31.42 / 30.31 | 30.37 / 28.86 / 27.31 / 22.49 | 27.26 (+0.16) | 30.95 / 29.19 | 25.30 / 28.01 / 21.00 / 18.52 | 23.21 (+0.37) | +0.26 | — / —, — / — |
+| depth + normal 1 → 0.1 / 0.2 → 0.02, until 0.5 (1) | 31.27 / 30.16 | 30.33 / 28.96 / 26.96 / 22.04 | 27.07 (-0.03) | 30.89 / 29.18 | 25.29 / 28.09 / 21.46 / 18.47 | 23.33 (+0.49) | +0.23 | — / —, — / — |
+| depth + normal, whole run, grazing 2 (1) | 31.27 / 30.20 | 30.32 / 28.75 / 27.00 / 22.42 | 27.12 (+0.02) | 30.94 / 29.16 | 24.53 / 28.06 / 21.30 / 17.98 | 22.97 (+0.13) | +0.08 | — / —, — / — |
+| depth only, whole run, grazing 2 (1) | 31.32 / 30.24 | 30.36 / 28.83 / 26.85 / 22.18 | 27.06 (-0.05) | 31.02 / 29.20 | 24.76 / 28.02 / 21.45 / 17.99 | 23.06 (+0.22) | +0.09 | — / —, — / — |
+| depth + normal, until 0.5, grazing 2 (1) | 31.29 / 30.22 | 30.27 / 28.75 / 26.81 / 22.02 | 26.96 (-0.14) | 31.04 / 29.20 | 25.09 / 28.00 / 21.42 / 18.51 | 23.25 (+0.42) | +0.14 | — / —, — / — |
+| depth only, until 0.5, grazing 2 (1) | 31.37 / 30.27 | 30.33 / 28.81 / 26.76 / 21.85 | 26.94 (-0.16) | 31.04 / 29.19 | 25.27 / 28.00 / 21.26 / 18.36 | 23.22 (+0.39) | +0.11 | — / —, — / — |
+| depth only 1 → 0.1, until 0.5, grazing 2 (1) | 31.34 / 30.21 | 30.32 / 28.85 / 27.36 / 22.35 | 27.22 (+0.12) | 31.00 / 29.22 | 25.08 / 28.06 / 21.22 / 18.52 | 23.22 (+0.39) | +0.25 | — / —, — / — |
+| depth only, until 0.3, grazing 2 (1) | 31.32 / 30.19 | 30.31 / 28.71 / 26.81 / 21.99 | 26.95 (-0.15) | 31.03 / 29.18 | 25.49 / 27.93 / 21.22 / 18.65 | 23.32 (+0.49) | +0.17 | — / —, — / — |
+| flatten 100 (1) | 31.35 / 30.26 | 30.33 / 28.80 / 26.95 / 22.13 | 27.05 (-0.05) | 31.13 / 29.24 | 25.01 / 27.97 / 20.62 / 17.76 | 22.84 (+0.01) | -0.02 | — / —, — / — |
+| anisotropy cap 5, weight 1 (1) | 31.29 / 30.21 | 30.24 / 28.73 / 27.01 / 22.49 | 27.12 (+0.01) | 31.02 / 29.21 | 24.97 / 27.98 / 20.55 / 17.69 | 22.80 (-0.04) | -0.01 | — / —, — / — |
+| colour correction off (3) | 33.76 / 32.11 | 31.42 / 29.84 / 27.72 / 22.90 | 27.97 (+0.87) | 31.92 / 29.77 | 25.09 / 28.07 / 20.41 / 17.53 | 22.78 (-0.06) | +0.40 | 30.72 / 27.40, 29.80 / 20.25 |
+| colour correction pull 0.1 (1) | 31.37 / 30.32 | 30.38 / 28.76 / 27.03 / 22.37 | 27.14 (+0.04) | 31.16 / 29.26 | 25.20 / 27.98 / 20.67 / 17.80 | 22.91 (+0.08) | +0.06 | — / —, — / — |
+| colour correction lr 5e-4 (1) | 31.98 / 30.78 | 30.72 / 29.27 / 27.10 / 22.20 | 27.32 (+0.22) | 31.32 / 29.39 | 25.16 / 28.02 / 20.54 / 17.71 | 22.86 (+0.02) | +0.12 | 32.44 / 27.66, 30.30 / 20.53 |
+| CC off + depth only, until 0.3 (1) | 33.41 / 31.85 | 31.55 / 29.55 / 27.50 / 22.67 | 27.82 (+0.72) | 31.78 / 29.70 | 25.49 / 28.24 / 21.07 / 18.56 | 23.34 (+0.51) | +0.61 | 31.02 / 27.34, 29.87 / 20.99 |
+| CC off + depth + normal, until 0.3 (1) | 33.30 / 31.80 | 31.59 / 29.64 / 27.60 / 22.77 | 27.90 (+0.80) | 31.80 / 29.71 | 25.29 / 28.27 / 21.29 / 18.67 | 23.38 (+0.54) | +0.67 | 30.93 / 27.42, 29.83 / 21.22 |
+| CC off + depth + normal, until 0.5 (1) | 33.34 / 31.84 | 31.63 / 29.63 / 27.48 / 22.31 | 27.76 (+0.66) | 31.70 / 29.66 | 24.69 / 28.32 / 21.49 / 18.61 | 23.28 (+0.44) | +0.55 | — / —, — / — |
+| CC off + depth only, until 0.5, grazing 2 (1) | 33.33 / 31.81 | 31.42 / 29.58 / 27.51 / 22.58 | 27.77 (+0.67) | 31.76 / 29.68 | 25.15 / 28.32 / 21.28 / 18.56 | 23.33 (+0.49) | +0.58 | — / —, — / — |
+
+Drift-free sets (`--exposure-jitter 0 --wb-drift 0`, glance pans dropped, under `e2e/out/testsets/`):
+`object-real-nx` / `yard-real-nx` follow the capture path, `object-real-up12-nx` / `yard-real-up75-nx` the +12 cm /
++0.75 m paths. They exist because the regular off-trajectory sets replay the capture's auto-exposure and
+white-balance drift on the same clock (the drift is a seeded function of time, identical in every dataset of a seed),
+so a test frame has the exposure of the capture frame taken at the same moment from a nearby place.
+
+Splat-stage time, sequential runs on an otherwise idle GPU (host load 3–4), two runs each, interleaved:
+
+| | object stage (prepare + train) | yard stage (prepare + train) |
+|---|---|---|
+| before | 59.1 / 59.7 s (13.0 + 46.3) | 40.0 / 40.3 s (11.6 + 28.5) |
+| depth only, until 0.3 (new default) | 61.5 / 62.2 s (14.5 + 47.3): **+4.1 %** | 42.6 / 42.8 s (12.7 + 30.0): **+6.4 %** |
+| depth + normal, until 0.3 | 61.6 s (13.2 + 48.3) | 42.8 s (12.4 + 30.2) |
+| depth + normal, whole run (alone on the GPU) | 74.4 s (15.7 + 58.5): +24 % | |
+
+Per-pass GPU time per iteration over the whole schedule (`profile: true`, object): depth + normal for the whole run
+adds 2.9 ms to the rasteriser backward (7.61 → 10.49 ms: 13 instead of 9 accumulators and their CAS adds), 0.45 ms to
+the loss (geometry kernel) and 0.17 ms to the rasteriser. With `until` 0.3 the geometry kernels only run during the
+¼- and ½-resolution part, and the depth targets cost 1.0–1.5 s of preparation (40 maps resampled on the engine
+thread) plus the extra pipelines.
+
+* **Depth supervision helps where the MVS sees what the off-trajectory views see, and only when it stops early.** With
+  the new default (inverse depth only, 0.5 → 0.05 over the first 30 %) the yard gains +0.48 dB off trajectory
+  (+0.75 m +0.49, +1.5 m +0.86, inward +0.50) and +0.50 dB on the drift-free +0.75 m set; the object +0.15 dB (+12 cm
+  +0.25, +25 cm +0.11, drift-free +12 cm +0.28). Held-out moves +0.09 (object) / −0.09 dB (yard), the Sim3 held-out
+  +0.08 / −0.04, colour-fit held-out +0.2–0.3 dB. All within the rule (mean off-trajectory +0.31 dB, held-out ≥ −0.09
+  dB, time +4–6 %): **on by default** (`SPLAT_TRAINER_DEFAULTS.geometry`).
+* **Supervising the whole run punches holes.** Off-trajectory views that see ground the capture only saw at grazing
+  angles (yard inward 1.5 m: the near ground) lose 1.5–1.7 dB: the depth loss pins the ground Gaussians onto a thin
+  layer whose gaps only show from the new viewpoint (coverage 0.981 instead of 0.9995; on the covered pixels the
+  render is as good as before). Stopping at 30–50 % lets the photometric phase close them (inward −1.7 → +0.5 dB);
+  down-weighting grazing targets (cos²) cuts that loss to a third for whole-run supervision but adds nothing once it
+  stops early.
+* **Normals add nothing here.** The normal L1 against the MVS normals (DN-Splatter-style, rendered normal = smallest
+  axis) gives the same off-trajectory gains as depth alone (until 0.3: +0.24 vs +0.31 dB) and needs the 13-accumulator
+  kernels, so its weight defaults to 0 (depth-only kernels). Stronger depth weights (1 → 0.1) or until 0.2 are within
+  noise of the default.
+* **Flatter Gaussians do not move novel-view PSNR.** Both regularisers do what they should (object: Gaussians with
+  mid/min > 5 73.5 → 99.7 % at flatten 100; needles max/mid > 5 8.3 → 0.1 % with the cap) but every set stays within
+  ±0.07 dB: off: the smears and the bowl-shaped tree tops come from surfaces no training view saw, not from the shape
+  of the Gaussians.
+* **Colour correction stays on.** Without it, raw held-out PSNR rises by 2.5 (object) / 0.8 dB (yard) and the regular
+  off-trajectory mean by +0.40 dB, but on the drift-free sets it LOSES 1.81 / 0.41 dB (object path / +12 cm) and 0.47 /
+  0.37 dB (yard path / +0.75 m): without the per-view matrices the model bakes the capture's exposure into region-wise
+  colours, which the regular test frames — exposed on the same clock — happen to reproduce. With the matrices the
+  splats hold the mean appearance, which is what a viewer from a new place should see. The colour-fit PSNR is mixed
+  (object +0.2, yard −0.1 to −0.3 dB without correction). A lower correction rate (lr 5e-4) or a stronger pull to
+  identity (0.1) sit in between and gain nothing on the drift-free sets. Combining "correction off" with depth
+  supervision also costs 0.35–0.45 dB object held-out against "correction off" alone.
+* **What remains**: the height failures are content the capture never saw (object top and floor behind it at +25 cm,
+  tree crowns and the ground behind the fence from +1.5 m). Depth supervision closes ≈ 0.5–0.9 dB of the yard's
+  8.3–11 dB height gap; it cannot invent unseen surfaces.
+
+End-to-end check with the new default (`E2E_GPU=host node e2e/run-e2e.mjs object-real --engine worker --splat --tag
+gr-final`: a fresh non-persistent run, depth maps from the scratch IndexedDB store): "geometry targets for 40 of 90
+views (1/2 size) in 1114 ms", splat stage 60.3 s (prepare 12.4 + train 47.7 s at 64.1 it/s), memory plan 863 MB
+(GPU 353 MB; 811 / 301 MB in the "Splat stage in the engine" run), every enforced check passes. Splat full-frame PSNR:
+held-out 31.30, −5 / +5 / +12 / +25 cm 30.47 / 28.91 / 27.16 / 22.40 dB (that section's run: 31.29; 30.20 / 28.63 /
+26.80 / 22.14 dB).
+
+Reproduce (after the two `gr-base` runs above; ≈ 5 min per variant and scene with all six sets):
+
+```sh
+E2E_GPU=host node e2e/generate-synth.mjs object-real --name object-real-up12-nx --out e2e/out/testsets --depth-every 0 \
+  --visibility-every 0 --set exposureJitter=0 --set whiteBalanceDrift=0 --set 'trajectory.shake.pans=[]' --set trajectory.heightAbove=0.32
+E2E_GPU=host node e2e/splat-replay.mjs e2e/out/e2e/yard-real-gr-base --out e2e/out/replay/yard \
+  --variant before='{"geometry":false}' --variant default='{}' --variant normals='{"geometry":{"normal":[0.1,0.01]}}' \
+  --variant whole-run='{"geometry":{"until":1}}' --variant ccoff='{"colourCorrection":false}' \
+  --variant flat='{"flatten":100}' --variant aniso='{"anisotropy":{"maxRatio":5,"weight":1}}'
+E2E_GPU=host node e2e/nvs.mjs yard-real e2e/out/replay/yard/default --renderers splat --test-dataset e2e/out/testsets/yard-real-up75-nx
+```

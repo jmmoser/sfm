@@ -102,6 +102,8 @@ describe('engine splat stage', () => {
       console.log(`[splat-engine] resumed: ${JSON.stringify(info)}`);
       expect(info.iterations).toBe(300);
       expect(info.stats.splatResumedFrom).toBe(100);
+      // default geometry supervision: the persisted filtered depth maps of the reloaded session
+      expect(Number(info.stats.splatDepthViews)).toBeGreaterThan(0);
       expect(resumed[0].iteration).toBe(120);
       expect(info.count).toBeGreaterThan(1000);
       expect(Number(info.stats.splatLoss)).toBeLessThan(0.25);

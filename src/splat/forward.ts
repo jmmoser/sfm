@@ -10,8 +10,8 @@
  * exclusive scan → emit), tile-sort (⌈log2 tiles⌉ bits), raster (ranges + rasteriser).
  */
 import { CTL } from './wgsl/sort';
-import { FRAME_BYTES, type SplatShaderConfig } from './wgsl/common';
-import { BIN_SETUP_WGSL, EMIT_WGSL, GATHER_WGSL, RANGES_WGSL, projectWGSL, rasterForwardWGSL } from './wgsl/raster';
+import { FRAME_BYTES, projStride, shaderKey, type SplatShaderConfig } from './wgsl/common';
+import { BIN_SETUP_WGSL, GATHER_WGSL, RANGES_WGSL, emitWGSL, projectWGSL, rasterForwardWGSL } from './wgsl/raster';
 import { PassProfiler, RadixSorter, bindGroup, compileAll, compileSortPipelines, makeBuffer, radixBits, scanCfgBuffer, type SortPipelines } from './gpu-util';
 import { DEFAULT_NEAR, FRUSTUM_GUARD, TILE_SIZE, cameraCentre, type SplatCamera } from './types';
 
@@ -32,7 +32,7 @@ export async function compileForwardPipelines(device: GPUDevice, lost: Promise<u
     compileAll(
       device,
       lost,
-      { project: projectWGSL(cfg), gather: GATHER_WGSL, binSetup: BIN_SETUP_WGSL, emit: EMIT_WGSL, ranges: RANGES_WGSL, raster: rasterForwardWGSL(cfg) },
+      { project: projectWGSL(cfg), gather: GATHER_WGSL, binSetup: BIN_SETUP_WGSL, emit: emitWGSL(cfg), ranges: RANGES_WGSL, raster: rasterForwardWGSL(cfg) },
       'splat-fwd',
     ),
   ]);
@@ -45,7 +45,7 @@ const forwardCache = new WeakMap<GPUDevice, Map<string, Promise<ForwardPipelines
 export function getForwardPipelines(device: GPUDevice, cfg: SplatShaderConfig): Promise<ForwardPipelines> {
   let perDevice = forwardCache.get(device);
   if (!perDevice) forwardCache.set(device, (perDevice = new Map()));
-  const key = `${cfg.shDegree}-${cfg.antialiased}`;
+  const key = shaderKey(cfg);
   let p = perDevice.get(key);
   if (!p) {
     p = compileForwardPipelines(device, device.lost, cfg);
@@ -97,6 +97,11 @@ export class SplatForward {
   readonly ranges: GPUBuffer;
   readonly outColor: GPUBuffer;
   readonly outN: GPUBuffer;
+  /**
+   * Geometry channels (pipelines compiled with `geometry`): 2 vec4 per pixel, [2o] = rendered
+   * Σ w·(1/z, n), [2o + 1] = its loss gradient (wgsl/raster.ts); null otherwise.
+   */
+  readonly outGeo: GPUBuffer | null;
   readonly depthSort: RadixSorter;
   isectSort: RadixSorter;
   readonly capacity: number;
@@ -104,11 +109,11 @@ export class SplatForward {
   readonly maxHeight: number;
   private readonly blockSums: GPUBuffer;
   private readonly binScanCfg: GPUBuffer;
-  private readonly bgProject: GPUBindGroup;
-  private readonly bgGather: GPUBindGroup;
-  private readonly bgScanReduce: GPUBindGroup;
-  private readonly bgScanTop: GPUBindGroup;
-  private readonly bgScanDown: GPUBindGroup;
+  private bgProject!: GPUBindGroup;
+  private bgGather!: GPUBindGroup;
+  private bgScanReduce!: GPUBindGroup;
+  private bgScanTop!: GPUBindGroup;
+  private bgScanDown!: GPUBindGroup;
   private bgBinSetup!: GPUBindGroup;
   private bgEmit!: GPUBindGroup;
   private bgRanges!: GPUBindGroup[];
@@ -123,11 +128,14 @@ export class SplatForward {
   isectResult: 0 | 1 = 0;
   private tileBits = 4;
 
+  private readonly params: GPUBuffer;
+
   constructor(
     private readonly device: GPUDevice,
-    readonly pipes: ForwardPipelines,
+    public pipes: ForwardPipelines,
     opts: SplatForwardOptions,
   ) {
+    this.params = opts.params;
     const label = opts.label ?? 'splat';
     const N = opts.capacity;
     this.capacity = N;
@@ -136,7 +144,7 @@ export class SplatForward {
     const maxPx = opts.maxWidth * opts.maxHeight;
     const maxTiles = Math.ceil(opts.maxWidth / TILE_SIZE) * Math.ceil(opts.maxHeight / TILE_SIZE);
     this.frame = device.createBuffer({ size: FRAME_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: `${label}-frame` });
-    this.proj = makeBuffer(device, N * 48, `${label}-proj`);
+    this.proj = makeBuffer(device, N * 16 * projStride(pipes.cfg), `${label}-proj`);
     this.rects = makeBuffer(device, N * 8, `${label}-rects`);
     this.tileCount = makeBuffer(device, N * 4, `${label}-tilecount`);
     this.offsets = makeBuffer(device, N * 4, `${label}-offsets`);
@@ -146,16 +154,34 @@ export class SplatForward {
     this.ranges = makeBuffer(device, maxTiles * 8, `${label}-ranges`);
     this.outColor = makeBuffer(device, maxPx * 16, `${label}-color`);
     this.outN = makeBuffer(device, maxPx * 4, `${label}-n`);
+    this.outGeo = pipes.cfg.geometry ? makeBuffer(device, maxPx * 32, `${label}-geo`) : null;
     if (N > 1024 * 1024) throw new Error('SplatForward: capacity above 1M Gaussians');
     this.depthSort = new RadixSorter(device, pipes.sort, N, `${label}-depthsort`);
     this.isectSort = new RadixSorter(device, pipes.sort, Math.max(4096, opts.isectCapacity ?? 12 * N), `${label}-isectsort`);
-    const P = pipes;
-    this.bgProject = bindGroup(device, P.project, [this.frame, opts.params, this.proj, this.rects, this.tileCount, this.depthSort.keys[0], this.depthSort.vals[0]]);
+    this.makeBindGroups();
+  }
+
+  private makeBindGroups(): void {
+    const device = this.device;
+    const P = this.pipes;
+    this.bgProject = bindGroup(device, P.project, [this.frame, this.params, this.proj, this.rects, this.tileCount, this.depthSort.keys[0], this.depthSort.vals[0]]);
     this.bgGather = bindGroup(device, P.gather, [this.binCtl, this.depthSort.vals[0], this.tileCount, this.offsets]);
     this.bgScanReduce = bindGroup(device, P.sort.scanReduce, [this.binScanCfg, this.binCtl, this.offsets, this.blockSums]);
     this.bgScanTop = bindGroup(device, P.sort.scanTop, [this.binScanCfg, this.binCtl, this.blockSums]);
     this.bgScanDown = bindGroup(device, P.sort.scanDown, [this.binScanCfg, this.binCtl, this.offsets, this.blockSums]);
     this.makeIsectBindGroups();
+  }
+
+  /**
+   * Switches to other forward pipelines of the same projection layout (the trainer's geometry →
+   * plain kernels at the end of its geometry losses); buffers are kept (`outGeo` stays allocated).
+   */
+  setPipelines(p: ForwardPipelines): void {
+    if (p === this.pipes) return;
+    if (projStride(p.cfg) !== projStride(this.pipes.cfg)) throw new Error('SplatForward.setPipelines: projection layouts differ');
+    if (p.cfg.geometry && !this.outGeo) throw new Error('SplatForward.setPipelines: no geometry buffer');
+    this.pipes = p;
+    this.makeBindGroups();
   }
 
   get isectCapacity(): number {
@@ -169,7 +195,7 @@ export class SplatForward {
     this.bgBinSetup = bindGroup(d, P.binSetup, [this.frame, this.binCtl, S.ctl]);
     this.bgEmit = bindGroup(d, P.emit, [this.frame, this.depthSort.vals[0], this.tileCount, this.rects, this.offsets, S.keys[0], S.vals[0], this.proj]);
     this.bgRanges = [0, 1].map((k) => bindGroup(d, P.ranges, [S.ctl, S.keys[k], this.ranges]));
-    this.bgRaster = [0, 1].map((k) => bindGroup(d, P.raster, [this.frame, this.ranges, S.vals[k], this.proj, this.outColor, this.outN]));
+    this.bgRaster = [0, 1].map((k) => bindGroup(d, P.raster, [this.frame, this.ranges, S.vals[k], this.proj, this.outColor, this.outN, ...(P.cfg.geometry ? [this.outGeo!] : [])]));
   }
 
   /** Reallocates the intersection buffers (between frames). */
@@ -253,6 +279,7 @@ export class SplatForward {
 
   destroy(): void {
     for (const b of [this.frame, this.proj, this.rects, this.tileCount, this.offsets, this.binCtl, this.blockSums, this.binScanCfg, this.ranges, this.outColor, this.outN]) b.destroy();
+    this.outGeo?.destroy();
     this.depthSort.destroy();
     this.isectSort.destroy();
   }

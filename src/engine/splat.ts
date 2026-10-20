@@ -20,10 +20,12 @@
  *             read-back; the engine persists the model (`packSplatModel`) and clears the checkpoints.
  */
 import type { CameraIntrinsics, CancelToken, PointCloud, ProgressCallback } from '../core/types';
+import type { DepthMap } from '../dense/types';
 import { footprintDownsample } from '../dense/pointcloud';
 import { undistortedCamera } from '../dense/undistort';
 import type { GPUContext } from '../gpu/device';
-import { SplatTrainer, SplatWorkDroppedError, type SplatTrainerOptions, type SplatTrainerState, type SplatTrainingView } from '../splat/trainer';
+import { SplatTrainer, SplatWorkDroppedError, DEFAULT_SPLAT_GEOMETRY, geometryMode, type SplatTrainerOptions, type SplatTrainerState, type SplatTrainingView } from '../splat/trainer';
+import { packDepthTarget } from '../splat/depth-target';
 import { backgroundShell, concatModels, initFromPointCloud, type ColourSource } from '../splat/init';
 import { splatCamera, type SplatModel } from '../splat/types';
 import { ENGINE_ERRORS, SPLAT_STAGES, namedError, type QualityPreset, type SplatOptions, type SplatTrainingDetail } from '../workers/protocol';
@@ -63,6 +65,12 @@ export interface SplatDeps {
   model: SparseModel;
   /** The fused dense cloud (null = none) and whether the engine keeps it resident anyway. Called once. */
   denseCloud(): Promise<PointCloud | null>;
+  /**
+   * The dense stage's fusion-filtered depth maps (undistorted pinhole views at the dense size,
+   * keyframe ids), for the trainer's geometry supervision (`SplatTrainerOptions.geometry`); called
+   * only when that is on; null / absent = none.
+   */
+  depthMaps?: (() => Promise<SplatDepthMaps | null>) | null;
   /** Points of the dense cloud (planning before it is loaded; 0 = none) and whether it is resident. */
   densePoints: number;
   denseResident: boolean;
@@ -79,6 +87,13 @@ export interface SplatDeps {
   residentBytes: number;
   /** The shared WebGPU context (a fresh device after a loss); null without WebGPU. */
   gpu(): Promise<GPUContext | null>;
+}
+
+/** Depth maps of the dense stage (EngineDepthStore / MemoryDepthMapStore). */
+export interface SplatDepthMaps {
+  get(id: number): Promise<DepthMap | null>;
+  /** Keyframe ids with a map. */
+  ids(): number[];
 }
 
 export interface SplatOutput {
@@ -184,12 +199,14 @@ export async function runSplat(deps: SplatDeps, opts: SplatOptions = {}, progres
   const t0 = now();
   const model = deps.model;
   const quality = opts.quality ?? deps.quality;
-  const { trainer: trainerOverrides = {}, ...presetOverrides } = deps.config.splat ?? {};
+  const { trainer: trainerConfig = {}, ...presetOverrides } = deps.config.splat ?? {};
   const preset: SplatPresetConfig = resolveSplatPreset(
     quality,
     { ...presetOverrides, iterations: opts.iterations ?? presetOverrides.iterations, maxGaussians: opts.maxGaussians ?? presetOverrides.maxGaussians, maxImageSize: opts.maxImageSize ?? presetOverrides.maxImageSize, maxViews: opts.maxViews ?? presetOverrides.maxViews },
     deps.config.dense ?? {},
   );
+  // the preset's trainer defaults, EngineConfig.splat.trainer field by field on top
+  const trainerOverrides: Partial<SplatTrainerOptions> = { ...preset.trainer, ...trainerConfig };
   const iterations = Math.max(1, Math.round(preset.iterations));
   const shDegree = trainerOverrides.shDegree ?? preset.shDegree;
   const stats: Record<string, number | string> = {};
@@ -223,12 +240,17 @@ export async function runSplat(deps: SplatDeps, opts: SplatOptions = {}, progres
   const span = sceneSpan(model);
   const shellRadius = Math.max(20 * span.cameraExtent, 3 * span.pointsP98);
   const denseTarget = deps.densePoints > 0 ? Math.min(deps.densePoints, Math.round(preset.denseInitFraction * preset.maxGaussians)) : 0;
+  // geometry supervision: the dense stage's depth maps of the registered keyframes with photos
+  const geoOpt = trainerOverrides.geometry ? { ...DEFAULT_SPLAT_GEOMETRY, ...trainerOverrides.geometry } : null;
+  const depthStore = geoOpt && deps.depthMaps ? await deps.depthMaps() : null;
+  const depthIds = new Set(depthStore ? depthStore.ids().filter((id) => withImage.some((im) => im.id === id)) : []);
   const planBase = {
     budgetMB: deps.memoryBudgetMB,
     residentBytes: deps.residentBytes,
     shDegree,
     loadedCloudPoints: deps.denseResident ? 0 : deps.densePoints,
     initPoints: denseTarget + model.numPoints + (shellOn ? preset.shellCount : 0),
+    geometry: geoOpt && depthIds.size ? { views: depthIds.size, factor: geoOpt.factor, normals: geometryMode(geoOpt) === true } : undefined,
   };
   const fit = fitSplatPlan(planBase, { views: Math.min(preset.maxViews, withImage.length), size: preset.maxImageSize, maxGaussians: preset.maxGaussians }, { dims: (s) => dims(s), maxBufferBytes: ctx.limits.maxStorageBufferBindingSize });
   // the dense cloud (read from the store unless resident) seeds the Gaussians and identifies the run
@@ -334,6 +356,34 @@ export async function runSplat(deps: SplatDeps, opts: SplatOptions = {}, progres
 
   // ---- trainer: pipelines, model, views
   const trainerOpts: SplatTrainerOptions = { ...trainerOverrides, maxGaussians, iterations, shDegree };
+  if (trainerOpts.geometry && !depthIds.size) {
+    deps.log('info', 'splat: geometry supervision requested but there are no dense depth maps: off');
+    trainerOpts.geometry = false;
+  }
+  /** Geometry targets of the views with a dense depth map (resampled to the training size). */
+  const uploadDepth = async (t: SplatTrainer): Promise<void> => {
+    if (!trainerOpts.geometry || !depthStore) return;
+    const td = now();
+    let n = 0;
+    for (let i = 0; i < views.length; i++) {
+      check(SPLAT_STAGES.prepare);
+      const id = views[i].id;
+      if (!depthIds.has(id)) continue;
+      const map = await depthStore.get(id);
+      if (!map) continue;
+      const mapCam = undistortedCamera(camOf(id), Math.max(map.width, map.height));
+      if (mapCam.width !== map.width || mapCam.height !== map.height) {
+        deps.log('warn', `splat: depth map ${id} is ${map.width}×${map.height}, its dense camera ${mapCam.width}×${mapCam.height}: skipped`);
+        continue;
+      }
+      t.setViewDepth(i, packDepthTarget(map, mapCam, undistortedCamera(camOf(id), size), { factor: geoOpt!.factor, grazing: geoOpt!.grazing }));
+      n++;
+      if (n % 4 === 0) await tick();
+    }
+    stats.splatDepthViews = n;
+    stats.splatDepthMs = Math.round(now() - td);
+    deps.log('info', `splat: geometry targets for ${n} of ${views.length} views (1/${geoOpt!.factor} size) in ${Math.round(now() - td)} ms`);
+  };
   const viewMeta = (): SplatTrainingView[] => views.map((im) => ({ id: im.id, cam: undistortedCamera(camOf(im.id), size), pose: im.pose, image: null }));
   const uploadViews = async (t: SplatTrainer, from: number, to: number): Promise<void> => {
     for (let i = 0; i < views.length; i++) {
@@ -353,6 +403,7 @@ export async function runSplat(deps: SplatDeps, opts: SplatOptions = {}, progres
     try {
       t.init(params, viewMeta());
       await uploadViews(t, from + 0.1 * (to - from), to);
+      await uploadDepth(t);
       deps.config.splatDebug?.onTrainer?.(t);
     } catch (e) {
       t.destroy();

@@ -8,12 +8,17 @@
  * mode 'adam'  — bindings: frame, opt, params (rw), adamM, adamV, grad2d, tileCount
  * mode 'grads' — bindings: frame, params (read), grad2d, tileCount, gradsOut
  *                (writes the raw gradients in the parameter layout; tests)
- * Both modes read the 9 accumulated 2-D gradients of a Gaussian and reset them to 0.
+ * Both modes read the 9 (13 with the geometry channels) accumulated 2-D gradients of a Gaussian
+ * and reset them to 0.
+ *
+ * Shape regularisers (Adam mode, `opt.shape`): flatten — L1 on the smallest scale (÷ scene extent,
+ * mean over the Gaussians: surfel-like discs); anisotropy — max(0, ln s_max − ln s_mid − ln r)
+ * (mean over the Gaussians: no needles longer than r × their width).
  */
 import { FRAME_WGSL, PARAMS_WGSL, ROT_WGSL, constantsWGSL, type SplatShaderConfig } from './common';
 
 /** Byte size of the Opt uniform. */
-export const OPT_BYTES = 96;
+export const OPT_BYTES = 112;
 
 const OPT_WGSL = /* wgsl */ `
 struct Opt {
@@ -23,10 +28,11 @@ struct Opt {
   bc: vec4f,    // 1 − beta1^t, 1 − beta2^t, 0, 0
   reg: vec4f,   // opacity regulariser / N, scale regulariser / (3N), 0, 0
   seed: vec4u,  // random seed of this step
+  shape: vec4f, // flatten / (N · extent), anisotropy / N, ln(max ratio), 0
 }
 `;
 
-const GRAD_MATH = /* wgsl */ `
+const gradMath = (geo: boolean, nrm: boolean): string => /* wgsl */ `
 struct PGrad {
   mean: vec3f,
   scale: vec3f,
@@ -42,8 +48,9 @@ struct PGrad {
 
 fn finite(x: f32) -> bool { return (bitcast<u32>(x) & 0x7f800000u) != 0x7f800000u; }
 
-// Parameter gradients of Gaussian i from its 2-D gradients g2 = [du, dv, dA, dB, dC, do, dr, dg, db].
-fn projBackward(i: u32, g2: array<f32, 9>) -> PGrad {
+// Parameter gradients of Gaussian i from its 2-D gradients g2 = [du, dv, dA, dB, dC, do, dr, dg, db]
+// (+ [d(1/z), dnx, dny, dnz] with the geometry channels).
+fn projBackward(i: u32, g2: array<f32, G2D>) -> PGrad {
   var o: PGrad;
   let mean = loadMean(i);
   let Wr = camRot();
@@ -110,6 +117,7 @@ fn projBackward(i: u32, g2: array<f32, 9>) -> PGrad {
   let rz3 = rz2 * rz;
   var dp = vec3f(fx * rz * g2[0], fy * rz * g2[1], -fx * p.x * rz2 * g2[0] - fy * p.y * rz2 * g2[1]);
   dp.z += dJ[0][0] * (-fx * rz2) + dJ[2][0] * (2.0 * fx * tx * rz3) + dJ[1][1] * (-fy * rz2) + dJ[2][1] * (2.0 * fy * ty * rz3);
+  ${geo ? 'dp.z -= g2[9] * rz2;' : ''}
   let dtx = dJ[2][0] * (-fx * rz2);
   let dty = dJ[2][1] * (-fy * rz2);
   if (clampX) { dp.z += dtx * tx * rz; } else { dp.x += dtx; }
@@ -134,7 +142,18 @@ fn projBackward(i: u32, g2: array<f32, 9>) -> PGrad {
   let dM = 2.0 * (dSig * M);
   let ds = vec3f(dot(dM[0], Rq[0]), dot(dM[1], Rq[1]), dot(dM[2], Rq[2]));
   o.scale = ds * s;
-  let G = mat3x3f(dM[0] * s.x, dM[1] * s.y, dM[2] * s.z); // ∂L/∂Rq, G[c][r]
+  var G = mat3x3f(dM[0] * s.x, dM[1] * s.y, dM[2] * s.z); // ∂L/∂Rq, G[c][r]
+  ${
+    nrm
+      ? `{
+    // n = ±Wr · Rq[k] (smallest-scale axis, facing the camera): ∂L/∂Rq[k] += ±Wrᵀ ∂L/∂n
+    let k = minAxis(loadScale(i));
+    let nc = Wr * Rq[k];
+    let sg = select(1.0, -1.0, dot(nc, p) > 0.0);
+    G[k] += sg * (transpose(Wr) * vec3f(g2[10], g2[11], g2[12]));
+  }`
+      : ''
+  }
   let w = qn.x;
   let x = qn.y;
   let y = qn.z;
@@ -146,6 +165,13 @@ fn projBackward(i: u32, g2: array<f32, 9>) -> PGrad {
   let dq = vec4f(dw, dx, dy, dz);
   o.quat = (dq - qn * dot(qn, dq)) * qinv;
   return o;
+}
+
+fn minAxis(ls: vec3f) -> u32 {
+  var k = 0u;
+  if (ls.y < ls[k]) { k = 1u; }
+  if (ls.z < ls[k]) { k = 2u; }
+  return k;
 }
 
 fn shColour(i: u32, dir: vec3f) -> vec3f {
@@ -179,17 +205,17 @@ ${
 }
 ${PARAMS_WGSL}
 ${ROT_WGSL}
-${GRAD_MATH}
+${gradMath(!!cfg.geometry, cfg.geometry === true)}
 ${adam ? ADAM_FNS : ''}
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {
   let i = gid.x;
   if (i >= frame.info.x) { return; }
   if (tileCount[i] == 0u) { return; }
-  var g2: array<f32, 9>;
-  for (var c = 0u; c < 9u; c++) {
-    g2[c] = bitcast<f32>(grad2d[9u * i + c]);
-    grad2d[9u * i + c] = 0u;
+  var g2: array<f32, G2D>;
+  for (var c = 0u; c < G2D; c++) {
+    g2[c] = bitcast<f32>(grad2d[G2D * i + c]);
+    grad2d[G2D * i + c] = 0u;
   }
   var g = projBackward(i, g2);
 ${adam ? ADAM_BODY : GRADS_BODY}
@@ -249,6 +275,22 @@ const ADAM_BODY = /* wgsl */ `
   // MCMC regularisers (opacity and scale L1, means over all Gaussians)
   g.opac += opt.reg.x * g.sig * (1.0 - g.sig);
   g.scale += opt.reg.y * g.s;
+  // shape regularisers: flatten (smallest scale → 0), anisotropy cap (s_max ≤ r · s_mid)
+  if (opt.shape.x > 0.0 || opt.shape.y > 0.0) {
+    let ls = loadScale(i);
+    var kmin = 0u;
+    var kmax = 0u;
+    for (var k = 1u; k < 3u; k++) {
+      if (ls[k] < ls[kmin]) { kmin = k; }
+      if (ls[k] > ls[kmax]) { kmax = k; }
+    }
+    let kmid = select(3u - kmin - kmax, 1u, kmin == kmax);
+    g.scale[kmin] += opt.shape.x * g.s[kmin];
+    if (kmin != kmax && ls[kmax] - ls[kmid] > opt.shape.z) {
+      g.scale[kmax] += opt.shape.y;
+      g.scale[kmid] -= opt.shape.y;
+    }
+  }
   let tot = dot(g.mean, vec3f(1.0)) + dot(g.scale, vec3f(1.0)) + dot(g.quat, vec4f(1.0)) + g.opac
     + dot(g.sh0, vec3f(1.0)) + dot(g.sh1, vec3f(1.0)) + dot(g.sh2, vec3f(1.0)) + dot(g.sh3, vec3f(1.0));
   if (!finite(tot)) { return; }

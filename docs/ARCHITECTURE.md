@@ -3418,3 +3418,95 @@ the app builds them from the viewer screen. UI contract: ENGINE.md §3 "Splat pr
   splats, layer pill, splat PLY export, reopened scan on its splats) and `e2e/ui/states.mjs` `splat-build` /
   `splat-no-webgpu`; screenshots of real runs: `e2e/ui/splat-shots.mjs` (e2e/README.md "Viewer splat layer").
 
+
+### `src/splat` + `src/engine` — Geometry supervision, shape regularisers and colour correction against off-trajectory views (2026-10; amends the `src/splat` and splat-stage notes above)
+
+Classical 3DGS interpolates well and extrapolates poorly, mostly in height (e2e/README.md "Breakthrough results":
+object +12 / +25 cm −3.3 / −8.0 dB, yard +0.75 / +1.5 m −8.3 / −11.0 dB against held-out). This experiment adds
+geometry supervision from the metric MVS, surfel / anisotropy regularisers and settles the colour-correction
+question, each measured on held-out AND the off-trajectory sets of both scenes (e2e/README.md "Splat-stage
+experiments on a frozen session": one e2e session per scene, the splat stage re-run per variant on identical
+inputs). Rule: a change is on by default only if it raises the mean off-trajectory full-frame PSNR, lowers held-out
+by ≤ 0.2 dB and costs ≤ ~15 % splat-stage time.
+
+* **Files**: `cpu-reference.ts` (geometry channels, ∂L/∂A), `depth-target.ts` (target packing, CPU loss),
+  `wgsl/{common,raster,backward,loss}.ts`, `forward.ts` (`outGeo`, `setPipelines`), `trainer.ts` (`geometry`,
+  `flatten`, `anisotropy`, `setViewDepth`, phase switch, `debugGeoLoss`), `types.ts` (memory),
+  `src/engine/splat.ts` (`depthMaps`, `uploadDepth`), `engine.ts`, `presets.ts` (`SplatPresetConfig.trainer`,
+  `SPLAT_TRAINER_DEFAULTS`), `memory.ts`; harness: `src/harness/engine/replay.ts`, `pipeline.ts` (`dumpSession`),
+  `e2e/splat-replay.mjs`.
+* **Geometry channels** (shader config `geometry: true | 'depth'`): the rasteriser also renders D = Σ w_i / z_i (z = camera
+  depth of the centre) and N = Σ w_i n_i, n_i = the rotation axis of the smallest scale in the camera frame, flipped to
+  face the camera (n · p < 0, the MVS convention). They are colour-like channels with a zero background, so the
+  existing front-to-back backward carries them: gᴳ · G joins r, gᴳ · (1/z, n) the splat's channel product, and each
+  Gaussian gets 4 more 2-D gradients (∂(1/z) → mean through z; ∂n → quaternion through its column, the axis choice and
+  the flip are piecewise constant). The accumulated alpha A = 1 − T is a channel of constant 1: its gradient rides in
+  dLdC.w (r += gᴬ·A, channel product += gᴬ). Layout: proj gets a 4th row (normal) and the backward 13 accumulators;
+  'depth' (normal weights 0) keeps proj at 3 rows (the depth is already in row 0) and uses 10. The per-pixel geometry
+  buffer interleaves [2o] = rendered (D, N) and [2o + 1] = ∂L/∂(D, N), so the rasteriser backward stays at 8 storage
+  bindings. iOS budget: raster forward 14 KB workgroup memory (normal staged as sC.w + a vec2 array), backward
+  ≈ 10 KB; still no f32 atomics (one CAS add per non-zero (splat, workgroup, component)).
+* **Geometry loss** (`GEO_LOSS_WGSL`, after the SSIM backward): per pixel of the current level with a target and
+  A ≥ 0.05: L = (1 / pixels) · w · (λ_d |D̂·z_t − 1| + λ_n ‖N̂ − n_t‖₁), D̂ = D / A, N̂ = N / A. Targets
+  (`packDepthTarget`): the dense stage's fusion-filtered depth map of the view (`EngineDepthStore` 'depth/<id>') resampled
+  along the rays to the training camera at ½ size (nearest source pixel; the dense and splat views are the same
+  undistorted, rolling-shutter-corrected pinholes, so z and the camera-frame normal carry over), 8 B per pixel: f16
+  inverse depth | f16 weight (w = 1 − cost, the filtered maps have cost < 0.5), octahedral normal in 2 × snorm16; optional
+  × |cos θ|^grazing between normal and ray. Weights decay exponentially λ(0) → λ(until·T); after `until` the trainer
+  swaps to the plain kernels of the same projection layout (`compilePostGeometryPipelines` shares the loss / MCMC /
+  sort pipelines; `SplatForward.setPipelines`; a rollback to before `until` swaps back). The relative inverse-depth
+  error is scale-free (object 0.3–2.5 m, yard 3–25 m). Alpha normalisation was necessary: on the un-normalised
+  blended inverse depth the loss can only be met where the render is opaque (toy test: depth error −25 % vs −94 %).
+* **Engine**: `SplatDeps.depthMaps()` (the in-memory filtered store of this engine's dense run, else an
+  `EngineDepthStore` over the depth backend: session store or scratch IndexedDB) — only when the trainer has
+  `geometry`; the training views that are dense views get a target (fast: 40 of 90 object / 81 yard views), packed on
+  the engine thread (1.0–1.5 s for 40 views) after the view uploads and again on a device-loss rebuild. Without depth
+  maps (no dense stage) geometry is switched off with a log line. Memory plan: + targets (40 × 300 × 400 × 8 B = 37 MB
+  at fast) + 32 B per training pixel (15 MB) + 4 B per Gaussian (10 accumulators; full mode: 16 + 16 B for the 4th
+  proj row and 13 accumulators); fast object: GPU 301 → 353 MB, peak 686 → 738 MB of 1.2 GB (the targets stay
+  allocated after `until`: a rollback may need them). The preset's trainer defaults (`SplatPresetConfig.trainer`) are merged under
+  `EngineConfig.splat.trainer` field by field and hashed into the run key.
+* **Shape regularisers** (Adam kernel, `opt.shape`): `flatten` — L1 on the smallest scale ÷ scene extent, mean over the
+  Gaussians (surfels); `anisotropy: { maxRatio, weight }` — max(0, ln s_max − ln s_mid − ln r), mean over the
+  Gaussians (no needles). Both act as intended (object: Gaussians with mid/min > 5 73.5 → 99.7 % with flatten 100;
+  max/mid > 5 8.3 → 0.1 % with the cap 5) but leave every PSNR within noise, so they stay off.
+* **Tests**: `cpu-reference.test.ts` (finite differences of every parameter through the geometry channels and ∂L/∂A, SH
+  0 / 1, clamped Jacobian; disc normal / inverse depth), `depth-target.test.ts` (octahedral round trip, ½-size and
+  cross-size resampling, grazing weights, loss gradient incl. ∂L/∂A vs finite differences), `trainer.gpu.test.ts`
+  (geometry forward + parameter gradients vs CPU, full and depth-only: rel. error ≈ 1e-6; loss kernel vs CPU at levels
+  1 / 2 / 4: 1e-7; depth supervision pulls perturbed Gaussians onto the target; the `until` switch renders identically
+  to `SplatRenderer` and a rollback restores the geometry kernels; flatten / anisotropy), `splat-engine.gpu.test.ts`
+  (the reloaded persistent session trains with its stored depth maps).
+* **Results** (e2e/README.md "Geometry supervision, shape regularisers, colour correction": 25 variants, full-frame
+  PSNR, off = mean of the four off-trajectory sets, drift-free = the capture path and the +12 cm / +0.75 m path without
+  exposure / white-balance drift; Δ against the five "before" runs):
+
+  | variant | object held / off (Δ) | yard held / off (Δ) | drift-free object path / +12 cm, yard path / +0.75 m | stage time |
+  |---|---|---|---|---|
+  | before (colour correction on, no geometry) | 31.28 / 27.10 | 31.10 / 22.83 | 32.53 / 27.81, 30.27 / 20.62 | 59.4 / 40.2 s |
+  | depth + normal, whole run | 31.30 / 26.99 (−0.11) | 30.84 / 22.65 (−0.18) | | +24 % |
+  | depth only, until 0.5 | 31.31 / 27.09 (−0.01) | 31.04 / 23.21 (+0.37) | | |
+  | depth + normal, until 0.3 | 31.27 / 27.10 (0.00) | 30.99 / 23.31 (+0.48) | 32.56 / 27.87, 30.26 / 21.32 | +4 / +7 % |
+  | **depth only, until 0.3 (default)** | **31.37 / 27.25 (+0.15)** | **31.01 / 23.31 (+0.48)** | **32.62 / 28.09, 30.25 / 21.12** | **+4.1 / +6.4 %** |
+  | depth only, until 0.3, grazing cos² | 31.32 / 26.95 (−0.15) | 31.03 / 23.32 (+0.49) | | |
+  | flatten 100 | 31.35 / 27.05 (−0.05) | 31.13 / 22.84 (+0.01) | | |
+  | anisotropy cap 5 | 31.29 / 27.12 (+0.01) | 31.02 / 22.80 (−0.04) | | |
+  | colour correction off | 33.76 / 27.97 (+0.87) | 31.92 / 22.78 (−0.06) | 30.72 / 27.40, 29.80 / 20.25 | (not timed alone) |
+  | colour correction off + depth only, until 0.3 | 33.41 / 27.82 (+0.72) | 31.78 / 23.34 (+0.51) | 31.02 / 27.34, 29.87 / 20.99 | |
+
+  Decisions (rule above): **inverse-depth supervision during the first 30 % is on by default** (mean off-trajectory
+  +0.31 dB, held-out +0.09 / −0.09 dB, stage +4–6 %, GPU +52 MB at fast); supervising the whole run punches holes into
+  ground the capture only saw at grazing angles (yard inward −1.7 dB, coverage 0.981), which stopping early avoids; the
+  normal term, the grazing weights, `flatten` and `anisotropy` stay options (no gain). **Per-view colour correction
+  stays on**: it loses raw held-out and regular off-trajectory PSNR only because those test frames reproduce the
+  capture's exposure drift on the same clock, which an uncorrected model bakes into region-wise colours; on drift-free
+  views the correction wins by 0.4–1.8 dB. Before this, the regular off-trajectory sets cannot judge exposure handling.
+* **Measuring on splats** (not wired): the geometry forward also renders D̂ = D / A per pixel, so the viewer's
+  `SplatLayer` could pick a 3-D point at a tap from the expected inverse depth of the splats it shows (a 1-pixel
+  readback of a `geometry`-config frame) instead of the hidden dense points / mesh it uses now.
+* **Open issues**: the remaining height gap is unseen content (object top / floor at +25 cm, tree crowns and the ground
+  behind the fence from +1.5 m): 0.5–0.9 dB of the yard's 8.3–11 dB recovered; a generative or symmetry prior would be
+  needed for the rest. Only the dense views (40 at fast) get targets; the depth targets (37 MB) stay allocated after
+  `until`; no iPhone timing (the target packing is CPU work on the engine thread, 1–1.5 s on the M4); the regular
+  off-trajectory datasets share the capture's exposure clock (use `--exposure-jitter 0 --wb-drift 0` sets for
+  appearance questions).
