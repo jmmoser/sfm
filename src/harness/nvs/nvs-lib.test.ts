@@ -14,6 +14,7 @@ import {
   gaussianKernel,
   prepareGroundTruth,
   psnr,
+  scoreCommon,
   scoreView,
   ssim,
   triptych,
@@ -27,8 +28,10 @@ import {
   gyroAt,
   heldOutFrames,
   mapPoseRelative,
+  nearestInSpace,
   mapPoseSim3,
   runRollingShutter,
+  sceneMismatch,
   selectEvenly,
   testViews,
   type PoseJSON,
@@ -213,6 +216,37 @@ describe('nvs metrics', () => {
     expect(triptych(gt, gt, w, h).length).toBe(4 * 3 * n);
   });
 
+  it('scoreCommon: every renderer on the pixels all of them cover', () => {
+    const gt = texture(w, h, 5);
+    // A: exact on the left half only; B: everywhere, but 0.8 × GT + 5 on the right half and +3 on the left
+    const a = new Uint8ClampedArray(4 * n);
+    const b = Uint8ClampedArray.from(gt);
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++) {
+        const i = 4 * (y * w + x);
+        if (x < w / 2) for (let c = 0; c < 4; c++) a[i + c] = gt[i + c];
+        for (let c = 0; c < 3; c++) b[i + c] = x < w / 2 ? gt[i + c] + 3 : 0.8 * gt[i + c] + 5;
+      }
+    const own = scoreView(b, gt, w, h, { shift: false });
+    const c = scoreCommon({ a, b }, prepareGroundTruth(gt, w, h), w, h);
+    expect(c.coverage).toBeCloseTo(0.5, 9);
+    expect(c.pixels).toBe(n / 2);
+    expect(c.scores.a.psnr).toBe(Infinity);
+    expect(c.scores.a.ssim).toBeCloseTo(1, 6);
+    // B on the common (left) pixels: a constant +3 offset → 20·log10(255/3), better than on all its own pixels
+    expect(c.scores.b.psnr).toBeCloseTo(20 * Math.log10(255 / 3), 1);
+    expect(c.scores.b.psnr).toBeGreaterThan(own.covered.psnr);
+    expect(c.scores.b.ccPsnr).toBeGreaterThan(45);
+    expect(scoreCommon({ a, b }, gt, w, h, { ssim: false }).scores.b.ssim).toBeNull();
+    const none = scoreCommon({ a, e: new Uint8ClampedArray(4 * n) }, gt, w, h);
+    expect(none.pixels).toBe(0);
+    expect(none.scores.a.psnr).toBeNaN();
+    const agg = aggregateScores([{ ...own, common: { coverage: c.coverage, ...c.scores.b } }]);
+    expect(agg.common.psnr.mean).toBeCloseTo(c.scores.b.psnr, 9);
+    expect(agg.common.coverage.mean).toBeCloseTo(0.5, 9);
+    expect(aggregateScores([own]).common.psnr.n).toBe(0);
+  });
+
   it('alignmentShift finds an image translation (render(x) = gt(x + d))', () => {
     const W = 120,
       H = 90;
@@ -321,6 +355,64 @@ describe('nvs views', () => {
     expect(shared.views[0].index).toBe(7);
   });
 
+  it('test dataset: its frames through the Sim3, the keyframe nearest in space, its own ω / ν', () => {
+    // the same world, a wider and higher path; frames indexed from 0 again
+    const tFrames = Array.from({ length: 12 }, (_, i) => {
+      const R = randomRotation(r);
+      const C = [1.3 * Math.cos(i / 2), 1.3 * Math.sin(i / 2), 0.5];
+      const t = mat3Vec(R, C).map((v) => -v);
+      return { index: i, file: `frames/${String(i).padStart(6, '0')}.jpg`, tTrue: 1000 + 125 * i, pose: { R, t }, f: 752 + i * 0.2, focusDistance: 1 };
+    });
+    const tImu = [
+      { t: 0, gyro: [0.1, 0.2, 0.3] },
+      { t: 1e5, gyro: [0.1, 0.2, 0.3] },
+    ];
+    const test = { meta: { ...meta, name: 'test' }, frames: tFrames, imu: tImu };
+    const fs = result.images.map((x) => x.f).sort((a, b) => a - b);
+    for (const pose of ['sim3', 'relative'] as const) {
+      const tv = testViews({ meta, frames }, result, { views: 4, pose, test });
+      expect(tv.candidates).toBe(12); // every test frame, keyframe indices and blur decisions do not apply
+      expect(tv.views.map((v) => v.index)).toEqual(selectEvenly(tFrames, 4).map((f) => f.index));
+      for (const v of tv.views) {
+        const f = tFrames[v.index];
+        expectPose(v.pose, mapPoseSim3(f.pose, sim), 1e-8); // exact data: both modes agree
+        expect(v.gap).toBeNull();
+        // nearest registered keyframe by GT camera centre
+        const c = cameraCenter(f.pose);
+        const d = keys.map((k) => Math.hypot(...cameraCenter(frames[k].pose).map((x, i) => x - c[i])));
+        const best = keys[d.indexOf(Math.min(...d))];
+        expect(v.nearestKeyframe).toBe(best);
+        expect(v.nearest!.keyframe).toBe(best);
+        expect(v.nearest!.distM).toBeCloseTo(Math.min(...d), 12);
+        const im = result.images.find((x) => x.index === best)!;
+        expect(v.camera.f).toBeCloseTo((((760 * im.f) / fs[fs.length >> 1]) * f.f) / frames[best].f, 9);
+        expect(v.omega).toEqual([0.1, -0.2, -0.3]);
+        expect(v.nu).not.toBeNull(); // central difference of the TEST frames
+        expect(v.gt.f).toBe(f.f);
+      }
+    }
+    // held-out views also report the keyframe nearest in space (a keyframe itself: distance 0, angle 0)
+    const own = testViews({ meta, frames }, result, { frames: [6] }).views[0];
+    expect(own.nearest).toMatchObject({ keyframe: 6 });
+    expect(own.nearest!.distM).toBe(0);
+    expect(own.nearest!.axisDeg).toBeCloseTo(0, 6);
+    expect(nearestInSpace([], frames[0].pose)).toBeNull();
+    expect(() => testViews({ meta, frames }, result, { test: { ...test, meta: { ...meta, width: 960, height: 720 } } })).toThrow(/test dataset frames/);
+  });
+
+  it('sceneMismatch: same seeded scene and camera, yard loop unchanged', () => {
+    const m = { scene: 'yard', seed: 1, intrinsics: { width: 960, height: 720, f: 753, cx: 478.5, cy: 361, k1: -0.03, k2: 0.005 }, config: { textureScale: 1, anisotropy: 8, trajectory: { shake: {} } } };
+    const moved = { ...m, config: { ...m.config, trajectory: { height: 2.25, lateralOffset: 1.5 } } };
+    expect(sceneMismatch(m, moved)).toEqual([]);
+    expect(sceneMismatch(m, { ...m, seed: 2 })).toEqual(['seed: 1 vs 2']);
+    expect(sceneMismatch(m, { ...moved, config: { ...moved.config, trajectory: { semiAxes: [8, 5] } } })).toEqual(['trajectory.semiAxes: null vs [8,5]']);
+    expect(sceneMismatch(m, { ...m, scene: 'object' })[0]).toMatch(/^scene/);
+    expect(sceneMismatch(m, { ...m, intrinsics: { ...m.intrinsics, f: 700 } })).toEqual(['intrinsics.f: 753 vs 700']);
+    // the object scene does not depend on the trajectory
+    const o = { ...m, scene: 'object', config: { ...m.config, trajectory: { semiAxes: [1, 1] } } };
+    expect(sceneMismatch({ ...m, scene: 'object' }, o)).toEqual([]);
+  });
+
   it('gyro interpolation, camera-frame ω, rolling-shutter models, dense size', () => {
     const imu = [
       { t: 0, gyro: [0, 0, 0] },
@@ -362,6 +454,11 @@ describe('parseNvsArgs', () => {
     const d = parseNvsArgs(['yard-real', 'r']);
     expect(d).toMatchObject({ renderers: null, views: 24, maxSize: 'dense', pose: 'relative', focal: 'relative', rs: 'auto', saveImages: false, ssim: true });
     expect(parseNvsArgs(['a', 'b', '--frames', '3,9']).frames).toEqual([3, 9]);
+    expect(parseNvsArgs(['a', 'b', '--test-dataset', 'a-up'])).toMatchObject({ testDataset: 'a-up', pose: 'sim3' });
+    expect(parseNvsArgs(['a', 'b', '--test-dataset', 'a-up', '--pose', 'relative']).pose).toBe('relative');
+    expect(d.testDataset).toBeNull();
+    expect(d.common).toBe(false);
+    expect(parseNvsArgs(['a', 'b', '--common']).common).toBe(true);
     expect(parseNvsArgs(['--help']).help).toBe(true);
   });
 

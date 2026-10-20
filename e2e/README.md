@@ -101,7 +101,8 @@ node e2e/generate-synth.mjs real                # object-real + yard-real (iPhon
   a shed. There are 8 houses with brick, siding, stucco or stone walls, windows, doors
   and gable roofs at 18–47 m, plus about 60 trees and bushes. Trajectory: a walk of
   1.03 laps of a 15 × 10 m loop at about 1 m/s, phone at 1.5 m with a 2 Hz ±3 cm bob and
-  ±2 cm sway, looking outward with ±25° slow panning.
+  ±2 cm sway, looking outward with ±25° slow panning. `trajectory.lateralOffset` (m, + =
+  outward) walks the same loop beside the gravel path (off-trajectory test sets).
 
 All materials are unlit, and the shading is Lambertian, baked and view-independent, so
 multi-view photo-consistency holds exactly. On top come realism effects: seeded sensor
@@ -996,9 +997,9 @@ the images with the ground-truth photos. This is the yardstick for photoreal sta
 
 ```sh
 node e2e/nvs.mjs <dataset> <runDir> [--renderers points,points-edl,mesh-lit,mesh-unlit,splat]
-     [--views N] [--frames i,j,...] [--max-size N|dense|full] [--pose relative|sim3]
+     [--views N] [--frames i,j,...] [--test-dataset NAME|DIR] [--max-size N|dense|full] [--pose relative|sim3]
      [--focal relative|keyframe|shared] [--rs auto|run|gt|none] [--rs-rotation-only] [--keep-blurred]
-     [--background R,G,B] [--no-ssim] [--save-images] [--out DIR] [--verbose] [--headed]
+     [--background R,G,B] [--no-ssim] [--common] [--save-images] [--out DIR] [--verbose] [--headed]
 
 E2E_GPU=host node e2e/nvs.mjs object-real e2e/out/e2e/object-real --save-images
 E2E_GPU=host node e2e/run-e2e.mjs object-real --nvs [--nvs-views N]   # pipeline, then the evaluation
@@ -1024,6 +1025,17 @@ run.
   divide the translation by the Sim3 scale (Umeyama run → GT on the camera centres). Local SfM
   error around k carries over, as it would for k itself. `--pose sim3` maps the GT pose through
   the global Sim3 instead.
+* **Off-trajectory views** (`--test-dataset NAME`): the frames of another dataset of the same
+  seeded scene, e.g. the same orbit 12 cm higher, replace the held-out frames. Generate one with
+  `generate-synth.mjs <preset> --name <name> --set trajectory.<field>=…` (object: `radius`,
+  `heightAbove`; yard: `height`, `lateralOffset`, which walks beside the loop without moving the
+  gravel path; `center` / `semiAxes` move the path and are refused). The tool refuses a test
+  dataset with another scene, seed, texture scale, camera or yard loop. Its GT poses share the
+  world frame, so `--pose sim3` (the default here) maps them through the run's Sim3; `--pose
+  relative` and the focal use the registered keyframe nearest in space. Every frame is a candidate,
+  and ω, ν and the GT image come from the test dataset. Output goes to `<runDir>/nvs-<name>/`.
+  Every view (held-out too) records the nearest training camera (GT centre distance and optical-axis
+  angle); `nvs.json` `distance` summarises it.
 * **Intrinsics**: the run's f, cx, cy, k1 and k2. The focal (`--focal relative`, the default) is
   the nearest keyframe's refined per-image focal (`sparse.images[].f`, normalised to the shared f
   by the median) times f_frame / f_k from the GT. The GT ratio covers the focus breathing of the
@@ -1079,6 +1091,11 @@ Each metric is computed per view, then averaged over the views. The code is in `
 * **SSIM**: 11×11 Gaussian window (σ 1.5), K1 0.01, K2 0.03, computed per RGB channel and then
   averaged (the 3DGS convention). The windows are restricted to the scored mask (normalised
   convolution), and the SSIM map is averaged over the mask.
+* **common** (`--common`): every renderer scored on the same pixels, the valid pixels that ALL
+  renderers of the run cover (`scoreCommon`: PSNR / SSIM of the un-premultiplied colour, and the
+  PSNR after a per-renderer affine colour fit on them). `covered` uses each renderer's own pixels,
+  so a mesh that draws only the well-reconstructed surfaces is scored on those; `common` compares
+  the renderers where all of them draw something.
 * **shift**: the residual translation render → GT. It is found by mean-removed SSD on 2×
   downsampled luma over ±6 px, with a parabolic sub-pixel step. It is a sanity check of pose,
   intrinsics and projection.

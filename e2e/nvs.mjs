@@ -5,14 +5,18 @@
  * truth photos (PSNR / SSIM, full frame and covered pixels, coverage, exposure-compensated).
  *
  *   node e2e/nvs.mjs <dataset> <runDir> [--renderers points,points-edl,mesh-lit,mesh-unlit,splat]
- *        [--views N] [--max-size N|dense|full] [--out DIR] [--save-images] … (--help for every option)
+ *        [--views N] [--max-size N|dense|full] [--test-dataset NAME] [--common] [--out DIR] [--save-images]
+ *        … (--help for every option)
  *
  * Test cameras (e2e/lib/nvs-views.mjs): nearest registered keyframe's estimated pose ∘ GT relative
- * motion (or the global Sim3), the run's intrinsics. Ground truth: the dataset JPEG undistorted with
- * the run's intrinsics to the run's dense view size and rolling-shutter corrected with the run's
- * model, exactly like the engine's dense views. Renderers: the app's Viewer drawing dense.ply /
- * mesh.ply, and the splat module's renderer for splats.ply when it exists (src/harness/nvs). Metrics:
- * e2e/lib/nvs-metrics.mjs. Writes <out>/nvs.json (default <runDir>/nvs/) and, with --save-images,
+ * motion (or the global Sim3), the run's intrinsics. --test-dataset scores the frames of another
+ * dataset of the same seeded scene (off-trajectory views) instead, through the global Sim3 by
+ * default. Ground truth: the dataset JPEG undistorted with the run's intrinsics to the run's dense
+ * view size and rolling-shutter corrected with the run's model, exactly like the engine's dense
+ * views. Renderers: the app's Viewer drawing dense.ply / mesh.ply, and the splat module's renderer
+ * for splats.ply when it exists (src/harness/nvs). Metrics: e2e/lib/nvs-metrics.mjs (--common adds
+ * every renderer's score on the pixels all of them cover).
+ * Writes <out>/nvs.json (default <runDir>/nvs/, <runDir>/nvs-<test dataset>/) and, with --save-images,
  * view-<frame>-<renderer>.png panels (GT | render | |diff|·3).
  *
  * Starts Vite (root = repo, free port) and headless Chromium (SwiftShader; E2E_GPU=host: the
@@ -28,7 +32,7 @@ import { CHROMIUM_ARGS, freePort, safeJoin } from './lib/e2e-browser.mjs';
 import { launchOptions } from './lib/launch.mjs';
 import { NVS_USAGE, NvsArgError, parseNvsArgs } from './lib/nvs-args.mjs';
 import { aggregateScores } from './lib/nvs-metrics.mjs';
-import { denseImageSize, gtRollingShutter, runRollingShutter, testViews } from './lib/nvs-views.mjs';
+import { denseImageSize, gtRollingShutter, runRollingShutter, sceneMismatch, testViews } from './lib/nvs-views.mjs';
 import { table } from './lib/e2e-checks.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -45,9 +49,34 @@ async function exists(p) {
 const readJSON = async (p) => JSON.parse(await readFile(p, 'utf8'));
 const f2 = (v, d = 2) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(d) : '—');
 
-/** Summary table: one row per renderer, means over the views. */
+/** Dataset directory of a name under e2e/data or a path. */
+async function datasetDir(name) {
+  return name.includes('/') || (await exists(join(name, 'meta.json'))) ? resolve(name) : join(ROOT, 'e2e', 'data', name);
+}
+
+async function loadDatasetJSON(dir) {
+  if (!(await exists(join(dir, 'meta.json')))) throw new Error(`dataset missing: ${dir}`);
+  return {
+    meta: await readJSON(join(dir, 'meta.json')),
+    frames: await readJSON(join(dir, 'frames.json')),
+    imu: (await exists(join(dir, 'imu.json'))) ? await readJSON(join(dir, 'imu.json')) : null,
+  };
+}
+
+/** Mean / median / max of the test views' distance to the nearest training camera (GT). */
+function distanceSummary(views) {
+  const stat = (xs) => {
+    const v = xs.filter((x) => Number.isFinite(x)).sort((a, b) => a - b);
+    if (!v.length) return null;
+    return { mean: v.reduce((a, b) => a + b, 0) / v.length, median: v[v.length >> 1], max: v[v.length - 1] };
+  };
+  return { distM: stat(views.map((v) => v.nearest?.distM)), axisDeg: stat(views.map((v) => v.nearest?.axisDeg)) };
+}
+
+/** Summary table: one row per renderer, means over the views (+ common-pixel columns with --common). */
 export function formatNvsTable(summary) {
-  const rows = [['renderer', 'views', 'coverage', 'PSNR', 'SSIM', 'cov PSNR', 'cov SSIM', 'cc PSNR', 'cc SSIM', 'cc cov PSNR', 'shift px']];
+  const common = Object.values(summary).some((s) => s.common?.psnr?.n > 0);
+  const rows = [['renderer', 'views', 'coverage', 'PSNR', 'SSIM', 'cov PSNR', 'cov SSIM', 'cc PSNR', 'cc SSIM', 'cc cov PSNR', 'shift px', ...(common ? ['common', 'com PSNR', 'com SSIM', 'com cc PSNR'] : [])]];
   for (const [name, s] of Object.entries(summary)) {
     rows.push([
       name,
@@ -61,6 +90,7 @@ export function formatNvsTable(summary) {
       f2(s.cc.full.ssim.mean, 3),
       f2(s.cc.covered.psnr.mean),
       f2(s.shiftPx.median, 2),
+      ...(common ? [f2(s.common.coverage.mean, 3), f2(s.common.psnr.mean), f2(s.common.ssim.mean, 3), f2(s.common.ccPsnr.mean)] : []),
     ]);
   }
   return table(rows, [0]);
@@ -72,24 +102,30 @@ export function formatNvsTable(summary) {
  */
 export async function runNvs(o, { log = (m) => console.log(`[nvs] ${m}`) } = {}) {
   const t0 = Date.now();
-  const dsDir = o.dataset.includes('/') || (await exists(join(o.dataset, 'meta.json'))) ? resolve(o.dataset) : join(ROOT, 'e2e', 'data', o.dataset);
+  const dsDir = await datasetDir(o.dataset);
   const runDir = resolve(o.runDir);
-  const outDir = resolve(o.out ?? join(runDir, 'nvs'));
-  if (!(await exists(join(dsDir, 'meta.json')))) throw new Error(`dataset missing: ${dsDir}`);
   if (!(await exists(join(runDir, 'result.json')))) throw new Error(`no result.json in ${runDir}`);
-  const meta = await readJSON(join(dsDir, 'meta.json'));
-  const frames = await readJSON(join(dsDir, 'frames.json'));
-  const imu = (await exists(join(dsDir, 'imu.json'))) ? await readJSON(join(dsDir, 'imu.json')) : null;
+  const { meta, frames, imu } = await loadDatasetJSON(dsDir);
   const result = await readJSON(join(runDir, 'result.json'));
+  // --test-dataset: the frames (GT images, poses, IMU) come from that dataset
+  const testDir = o.testDataset ? await datasetDir(o.testDataset) : null;
+  const test = testDir ? await loadDatasetJSON(testDir) : null;
+  if (test) {
+    const bad = sceneMismatch(meta, test.meta);
+    if (bad.length) throw new Error(`test dataset ${test.meta.name} is not the scene of ${meta.name}: ${bad.join('; ')}`);
+  }
+  const gtDir = testDir ?? dsDir;
+  const gtMeta = test?.meta ?? meta;
+  const outDir = resolve(o.out ?? join(runDir, test ? `nvs-${test.meta.name}` : 'nvs'));
 
-  const tv = testViews({ meta, frames, imu }, result, { views: o.views, frames: o.frames ?? undefined, pose: o.pose, focal: o.focal, keepBlurred: o.keepBlurred, rsTranslation: o.rsTranslation });
+  const tv = testViews({ meta, frames, imu }, result, { views: o.views, frames: o.frames ?? undefined, pose: o.pose, focal: o.focal, keepBlurred: o.keepBlurred, rsTranslation: o.rsTranslation, test });
   const maxSize = o.maxSize === 'full' ? 0 : o.maxSize === 'dense' ? (denseImageSize(result) ?? 0) : o.maxSize;
   let rs = null;
   if (o.rs === 'auto' || o.rs === 'run') {
     rs = runRollingShutter(result);
     if (!rs && o.rs === 'run') log('WARNING: --rs run, but the run estimated no rolling shutter: no correction');
   } else if (o.rs === 'gt') {
-    rs = gtRollingShutter(meta);
+    rs = gtRollingShutter(gtMeta);
     if (!rs) log('WARNING: --rs gt, but the dataset has no rolling shutter: no correction');
   }
   const files = { dense: await exists(join(runDir, 'dense.ply')), mesh: await exists(join(runDir, 'mesh.ply')), splats: await exists(join(runDir, 'splats.ply')) };
@@ -97,8 +133,10 @@ export async function runNvs(o, { log = (m) => console.log(`[nvs] ${m}`) } = {})
     o.renderers ??
     [...(files.dense ? ['points', 'points-edl'] : []), ...(files.mesh ? ['mesh-lit', 'mesh-unlit'] : []), ...(files.splats ? ['splat'] : [])];
   if (!renderers.length) throw new Error(`nothing to render in ${runDir} (no dense.ply, mesh.ply or splats.ply)`);
+  const dist = distanceSummary(tv.views);
   log(
-    `${meta.name}: ${tv.views.length} of ${tv.candidates} held-out frames (${result.images?.length ?? 0} registered), Sim3 s ${tv.sim3.s.toFixed(4)}, ` +
+    `${meta.name}: ${tv.views.length} of ${tv.candidates} ${test ? `frames of the test dataset ${test.meta.name}` : 'held-out frames'} (${result.images?.length ?? 0} registered), ` +
+      `nearest training camera ${f2(dist.distM?.mean, 3)} m / ${f2(dist.axisDeg?.mean, 1)}° (mean), Sim3 s ${tv.sim3.s.toFixed(4)}, ` +
       `pose ${o.pose}, focal ${o.focal}, max size ${maxSize || 'full'}, RS ${rs ? `${rs.axis} ${rs.readoutMs} ms${o.rsTranslation ? ' + translation' : ' (rotation only)'}` : 'none'}; renderers ${renderers.join(', ')}`,
   );
   if (o.saveImages) await mkdir(outDir, { recursive: true });
@@ -138,7 +176,7 @@ export async function runNvs(o, { log = (m) => console.log(`[nvs] ${m}`) } = {})
         }
       });
     await serve('/__nvs/run/', runDir);
-    await serve('/__nvs/data/', dsDir);
+    await serve('/__nvs/data/', gtDir);
     await page.exposeFunction('__nvsLog', (m) => {
       if (o.verbose) log(String(m));
     });
@@ -158,6 +196,7 @@ export async function runNvs(o, { log = (m) => console.log(`[nvs] ${m}`) } = {})
         background: o.background,
         saveImages: o.saveImages,
         ssim: o.ssim,
+        common: o.common,
         camera: tv.views[0]?.camera ?? { ...result.intrinsics, width: meta.width, height: meta.height },
       },
     );
@@ -166,9 +205,10 @@ export async function runNvs(o, { log = (m) => console.log(`[nvs] ${m}`) } = {})
     const views = [];
     for (const [k, v] of tv.views.entries()) {
       const r = await page.evaluate((x) => window.nvsView(x), { index: v.index, file: v.file, pose: v.pose, camera: v.camera, omega: v.omega, nu: v.nu });
-      views.push({ index: v.index, nearestKeyframe: v.nearestKeyframe, gap: v.gap, gt: v.gt, ...r });
+      views.push({ index: v.index, nearestKeyframe: v.nearestKeyframe, gap: v.gap, nearest: v.nearest, gt: v.gt, ...r });
       const s = Object.entries(r.scores).map(([n, x]) => `${n} ${f2(x.full.psnr)}/${f2(x.covered.psnr)} dB cov ${f2(x.coverage, 2)}`);
-      log(`view ${k + 1}/${tv.views.length} frame ${v.index} (gap ${v.gap}): ${s.join(', ')}${Object.keys(r.errors).length ? `; errors ${JSON.stringify(r.errors)}` : ''}`);
+      const where = v.gap !== null ? `gap ${v.gap}` : `nearest keyframe ${v.nearestKeyframe} at ${f2(v.nearest?.distM, 3)} m, ${f2(v.nearest?.axisDeg, 1)}°`;
+      log(`view ${k + 1}/${tv.views.length} frame ${v.index} (${where}): ${s.join(', ')}${Object.keys(r.errors).length ? `; errors ${JSON.stringify(r.errors)}` : ''}`);
     }
     await page.evaluate(() => window.nvsTeardown());
     await context.close();
@@ -181,9 +221,10 @@ export async function runNvs(o, { log = (m) => console.log(`[nvs] ${m}`) } = {})
       tool: 'e2e/nvs.mjs',
       dataset: meta.name,
       datasetDir: dsDir,
+      testDataset: test ? { name: test.meta.name, dir: testDir, trajectory: test.meta.config?.trajectory ?? null } : null,
       runDir,
       createdAt: new Date().toISOString(),
-      options: { views: o.views, frames: o.frames, renderers, maxSize, pose: o.pose, focal: o.focal, rs: o.rs, rsTranslation: o.rsTranslation, keepBlurred: o.keepBlurred, background: o.background, ssim: o.ssim },
+      options: { views: o.views, frames: o.frames, testDataset: o.testDataset, renderers, maxSize, pose: o.pose, focal: o.focal, rs: o.rs, rsTranslation: o.rsTranslation, keepBlurred: o.keepBlurred, background: o.background, ssim: o.ssim, common: o.common },
       definitions: {
         psnr: '10·log10(255²/MSE), MSE over RGB of the scored pixels, 8-bit sRGB; mean over views',
         ssim: '11×11 Gaussian (σ 1.5), K1 0.01, K2 0.03, per RGB channel then averaged; windows restricted to the scored mask (normalised convolution)',
@@ -191,6 +232,7 @@ export async function runNvs(o, { log = (m) => console.log(`[nvs] ${m}`) } = {})
         covered: 'un-premultiplied render vs GT on covered pixels (alpha ≥ 0.5) only',
         cc: 'after a per-view least-squares 3×4 affine colour fit render → GT on the covered pixels (applied to covered pixels only)',
         coverage: 'covered valid pixels / valid GT pixels',
+        common: 'with --common: every renderer on the valid pixels that ALL renderers cover (un-premultiplied; ccPsnr after a per-renderer affine fit on them)',
         shift: 'residual image shift render → GT (2× downsampled luma, ±6 px search), full-resolution px',
       },
       run: {
@@ -202,6 +244,7 @@ export async function runNvs(o, { log = (m) => console.log(`[nvs] ${m}`) } = {})
         rollingShutter: rs,
         heldOutCandidates: tv.candidates,
       },
+      distance: dist,
       setup,
       summary,
       views,
@@ -214,7 +257,10 @@ export async function runNvs(o, { log = (m) => console.log(`[nvs] ${m}`) } = {})
   }
   await mkdir(outDir, { recursive: true });
   await writeFile(join(outDir, 'nvs.json'), JSON.stringify(out, null, 1));
-  log(`${meta.name} novel views (${out.views.length} held-out frames, ${out.timing.totalS} s, load ${out.host.loadavg[0]}):\n${formatNvsTable(out.summary)}`);
+  log(
+    `${meta.name} novel views (${out.views.length} ${test ? `${test.meta.name} frames` : 'held-out frames'}, nearest training camera ${f2(dist.distM?.mean, 3)} m / ${f2(dist.axisDeg?.mean, 1)}°, ` +
+      `${out.timing.totalS} s, load ${out.host.loadavg[0]}):\n${formatNvsTable(out.summary)}`,
+  );
   log(`wrote ${join(outDir, 'nvs.json')}${o.saveImages ? ' + PNG panels' : ''}`);
   return out;
 }

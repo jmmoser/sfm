@@ -19,6 +19,12 @@
 //    frame time, camera frame: ω_cam = R_cam_device·ω_dev) and, with a GT focus distance (-real
 //    sets), the translational term ν = camera-frame velocity of the centre (central difference of the
 //    neighbouring GT frames) / focus distance — the engine corrects its dense views with both.
+//
+// Test dataset (opts.test, e2e/nvs.mjs --test-dataset): the frames of ANOTHER dataset of the same
+// seeded scene (e.g. an off-trajectory walk) are scored instead of the held-out frames. Its GT poses
+// share the run dataset's world frame, so 'sim3' maps them directly; 'relative' and the focal use the
+// registered keyframe whose GT camera centre is nearest (not the nearest frame index). Every test
+// frame is a candidate; ω, ν and the GT image come from the test dataset.
 import { mat3Mul, mat3T, mat3Vec, umeyama } from './linalg.mjs';
 
 export function cameraCenter(pose) {
@@ -76,6 +82,47 @@ export function nearestImage(sorted, index) {
   let best = null;
   for (const im of sorted) if (!best || Math.abs(im.index - index) < Math.abs(best.index - index)) best = im;
   return best;
+}
+
+/**
+ * Why a test dataset cannot be scored against a run of `meta`'s dataset: a different scene, seed,
+ * texture or camera, or (yard) a different walking loop, which moves the scene's gravel path.
+ * Empty when they are the same seeded scene seen by the same camera.
+ */
+export function sceneMismatch(meta, testMeta) {
+  const out = [];
+  const same = (what, a, b) => {
+    if (JSON.stringify(a ?? null) !== JSON.stringify(b ?? null)) out.push(`${what}: ${JSON.stringify(a ?? null)} vs ${JSON.stringify(b ?? null)}`);
+  };
+  same('scene', meta.scene, testMeta.scene);
+  same('seed', meta.seed, testMeta.seed);
+  same('textureScale', meta.config?.textureScale, testMeta.config?.textureScale);
+  same('anisotropy', meta.config?.anisotropy, testMeta.config?.anisotropy);
+  for (const k of ['width', 'height', 'f', 'cx', 'cy', 'k1', 'k2']) same(`intrinsics.${k}`, meta.intrinsics?.[k], testMeta.intrinsics?.[k]);
+  if (meta.scene === 'yard') for (const k of ['center', 'semiAxes']) same(`trajectory.${k}`, meta.config?.trajectory?.[k], testMeta.config?.trajectory?.[k]);
+  return out;
+}
+
+/** Unit optical axis (camera +z) in the world: third row of R. */
+function opticalAxis(pose) {
+  return [pose.R[6], pose.R[7], pose.R[8]];
+}
+
+/**
+ * Registered image whose GT camera centre is nearest to a GT pose, with that distance (GT metres)
+ * and the angle between the two optical axes (deg). gtCentres: [{ im, c, axis }].
+ */
+export function nearestInSpace(gtCentres, pose) {
+  const c = cameraCenter(pose),
+    a = opticalAxis(pose);
+  let best = null;
+  for (const k of gtCentres) {
+    const d = Math.hypot(k.c[0] - c[0], k.c[1] - c[1], k.c[2] - c[2]);
+    if (!best || d < best.distM) best = { im: k.im, distM: d, axis: k.axis };
+  }
+  if (!best) return null;
+  const dot = Math.max(-1, Math.min(1, a[0] * best.axis[0] + a[1] * best.axis[1] + a[2] * best.axis[2]));
+  return { im: best.im, distM: best.distM, axisDeg: (Math.acos(dot) * 180) / Math.PI };
 }
 
 /** Test pose from a keyframe's estimated pose and the GT relative motion keyframe → frame. */
@@ -173,15 +220,23 @@ export function denseImageSize(result) {
 }
 
 /**
- * Test views of a run. dataset: { meta, frames, imu? }; result: the run's result.json.
+ * Test views of a run. dataset: { meta, frames, imu? } (the run's dataset); result: the run's result.json.
  * opts: { views = 24, pose = 'relative' | 'sim3', focal = 'relative' | 'keyframe' | 'shared',
- *         keepBlurred = false, frames?: number[] (explicit frame indices), rsTranslation = true }.
- * Returns { sim3, candidates, views: [{ index, file, tTrue, nearestKeyframe, gap, pose: {R, t},
- *   camera: {f, cx, cy, k1, k2, width, height}, omega, nu, gt: {f, gain, wb, rsPx, blurPx, omega} }] }.
+ *         keepBlurred = false, frames?: number[] (explicit frame indices), rsTranslation = true,
+ *         test?: { meta, frames, imu? } (score that dataset's frames instead of the held-out ones) }.
+ * Returns { sim3, candidates, views: [{ index, file, tTrue, nearestKeyframe, gap, nearest: { keyframe,
+ *   distM, axisDeg }, pose: {R, t}, camera: {f, cx, cy, k1, k2, width, height}, omega, nu,
+ *   gt: {f, gain, wb, rsPx, blurPx, omega} }] }. gap: frame-index distance to nearestKeyframe (null
+ * for a test dataset); nearest: the registered keyframe nearest in space (GT centres, GT metres).
  */
 export function testViews(dataset, result, opts = {}) {
-  const { meta, frames, imu } = dataset;
+  const { meta, frames } = dataset;
+  const test = opts.test ?? null;
+  const tMeta = test ? test.meta : meta,
+    tFrames = test ? test.frames : frames,
+    tImu = test ? test.imu : dataset.imu;
   const byIndex = new Map(frames.map((f) => [f.index, f]));
+  const tByIndex = test ? new Map(tFrames.map((f) => [f.index, f])) : byIndex;
   const images = registeredImages(result);
   if (images.length < 3) throw new Error(`the run registered ${images.length} images (need ≥ 3)`);
   const sim3 = runToGtSim3(images, byIndex);
@@ -190,34 +245,38 @@ export function testViews(dataset, result, opts = {}) {
   const W = intr.width ?? meta.width,
     H = intr.height ?? meta.height;
   if (W !== meta.width || H !== meta.height) throw new Error(`result intrinsics are ${W}×${H}, the dataset frames ${meta.width}×${meta.height}`);
+  if (test && (tMeta.width !== W || tMeta.height !== H)) throw new Error(`test dataset frames are ${tMeta.width}×${tMeta.height}, the run's ${W}×${H}`);
+  const gtCentres = images.filter((im) => byIndex.has(im.index)).map((im) => ({ im, c: cameraCenter(byIndex.get(im.index).pose), axis: opticalAxis(byIndex.get(im.index).pose) }));
   // per-image focal of the result (engine frame) relative to its median → the shared f's frame
   const fs = images.map((im) => im.f).filter((f) => f > 0).sort((a, b) => a - b);
   const fMed = fs.length ? fs[fs.length >> 1] : 0;
   const keyFocal = (im) => (im.f > 0 && fMed > 0 ? (intr.f * im.f) / fMed : intr.f);
-  const candidates = heldOutFrames(frames, result, opts);
-  const chosen = opts.frames?.length ? opts.frames.map((i) => byIndex.get(i)).filter(Boolean) : selectEvenly(candidates, opts.views ?? 24);
+  const candidates = test ? tFrames.slice() : heldOutFrames(frames, result, opts);
+  const chosen = opts.frames?.length ? opts.frames.map((i) => tByIndex.get(i)).filter(Boolean) : selectEvenly(candidates, opts.views ?? 24);
   const poseMode = opts.pose ?? 'relative';
   const focalMode = opts.focal ?? 'relative';
   const views = chosen.map((f) => {
-    const k = nearestImage(images, f.index);
+    const near = nearestInSpace(gtCentres, f.pose);
+    const k = test ? near.im : nearestImage(images, f.index);
     const gk = byIndex.get(k.index);
     const pose = poseMode === 'sim3' ? mapPoseSim3(f.pose, sim3) : mapPoseRelative(f.pose, gk.pose, k.pose, sim3.s);
     let fx = intr.f;
     if (focalMode === 'keyframe') fx = keyFocal(k);
     else if (focalMode === 'relative') fx = keyFocal(k) * (f.f > 0 && gk.f > 0 ? f.f / gk.f : 1);
-    const omega = imu ? cameraOmega(meta, imu, f) : null;
-    const nu = opts.rsTranslation === false ? null : cameraNu(byIndex, f);
+    const omega = tImu ? cameraOmega(tMeta, tImu, f) : null;
+    const nu = opts.rsTranslation === false ? null : cameraNu(tByIndex, f);
     return {
       index: f.index,
       file: f.file,
       tTrue: f.tTrue,
       nearestKeyframe: k.index,
-      gap: Math.abs(k.index - f.index),
+      gap: test ? null : Math.abs(k.index - f.index),
+      nearest: near ? { keyframe: near.im.index, distM: near.distM, axisDeg: near.axisDeg } : null,
       pose,
       camera: { f: fx, cx: intr.cx, cy: intr.cy, k1: intr.k1 ?? 0, k2: intr.k2 ?? 0, width: W, height: H },
       omega,
       nu,
-      gt: { f: f.f ?? meta.intrinsics?.f ?? null, gain: f.gain ?? null, wb: f.wb ?? null, rsPx: f.rsPx ?? null, blurPx: f.blurPx ?? null, omega: f.omega ?? null },
+      gt: { f: f.f ?? tMeta.intrinsics?.f ?? null, gain: f.gain ?? null, wb: f.wb ?? null, rsPx: f.rsPx ?? null, blurPx: f.blurPx ?? null, omega: f.omega ?? null },
     };
   });
   return { sim3, candidates: candidates.length, views };

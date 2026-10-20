@@ -9,36 +9,43 @@ export const NVS_USAGE = `usage: node e2e/nvs.mjs <dataset> <runDir> [options]
   --renderers a,b,…         ${NVS_RENDERERS.join(', ')} (default: all whose input file exists)
   --views N                 held-out views, evenly spread over the non-keyframes (default 24)
   --frames i,j,…            explicit frame indices instead of --views
+  --test-dataset NAME|DIR   score the frames of another dataset of the same seeded scene (e.g. an
+                            off-trajectory walk) instead of the held-out frames; default --pose sim3,
+                            output <runDir>/nvs-<name>/
   --max-size N|dense|full   long side of the test images (default dense: the run's dense view size)
-  --pose relative|sim3      held-out pose: nearest keyframe ∘ GT relative motion (default) or global Sim3
+  --pose relative|sim3      test pose: nearest keyframe ∘ GT relative motion (default without
+                            --test-dataset; nearest in space with it) or the global Sim3
   --focal relative|keyframe|shared   test focal (default relative: nearest keyframe's × GT focal ratio)
   --rs auto|run|gt|none     rolling-shutter correction of the GT images (default auto = the run's model)
   --rs-rotation-only        no translational term in that correction
   --keep-blurred            also score frames the capture rejected as blurred
   --background R,G,B        full-frame background (default 0,0,0)
   --no-ssim                 skip SSIM (faster)
+  --common                  also score every renderer on the pixels all of them cover
   --save-images             write GT | render | |diff|·3 PNGs per view and renderer
   --out DIR                 output directory (default <runDir>/nvs)
   --verbose | --headed`;
 
 export class NvsArgError extends Error {}
 
-/** Parse argv → { dataset, runDir, renderers|null, views, frames|null, maxSize, pose, focal, rs, rsTranslation, keepBlurred, background, ssim, saveImages, out, verbose, headed, help }. */
+/** Parse argv → { dataset, runDir, testDataset|null, renderers|null, views, frames|null, maxSize, pose, focal, rs, rsTranslation, keepBlurred, background, ssim, common, saveImages, out, verbose, headed, help }. */
 export function parseNvsArgs(argv) {
   const o = {
     dataset: null,
     runDir: null,
+    testDataset: null,
     renderers: null,
     views: 24,
     frames: null,
     maxSize: 'dense',
-    pose: 'relative',
+    pose: null,
     focal: 'relative',
     rs: 'auto',
     rsTranslation: true,
     keepBlurred: false,
     background: [0, 0, 0],
     ssim: true,
+    common: false,
     saveImages: false,
     out: null,
     verbose: false,
@@ -78,6 +85,7 @@ export function parseNvsArgs(argv) {
         break;
       }
       case '--frames': o.frames = intList(); break;
+      case '--test-dataset': o.testDataset = next(); break;
       case '--max-size': {
         const v = next();
         if (v === 'dense' || v === 'full') o.maxSize = v;
@@ -101,6 +109,7 @@ export function parseNvsArgs(argv) {
         break;
       }
       case '--no-ssim': o.ssim = false; break;
+      case '--common': o.common = true; break;
       case '--save-images': o.saveImages = true; break;
       case '--out': o.out = next(); break;
       case '--verbose': o.verbose = true; break;
@@ -112,6 +121,7 @@ export function parseNvsArgs(argv) {
         pos.push(a);
     }
   }
+  o.pose ??= o.testDataset ? 'sim3' : 'relative';
   if (o.help) return o;
   if (pos.length !== 2) throw new NvsArgError(`expected <dataset> <runDir>, got ${pos.length} positional argument(s)`);
   [o.dataset, o.runDir] = pos;

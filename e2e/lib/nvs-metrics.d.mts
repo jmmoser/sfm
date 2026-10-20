@@ -25,6 +25,8 @@ export interface ViewScore {
   cc: { full: Score; covered: Score; affine: number[] };
   shift: { dx: number; dy: number } | null;
   images?: { full: Uint8ClampedArray; ccFull: Uint8ClampedArray };
+  /** Set by the caller from scoreCommon (nvs.mjs --common). */
+  common?: { coverage: number; psnr: number; ssim: number | null; ccPsnr: number };
 }
 export function scoreView(
   render: RGBA8,
@@ -33,6 +35,13 @@ export function scoreView(
   h: number,
   opts?: { background?: number[]; ssim?: boolean; shift?: boolean; keepImages?: boolean },
 ): ViewScore;
+export function scoreCommon(
+  renders: Record<string, RGBA8>,
+  gt: RGBA8 | PreparedGroundTruth,
+  w: number,
+  h: number,
+  opts?: { ssim?: boolean },
+): { coverage: number; pixels: number; scores: Record<string, { psnr: number; ssim: number | null; ccPsnr: number }> };
 export function triptych(gt: RGBA8, full: RGBA8, w: number, h: number, gain?: number): Uint8ClampedArray;
 export interface Stat { mean: number | null; median: number | null; min: number | null; max: number | null; n: number }
 export interface ScoreSummary {
@@ -42,5 +51,6 @@ export interface ScoreSummary {
   covered: { psnr: Stat; ssim: Stat };
   cc: { full: { psnr: Stat; ssim: Stat }; covered: { psnr: Stat; ssim: Stat } };
   shiftPx: Stat;
+  common: { coverage: Stat; psnr: Stat; ssim: Stat; ccPsnr: Stat };
 }
 export function aggregateScores(scores: ViewScore[]): ScoreSummary;
