@@ -7,7 +7,8 @@
 import { describe, expect, it } from 'vitest';
 import { runIncrementalSfM } from '../sfm/mapper';
 import { buildSyntheticDatabase, evaluateReconstruction, generateScene } from '../sfm/synthetic';
-import { explainedCorrespondenceRatio, refinePrincipalPoint } from './refine';
+import { explainedCorrespondenceRatio, liveModelHealth, refinePrincipalPoint, splitPairs } from './refine';
+import type { GyroConsistency } from '../sfm/gyro';
 
 describe('refinePrincipalPoint', () => {
   it('recovers an offset principal point and removes the constant rotation error', async () => {
@@ -68,4 +69,58 @@ describe('explainedCorrespondenceRatio (model choice)', () => {
     // unregistered images do not count
     expect(explainedCorrespondenceRatio(new (rec.constructor as new () => typeof rec)(), db)).toBe(0);
   });
+});
+
+describe('liveModelHealth (offline SfM skipped for a healthy live model)', () => {
+  it('healthy closed model; symptoms: unclosed loop, unregistered keyframe, gyro breaks / outliers, no gyro', async () => {
+    const scene = generateScene({ kind: 'loop', numImages: 30, seed: 4, noisePx: 0.3, descriptors: false, outlierRatio: 0 });
+    const { db } = buildSyntheticDatabase(scene, { verify: false });
+    const [rec] = await runIncrementalSfM(db, { intrinsics: { ...scene.camera } });
+    const ids = scene.imageIds;
+    expect(rec.numRegisteredImages).toBe(ids.length);
+    const gyro: GyroConsistency = { pairs: 29, breaks: [], outliers: [], breaksWithoutOutliers: 0, medianErrDeg: 0.05 };
+    const ok = liveModelHealth(rec, db, ids, gyro);
+    expect(ok.healthy).toBe(true);
+    expect(ok.split!.splitPairs).toBe(0);
+    expect(ok.reason).toMatch(/all 30 keyframes registered/);
+    // the loop left open: the second half of the capture drifted 30 cm (its cameras and the points of
+    // its tracks), and every track spanning both halves is kept as two points
+    const open = rec.clone();
+    const half = new Set(ids.slice(0, 15));
+    const d = [0.3, 0, 0];
+    for (const id of ids.slice(15)) {
+      const p = open.images.get(id)!.pose;
+      for (let r = 0; r < 3; r++) p.t[r] -= p.R[3 * r] * d[0] + p.R[3 * r + 1] * d[1] + p.R[3 * r + 2] * d[2];
+    }
+    let parted = 0;
+    for (const p of [...open.points.values()]) {
+      const a = p.track.filter((el) => half.has(el.image));
+      const b = p.track.filter((el) => !half.has(el.image));
+      const moved = [p.xyz[0] + d[0], p.xyz[1] + d[1], p.xyz[2] + d[2]];
+      if (a.length === 0) p.xyz.set(moved);
+      if (a.length < 2 || b.length < 2) continue;
+      const xyz = Float64Array.from(p.xyz);
+      open.deletePoint(p.id);
+      open.addPoint(xyz, a);
+      open.addPoint(moved, b);
+      parted++;
+    }
+    expect(parted).toBeGreaterThan(100);
+    const sp = splitPairs(open, db);
+    expect(sp.loopPairs).toBeGreaterThanOrEqual(2);
+    expect(sp.splitRatio).toBeGreaterThan(splitPairs(rec, db).splitRatio);
+    const h = liveModelHealth(open, db, ids, gyro);
+    expect(h.healthy).toBe(false);
+    expect(h.reason).toMatch(/unclosed loop/);
+    // a keyframe the live model never registered
+    const missing = rec.clone();
+    missing.deregisterImage(ids[7]);
+    expect(liveModelHealth(missing, db, ids, gyro).reason).toMatch(/1 of 30 keyframes not registered/);
+    // gyro: unverified, breaks, outliers
+    expect(liveModelHealth(rec, db, ids, null).healthy).toBe(false);
+    expect(liveModelHealth(rec, db, ids, { ...gyro, breaksWithoutOutliers: 1 }).reason).toMatch(/gyro break/);
+    expect(liveModelHealth(rec, db, ids, { ...gyro, outliers: [ids[3]] }).reason).toMatch(/disagree with the gyro/);
+    // too few images to judge
+    expect(liveModelHealth(rec, db, ids, gyro, { minImages: 40 }).healthy).toBe(false);
+  }, 120_000);
 });

@@ -113,11 +113,15 @@ Train/extend the vocabulary → candidate pairs (sequential 10, retrieval 15,
 spatial 10) → match + verify (+ gyro gate) → refine the live model → gyro calibration
 (bias, camera–IMU offset) → rolling-shutter estimation on the live model (gyro rotation +
 translation from the neighbouring keyframes × point depth; 2 passes) and keypoint
-correction → `runIncrementalSfM` (gyro-checked registrations) → keep the better of live
+correction → only when the live model is unhealthy (`liveModelHealth`: unregistered keyframes,
+no verified gyro, gyro breaks / outliers, few explained correspondences, an unclosed loop),
+`runIncrementalSfM` (gyro-checked registrations) and the better of live
 vs offline (gyro breaks, then registered images, then explained correspondences, then
 reprojection error; isolated gyro outliers deregistered) → final global BA (focal + principal point + k1 + k2) →
 per-image focal lengths (focus breathing; kept only if they help) → world alignment
-(`sfm/world.ts`) → persist. Details: ARCHITECTURE §6 "Real-capture robustness".
+(`sfm/world.ts`) → persist. Pair verification, vocabulary quantisation and the rolling-shutter
+hypotheses run on CPU helper workers (`EngineConfig.cpuWorkers`). Details: ARCHITECTURE §6
+"Real-capture robustness" and "Refine performance".
 
 ### Dense / mesh
 Views stream from IndexedDB through an LRU image cache; depth maps go through a

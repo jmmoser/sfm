@@ -56,6 +56,7 @@ import {
 import { MB, deviceMemoryBudgetMB, formatBreakdown, sumBreakdown, type GpuMemoryHints, type MemoryBreakdown } from './memory';
 import { ENGINE_DEFAULTS, QUALITY_PRESETS, type QualityPresetConfig, type ResolvedMode } from './presets';
 import { modelPointCloud, runRefine } from './refine';
+import { CpuPool, defaultCpuWorkers } from './cpu-pool';
 import type { EngineConfig, EngineEvents, KeyframeRecord, SparseModel, SparseResultEx } from './types';
 import { cameraFromDevice } from '../sensors/frame-orientation';
 
@@ -665,7 +666,14 @@ export class PhotogrammetryEngine {
       live.state.captureFinished = true;
       await live.flush();
       const t0 = now();
-      const out = await runRefine({ live, config: this.config, store: this.store!, log: (l, m, d) => this.log(l, m, d) }, progress, cancel);
+      // CPU helper workers for the pair verification and vocabulary indexing (refine only)
+      const pool = CpuPool.create(this.config.cpuWorkers ?? defaultCpuWorkers());
+      let out: Awaited<ReturnType<typeof runRefine>>;
+      try {
+        out = await runRefine({ live, config: this.config, store: this.store!, log: (l, m, d) => this.log(l, m, d), pool }, progress, cancel);
+      } finally {
+        pool?.dispose();
+      }
       releaseSiftCPUMemory();
       this.model = out.model;
       this.sparse = out.result;

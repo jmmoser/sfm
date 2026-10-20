@@ -1,19 +1,21 @@
 /**
  * Refine after capture (ENGINE.md "Refine"): vocabulary retrain / extend → candidate pairs
- * (sequential 10, retrieval 15, spatial 10) → match + verify → full incremental SfM from scratch
- * (live-refined intrinsics as the initial guess) → keep the better of the live and the offline
- * model (registered images, then mean reprojection error) → final global BA with
+ * (sequential 10, retrieval 15, spatial 10) → match + verify → refined live model → unless it is
+ * healthy (`liveModelHealth`), a full incremental SfM from scratch (live-refined intrinsics as the
+ * initial guess) and the better of the live and the offline model (gyro breaks, registered
+ * images, explained correspondences, mean reprojection error) → final global BA with
  * self-calibration (f, k1, k2), re-triangulation and filtering → world alignment (IMU gravity /
  * time offset / metric scale, GPS, compass; verified R_cam_device) → SparseModel.
  *
  * Progress stages: 'matching', 'reconstruction', 'alignment' (src/app/stages.ts).
  */
 import type { CancelToken, MatchPairs, PointCloud, ProgressCallback, TwoViewGeometry } from '../core/types';
+import { estimateTwoViewGeometry } from '../geometry/twoview';
 import { mergePairs, retrievalPairs, sequentialPairs, spatialPairs, type ImagePair, type SpatialCamera } from '../sfm/pairs';
 import type { CorrespondenceGraph } from '../sfm/correspondence-graph';
 import { pairKey, type FeatureDatabase } from '../sfm/database';
 import { extractColors, IncrementalMapper, runIncrementalSfM, SfMCancelledError, type MapperOptions, type RunSfMOptions } from '../sfm/mapper';
-import type { Reconstruction } from '../sfm/reconstruction';
+import { reprojectionErrorSq, type Reconstruction } from '../sfm/reconstruction';
 import { VocabularyIndex } from '../sfm/vocab';
 import { computeWorldAlignment, type WorldAlignment, type WorldKeyframe } from '../sfm/world';
 import { gyroConsistency, timedRotations, type GyroConsistency } from '../sfm/gyro';
@@ -21,11 +23,32 @@ import { median } from '../math/stats';
 import { handEyeCheck, type LiveSession } from './live';
 import { refinePerImageFocal, refineRollingShutter, rsStats, sparseRollingShutter, type RefineRSResult } from './refine-camera';
 import { pairToStored, type EngineStore, type StoredPair, type StoredPairs } from './persistence';
+import type { CpuPool } from './cpu-pool';
 import { ENGINE_DEFAULTS } from './presets';
 import type { EngineConfig, SparseCameraEx, SparseModel, SparseResultEx } from './types';
 
 const now = (): number => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+
+/**
+ * Yield one macrotask (every pending microtask runs first) without the ≥ 4 ms clamp of nested
+ * timers: a message to ourselves. Used to let a queued GPU job encode and submit its work before
+ * the caller blocks the thread with CPU work.
+ */
+const taskChannel = typeof MessageChannel !== 'undefined' ? new MessageChannel() : null;
+const taskQueue: (() => void)[] = [];
+if (taskChannel) {
+  taskChannel.port1.onmessage = () => taskQueue.shift()?.();
+  // (Node: the open port must not keep the process alive)
+  for (const port of [taskChannel.port1, taskChannel.port2]) (port as unknown as { unref?: () => void }).unref?.();
+}
+const yieldTask = (): Promise<void> =>
+  taskChannel
+    ? new Promise((r) => {
+        taskQueue.push(r);
+        taskChannel.port2.postMessage(null);
+      })
+    : tick();
 
 export function cancelledError(stage: string): Error {
   return new SfMCancelledError(stage);
@@ -39,6 +62,8 @@ export interface RefineDeps {
   live: LiveSession;
   config: EngineConfig;
   store: EngineStore;
+  /** CPU helper workers for the pair verification and the vocabulary indexing (null / absent: this thread). */
+  pool?: CpuPool | null;
   log(level: 'debug' | 'info' | 'warn' | 'error', message: string, data?: unknown): void;
   /** Await visibility between GPU batches (the engine's gate does it per call). */
 }
@@ -169,21 +194,36 @@ export async function refinePrincipalPoint(
   return { rec: work, accepted: true, reason: `offset from the image centre ${shifts.join(', ')}; reprojection ${before.toFixed(3)} → ${after.toFixed(3)} px` };
 }
 
-/** Add the not-yet-indexed keyframes to a vocabulary index, yielding every ~30 ms. */
+/**
+ * Add the not-yet-indexed keyframes to a vocabulary index, yielding every ~30 ms. With a CPU pool
+ * the keyframes are quantised on its workers (≤ 2 per worker in flight) and added here in order:
+ * the same index as quantising here (exact quantiser), which is also the fallback for a failed job.
+ */
 async function indexVocabulary(
   vocab: VocabularyIndex,
   ids: readonly number[],
   db: FeatureDatabase,
   cancel: CancelToken | undefined,
   onProgress?: (done: number) => void,
+  pool?: CpuPool | null,
 ): Promise<void> {
   let last = now();
-  for (let k = 0; k < ids.length; k++) {
-    const fs = db.features.get(ids[k]);
-    if (fs && !vocab.has(ids[k])) vocab.add(ids[k], fs);
+  const todo = ids.filter((id) => db.features.has(id) && !vocab.has(id));
+  const jobs: Promise<Uint32Array | null>[] = [];
+  const launch = (): void => {
+    const fs = db.features.get(todo[jobs.length])!;
+    jobs.push(pool!.quantize(vocab, fs).catch(() => null));
+  };
+  if (pool && pool.size > 0) while (jobs.length < Math.min(todo.length, 2 * pool.size)) launch();
+  for (let k = 0; k < todo.length; k++) {
+    const fs = db.features.get(todo[k])!;
+    const words = k < jobs.length ? await jobs[k] : null;
+    if (k < jobs.length && jobs.length < todo.length) launch();
+    if (words) vocab.addBow(todo[k], vocab.bowFromWords(words));
+    else vocab.add(todo[k], fs);
     if (now() - last > 30) {
       checkCancel(cancel, 'matching');
-      onProgress?.(k + 1);
+      onProgress?.(ids.length - todo.length + k + 1);
       await tick();
       last = now();
     }
@@ -214,6 +254,206 @@ export function explainedCorrespondenceRatio(rec: Reconstruction, db: FeatureDat
   return total > 0 ? explained / total : 0;
 }
 
+/** Options of `splitPairs`. */
+export interface SplitPairOptions {
+  /** A SPLIT pair has at least this many split correspondences and this fraction of its inliers split (defaults 15, 0.25). */
+  minSplit: number;
+  minSplitFraction: number;
+  /**
+   * A split pair is LOOP-LIKE when the median reprojection error (px) of a's points in b over its
+   * split correspondences is above `minReprojPx` (default 8: twice the 4 px track-merge threshold)
+   * and at most `maxReprojFocal` × the focal length (default 0.4 ⇒ 300 px at f 750).
+   */
+  minReprojPx: number;
+  maxReprojFocal: number;
+}
+
+export const DEFAULT_SPLIT_PAIR_OPTIONS: Readonly<SplitPairOptions> = Object.freeze({ minSplit: 15, minSplitFraction: 0.25, minReprojPx: 8, maxReprojFocal: 0.4 });
+
+/** Result of `splitPairs`. */
+export interface SplitPairStats {
+  /** Verified pairs with both images registered, their correspondences, and the share split between different 3-D points. */
+  pairs: number;
+  correspondences: number;
+  splitRatio: number;
+  /** Split pairs and their split correspondences. */
+  splitPairs: number;
+  splitCorrespondences: number;
+  /** Loop-like split pairs and their split correspondences. */
+  loopPairs: number;
+  loopCorrespondences: number;
+  /** The split pairs, most split first: "a-b split/inliers rotation° reprojection px" (diagnostics). */
+  detail: string[];
+}
+
+/**
+ * Verified pairs whose correspondences a model keeps on DIFFERENT 3-D points (both features observe
+ * a point, but not the same one). A model that did not close a loop triangulates both ends of it
+ * separately, so the loop pairs are split — many of them, each mostly — and a's points land in b
+ * a few to a few hundred pixels from b's features (the loop gap: e2e yard-real live models 12–15 px,
+ * 50–255 px and beyond 0.4 f; rotation 0–8° off the model's). A closed model's split pairs are false pairs on
+ * repeated structure, which it rightly keeps apart: few correspondences in total, mostly hundreds to
+ * thousands of pixels off (e2e yard-real, 168 k correspondences: 40–85 split pairs with 950–1940
+ * correspondences, 60–190 of them loop-like; unclosed live models: 95–130 split pairs with
+ * 2950–5650, of them ≥ 1200 loop-like when the gap is ≤ 0.4 f; object-real: none).
+ */
+export function splitPairs(rec: Reconstruction, db: FeatureDatabase, opts: Partial<SplitPairOptions> = {}): SplitPairStats {
+  const o = { ...DEFAULT_SPLIT_PAIR_OPTIONS, ...opts };
+  let pairs = 0,
+    total = 0,
+    split = 0,
+    nSplit = 0,
+    splitCorr = 0,
+    nLoop = 0,
+    loopCorr = 0;
+  const detail: { key: string; n: number }[] = [];
+  const Rba = new Float64Array(9);
+  const errs: number[] = [];
+  for (const [a, b, g] of db.pairs()) {
+    const ia = rec.images.get(a),
+      ib = rec.images.get(b);
+    if (!ia || !ib || !ia.registered || !ib.registered) continue;
+    pairs++;
+    const inl = g.inliers;
+    const n = inl.length >> 1;
+    let ns = 0;
+    for (let k = 0; k < inl.length; k += 2) {
+      const pa = ia.point3D[inl[k]],
+        pb = ib.point3D[inl[k + 1]];
+      if (pa >= 0 && pb >= 0 && pa !== pb) ns++;
+    }
+    total += n;
+    split += ns;
+    if (ns < Math.max(o.minSplit, o.minSplitFraction * n)) continue;
+    nSplit++;
+    splitCorr += ns;
+    // where a's point of each split correspondence lands in b
+    const cam = rec.cameras.get(ib.cameraId)!;
+    const kp = ib.keypoints;
+    errs.length = 0;
+    for (let k = 0; k < inl.length && kp; k += 2) {
+      const pa = ia.point3D[inl[k]],
+        pb = ib.point3D[inl[k + 1]];
+      if (!(pa >= 0 && pb >= 0 && pa !== pb)) continue;
+      const X = rec.points.get(pa)?.xyz;
+      if (X) errs.push(Math.sqrt(reprojectionErrorSq(cam, ib.pose, X[0], X[1], X[2], kp[4 * inl[k + 1]], kp[4 * inl[k + 1] + 1])));
+    }
+    const med = errs.length ? median(errs) : NaN;
+    if (med > o.minReprojPx && med <= o.maxReprojFocal * cam.f) {
+      nLoop++;
+      loopCorr += ns;
+    }
+    // diagnostics: the pair's rotation against the model's relative rotation R_b R_aᵀ
+    let errDeg = NaN;
+    if (g.R) {
+      const A = ia.pose.R,
+        B = ib.pose.R;
+      for (let i = 0; i < 3; i++)
+        for (let j = 0; j < 3; j++) Rba[3 * i + j] = B[3 * i] * A[3 * j] + B[3 * i + 1] * A[3 * j + 1] + B[3 * i + 2] * A[3 * j + 2];
+      let tr = 0;
+      for (let k = 0; k < 9; k++) tr += Rba[k] * g.R[k];
+      errDeg = (Math.acos(Math.max(-1, Math.min(1, (tr - 1) / 2))) * 180) / Math.PI;
+    }
+    detail.push({ key: `${a}-${b} ${ns}/${n} ${errDeg.toFixed(1)}° ${med.toFixed(0)}px`, n: ns });
+  }
+  detail.sort((x, y) => y.n - x.n);
+  return {
+    pairs,
+    correspondences: total,
+    splitRatio: total > 0 ? split / total : 0,
+    splitPairs: nSplit,
+    splitCorrespondences: splitCorr,
+    loopPairs: nLoop,
+    loopCorrespondences: loopCorr,
+    detail: detail.map((d) => d.key),
+  };
+}
+
+/** Verdict of `liveModelHealth`. */
+export interface LiveModelHealth {
+  /** True: the live model needs no offline SfM to be checked against. */
+  healthy: boolean;
+  /** The first symptom found, or the evidence of health. */
+  reason: string;
+  explained: number;
+  split: SplitPairStats | null;
+}
+
+/** Thresholds of `liveModelHealth`. */
+export interface LiveHealthOptions {
+  /** Registered images needed to judge (default 20). */
+  minImages: number;
+  /** Explained share of the verified correspondences (default 0.7; e2e live and offline models 0.83–0.96). */
+  minExplained: number;
+  /** Split correspondences on loop-like split pairs: at most max(abs, fraction × all) (defaults 150, 0.25 %). */
+  maxLoopCorrespondences: number;
+  maxLoopFraction: number;
+  /** Split correspondences on any split pair: at most max(abs, fraction × all) (defaults 1000, 1.5 %). */
+  maxSplitCorrespondences: number;
+  maxSplitFraction: number;
+  split: Partial<SplitPairOptions>;
+}
+
+export const DEFAULT_LIVE_HEALTH_OPTIONS: Readonly<Omit<LiveHealthOptions, 'split'>> = Object.freeze({
+  minImages: 20,
+  minExplained: 0.7,
+  maxLoopCorrespondences: 150,
+  maxLoopFraction: 0.0025,
+  maxSplitCorrespondences: 1000,
+  maxSplitFraction: 0.015,
+});
+
+/**
+ * Whether the refined live model needs the from-scratch offline SfM as an independent check. That
+ * SfM rescued live models made of fragments joined by a wrong rotation (gyro breaks), with
+ * misplaced (gyro outliers) or unregistered keyframes, and with an unclosed loop (e2e/README
+ * "Real-capture robustness"); a live model without those symptoms has been kept in every e2e run
+ * (it ties with the offline model: object-real 0.582 vs 0.587 px, 95.7 vs 96.4 % explained;
+ * yard-real 0.382 vs 0.384 px, 86.6 vs 87.3 %) — and the offline SfM is 40–50 % of refine's
+ * reconstruction time. Healthy when ALL hold (a deterministic function of the model and the pairs):
+ *  - every keyframe of `keyframes` is registered, and at least `minImages`;
+ *  - the gyro is verified (`gyro` not null) and the model has no gyro breaks or outliers;
+ *  - at least `minExplained` of the verified correspondences are explained (same 3-D point);
+ *  - no unclosed loop (`splitPairs`): few correspondences on loop-like split pairs (a loop gap of a
+ *    few to a few hundred pixels), and few on split pairs at all (any gap). The thresholds sit
+ *    between the e2e closed models (≤ 190 loop-like / ≤ 1940 split correspondences of 168 k on
+ *    yard-real: limits 420 / 2520; none on object-real) and the unclosed live models (≥ 1200
+ *    loop-like, or 2950–5650 split).
+ * Any doubt runs the offline SfM, as before: a wrong "unhealthy" only costs time.
+ */
+export function liveModelHealth(
+  rec: Reconstruction,
+  db: FeatureDatabase,
+  keyframes: readonly number[],
+  gyro: GyroConsistency | null,
+  opts: Partial<LiveHealthOptions> = {},
+): LiveModelHealth {
+  const o = { ...DEFAULT_LIVE_HEALTH_OPTIONS, ...opts };
+  const out = (healthy: boolean, reason: string, explained = NaN, split: SplitPairStats | null = null): LiveModelHealth => ({ healthy, reason, explained, split });
+  let missing = 0;
+  for (const id of keyframes) if (db.features.has(id) && !rec.images.get(id)?.registered) missing++;
+  if (missing > 0) return out(false, `${missing} of ${keyframes.length} keyframes not registered`);
+  const n = rec.numRegisteredImages;
+  if (n < o.minImages) return out(false, `only ${n} registered images (< ${o.minImages})`);
+  if (!gyro) return out(false, 'no verified gyro to check it against');
+  if (gyro.breaksWithoutOutliers > 0) return out(false, `${gyro.breaksWithoutOutliers} gyro break(s)`);
+  if (gyro.outliers.length > 0) return out(false, `${gyro.outliers.length} keyframe(s) disagree with the gyro`);
+  const explained = explainedCorrespondenceRatio(rec, db);
+  if (!(explained >= o.minExplained)) return out(false, `${(100 * explained).toFixed(1)} % of the correspondences explained (< ${(100 * o.minExplained).toFixed(0)} %)`, explained);
+  const sp = splitPairs(rec, db, opts.split);
+  const maxLoop = Math.max(o.maxLoopCorrespondences, o.maxLoopFraction * sp.correspondences);
+  const maxSplit = Math.max(o.maxSplitCorrespondences, o.maxSplitFraction * sp.correspondences);
+  const counts = `${sp.loopCorrespondences} correspondences on ${sp.loopPairs} loop-like and ${sp.splitCorrespondences} on ${sp.splitPairs} split pairs`;
+  if (sp.loopCorrespondences > maxLoop || sp.splitCorrespondences > maxSplit)
+    return out(false, `unclosed loop? ${counts} (limits ${Math.round(maxLoop)} / ${Math.round(maxSplit)})`, explained, sp);
+  return out(
+    true,
+    `all ${n} keyframes registered, gyro-consistent (median ${gyro.medianErrDeg.toFixed(2)}°), ${(100 * explained).toFixed(1)} % explained, ${counts}`,
+    explained,
+    sp,
+  );
+}
+
 /** Full refine pipeline. */
 export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, cancel?: CancelToken): Promise<RefineOutput> {
   const live = deps.live;
@@ -237,17 +477,18 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
         const vocab = VocabularyIndex.train(sources, { numWords: vc.refineWords ?? ENGINE_DEFAULTS.refineVocabularyWords });
         // indexing quantises every feature (≈ 35 ms per 4k-feature keyframe with SIMD, 260 ms in
         // JS): yield between keyframes so cancel / progress / visibility messages get through
-        await indexVocabulary(vocab, order, st.db, cancel, (k) => report('matching', 0.04 * (k / order.length), `vocabulary ${k}/${order.length}`));
+        await indexVocabulary(vocab, order, st.db, cancel, (k) => report('matching', 0.04 * (k / order.length), `vocabulary ${k}/${order.length}`), deps.pool);
         st.vocab = vocab;
         st.vocabTrainedOn = order.slice();
         void deps.store.putBinary('vocab', st.vocab.exportCodebook()).catch(() => undefined);
       }
-    } else await indexVocabulary(st.vocab, order, st.db, cancel);
+    } else await indexVocabulary(st.vocab, order, st.db, cancel, undefined, deps.pool);
   } catch (e) {
     if ((e as Error)?.name === 'CancelledError') throw e;
     deps.log('warn', `vocabulary failed: ${(e as Error)?.message ?? e}`);
   }
   checkCancel(cancel, 'matching');
+  stats.vocabularyMs = Math.round(now() - tMatch);
   const rp = cfg.refinePairs ?? {};
   const seq = sequentialPairs(order, rp.sequential ?? ENGINE_DEFAULTS.refineSequential);
   const exclude = (a: number, b: number): boolean => st.attempted.has(pairKey(a, b));
@@ -262,20 +503,76 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   const speculative = new Set<number>();
   for (const [a, b] of [...ret, ...spa]) speculative.add(pairKey(a, b));
   for (const [a, b] of seq) speculative.delete(pairKey(a, b));
+  // per candidate source (sequential, retrieval, spatial — first that proposed it): pairs, verified, verification ms
+  const source = new Map<number, number>();
+  for (const [k, list] of [seq, ret, spa].entries()) for (const [a, b] of list) if (!source.has(pairKey(a, b))) source.set(pairKey(a, b), k);
+  const bySource = [0, 1, 2].map(() => ({ pairs: 0, verified: 0, ms: 0, failedMs: 0 }));
   const pairs = mergePairs([seq, ret, spa], exclude).filter(([a, b]) => st.db.features.has(a) && st.db.features.has(b));
   stats.candidatePairs = pairs.length;
   const stored: StoredPair[] = [];
   const attempted: number[] = [];
   let verified = 0;
   let lastYield = now();
+  // verification compute time (engine thread or pool workers), waiting for the GPU matcher, and
+  // (pool) waiting for verification results
+  let verifyMs = 0,
+    matchWaitMs = 0,
+    resultWaitMs = 0;
   // One-deep prefetch: pair i+1 is matched on the GPU while pair i is verified on the CPU
-  // (the GPU chain still runs one job at a time). Rejections surface when awaited; after a
-  // cancel the queued job skips its match.
+  // (the GPU chain still runs one job at a time). The queued job needs the event loop to encode
+  // and submit its work: one macrotask after pair i's matches arrived lets it reach the GPU
+  // before the (synchronous) verification starts — otherwise the GPU idles during every
+  // verification and the CPU during every match (e2e: 7–10 s of waiting per refine).
+  // Rejections surface when awaited; after a cancel the queued job skips its match.
   const putative = (i: number): Promise<MatchPairs | null> | null => {
     if (i >= pairs.length) return null;
     const p = live.putativeMatches(pairs[i][0], pairs[i][1], cancel);
     p.catch(() => undefined);
     return p;
+  };
+  // With the CPU pool the verifications run on its workers, up to `maxInflight` at a time, while this
+  // thread feeds the GPU matcher; their results are gated and recorded in candidate order (the
+  // same database / graph as verifying here, which is the fallback for a failed job).
+  const pool = deps.pool && deps.pool.size > 0 ? deps.pool : null;
+  const maxInflight = pool ? 2 * pool.size : 0;
+  type Verification = { geometry: TwoViewGeometry | null; ms: number };
+  const verifyHere = (a: number, b: number, m: MatchPairs, maxIterations: number): Verification => {
+    const t0 = now();
+    const v = live.verifyInputs(a, b, m, { maxIterations });
+    const geometry = v ? estimateTwoViewGeometry(v.kp1, v.kp2, m, v.cam1, v.cam2, v.opts) : null;
+    return { geometry, ms: now() - t0 };
+  };
+  const verifyPooled = (a: number, b: number, m: MatchPairs, maxIterations: number): Promise<Verification> => {
+    const v = live.verifyInputs(a, b, m, { maxIterations });
+    if (!v) return Promise.resolve({ geometry: null, ms: 0 });
+    return pool!.verify(v.kp1, v.kp2, m, v.cam1, v.cam2, v.opts).catch((e: unknown) => {
+      if (cancel?.cancelled) return { geometry: null, ms: 0 };
+      deps.log('warn', `pair ${a}-${b}: CPU worker failed (${(e as Error)?.message ?? e}), verifying here`);
+      return verifyHere(a, b, m, maxIterations);
+    });
+  };
+  const record = (a: number, b: number, key: number, r: Verification): void => {
+    const g = r.geometry ? live.gatePair(a, b, r.geometry) : null;
+    const src = bySource[source.get(key) ?? 0];
+    src.pairs++;
+    src.ms += r.ms;
+    verifyMs += r.ms;
+    if (g && g.config !== 'degenerate' && g.inliers.length >> 1 >= ENGINE_DEFAULTS.minPairInliers) {
+      src.verified++;
+      live.addPair(a, b, g);
+      stored.push(pairToStored(a, b, g));
+      verified++;
+    } else src.failedMs += r.ms;
+  };
+  const inflight: { a: number; b: number; key: number; done: boolean; result: Promise<Verification> }[] = [];
+  const drain = async (keep: number): Promise<void> => {
+    while (inflight.length > keep || (inflight.length > 0 && inflight[0].done)) {
+      const job = inflight.shift()!;
+      const t0 = now();
+      const r = await job.result;
+      resultWaitMs += now() - t0;
+      record(job.a, job.b, job.key, r);
+    }
   };
   let next = putative(0);
   for (let i = 0; i < pairs.length; i++) {
@@ -286,17 +583,22 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     attempted.push(key);
     const cur = next!;
     next = putative(i + 1);
-    let g: TwoViewGeometry | null = null;
+    const maxIterations = speculative.has(key) ? 1000 : 2000;
     try {
+      const tw = now();
       const m = await cur;
-      g = m ? live.verifyPair(a, b, m, { maxIterations: speculative.has(key) ? 1000 : 2000 }) : null;
+      if (next) await yieldTask();
+      matchWaitMs += now() - tw;
+      if (pool) {
+        if (m) {
+          const job = { a, b, key, done: false, result: verifyPooled(a, b, m, maxIterations) };
+          void job.result.then(() => (job.done = true));
+          inflight.push(job);
+        }
+        await drain(maxInflight);
+      } else if (m) record(a, b, key, verifyHere(a, b, m, maxIterations));
     } catch (e) {
       deps.log('warn', `pair ${a}-${b}: ${(e as Error)?.message ?? e}`);
-    }
-    if (g && g.config !== 'degenerate' && g.inliers.length >> 1 >= ENGINE_DEFAULTS.minPairInliers) {
-      live.addPair(a, b, g);
-      stored.push(pairToStored(a, b, g));
-      verified++;
     }
     if (now() - lastYield > 40) {
       report('matching', 0.05 + 0.95 * ((i + 1) / pairs.length), `verified ${verified} of ${i + 1}/${pairs.length} pairs`);
@@ -304,11 +606,21 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
       lastYield = now();
     }
   }
+  await drain(0);
   const rec: StoredPairs = { pairs: stored, attempted };
   await deps.store.putValue('refine/pairs', rec).catch((e: unknown) => deps.log('warn', `could not persist refine pairs: ${(e as Error)?.message ?? e}`));
   stats.newPairs = verified;
   stats.pairs = st.db.numPairs;
   stats.matchingMs = Math.round(now() - tMatch);
+  stats.verifyMs = Math.round(verifyMs);
+  stats.matchWaitMs = Math.round(matchWaitMs);
+  if (pool) {
+    stats.cpuWorkers = pool.size;
+    stats.verifyResultWaitMs = Math.round(resultWaitMs);
+  }
+  stats.verifyBySource = ['sequential', 'retrieval', 'spatial']
+    .map((n, k) => `${n} ${bySource[k].verified}/${bySource[k].pairs} ${Math.round(bySource[k].ms)} ms (failed ${Math.round(bySource[k].failedMs)} ms)`)
+    .join(', ');
   report('matching', 1, `${st.db.numPairs} verified pairs`);
 
   // ---------------------------------------------------------------- reconstruction
@@ -333,6 +645,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   // gyro bias / camera–IMU offset from the refined live model (the rolling-shutter estimation needs
   // ω at the right time; the live calibration may be off or stale)
   if (liveRec && liveRec.numRegisteredImages >= 12 && cfg.estimateRollingShutter !== false) live.calibrateGyro('refine');
+  stats.liveRefineMs = Math.round(now() - tRec);
   // Model choice: gyro consistency first (a model whose consecutive keyframes disagree with the
   // gyro beyond isolated outliers is made of fragments joined by a wrong rotation), then the
   // registered images, then the mean reprojection error.
@@ -347,17 +660,31 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   const rsEnabled = cfg.estimateRollingShutter !== false && !!gyro;
   let rs: RefineRSResult | null = null;
   const runRS = async (rec: Reconstruction, mapper: IncrementalMapper): Promise<void> => {
+    const tRS = now();
+    const tm0 = { ...mapper.timings };
     const prev = st.rollingShutter;
     report('reconstruction', 0.08, 'rolling shutter');
     await tick();
     const rsOpts = cfg.rollingShutterOptions ?? {};
+    let searchMs = 0,
+      readjustMs = 0,
+      evaluations = 0;
     const readjust = async (): Promise<void> => {
+      const t0 = now();
       // keypoints changed in place: drop cached normalised coordinates and re-adjust
       live.mapper.incrementalMapper.triangulator.invalidate();
       mapper.triangulator.invalidate();
       await mapper.iterativeGlobalRefinement(undefined, cancel, true);
+      readjustMs += now() - t0;
     };
-    let r = refineRollingShutter(rec, st, gyro!, rsOpts, live.liveRollingShutter());
+    const estimate = async (opts: typeof rsOpts, known: RefineRSResult['applied']): Promise<RefineRSResult> => {
+      const t0 = now();
+      const out = await refineRollingShutter(rec, st, gyro!, opts, known, deps.pool ?? null);
+      searchMs += now() - t0;
+      evaluations += out.estimate?.curve.length ?? 0;
+      return out;
+    };
+    let r = await estimate(rsOpts, live.liveRollingShutter());
     const first = r;
     if (r.applied || prev) await readjust();
     // further passes on the model re-adjusted with the estimate (the short BAs start from the input
@@ -371,7 +698,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
       // true bias): measured neutral on abl-*-rs / object-real and worse on yard-real (principal
       // point 0.4 → 1.3 px, rotation 0.10 → 0.13°) — ARCHITECTURE "Real-capture robustness"
       const before = r.applied;
-      r = refineRollingShutter(rec, st, gyro!, { ...rsOpts, around: before }, before);
+      r = await estimate({ ...rsOpts, around: before }, before);
       passes = p;
       await readjust();
       if (!r.applied || r.applied.axis !== before.axis || Math.abs(r.applied.readoutMs - before.readoutMs) < 0.5) break;
@@ -380,6 +707,12 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     Object.assign(stats, rsStats(r, st.cameraFromDevice()));
     if (first.estimate) stats.rsImprovementPct = Math.round(1000 * first.estimate.improvement) / 10;
     stats.rsPasses = passes;
+    stats.rsMs = Math.round(now() - tRS);
+    const tm = mapper.timings;
+    stats.rsGlobalBA = `${tm.numGlobalBA - tm0.numGlobalBA} BAs, ${tm.globalBAIterations - tm0.globalBAIterations} iterations, ${Math.round(tm.globalBA - tm0.globalBA)} ms`;
+    stats.rsSearchMs = Math.round(searchMs);
+    stats.rsReadjustMs = Math.round(readjustMs);
+    stats.rsEvaluations = evaluations;
     if (passes > 1 && first.applied) stats.rsPass1 = `${first.applied.axis} ${first.applied.readoutMs.toFixed(1)} ms`;
     deps.log(
       'info',
@@ -402,26 +735,35 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     rotationCheck: live.rotationCheck(),
     ...(cfg.mapper ?? {}),
   };
+  // the offline SfM checks the live model independently: skipped when the live model is healthy
+  const lc = consistency(liveRec);
+  const health = liveRec && cfg.refineOfflineSfM !== 'always' ? liveModelHealth(liveRec, st.db, order, lc) : null;
+  stats.offlineSfM = health?.healthy ? `skipped: ${health.reason}` : health ? `run: ${health.reason}` : 'run';
+  deps.log('info', `refine: offline SfM ${stats.offlineSfM}`);
+  if (health?.split) deps.log('info', `refine: live model split pairs: ${health.split.detail.slice(0, 40).join('; ')}`);
   let offline: Reconstruction | null = null;
-  try {
-    const models = await runIncrementalSfM(
-      st.db,
-      mapperOpts,
-      (e) => report('reconstruction', 0.1 + 0.85 * Math.max(0, e.progress), e.message),
-      cancel,
-    );
-    offline = models[0] ?? null;
-  } catch (e) {
-    if ((e as Error)?.name === 'CancelledError') throw e;
-    deps.log('warn', `offline SfM failed: ${(e as Error)?.message ?? e}`);
+  if (!health?.healthy) {
+    const tOff = now();
+    try {
+      const models = await runIncrementalSfM(
+        st.db,
+        mapperOpts,
+        (e) => report('reconstruction', 0.1 + 0.85 * Math.max(0, e.progress), e.message),
+        cancel,
+      );
+      offline = models[0] ?? null;
+    } catch (e) {
+      if ((e as Error)?.name === 'CancelledError') throw e;
+      deps.log('warn', `offline SfM failed: ${(e as Error)?.message ?? e}`);
+    }
+    stats.offlineSfMMs = Math.round(now() - tOff);
   }
   const score = (r: Reconstruction | null): [number, number] => (r ? [r.numRegisteredImages, r.meanReprojectionError()] : [0, Infinity]);
   const [lr, le] = score(liveRec);
   const [or, oe] = score(offline);
-  const lc = consistency(liveRec),
-    oc = consistency(offline);
+  const oc = consistency(offline);
   stats.liveRegistered = lr;
-  stats.offlineRegistered = or;
+  if (offline) stats.offlineRegistered = or;
   if (lc) stats.gyroBreaksLive = `${lc.breaksWithoutOutliers} (+${lc.outliers.length} outliers, median ${lc.medianErrDeg.toFixed(2)}°)`;
   if (oc) stats.gyroBreaksOffline = `${oc.breaksWithoutOutliers} (+${oc.outliers.length} outliers, median ${oc.medianErrDeg.toFixed(2)}°)`;
   let chosen: Reconstruction;
@@ -430,10 +772,22 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   const lb = lc ? lc.breaksWithoutOutliers : 0,
     ob = oc ? oc.breaksWithoutOutliers : 0;
   // explained correspondences: a model that did not close a loop splits the loop pairs' tracks
-  const lx = liveRec ? explainedCorrespondenceRatio(liveRec, st.db) : 0,
+  const lx = liveRec ? (health && Number.isFinite(health.explained) ? health.explained : explainedCorrespondenceRatio(liveRec, st.db)) : 0,
     ox = offline ? explainedCorrespondenceRatio(offline, st.db) : 0;
   stats.liveExplained = Math.round(1000 * lx) / 1000;
-  stats.offlineExplained = Math.round(1000 * ox) / 1000;
+  if (offline) stats.offlineExplained = Math.round(1000 * ox) / 1000;
+  const fmtSplit = (sp: SplitPairStats): string =>
+    `${(100 * sp.splitRatio).toFixed(2)} % of ${sp.correspondences} correspondences split; ${sp.splitCorrespondences} on ${sp.splitPairs} split pairs, ${sp.loopCorrespondences} on ${sp.loopPairs} loop-like`;
+  if (liveRec) {
+    const sp = health?.split ?? splitPairs(liveRec, st.db);
+    stats.liveSplit = fmtSplit(sp);
+    if (!health?.split) deps.log('info', `refine: live model ${stats.liveSplit}; split pairs: ${sp.detail.slice(0, 40).join('; ')}`);
+  }
+  if (offline) {
+    const sp = splitPairs(offline, st.db);
+    stats.offlineSplit = fmtSplit(sp);
+    deps.log('info', `refine: offline model ${stats.offlineSplit}; split pairs: ${sp.detail.slice(0, 40).join('; ')}`);
+  }
   const minExplainedGap = cfg.modelChoiceExplainedGap ?? 0.015;
   const liveBetter = (): boolean => {
     if (lb !== ob) return lb < ob;
@@ -478,6 +832,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   const ppMin = cfg.refinePrincipalPoint === false ? Infinity : cfg.refinePrincipalPoint === true ? 3 : ENGINE_DEFAULTS.refinePrincipalPointMinImages;
   if (chosen.numRegisteredImages >= ppMin) {
     report('reconstruction', 0.97, 'final bundle adjustment (principal point)');
+    const tPP = now();
     try {
       const r = await refinePrincipalPoint(chosen, st.db, st.graph, { ...(which === 'live' ? live.mapper.incrementalMapper.opts : mapperOpts) }, cancel);
       if (r.accepted) chosen = r.rec;
@@ -488,10 +843,12 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
       stats.principalPoint = 'kept (BA failed)';
       deps.log('warn', `principal point BA failed: ${(e as Error)?.message ?? e}`);
     }
+    stats.principalPointMs = Math.round(now() - tPP);
   }
   // per-image focal lengths (focus breathing): only when they lower the reprojection error clearly
   if (cfg.perImageFocal !== false && chosen.numRegisteredImages >= 10) {
     report('reconstruction', 0.985, 'per-image focal');
+    const tPF = now();
     try {
       const mo = { ...(which === 'live' ? live.mapper.incrementalMapper.opts : mapperOpts) };
       const ppOn = cfg.refinePrincipalPoint !== false && chosen.numRegisteredImages >= ppMin;
@@ -517,10 +874,14 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
       stats.perImageFocal = 'kept shared (BA failed)';
       deps.log('warn', `per-image focal BA failed: ${(e as Error)?.message ?? e}`);
     }
+    stats.perImageFocalMs = Math.round(now() - tPF);
   }
   stats.reconstructionMs = Math.round(now() - tRec);
   report('reconstruction', 1, `${which} model: ${chosen.numRegisteredImages}/${order.length} images, ${chosen.numPoints} points`);
-  deps.log('info', `refine: live ${lr} images (${le.toFixed(3)} px, ${(100 * lx).toFixed(1)} % explained), offline ${or} images (${oe.toFixed(3)} px, ${(100 * ox).toFixed(1)} % explained) → ${which}`);
+  deps.log(
+    'info',
+    `refine: live ${lr} images (${le.toFixed(3)} px, ${(100 * lx).toFixed(1)} % explained), ${health?.healthy ? 'offline SfM skipped' : `offline ${or} images (${oe.toFixed(3)} px, ${(100 * ox).toFixed(1)} % explained)`} → ${which}`,
+  );
 
   // ---------------------------------------------------------------- alignment
   const tAl = now();

@@ -143,6 +143,19 @@ export interface EngineConfig {
    * otherwise the lower mean reprojection error.
    */
   modelChoiceExplainedGap?: number;
+  /**
+   * The from-scratch offline SfM of refine, the independent check of the live model: 'auto'
+   * (default) runs it only when the live model shows a symptom it has to be checked for (keyframes
+   * not registered, no verified gyro, gyro breaks or outliers, few images, a low explained ratio,
+   * unmerged loop-closure pairs: `liveModelHealth` in refine.ts); 'always' runs it every time.
+   */
+  refineOfflineSfM?: 'auto' | 'always';
+  /**
+   * CPU helper workers (nested in the engine worker) that verify refine's candidate pairs and
+   * quantise its vocabulary in parallel (default: hardware threads − 2, at most 3; 0 = everything
+   * on the engine thread). Same results either way.
+   */
+  cpuWorkers?: number;
   /** Per-image focal lengths tied to the shared focal in the final refinement (default true; kept only if it helps). */
   perImageFocal?: boolean;
   /** Prior σ of the per-image focal (relative, default 0.005) and the required reprojection improvement (default 0.005). */
