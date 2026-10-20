@@ -359,8 +359,9 @@ export function searchRollingShutter(cost: RSCostFunction, opts: Partial<Rolling
       bi = xs.reduce((k, x, i) => (known.get(x)! < known.get(xs[k])! ? i : k), 0);
     }
     const tol = Math.max(0.5, 0.2 * o.stepMs);
-    // still best at the range end: bisect towards it until bracketed (or within tol of the end)
-    for (let g = 0; g < 6 && bi === xs.length - 1 && bi > 0 && xs[bi] - xs[bi - 1] > tol; g++) {
+    // still best at the range end: bisect towards it until bracketed (or within tol of the end);
+    // not after an extension stopped short of the end (the minimum lies beyond, nothing to bracket)
+    for (let g = 0; g < 6 && bi === xs.length - 1 && bi > 0 && xs[bi] >= o.maxReadoutMs && xs[bi] - xs[bi - 1] > tol; g++) {
       const mid = 0.5 * (xs[bi - 1] + xs[bi]);
       known.set(mid, f(mid));
       xs = [...known.keys()].sort((a, b) => a - b);

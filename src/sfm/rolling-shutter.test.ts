@@ -178,6 +178,10 @@ describe('searchRollingShutter', () => {
     expect(searchRollingShutter(quad(45)).best.readoutMs).toBe(40);
     // around an earlier estimate, the extension clamped to the range end
     expect(Math.abs(searchRollingShutter(quad(38), { around: { axis: 'rows', readoutMs: 30 } }).best.readoutMs - 38)).toBeLessThan(0.5);
+    // an extension stopped short of the range end (its step limit) is not bisected back
+    const short = searchRollingShutter(quad(38), { around: { axis: 'rows', readoutMs: 5 } });
+    expect(short.best.readoutMs).toBe(short.curve[short.curve.length - 1].readoutMs);
+    expect(short.best.readoutMs).toBeLessThan(40);
   });
 });
 
