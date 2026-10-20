@@ -10,6 +10,10 @@
  *
  * Rendering is on demand: a frame is drawn only when content, display options,
  * size or the camera change (including OrbitControls damping); no idle loop.
+ *
+ * Gaussian splats (`setSplats`, WebGPU, ./splat-layer.ts, loaded lazily) are drawn in a canvas
+ * under the WebGL one; while they are shown the WebGL canvas clears to transparent and draws the
+ * overlays only (the points / mesh are kept for picking).
  */
 import {
   BufferAttribute,
@@ -27,6 +31,7 @@ import {
   PerspectiveCamera,
   Points,
   Quaternion,
+  SRGBColorSpace,
   Scene,
   Sphere,
   Vector2,
@@ -61,6 +66,19 @@ import {
 } from './helpers';
 import { MeasureTool, measureDistance, type MeasureCallback } from './measure';
 import { PointCloudMaterial, patchMeshMaterial } from './points-material';
+import { subsampleMeans } from './splat-camera';
+import type { SplatLayer, SplatLayerStats, SplatView } from './splat-layer';
+import type { SplatModel } from '../splat/types';
+
+/** State of the splat layer: no model, compiling / uploading, shown-able, recovering a lost device, failed. */
+export type SplatDisplayState = 'none' | 'loading' | 'ready' | 'lost' | 'unavailable';
+
+/** A trained splat model for `setSplats` (the engine's `SplatModelPayload` fits). */
+export interface SplatInput {
+  model: SplatModel;
+  /** Trained with the Mip-Splatting opacity compensation (default true). */
+  antialiased?: boolean;
+}
 
 export interface ViewerOptions {
   /** CSS colour of the background, or 'transparent'. Default '#101216'. */
@@ -84,6 +102,14 @@ export interface ViewerOptions {
   autoFit?: 'first' | 'follow' | 'off';
   /** Vertical field of view in degrees (default 50). */
   fovDeg?: number;
+  /** Splat layer: most canvas pixels (default 2 M; the canvas pixel ratio is lowered to fit). */
+  splatMaxPixels?: number;
+  /** Splat layer: most pixels of a frame drawn while the view moves (default 0.5 M). */
+  splatInteractivePixels?: number;
+  /** Splat layer state changes (setSplats; 'lost' / 'unavailable' after a GPU device loss). */
+  onSplatState?: (state: SplatDisplayState, detail?: string) => void;
+  /** Splat layer on a software WebGPU adapter (tests; refused by default: far too slow). */
+  splatAllowSoftware?: boolean;
 }
 
 export interface PointCloudDisplayOptions {
@@ -98,6 +124,11 @@ export interface PointCloudDisplayOptions {
 }
 
 export interface DisplayOptions {
+  /**
+   * Show the Gaussian splats (setSplats) when ready, INSTEAD of the points, mesh and grid (they
+   * still serve picking / measuring). Default true.
+   */
+  splats?: boolean;
   points?: boolean;
   mesh?: boolean;
   cameras?: boolean;
@@ -133,6 +164,12 @@ export interface ViewerStats {
   sparsePoints: number;
   triangles: number;
   cameras: number;
+  /** Gaussians of the splat model (0: none) and the layer's state / frame statistics. */
+  splats: number;
+  splatState: SplatDisplayState;
+  /** The last frame showed the splats (WebGL drew overlays only). */
+  splatsShown: boolean;
+  splatLayer: SplatLayerStats | null;
 }
 
 /** Screen position in CSS px relative to the container's top-left: {x, y} or [x, y]. */
@@ -190,7 +227,7 @@ export class Viewer {
   readonly controls: OrbitControls;
 
   private readonly canvas: HTMLCanvasElement;
-  private readonly opts: Required<Omit<ViewerOptions, 'background'>> & { background: string };
+  private readonly opts: Required<Omit<ViewerOptions, 'background' | 'onSplatState'>> & Pick<ViewerOptions, 'onSplatState'> & { background: string };
   private readonly bgColor = new Color();
   private readonly bgAlpha: number;
   private readonly contentScene = new Scene();
@@ -240,6 +277,7 @@ export class Viewer {
   private gridKey = '';
 
   private display: Required<DisplayOptions> = {
+    splats: true,
     points: true,
     mesh: true,
     cameras: true,
@@ -285,6 +323,14 @@ export class Viewer {
   private pickZ = new Float64Array(0);
   private pickD2 = new Float64Array(0);
   private readonly listeners: [EventTarget, string, EventListener][] = [];
+  private splatLayer: SplatLayer | null = null;
+  private splatBounds: Layer | null = null;
+  private splatCount = 0;
+  private splatState: SplatDisplayState = 'none';
+  /** Bumped by every setSplats: a slower earlier call must not install its model. */
+  private splatToken = 0;
+  private lastFrameSplats = false;
+  private readonly splatBg = new Color();
 
   constructor(container: HTMLElement, opts: ViewerOptions = {}) {
     this.container = container;
@@ -296,6 +342,10 @@ export class Viewer {
       pickMode: opts.pickMode ?? 'auto',
       autoFit: opts.autoFit ?? 'first',
       fovDeg: opts.fovDeg ?? 50,
+      splatMaxPixels: opts.splatMaxPixels ?? 2_000_000,
+      splatInteractivePixels: opts.splatInteractivePixels ?? 500_000,
+      splatAllowSoftware: opts.splatAllowSoftware ?? false,
+      onSplatState: opts.onSplatState,
     };
     const transparent = this.opts.background === 'transparent';
     this.bgAlpha = transparent ? 0 : 1;
@@ -328,7 +378,8 @@ export class Viewer {
       this.renderer = new WebGLRenderer({
         canvas,
         antialias: this.opts.antialias,
-        alpha: transparent,
+        // always: the splat layer shows through where the overlays-only frame is transparent
+        alpha: true,
         powerPreference: 'high-performance',
         preserveDrawingBuffer: false,
         depth: true,
@@ -590,6 +641,86 @@ export class Viewer {
     this.onContentChanged();
   }
 
+  /**
+   * Gaussian splats drawn by the WebGPU splat layer (null removes them and frees the GPU memory).
+   * The model's arrays are kept (not copied) for a device-loss rebuild. Resolves true when the
+   * layer is ready, false when it cannot show them (no WebGPU or a software adapter, failed
+   * compilation / upload; state 'unavailable') or a newer call superseded this one. Shown while
+   * `display.splats` (default true) instead of the points / mesh / grid.
+   */
+  async setSplats(input: SplatInput | null): Promise<boolean> {
+    if (this.disposed) return false;
+    const token = ++this.splatToken;
+    if (!input || input.model.count === 0) {
+      this.splatLayer?.dispose();
+      this.splatLayer = null;
+      this.splatBounds = null;
+      this.splatCount = 0;
+      this.setSplatState('none');
+      this.boundsDirty = true;
+      this.onContentChanged();
+      return false;
+    }
+    const { model } = input;
+    const samples = subsampleMeans(model.means, model.count, BOUNDS_SAMPLES);
+    this.splatBounds = { samples, bounds: robustBoundsOfSamples(samples, model.count) };
+    this.boundsDirty = true;
+    this.setSplatState('loading');
+    try {
+      if (!this.splatLayer) {
+        const { SplatLayer } = await import('./splat-layer');
+        if (this.disposed || token !== this.splatToken) return false;
+        const layer = await SplatLayer.create(this.container, this.canvas, {
+          maxPixels: this.opts.splatMaxPixels,
+          maxPixelRatio: this.opts.maxPixelRatio,
+          interactivePixels: this.opts.splatInteractivePixels,
+          allowSoftware: this.opts.splatAllowSoftware,
+          onState: (st, detail) => {
+            if (layer === this.splatLayer) this.setSplatState(st, detail);
+          },
+          onInvalidate: () => this.requestRender(),
+        });
+        if (this.disposed || token !== this.splatToken) {
+          layer.dispose();
+          return false;
+        }
+        this.splatLayer = layer;
+      }
+      await this.splatLayer.setModel(model, input.antialiased ?? true);
+      if (this.disposed || token !== this.splatToken) return false;
+      this.splatCount = model.count;
+      this.setSplatState('ready');
+      this.onContentChanged();
+      return true;
+    } catch (e) {
+      if (this.disposed || token !== this.splatToken) return false;
+      console.warn('[viewer] splats unavailable:', (e as Error)?.message ?? e);
+      this.splatLayer?.dispose();
+      this.splatLayer = null;
+      this.splatCount = 0;
+      this.setSplatState('unavailable', (e as Error)?.message ?? String(e));
+      this.onContentChanged();
+      return false;
+    }
+  }
+
+  private setSplatState(st: SplatDisplayState, detail?: string): void {
+    if (st === this.splatState) return;
+    this.splatState = st;
+    this.contentVersion++;
+    try {
+      this.opts.onSplatState?.(st, detail);
+    } catch (e) {
+      console.error(e);
+    }
+    this.requestRender();
+  }
+
+  /** Splats are drawn instead of the points / mesh this frame. */
+  private splatsShown(): boolean {
+    return this.display.splats && this.splatState === 'ready' && !!this.splatLayer?.ready;
+  }
+
   /** Camera frustums (≈3 % of the scene radius) + trajectory polyline; last one highlighted. */
   setCameras(cams: { pose: Pose; intrinsics: CameraIntrinsics }[], highlightLast = true): void {
     if (this.disposed) return;
@@ -681,7 +812,7 @@ export class Viewer {
 
   private onContentChanged(): void {
     this.contentVersion++;
-    const realContent = !!(this.dense || this.sparse || this.meshLayer);
+    const realContent = !!(this.dense || this.sparse || this.meshLayer || this.splatBounds?.bounds);
     const anyContent = realContent || this.cams.length > 0;
     if (!anyContent) {
       this.autoFitArmed = true;
@@ -703,6 +834,8 @@ export class Viewer {
     if (this.dense) layers.push(this.dense);
     if (this.sparse) layers.push(this.sparse);
     if (this.meshLayer) layers.push(this.meshLayer);
+    // The splats only frame the view without other content: a sky shell would blow up the bounds.
+    if (!layers.length && this.splatBounds) layers.push(this.splatBounds);
     // Robust content bounds: union of per-layer robust boxes.
     let robust: Bounds3 | null = null;
     let clip: Bounds3 | null = null;
@@ -951,24 +1084,28 @@ export class Viewer {
     const bufH = this.height * pr;
     const projScale = bufH / (2 * Math.tan((this.camera.fov * Math.PI) / 360));
     const maxSize = Math.min(64 * pr, this.maxPointSize);
+    // Splats replace the points / mesh / grid (the WebGL canvas draws the overlays only).
+    const splats = this.splatsShown();
+    this.splatLayer?.setVisible(splats);
+    const showPoints = this.display.points && !splats;
 
     const dense = this.dense;
     if (dense) {
       const lod = lowQuality && !!dense.lodPoints;
-      dense.points.visible = this.display.points && !lod;
-      if (dense.lodPoints) dense.lodPoints.visible = this.display.points && lod;
+      dense.points.visible = showPoints && !lod;
+      if (dense.lodPoints) dense.lodPoints.visible = showPoints && lod;
       this.denseMaterial.setSizes(this.densePointSizeCss * pr, 1, maxSize);
       this.denseMaterial.updateView(projScale, lod ? dense.lodSizeScale : 1);
       this.lastFrameLod = lod;
     }
     if (this.sparse) {
-      this.sparse.points.visible = this.display.points;
+      this.sparse.points.visible = showPoints;
       this.sparseMaterial.setSizes(this.display.sparsePointSizePx * pr, 1, maxSize);
       this.sparseMaterial.updateView(projScale, 1);
     }
-    if (this.meshLayer) this.meshLayer.mesh.visible = this.display.mesh;
+    if (this.meshLayer) this.meshLayer.mesh.visible = this.display.mesh && !splats;
     this.cameraOverlay.object.visible = this.display.cameras;
-    if (this.grid) this.grid.visible = this.gridActive && this.display.grid;
+    if (this.grid) this.grid.visible = this.gridActive && this.display.grid && !splats;
 
     // Headlight from above-left of the viewer.
     const ld = this.camera.position.distanceTo(this.controls.target) + 1e-9;
@@ -978,8 +1115,8 @@ export class Viewer {
 
     this.measure.update(this.camera, this.overlayRoot, this.width, this.height);
 
-    const pointsVisible = this.display.points && (!!dense || !!this.sparse);
-    const hasContent = pointsVisible || (this.display.mesh && !!this.meshLayer);
+    const pointsVisible = showPoints && (!!dense || !!this.sparse);
+    const hasContent = pointsVisible || (this.display.mesh && !splats && !!this.meshLayer);
     // EDL shades points only: a mesh alone is drawn directly (keeps canvas MSAA).
     const useEdl = this.display.edl && this.edl.supported && pointsVisible;
     if (useEdl) {
@@ -988,8 +1125,10 @@ export class Viewer {
       else this.targetSig[0] = NaN;
     }
     r.setRenderTarget(null);
-    r.setClearColor(this.bgColor, this.bgAlpha);
+    r.setClearColor(this.bgColor, splats ? 0 : this.bgAlpha);
     r.clear(true, true, false);
+    if (splats) this.splatLayer!.draw(this.splatView(lowQuality));
+    this.lastFrameSplats = splats;
     if (this.grid?.visible) r.render(this.backgroundScene, this.camera);
     if (useEdl) {
       this.edl.composite(r, this.camera.near, this.camera.far, {
@@ -1002,6 +1141,28 @@ export class Viewer {
     }
     r.render(this.overlayScene, this.camera);
     this.frames++;
+  }
+
+  /** What the splat layer draws for the current camera (view matrix incl. the world root). */
+  private splatView(interactive: boolean): SplatView {
+    _m.multiplyMatrices(this.camera.matrixWorldInverse, this.contentRoot.matrixWorld);
+    let background: [number, number, number] | null = null;
+    if (this.bgAlpha > 0) {
+      this.bgColor.getRGB(this.splatBg, SRGBColorSpace);
+      background = [this.splatBg.r, this.splatBg.g, this.splatBg.b];
+    }
+    // Near plane: the content clip planes, but never cutting splats near the orbit target.
+    const targetDist = this.camera.position.distanceTo(this.controls.target);
+    const near = Math.max(1e-9, Math.min(this.camera.near, 0.05 * targetDist));
+    return {
+      view: _m.elements.slice(),
+      projection: this.camera.projectionMatrix.elements.slice(),
+      cssWidth: this.width,
+      cssHeight: this.height,
+      near,
+      background,
+      interactive,
+    };
   }
 
   /** Camera matrices + content version + size: equal signatures ⇒ identical content target. */
@@ -1078,6 +1239,9 @@ export class Viewer {
     this.meshLitPlain.dispose();
     this.meshUnlitPlain.dispose();
     this.edl.dispose();
+    this.splatToken++;
+    this.splatLayer?.dispose();
+    this.splatLayer = null;
     this.renderer.dispose();
     try {
       this.renderer.forceContextLoss();
@@ -1088,23 +1252,49 @@ export class Viewer {
     if (this.restorePosition !== null) this.container.style.position = this.restorePosition;
   }
 
-  /** PNG of the current view (full quality; includes the measurement label). */
-  screenshot(): Promise<Blob> {
-    if (this.disposed) return Promise.reject(new Error('Viewer disposed'));
+  /** PNG of the current view (full quality; includes the splats and the measurement label). */
+  async screenshot(): Promise<Blob> {
+    if (this.disposed) throw new Error('Viewer disposed');
     // A lost context has no drawing buffer: toBlob would yield a blank image.
-    if (this.contextLost || this.renderer.getContext().isContextLost()) {
-      return Promise.reject(new Error('WebGL context lost'));
+    if (this.contextLost || this.renderer.getContext().isContextLost()) throw new Error('WebGL context lost');
+    // splats: their canvas read back first (async), the WebGL overlays drawn on top below
+    let under: HTMLCanvasElement | null = null;
+    if (this.splatsShown()) {
+      this.renderFrame(false);
+      const px = await this.splatLayer!.readPixels();
+      if (this.disposed) throw new Error('Viewer disposed');
+      if (px) {
+        const d = px.data;
+        if (this.bgAlpha === 0) {
+          // transparent background: premultiplied → straight alpha for ImageData
+          for (let i = 0; i < d.length; i += 4) {
+            const a = d[i + 3];
+            if (a > 0 && a < 255) for (let c = 0; c < 3; c++) d[i + c] = Math.min(255, Math.round((255 * d[i + c]) / a));
+          }
+        }
+        under = document.createElement('canvas');
+        under.width = px.width;
+        under.height = px.height;
+        under.getContext('2d')?.putImageData(new ImageData(new Uint8ClampedArray(d.buffer as ArrayBuffer, d.byteOffset, d.byteLength), px.width, px.height), 0, 0);
+      }
     }
     this.renderFrame(false);
     let src: HTMLCanvasElement = this.canvas;
     const label = this.measure.labelForScreenshot();
-    if (label) {
+    if (label || under) {
       const c2 = document.createElement('canvas');
       c2.width = this.canvas.width;
       c2.height = this.canvas.height;
       const ctx = c2.getContext('2d');
+      if (ctx && under) {
+        ctx.imageSmoothingQuality = 'high';
+        ctx.drawImage(under, 0, 0, c2.width, c2.height);
+      }
       if (ctx) {
         ctx.drawImage(this.canvas, 0, 0);
+        src = c2;
+      }
+      if (ctx && label) {
         const s = c2.width / Math.max(1, this.width);
         ctx.font = `600 ${13 * s}px -apple-system, system-ui, sans-serif`;
         const tw = ctx.measureText(label.text).width;
@@ -1117,7 +1307,6 @@ export class Viewer {
         ctx.fillStyle = '#fff';
         ctx.textBaseline = 'middle';
         ctx.fillText(label.text, x + padX, y + hgt / 2);
-        src = c2;
       }
     }
     return new Promise((resolve, reject) =>
@@ -1153,7 +1342,21 @@ export class Viewer {
       sparsePoints: this.sparse?.count ?? 0,
       triangles: this.meshLayer?.source.triangleCount ?? 0,
       cameras: this.cams.length,
+      splats: this.splatCount,
+      splatState: this.splatState,
+      splatsShown: this.lastFrameSplats,
+      splatLayer: this.splatLayer?.stats() ?? null,
     };
+  }
+
+  /**
+   * The splat layer's canvas pixels (RGBA8, rows top to bottom) after drawing the current view at
+   * full size; null when the splats are not shown. For tests / thumbnails.
+   */
+  async readSplatPixels(): Promise<{ width: number; height: number; data: Uint8Array } | null> {
+    if (this.disposed || !this.splatsShown()) return null;
+    this.renderNow();
+    return this.splatLayer!.readPixels();
   }
 
   /** True while a frame is scheduled. */
@@ -1195,6 +1398,8 @@ export class Viewer {
    *     depth) on oblique surfaces.
    * Cost is independent of the number of points (1 + 1 per tap renders and
    * tiny readbacks, a few ms). CPU fallback: see pickNearestProjected().
+   * While the splats are shown, the points and the mesh (hidden) are picked: they are the
+   * surfaces the splats were initialised from and trained on.
    */
   pickPoints(ps: ScreenPoint[]): (Vec3 | null)[] {
     if (this.disposed || this.contextLost || this.width === 0 || this.height === 0) return ps.map(() => null);
@@ -1210,17 +1415,19 @@ export class Viewer {
     const pr = this.pixelRatio;
     const projScale = (this.height * pr) / (2 * Math.tan((this.camera.fov * Math.PI) / 360));
     const maxSize = Math.min(64 * pr, this.maxPointSize);
+    const pick = this.pickLayers();
     if (dense) {
-      dense.points.visible = this.display.points;
+      dense.points.visible = pick.points;
       if (dense.lodPoints) dense.lodPoints.visible = false;
       this.denseMaterial.setSizes(this.densePointSizeCss * pr, 1, maxSize);
       this.denseMaterial.updateView(projScale, 1);
     }
     if (this.sparse) {
-      this.sparse.points.visible = this.display.points;
+      this.sparse.points.visible = pick.points;
       this.sparseMaterial.setSizes(this.display.sparsePointSizePx * pr, 1, maxSize);
     }
-    if (this.meshLayer) this.meshLayer.mesh.visible = this.display.mesh;
+    if (this.meshLayer) this.meshLayer.mesh.visible = pick.mesh;
+    // the grid is in the background scene: never in the picking target
 
     const db = this.renderer.getDrawingBufferSize(_v2);
     const W = db.x;
@@ -1426,6 +1633,12 @@ export class Viewer {
     return out;
   }
 
+  /** What picking hits: the displayed points / mesh, or both (hidden) while the splats are shown. */
+  private pickLayers(): { points: boolean; mesh: boolean } {
+    if (this.splatsShown()) return { points: true, mesh: true };
+    return { points: this.display.points, mesh: this.display.mesh };
+  }
+
   private pickCPU(p: { x: number; y: number }): Vec3 | null {
     _m.multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse).multiply(this.contentRoot.matrixWorld);
     const e = _m.elements;
@@ -1445,7 +1658,8 @@ export class Viewer {
       best = new Float64Array([pos[3 * i], pos[3 * i + 1], pos[3 * i + 2]]);
     };
     const pr = this.pixelRatio;
-    if (this.display.points && this.dense) {
+    const pick = this.pickLayers();
+    if (pick.points && this.dense) {
       // Use exactly the attributes the GPU draws with (radius / confidence filter).
       const g = this.dense.geometry;
       const radiusAttr = this.denseMaterial.usesRadius ? (g.getAttribute('radius') as BufferAttribute | undefined) : undefined;
@@ -1460,12 +1674,12 @@ export class Viewer {
         minConfidence: this.denseMaterial.minConfidence,
       });
     }
-    if (this.display.points && this.sparse) {
+    if (pick.points && this.sparse) {
       consider((this.sparse.geometry.getAttribute('position') as BufferAttribute).array as Float32Array, this.sparse.count, {
         sizePx: this.display.sparsePointSizePx,
       });
     }
-    if (this.display.mesh && this.meshLayer) {
+    if (pick.mesh && this.meshLayer) {
       const src = this.meshLayer.source;
       // Vertices as 1 px points: snapping when the tap is just off the mesh.
       consider(src.positions, src.vertexCount, { sizePx: 1 });
