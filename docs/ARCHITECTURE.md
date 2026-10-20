@@ -1734,8 +1734,8 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   min angle 1.5°, re-triangulation of pairs < 20 % triangulated with 5°, ignore two-view tracks).
   `RayTriangulator`: 2-view minimal samples (exhaustive for ≤ 15 observations), angular residuals, cheirality
   via the camera z-axis, LO = weighted LS ray intersection (re-weighted by 1/distance² ≈ angular error; no
-  DLT/SVD, no allocation). Deviations: a track never gets two observations of the same image
-  (continue/complete skip images already in the track; merge skips point pairs that share an image);
+  DLT/SVD, no allocation). Deviations: continue / complete never add a second observation of an image to a track
+  (they skip images already in it; `merge`, as COLMAP, can still join two tracks that both observe an image);
   `completeImage` only scans the image's own correspondences (COLMAP re-scans every element of its tracks —
   5× slower; `completeAllTracks` after global BA covers the rest); `completeAllTracks` iterates
   untriangulated features (fewer) instead of all tracks; `mergeAllTracks` scans each graph edge once.
@@ -1946,13 +1946,14 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   `findInitialPair` reads stored pairs in canonical order (no inverted copies cached for half the pairs);
   `runIncrementalSfM` with `initImagePair` builds one model from that pair: it stops once a model exists and relaxes
   the levels only while the pair fails (was: one overlapping model per threshold level).
-* **Clarification**: `merge` never joins two tracks that both observe an image (COLMAP's does; co-located SIFT
-  orientations would give a track two observations of one image); continue / complete never add a second observation
-  of an image either. Visibility counts of images whose graph edges change AFTER they were added (pair replacement /
+* **Clarification**: `merge` (as COLMAP) can join two tracks that both observe an image (e.g. co-located SIFT
+  orientations); continue / complete never add a second observation of an image. Skipping such merges was tried (bug
+  sweep, 2026-10, sparse e2e): yard ATE +15 %, yard-real −5 %, object / object-real unchanged, so `merge` stays as
+  COLMAP's. Visibility counts of images whose graph edges change AFTER they were added (pair replacement /
   late pairs) can go stale; only next-best-view ranking reads them and registration resyncs first.
 * Verified correct (no change): `transform` pose update, `invertTwoView`, visibility pyramid vs COLMAP, ray triangulator
   (cheirality, angle tests, LO), local/global gauges (largest relative-translation axis), intrinsics flags, COLMAP
-  filter / merge (apart from the same-image check) / complete / retriangulate semantics, multi-model registration
+  filter / merge / complete / retriangulate semantics, multi-model registration
   bookkeeping, cancel at any point.
 * **Tests**: `core-review.test.ts` (adversarial: ids, π rotations, 1e±3 scales with 1e5 offsets, parallel / behind rays,
   60 % outlier rays, 600-step bookkeeping fuzz with an exhaustive invariant checker incl. brute-force visibility,

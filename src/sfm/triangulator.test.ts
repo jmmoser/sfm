@@ -1,10 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { Pose } from '../core/types';
-import { projectWorld } from '../geometry/camera';
 import { Rng } from '../math/random';
 import { rotvecToMat3 } from '../math/rotation';
-import { CorrespondenceGraph } from './correspondence-graph';
-import { reconstructionInvariantErrors } from './core-testutil';
 import { buildCorrespondenceGraph } from './mapper';
 import { Reconstruction } from './reconstruction';
 import { buildSyntheticDatabase, generateScene, type SyntheticScene } from './synthetic';
@@ -246,40 +243,5 @@ describe('IncrementalTriangulator', () => {
     for (const id of [...rec.points.keys()]) rec.deletePoint(id);
     rec.cameras.get(0)!.f = 1e6;
     expect(tri.triangulateImage(o, 0)).toBe(0);
-  });
-
-  it('never merges points that observe the same image (co-located SIFT orientations)', () => {
-    // images 0 and 1 have two features at the same pixel (two orientations): 0:0–1:0 and 0:1–1:1
-    // match, and image 2's feature matches 0:0 and 1:1 ⇒ points {0:0, 1:0, 2:0} and {0:1, 1:1}
-    const cam = { width: 640, height: 480, f: 500, cx: 320, cy: 240, k1: 0, k2: 0 };
-    const X = [0.1, -0.05, 5];
-    const counts = [2, 2, 1];
-    const graph = new CorrespondenceGraph();
-    counts.forEach((n, id) => graph.addImage(id, n));
-    graph.addTwoView(0, 1, Uint32Array.of(0, 0, 1, 1));
-    graph.addTwoView(0, 2, Uint32Array.of(0, 0));
-    graph.addTwoView(1, 2, Uint32Array.of(1, 0));
-    const rec = new Reconstruction();
-    const cid = rec.addCamera(cam);
-    const poses = [-0.6, 0, 0.6].map((cx): Pose => ({ R: Float64Array.of(1, 0, 0, 0, 1, 0, 0, 0, 1), t: Float64Array.of(-cx, 0, 0) }));
-    const uv = new Float64Array(2);
-    counts.forEach((n, id) => {
-      projectWorld(cam, poses[id], X, uv);
-      const kp = new Float32Array(4 * n);
-      for (let f = 0; f < n; f++) kp.set([uv[0], uv[1], 2, f], 4 * f);
-      rec.addImage(id, cid, n, kp);
-    });
-    rec.attachGraph(graph);
-    counts.forEach((_, id) => rec.registerImage(id, poses[id]));
-    const tri = new IncrementalTriangulator(graph, rec);
-    tri.triangulateImage(o, 0);
-    expect(rec.numPoints).toBe(2);
-    expect(reconstructionInvariantErrors(rec, { oneObservationPerImage: true })).toEqual([]);
-    // as after a local BA, then a global one
-    tri.clearCaches();
-    expect(tri.mergeTracks(o, tri.getModifiedPoints())).toBe(0);
-    expect(tri.mergeAllTracks(o)).toBe(0);
-    expect(rec.numPoints).toBe(2);
-    expect(reconstructionInvariantErrors(rec, { oneObservationPerImage: true })).toEqual([]);
   });
 });
