@@ -185,7 +185,14 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
   function requestBench(): void {
     if (benchRun) return;
     if (!app.engineHoldsData()) {
-      runBench();
+      // no scan, but a worker kept after a discard or delete still parks the compiled feature
+      // pipeline and its GPU caches: freed first, nothing to ask (nothing the user sees is lost)
+      void app
+        .releaseEngine()
+        .catch(() => undefined)
+        .then(() => {
+          if (!closed) runBench();
+        });
       return;
     }
     actionSheet(
