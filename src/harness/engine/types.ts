@@ -130,6 +130,13 @@ export interface HarnessConfig {
    * pairs + live model after finishCapture and after refine. Default false.
    */
   debugDump?: boolean;
+  /**
+   * Experiments (needs `persist: true`): after mesh, write the engine's session store (keyframe
+   * JPEGs + records, values, binaries incl. the filtered `depth/` maps) to `<output prefix>session/`
+   * through `window.__e2eWrite`, so the splat stage can be re-run on the same inputs
+   * (src/harness/engine/replay.ts, e2e/splat-replay.mjs). Default false.
+   */
+  dumpSession?: boolean;
 }
 
 /** Config with every default filled in. */

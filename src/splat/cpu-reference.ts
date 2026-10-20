@@ -21,6 +21,16 @@
  * Backward (front to back, with the final colour): for splat i with w = αT,
  * ∂C/∂c_i = w, ∂C/∂α_i = T c_i − (C − C_{≤i}) / (1 − α_i), then through σ to the 2-D mean and
  * conic, and through the projection to the 3-D parameters.
+ *
+ * Geometry outputs (`geometry: true`, the trainer's depth / normal supervision): per pixel
+ * G = Σ w_i · (1 / z_i, n_i) — the alpha-blended inverse depth of the Gaussian centres and the
+ * blended normal, n_i = the rotation axis of the smallest scale in the camera frame, flipped to
+ * face the camera (n · p < 0; DN-Splatter / PGSR). They are four more "colour" channels with a
+ * zero background: the backward adds gᴳ · G to r and gᴳ · (1/z, n) to the splat's channel
+ * product, and four 2-D gradients per Gaussian (∂(1/z), ∂n) that reach the mean through z and
+ * the quaternion through n (the axis choice and the flip are piecewise constant). The loss
+ * normalises them by the accumulated alpha A = Σ w_i = 1 − T, itself a channel of constant 1:
+ * ∂L/∂A (`dLdA`) adds gᴬ · A to r and gᴬ to the channel product.
  */
 import {
   ALPHA_MAX,
@@ -85,6 +95,10 @@ export interface ProjectedGaussian {
   colourRaw: [number, number, number];
   colour: [number, number, number];
   depth: number;
+  /** Camera-frame unit normal (smallest-scale axis, facing the camera) and its axis / sign. */
+  normal: [number, number, number];
+  normalAxis: number;
+  normalSign: number;
 }
 
 function quatToRot(w: number, x: number, y: number, z: number): number[] {
@@ -204,6 +218,21 @@ export function projectGaussian(model: SplatModel, i: number, cam: SplatCamera, 
   out.colourRaw = colourRaw;
   out.colour = [Math.max(0, colourRaw[0]), Math.max(0, colourRaw[1]), Math.max(0, colourRaw[2])];
   out.depth = p[2];
+  // normal: axis of the smallest scale (first on ties, compared as log-scales like the GPU)
+  const ls = [model.logScales[3 * i], model.logScales[3 * i + 1], model.logScales[3 * i + 2]];
+  let ka = 0;
+  if (ls[1] < ls[ka]) ka = 1;
+  if (ls[2] < ls[ka]) ka = 2;
+  const ax = [Rq[ka], Rq[3 + ka], Rq[6 + ka]];
+  const nc: [number, number, number] = [
+    R[0] * ax[0] + R[1] * ax[1] + R[2] * ax[2],
+    R[3] * ax[0] + R[4] * ax[1] + R[5] * ax[2],
+    R[6] * ax[0] + R[7] * ax[1] + R[8] * ax[2],
+  ];
+  const sgn = nc[0] * p[0] + nc[1] * p[1] + nc[2] * p[2] > 0 ? -1 : 1;
+  out.normal = [sgn * nc[0], sgn * nc[1], sgn * nc[2]];
+  out.normalAxis = ka;
+  out.normalSign = sgn;
   out.visible = true;
   return out;
 }
@@ -211,6 +240,8 @@ export function projectGaussian(model: SplatModel, i: number, cam: SplatCamera, 
 export interface RenderOptions extends ProjectOptions {
   /** Background colour (default black). */
   background?: [number, number, number];
+  /** Also render the geometry channels (inverse depth, normal; see the module comment). */
+  geometry?: boolean;
 }
 
 export interface CPURender {
@@ -222,6 +253,8 @@ export interface CPURender {
   T: Float64Array;
   /** Index of the last contributing splat in the pixel's tile list + 1. */
   n: Int32Array;
+  /** With `geometry`: Σ w·(1/z, nx, ny, nz) per pixel (4 floats), else null. */
+  geo: Float64Array | null;
   proj: ProjectedGaussian[];
   /** Per tile: Gaussian indices sorted by (depth, index). */
   tileLists: Int32Array[];
@@ -290,6 +323,7 @@ export function renderCPU(model: SplatModel, cam: SplatCamera, opts: RenderOptio
   const color = new Float64Array(3 * W * H);
   const Tout = new Float64Array(W * H);
   const nOut = new Int32Array(W * H);
+  const geo = opts.geometry ? new Float64Array(4 * W * H) : null;
   for (let py = 0; py < H; py++) {
     for (let px = 0; px < W; px++) {
       const list = lists[Math.floor(py / TILE_SIZE) * tilesX + Math.floor(px / TILE_SIZE)];
@@ -297,6 +331,10 @@ export function renderCPU(model: SplatModel, cam: SplatCamera, opts: RenderOptio
       let r = 0;
       let g = 0;
       let b = 0;
+      let gd = 0;
+      let gx = 0;
+      let gy = 0;
+      let gz = 0;
       let last = 0;
       for (let k = 0; k < list.length; k++) {
         const s = proj[list[k]];
@@ -312,6 +350,12 @@ export function renderCPU(model: SplatModel, cam: SplatCamera, opts: RenderOptio
         r += s.colour[0] * w;
         g += s.colour[1] * w;
         b += s.colour[2] * w;
+        if (geo) {
+          gd += w / s.depth;
+          gx += w * s.normal[0];
+          gy += w * s.normal[1];
+          gz += w * s.normal[2];
+        }
         T = Tn;
         last = k + 1;
       }
@@ -321,15 +365,23 @@ export function renderCPU(model: SplatModel, cam: SplatCamera, opts: RenderOptio
       color[3 * o + 2] = b + T * bg[2];
       Tout[o] = T;
       nOut[o] = last;
+      if (geo) geo.set([gd, gx, gy, gz], 4 * o);
     }
   }
-  return { width: W, height: H, color, T: Tout, n: nOut, proj, tileLists: lists, tilesX, tilesY };
+  return { width: W, height: H, color, T: Tout, n: nOut, geo, proj, tileLists: lists, tilesX, tilesY };
 }
 
-/** Gradients of the projected (2-D) quantities, 9 per Gaussian like the GPU accumulators. */
+/**
+ * Gradients of the projected (2-D) quantities, 9 per Gaussian like the GPU accumulators (13 with
+ * the geometry channels).
+ */
 export interface Grad2D {
-  /** [∂u, ∂v, ∂A, ∂B, ∂C, ∂o, ∂r, ∂g, ∂b] per Gaussian (conic = [[A, B], [B, C]]). */
+  /**
+   * [∂u, ∂v, ∂A, ∂B, ∂C, ∂o, ∂r, ∂g, ∂b] per Gaussian (conic = [[A, B], [B, C]]), followed by
+   * [∂(1/z), ∂nx, ∂ny, ∂nz] when `stride` is 13.
+   */
   g: Float64Array;
+  stride: 9 | 13;
 }
 
 /** Parameter gradients in the SplatModel layout. */
@@ -341,12 +393,17 @@ export interface SplatGrads {
   sh: Float64Array;
 }
 
-/** Rasteriser backward: ∂L/∂(2-D quantities) given ∂L/∂C per pixel (RGB). */
-export function rasterBackwardCPU(fwd: CPURender, dLdC: ArrayLike<number>, opts: ProjectOptions = {}): Grad2D {
+/**
+ * Rasteriser backward: ∂L/∂(2-D quantities) given ∂L/∂C per pixel (RGB) and, for a geometry
+ * render, ∂L/∂G per pixel (4: inverse depth, normal) and ∂L/∂A (accumulated alpha 1 − T).
+ */
+export function rasterBackwardCPU(fwd: CPURender, dLdC: ArrayLike<number>, opts: ProjectOptions = {}, dLdG?: ArrayLike<number> | null, dLdA?: ArrayLike<number> | null): Grad2D {
   const alphaMin = opts.alphaMin ?? ALPHA_MIN;
   const W = fwd.width;
   const H = fwd.height;
-  const g = new Float64Array(9 * fwd.proj.length);
+  const geo = fwd.geo && dLdG ? fwd.geo : null;
+  const S = geo ? 13 : 9;
+  const g = new Float64Array(S * fwd.proj.length);
   for (let py = 0; py < H; py++) {
     for (let px = 0; px < W; px++) {
       const o = py * W + px;
@@ -354,8 +411,15 @@ export function rasterBackwardCPU(fwd: CPURender, dLdC: ArrayLike<number>, opts:
       const gr = dLdC[3 * o];
       const gg = dLdC[3 * o + 1];
       const gb = dLdC[3 * o + 2];
-      // r = gᵀ (colour still to come, background included)
+      const gd = geo ? dLdG![4 * o] : 0;
+      const gnx = geo ? dLdG![4 * o + 1] : 0;
+      const gny = geo ? dLdG![4 * o + 2] : 0;
+      const gnz = geo ? dLdG![4 * o + 3] : 0;
+      // r = gᵀ (colour still to come, background included) + gᴳᵀ (geometry still to come)
       let rem = gr * fwd.color[3 * o] + gg * fwd.color[3 * o + 1] + gb * fwd.color[3 * o + 2];
+      if (geo) rem += gd * geo[4 * o] + gnx * geo[4 * o + 1] + gny * geo[4 * o + 2] + gnz * geo[4 * o + 3];
+      const ga = dLdA ? dLdA[o] : 0;
+      rem += ga * (1 - fwd.T[o]);
       let T = 1;
       const n = fwd.n[o];
       for (let k = 0; k < n; k++) {
@@ -370,13 +434,21 @@ export function rasterBackwardCPU(fwd: CPURender, dLdC: ArrayLike<number>, opts:
         if (a0 < alphaMin) continue;
         const alpha = Math.min(ALPHA_MAX, a0);
         const w = alpha * T;
-        const gc = gr * s.colour[0] + gg * s.colour[1] + gb * s.colour[2];
+        let gc = gr * s.colour[0] + gg * s.colour[1] + gb * s.colour[2];
+        if (geo) gc += gd / s.depth + gnx * s.normal[0] + gny * s.normal[1] + gnz * s.normal[2];
+        gc += ga;
         rem -= w * gc;
         const dLda = T * gc - rem / (1 - alpha);
-        const b9 = 9 * id;
+        const b9 = S * id;
         g[b9 + 6] += w * gr;
         g[b9 + 7] += w * gg;
         g[b9 + 8] += w * gb;
+        if (geo) {
+          g[b9 + 9] += w * gd;
+          g[b9 + 10] += w * gnx;
+          g[b9 + 11] += w * gny;
+          g[b9 + 12] += w * gnz;
+        }
         if (a0 < ALPHA_MAX) {
           g[b9 + 5] += G * dLda;
           const dLds = -alpha * dLda;
@@ -390,18 +462,19 @@ export function rasterBackwardCPU(fwd: CPURender, dLdC: ArrayLike<number>, opts:
       }
     }
   }
-  return { g };
+  return { g, stride: S };
 }
 
 /**
  * Projection backward of one Gaussian: adds ∂L/∂parameters to `out` given its 2-D gradients
- * `g9` = [∂u, ∂v, ∂A, ∂B, ∂C, ∂o, ∂r, ∂g, ∂b].
+ * `g9` = [∂u, ∂v, ∂A, ∂B, ∂C, ∂o, ∂r, ∂g, ∂b] (+ [∂(1/z), ∂nx, ∂ny, ∂nz] when 13 long).
  */
 export function projectBackwardGaussian(model: SplatModel, i: number, cam: SplatCamera, pg: ProjectedGaussian, g9: ArrayLike<number>, out: SplatGrads, opts: ProjectOptions = {}): void {
   if (!pg.visible) return;
   const antialiased = opts.antialiased ?? true;
   const R = cam.R;
   const [du, dv, dA, dB, dC, dop, dr, dg, db] = Array.from(g9);
+  const geo = g9.length >= 13;
   // opacity: o = sigmoid(logit) · comp
   out.opacities[i] += dop * pg.comp * pg.sig * (1 - pg.sig);
   const dcomp = dop * pg.sig;
@@ -454,6 +527,8 @@ export function projectBackwardGaussian(model: SplatModel, i: number, cam: Splat
   let dpy = cam.fy * rz * dv;
   let dpz = -cam.fx * p[0] * rz2 * du - cam.fy * p[1] * rz2 * dv;
   dpz += dJ[0] * (-cam.fx * rz2) + dJ[2] * (2 * cam.fx * pg.tx * rz3) + dJ[4] * (-cam.fy * rz2) + dJ[5] * (2 * cam.fy * pg.ty * rz3);
+  // inverse depth 1/z
+  if (geo) dpz -= g9[9] * rz2;
   const dtx = dJ[2] * (-cam.fx * rz2);
   const dty = dJ[5] * (-cam.fy * rz2);
   if (pg.clampX) dpz += dtx * pg.tx * rz;
@@ -505,6 +580,12 @@ export function projectBackwardGaussian(model: SplatModel, i: number, cam: Splat
     out.logScales[3 * i + c] += ds * s[c];
     for (let r = 0; r < 3; r++) dRq[3 * r + c] = dM[3 * r + c] * s[c];
   }
+  if (geo) {
+    // n = sign · R · Rq[:, k]  →  ∂L/∂Rq[:, k] += sign · Rᵀ ∂L/∂n
+    const k = pg.normalAxis;
+    const sg = pg.normalSign;
+    for (let r = 0; r < 3; r++) dRq[3 * r + k] += sg * (R[r] * g9[10] + R[3 + r] * g9[11] + R[6 + r] * g9[12]);
+  }
   const [w, x, y, z] = pg.qn;
   const G = dRq;
   const dw = 2 * (-z * G[1] + y * G[2] + z * G[3] - x * G[5] - y * G[6] + x * G[7]);
@@ -528,12 +609,24 @@ export function zeroGrads(model: SplatModel): SplatGrads {
   };
 }
 
-/** Full backward: parameter gradients for ∂L/∂C (RGB per pixel) of `renderCPU(model, cam, opts)`. */
-export function backwardCPU(model: SplatModel, cam: SplatCamera, dLdC: ArrayLike<number>, opts: RenderOptions = {}, fwd?: CPURender): { grads: SplatGrads; grad2d: Grad2D; fwd: CPURender } {
+/**
+ * Full backward: parameter gradients for ∂L/∂C (RGB per pixel) of `renderCPU(model, cam, opts)`
+ * and, with `opts.geometry`, ∂L/∂G (4 per pixel: inverse depth, normal) and ∂L/∂A (1 − T).
+ */
+export function backwardCPU(
+  model: SplatModel,
+  cam: SplatCamera,
+  dLdC: ArrayLike<number>,
+  opts: RenderOptions = {},
+  fwd?: CPURender,
+  dLdG?: ArrayLike<number> | null,
+  dLdA?: ArrayLike<number> | null,
+): { grads: SplatGrads; grad2d: Grad2D; fwd: CPURender } {
   const f = fwd ?? renderCPU(model, cam, opts);
-  const grad2d = rasterBackwardCPU(f, dLdC, opts);
+  const grad2d = rasterBackwardCPU(f, dLdC, opts, dLdG, dLdA);
   const grads = zeroGrads(model);
-  for (let i = 0; i < model.count; i++) projectBackwardGaussian(model, i, cam, f.proj[i], grad2d.g.subarray(9 * i, 9 * i + 9), grads, opts);
+  const S = grad2d.stride;
+  for (let i = 0; i < model.count; i++) projectBackwardGaussian(model, i, cam, f.proj[i], grad2d.g.subarray(S * i, S * i + S), grads, opts);
   return { grads, grad2d, fwd: f };
 }
 

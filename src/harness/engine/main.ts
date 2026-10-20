@@ -12,7 +12,8 @@
  * browser by hand, `harness.html?dataset=object&engine=mock&maxFrames=40&densify=1` runs on
  * load and shows the result summary.
  */
-import { startPipeline, type RunHandle } from './pipeline';
+import { startPipeline, writeBinary, type RunHandle } from './pipeline';
+import { replaySplat, type ReplaySplatConfig, type ReplaySplatResult } from './replay';
 import type { HarnessConfig, HarnessEngineKind, HarnessResult } from './types';
 
 declare global {
@@ -22,6 +23,8 @@ declare global {
     harnessSnapshot: () => HarnessResult | null;
     harnessLast?: HarnessResult;
     harnessReady?: boolean;
+    /** Experiments: the splat stage on a dumped session (./replay.ts, e2e/splat-replay.mjs). */
+    replaySplat: (config: ReplaySplatConfig) => Promise<ReplaySplatResult>;
   }
 }
 
@@ -63,6 +66,7 @@ window.harnessAbort = (reason?: string): boolean => {
   return true;
 };
 window.harnessSnapshot = (): HarnessResult | null => current?.snapshot() ?? window.harnessLast ?? null;
+window.replaySplat = (config: ReplaySplatConfig): Promise<ReplaySplatResult> => replaySplat(config, log, writeBinary);
 window.harnessReady = true;
 
 // ---- manual use: harness.html?dataset=object&engine=mock&… ----

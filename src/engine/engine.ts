@@ -986,6 +986,15 @@ export class PhotogrammetryEngine {
           },
           densePoints,
           denseResident,
+          // the fusion-filtered depth maps (trainer geometry supervision): in memory (dense run
+          // of this engine, no storage) or in the depth backend (session / scratch store)
+          depthMaps: this.hasDense
+            ? async () => {
+                const f = this.denseOut?.filtered ?? new EngineDepthStore(await this.depthBackend(), 'depth', 0);
+                await f.scan();
+                return f;
+              }
+            : null,
           quality: this.quality,
           mode: this.resolvedMode(),
           config: this.config,

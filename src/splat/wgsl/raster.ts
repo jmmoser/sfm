@@ -3,12 +3,15 @@
  * order), tile ranges and the tile rasteriser. See ../cpu-reference.ts for the math and
  * ../forward.ts for the buffers and the dispatch sequence.
  *
- * proj (3 vec4 per Gaussian): (mean2d.xy, depth, opacity), (conic A, B, C, 0), (colour rgb, 0)
- * with conic = [[A, B], [B, C]] (inverse of the filtered screen covariance).
+ * proj (3 vec4 per Gaussian): (mean2d.xy, depth, opacity), (conic A, B, C, ln(o / α_min)),
+ * (colour rgb, 0) with conic = [[A, B], [B, C]] (inverse of the filtered screen covariance); with
+ * the geometry channels a 4th row (camera-frame normal, 0).
+ * geo (geometry channels, 2 vec4 per pixel): [2o] = the rendered Σ w·(1/z, n) (forward), [2o + 1] =
+ * ∂loss/∂(that) (the geometry loss kernel, wgsl/loss.ts), read by the backward.
  * rects (vec2u per Gaussian): (x0 | y0 << 16, x1 | y1 << 16), inclusive tile rectangle.
  */
 import { ALPHA_MIN, TILE_SIZE } from '../types';
-import { ATOMIC_ADD_F32_WGSL, FRAME_WGSL, PARAMS_WGSL, PROJECT_WGSL, ROT_WGSL, TILE_TEST_WGSL, constantsWGSL, type SplatShaderConfig } from './common';
+import { ATOMIC_ADD_F32_WGSL, FRAME_WGSL, PARAMS_WGSL, PROJECT_WGSL, ROT_WGSL, TILE_TEST_WGSL, constantsWGSL, grad2dStride, projStride, type SplatShaderConfig } from './common';
 
 /** Per-Gaussian projection → proj, rect, tile count, depth-sort key / value. */
 export function projectWGSL(cfg: SplatShaderConfig): string {
@@ -37,9 +40,10 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     depthKeys[i] = 0xffffffffu;
     return;
   }
-  proj[3u * i] = vec4f(pr.mean2d, pr.depth, pr.opacity);
-  proj[3u * i + 1u] = vec4f(pr.conic, log(pr.opacity / ALPHA_MIN));
-  proj[3u * i + 2u] = vec4f(pr.colour, 0.0);
+  proj[PS * i] = vec4f(pr.mean2d, pr.depth, pr.opacity);
+  proj[PS * i + 1u] = vec4f(pr.conic, log(pr.opacity / ALPHA_MIN));
+  proj[PS * i + 2u] = vec4f(pr.colour, 0.0);
+  if (GEOMETRY) { proj[4u * i + 3u] = vec4f(pr.normal, 0.0); }
   rects[i] = vec2u(pr.rect.x | (pr.rect.y << 16u), pr.rect.z | (pr.rect.w << 16u));
   let tau = 2.0 * log(pr.opacity / ALPHA_MIN);
   var n = 0u;
@@ -86,9 +90,10 @@ fn main() {
 `;
 
 /** Emits (tile id, Gaussian) pairs in depth order at the scanned offsets (touched tiles only). */
-export const EMIT_WGSL = /* wgsl */ `
+export const emitWGSL = (cfg: Pick<SplatShaderConfig, 'geometry' | 'wideProj'>): string => /* wgsl */ `
 const TILE: u32 = ${TILE_SIZE}u;
 const ALPHA_MIN: f32 = ${ALPHA_MIN};
+const PS: u32 = ${projStride(cfg)}u;
 ${FRAME_WGSL}
 @group(0) @binding(0) var<uniform> frame: Frame;
 @group(0) @binding(1) var<storage, read> depthVals: array<u32>;
@@ -111,8 +116,8 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
   let x1 = r.y & 0xffffu;
   let y1 = r.y >> 16u;
   let cap = frame.info.z;
-  let pa = proj[3u * g];
-  let conic = proj[3u * g + 1u].xyz;
+  let pa = proj[PS * g];
+  let conic = proj[PS * g + 1u].xyz;
   let tau = 2.0 * log(pa.w / ALPHA_MIN);
   var o = offsets[j];
   for (var ty = y0; ty <= y1; ty++) {
@@ -151,9 +156,11 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u
 /**
  * Tile rasteriser: one 16×16 workgroup per tile; splats are loaded 256 at a time into
  * workgroup memory and composited front to back. Writes (colour + T·background, T) and the
- * number of tile-list entries up to the last contributor (for the backward pass).
+ * number of tile-list entries up to the last contributor (for the backward pass); with the
+ * geometry channels also Σ w·(1/z, n) to geo[2o] (the normal staged as sC.w + sD: 14 KB).
  */
 export function rasterForwardWGSL(cfg: SplatShaderConfig): string {
+  const geo = !!cfg.geometry;
   return /* wgsl */ `
 ${constantsWGSL(cfg)}
 ${FRAME_WGSL}
@@ -163,6 +170,8 @@ ${FRAME_WGSL}
 @group(0) @binding(3) var<storage, read> proj: array<vec4f>;
 @group(0) @binding(4) var<storage, read_write> outColor: array<vec4f>;
 @group(0) @binding(5) var<storage, read_write> outN: array<u32>;
+${geo ? `@group(0) @binding(6) var<storage, read_write> geo: array<vec4f>;
+var<workgroup> sD: array<vec2f, 256>;` : ''}
 var<workgroup> sA: array<vec4f, 256>;
 var<workgroup> sB: array<vec4f, 256>;
 var<workgroup> sC: array<vec4f, 256>;
@@ -187,6 +196,7 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec
   let pf = vec2f(f32(px), f32(py));
   var T = 1.0;
   var C = vec3f(0.0);
+  var Gd = vec4f(0.0);
   var last = 0u;
   var done = !inside;
   if (done) { atomicAdd(&doneCount, 1u); }
@@ -197,9 +207,11 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec
     let idx = range.x + b + li;
     if (idx < range.y) {
       let g = isectVals[idx];
-      sA[li] = proj[3u * g];
-      sB[li] = proj[3u * g + 1u];
-      sC[li] = proj[3u * g + 2u];
+      sA[li] = proj[PS * g];
+      sB[li] = proj[PS * g + 1u];
+      ${geo ? `let nrm = proj[4u * g + 3u].xyz;
+      sC[li] = vec4f(proj[4u * g + 2u].xyz, nrm.x);
+      sD[li] = nrm.yz;` : 'sC[li] = proj[PS * g + 2u];'}
     }
     workgroupBarrier();
     if (!done) {
@@ -218,6 +230,7 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec
           break;
         }
         C += sC[k].xyz * (alpha * T);
+        ${geo ? 'Gd += (alpha * T) * vec4f(1.0 / s.z, sC[k].w, sD[k]);' : ''}
         T = Tn;
         last = b + k + 1u;
       }
@@ -228,6 +241,7 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec
     let o = py * W + px;
     outColor[o] = vec4f(C + T * frame.bg.xyz, T);
     outN[o] = last;
+    ${geo ? 'geo[2u * o] = Gd;' : ''}
   }
 }
 `;
@@ -258,8 +272,10 @@ export function rasterBackwardWGSL(cfg: SplatShaderConfig, groups = 2, perStep =
   const NT = 32 * groups;
   const Q = perStep;
   const RING = 64 * Q;
+  const geo = !!cfg.geometry;
+  const NA = grad2dStride(cfg);
   const qs = Array.from({ length: Q }, (_, q) => q);
-  const accDecl = qs.map((q) => `  var acc${q}: array<f32, 9>;\n  for (var c = 0u; c < 9u; c++) { acc${q}[c] = 0.0; }`).join('\n');
+  const accDecl = qs.map((q) => `  var acc${q}: array<f32, ${NA}>;\n  for (var c = 0u; c < ${NA}u; c++) { acc${q}[c] = 0.0; }`).join('\n');
   const evalSplat = (q: number): string => /* wgsl */ `
         {
           let i = m * ${Q}u + ${q}u;
@@ -275,7 +291,16 @@ export function rasterBackwardWGSL(cfg: SplatShaderConfig, groups = 2, perStep =
               if (a0 >= ALPHA_MIN) {
                 let alpha = min(ALPHA_MAX, a0);
                 let w = alpha * T;
-                let gc = dot(gp, ringC[slot].xyz);
+                ${
+                  geo
+                    ? `let rc = ringC[slot];
+                let gc = dot(gp.xyz, rc.xyz) + gp.w + gG.x / sa.z + dot(gG.yzw, vec3f(rc.w, ringD[slot]));
+                acc${q}[9] += w * gG.x;
+                acc${q}[10] += w * gG.y;
+                acc${q}[11] += w * gG.z;
+                acc${q}[12] += w * gG.w;`
+                    : 'let gc = dot(gp, ringC[slot].xyz);'
+                }
                 r = r - w * gc;
                 let dLda = T * gc - r / (1.0 - alpha);
                 acc${q}[6] += w * gp.x;
@@ -296,7 +321,7 @@ export function rasterBackwardWGSL(cfg: SplatShaderConfig, groups = 2, perStep =
           }
         }`;
   const storePartial = qs
-    .map((q) => `        for (var c = 0u; c < 9u; c++) {\n          partial[((j * ${Q}u + ${q}u) * NG + g) * 9u + c] = acc${q}[c];\n          acc${q}[c] = 0.0;\n        }`)
+    .map((q) => `        for (var c = 0u; c < ${NA}u; c++) {\n          partial[((j * ${Q}u + ${q}u) * NG + g) * ${NA}u + c] = acc${q}[c];\n          acc${q}[c] = 0.0;\n        }`)
     .join('\n');
   return /* wgsl */ `
 ${constantsWGSL(cfg)}
@@ -311,6 +336,9 @@ const NT: u32 = ${NT}u;
 @group(0) @binding(5) var<storage, read> outN: array<u32>;
 @group(0) @binding(6) var<storage, read> dLdC: array<vec4f>;
 @group(0) @binding(7) var<storage, read_write> grad2d: array<atomic<u32>>;
+${geo ? `@group(0) @binding(8) var<storage, read> geo: array<vec4f>;
+var<workgroup> pixGG: array<vec4f, ${NT}>;
+var<workgroup> ringD: array<vec2f, ${RING}>;` : ''}
 var<workgroup> pixT: array<f32, ${NT}>;
 var<workgroup> pixR: array<f32, ${NT}>;
 var<workgroup> pixN: array<u32, ${NT}>;
@@ -319,7 +347,7 @@ var<workgroup> ringA: array<vec4f, ${RING}>;
 var<workgroup> ringB: array<vec4f, ${RING}>;
 var<workgroup> ringC: array<vec4f, ${RING}>;
 var<workgroup> ringId: array<u32, ${RING}>;
-var<workgroup> partial: array<f32, ${32 * Q * groups * 9}>;
+var<workgroup> partial: array<f32, ${32 * Q * groups * NA}>;
 var<workgroup> kmax: atomic<u32>;
 var<workgroup> kSnap: vec2u;
 ${ATOMIC_ADD_F32_WGSL('grad2d')}
@@ -346,6 +374,9 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u
     let nn = outN[o];
     let gp = dLdC[o];
     pixR[li] = dot(gp.xyz, outColor[o].xyz);
+    ${geo ? `let gg = geo[2u * o + 1u];
+    pixR[li] += dot(gg, geo[2u * o]) + gp.w * (1.0 - outColor[o].w);
+    pixGG[li] = gg;` : ''}
     pixN[li] = nn;
     pixG[li] = gp;
     atomicMax(&kmax, nn);
@@ -353,6 +384,7 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u
     pixR[li] = 0.0;
     pixN[li] = 0u;
     pixG[li] = vec4f(0.0);
+    ${geo ? 'pixGG[li] = vec4f(0.0);' : ''}
   }
   workgroupBarrier();
   if (li == 0u) { kSnap = vec2u(atomicLoad(&kmax), ranges[2u * tile]); }
@@ -367,9 +399,11 @@ ${accDecl}
       let slot = i % ${RING}u;
       if (i < K) {
         let gid = isectVals[start + i];
-        ringA[slot] = proj[3u * gid];
-        ringB[slot] = proj[3u * gid + 1u];
-        ringC[slot] = proj[3u * gid + 2u];
+        ringA[slot] = proj[PS * gid];
+        ringB[slot] = proj[PS * gid + 1u];
+        ${geo ? `let nrm = proj[4u * gid + 3u].xyz;
+        ringC[slot] = vec4f(proj[4u * gid + 2u].xyz, nrm.x);
+        ringD[slot] = nrm.yz;` : 'ringC[slot] = proj[PS * gid + 2u];'}
         ringId[slot] = gid;
       } else {
         ringId[slot] = 0xffffffffu;
@@ -386,7 +420,8 @@ ${accDecl}
         let lx = (p0 + lp) & 15u;
         let ly = (p0 + lp) >> 4u;
         let pf = vec2f(f32(ox + lx), f32(oy + ly));
-        let gp = pixG[lp].xyz;
+        let gp = pixG[lp]${geo ? '' : '.xyz'};
+        ${geo ? 'let gG = pixGG[lp];' : ''}
         var T = pixT[lp];
         var r = pixR[lp];
 ${qs.map(evalSplat).join('\n')}
@@ -399,17 +434,17 @@ ${storePartial}
       workgroupBarrier();
     }
     // lane 0's slot of this block and lanes 1..31's slots of the previous block are complete
-    for (var t = li; t < ${32 * Q * 9}u; t += NT) {
-      let jq = t / 9u;
-      let c = t - 9u * jq;
+    for (var t = li; t < ${32 * Q * NA}u; t += NT) {
+      let jq = t / ${NA}u;
+      let c = t - ${NA}u * jq;
       let jj = jq / ${Q}u;
       let q = jq - ${Q}u * jj;
       var s = 0.0;
-      for (var gg = 0u; gg < NG; gg++) { s += partial[(jq * NG + gg) * 9u + c]; }
+      for (var gg = 0u; gg < NG; gg++) { s += partial[(jq * NG + gg) * ${NA}u + c]; }
       if (s != 0.0) {
         let m = select(32u * (B - 1u) + jj, 32u * B, jj == 0u);
         let gid = ringId[(m * ${Q}u + q) % ${RING}u];
-        if (gid != 0xffffffffu) { atomicAddF32(gid * 9u + c, s); }
+        if (gid != 0xffffffffu) { atomicAddF32(gid * ${NA}u + c, s); }
       }
     }
     workgroupBarrier();

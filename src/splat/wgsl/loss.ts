@@ -375,3 +375,86 @@ fn main(@builtin(local_invocation_index) li: u32) {
   if (cc.enabled != 0u && li == 0u) { colour[cc.view * 48u + 36u] = colour[cc.view * 48u + 36u] + 1.0; }
 }
 `;
+
+/** Byte size of the GeoCfg uniform. */
+export const GEO_CFG_BYTES = 32;
+/** Pixels whose accumulated alpha is below this get no geometry loss (D / A undefined). */
+export const GEO_MIN_ALPHA = 0.05;
+
+/**
+ * Geometry loss (the trainer's depth / normal supervision; CPU reference: ../depth-target.ts
+ * `geometryLossCPU`). Per pixel of the current level with a target (the dense stage's filtered
+ * depth map resampled to the view at 1/tfactor size; target pixel = ⌊(f·x + ⌊f/2⌋) / tfactor⌋)
+ * and accumulated alpha A = 1 − T ≥ GEO_MIN_ALPHA:
+ * L = invPx · w · (λ_d · |D̂·z_t − 1| + λ_n · ‖N̂ − n_t‖₁) with D̂ = D / A, N̂ = N / A the expected
+ * inverse depth and normal (D = Σ w_i / z_i, N = Σ w_i n_i: geo[2o]) and z_t, n_t, w the target
+ * depth, normal and weight. Writes ∂L/∂(D, N) to geo[2o + 1] and ∂L/∂A to dLdC[o].w (zero without
+ * a target; after the SSIM backward, which writes dLdC[o] = (∂L/∂C, 0)) and per-workgroup sums
+ * (Σ w·|D̂·z_t − 1|, Σ w·‖N̂ − n_t‖₁, target pixels, Σ w) to geoPartial.
+ */
+export const GEO_LOSS_WGSL = /* wgsl */ `
+${FRAME_WGSL}
+struct GeoCfg {
+  tw: u32,
+  th: u32,
+  factor: u32,
+  tfactor: u32,
+  wDepth: f32,
+  wNormal: f32,
+  invPx: f32,
+  enabled: u32,
+}
+@group(0) @binding(0) var<uniform> frame: Frame;
+@group(0) @binding(1) var<uniform> gc: GeoCfg;
+@group(0) @binding(2) var<storage, read_write> geo: array<vec4f>;
+@group(0) @binding(3) var<storage, read> dtgt: array<vec2u>;
+@group(0) @binding(4) var<storage, read_write> geoPartial: array<vec4f>;
+@group(0) @binding(5) var<storage, read> render: array<vec4f>;
+@group(0) @binding(6) var<storage, read_write> dLdC: array<vec4f>;
+const GEO_MIN_ALPHA: f32 = ${GEO_MIN_ALPHA};
+var<workgroup> red: array<vec4f, 256>;
+fn signNZ(v: vec2f) -> vec2f { return select(vec2f(-1.0), vec2f(1.0), v >= vec2f(0.0)); }
+fn octDecode(e: vec2f) -> vec3f {
+  var n = vec3f(e, 1.0 - abs(e.x) - abs(e.y));
+  if (n.z < 0.0) { n = vec3f((1.0 - abs(e.yx)) * signNZ(e), n.z); }
+  return normalize(n);
+}
+@compute @workgroup_size(16, 16)
+fn main(@builtin(workgroup_id) wg: vec3u, @builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_index) li: u32) {
+  let W = frame.dims.x;
+  let H = frame.dims.y;
+  var s = vec4f(0.0);
+  if (gid.x < W && gid.y < H) {
+    let o = gid.y * W + gid.x;
+    var gG = vec4f(0.0);
+    var gA = 0.0;
+    let j = (gc.factor * gid.x + gc.factor / 2u) / gc.tfactor;
+    let k = (gc.factor * gid.y + gc.factor / 2u) / gc.tfactor;
+    let A = 1.0 - render[o].w;
+    if (gc.enabled != 0u && j < gc.tw && k < gc.th && A >= GEO_MIN_ALPHA) {
+      let t = dtgt[k * gc.tw + j];
+      let a = unpack2x16float(t.x);
+      if (a.x > 0.0 && a.y > 0.0) {
+        let g = geo[2u * o] / A;
+        let zt = 1.0 / a.x;
+        let e = g.x * zt - 1.0;
+        let dn = g.yzw - octDecode(unpack2x16snorm(t.y));
+        let c = gc.invPx * a.y;
+        let gh = vec4f(gc.wDepth * c * sign(e) * zt, (gc.wNormal * c) * sign(dn));
+        gG = gh / A;
+        gA = -dot(gh, g) / A;
+        s = vec4f(a.y * abs(e), a.y * (abs(dn.x) + abs(dn.y) + abs(dn.z)), 1.0, a.y);
+      }
+    }
+    geo[2u * o + 1u] = gG;
+    dLdC[o].w = gA;
+  }
+  red[li] = s;
+  workgroupBarrier();
+  for (var st = 128u; st > 0u; st = st >> 1u) {
+    if (li < st) { red[li] += red[li + st]; }
+    workgroupBarrier();
+  }
+  if (li == 0u) { geoPartial[wg.y * frame.dims.z + wg.x] = red[0]; }
+}
+`;

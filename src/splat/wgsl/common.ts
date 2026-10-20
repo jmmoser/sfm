@@ -19,6 +19,33 @@ export interface SplatShaderConfig {
   shDegree: ShDegree;
   /** Mip-Splatting opacity compensation of the screen-space low-pass filter. */
   antialiased: boolean;
+  /**
+   * Geometry channels (the trainer's depth / normal supervision, ../cpu-reference.ts): the
+   * projection also stores the camera-frame normal (proj stride 4 instead of 3), the rasteriser
+   * renders Σ w·(1/z, n) next to the colour, and the backward carries 13 gradients per Gaussian
+   * instead of 9. Default false.
+   */
+  geometry?: boolean;
+  /**
+   * Proj stride 4 without the geometry channels: the trainer's kernels after its geometry losses
+   * end (`SplatGeometryOptions.until`) keep the geometry run's buffer layout. Default false.
+   */
+  wideProj?: boolean;
+}
+
+/** vec4 rows of `proj` per Gaussian. */
+export function projStride(cfg: Pick<SplatShaderConfig, 'geometry' | 'wideProj'>): 3 | 4 {
+  return cfg.geometry || cfg.wideProj ? 4 : 3;
+}
+
+/** 2-D gradient accumulators per Gaussian (wgsl/raster.ts backward → wgsl/backward.ts). */
+export function grad2dStride(cfg: Pick<SplatShaderConfig, 'geometry'>): 9 | 13 {
+  return cfg.geometry ? 13 : 9;
+}
+
+/** Pipeline-cache key of a shader configuration. */
+export function shaderKey(cfg: SplatShaderConfig): string {
+  return `${cfg.shDegree}-${cfg.antialiased}${cfg.geometry ? '-geo' : cfg.wideProj ? '-wide' : ''}`;
 }
 
 /** Byte size of the Frame uniform (must match the struct below). */
@@ -42,6 +69,9 @@ const BLUR_EPS: f32 = ${f(BLUR_EPS)};
 const SH_K: u32 = ${K}u;
 const SH_N: u32 = ${3 * K}u;
 const ANTIALIASED: bool = ${cfg.antialiased};
+const GEOMETRY: bool = ${!!cfg.geometry};
+const PS: u32 = ${projStride(cfg)}u;
+const G2D: u32 = ${grad2dStride(cfg)}u;
 `;
 }
 
@@ -110,6 +140,15 @@ struct Proj {
   colour: vec3f,
   rect: vec4u,
   depth: f32,
+  normal: vec3f,
+}
+
+// Axis of the smallest scale (first on ties, log-scales compared like ../cpu-reference.ts).
+fn minAxis(ls: vec3f) -> u32 {
+  var k = 0u;
+  if (ls.y < ls[k]) { k = 1u; }
+  if (ls.z < ls[k]) { k = 2u; }
+  return k;
 }
 
 fn shColour(i: u32, dir: vec3f) -> vec3f {
@@ -172,6 +211,11 @@ fn projectGaussian(i: u32) -> Proj {
   o.colour = max(shColour(i, dir), vec3f(0.0));
   o.rect = vec4u(u32(lo.x) / TILE, u32(lo.y) / TILE, u32(hi.x) / TILE, u32(hi.y) / TILE);
   o.depth = p.z;
+  if (GEOMETRY) {
+    // camera-frame normal: the smallest-scale axis, facing the camera
+    let nc = Wr * Rq[minAxis(loadScale(i))];
+    o.normal = select(nc, -nc, dot(nc, p) > 0.0);
+  }
   return o;
 }
 `;

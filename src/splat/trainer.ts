@@ -3,9 +3,10 @@
  *
  *   forward (forward.ts) → target (view image box-downscaled to the current level)
  *   → loss: per-view affine colour correction, (1 − λ)·L1 + λ·D-SSIM, ∂loss/∂C, colour-matrix
- *     Adam step → rasteriser backward (no per-pixel atomics; one float CAS add per
+ *     Adam step [+ geometry: inverse-depth / normal L1 against the dense stage's depth maps,
+ *     `geometry`] → rasteriser backward (no per-pixel atomics; one float CAS add per
  *     splat × tile × component) → projection backward fused with Adam (visible Gaussians only)
- *     + MCMC regularisers and position noise.
+ *     + MCMC regularisers, shape regularisers (`flatten`, `anisotropy`) and position noise.
  *
  * Every `mcmc.refineEvery` steps (between `start` and `stop`) the host reads the opacities
  * back once and plans an MCMC relocation / growth step (mcmc.ts) that the GPU applies.
@@ -28,7 +29,7 @@
 import type { CameraIntrinsics, Pose, RGBAImage } from '../core/types';
 import type { GPUContext } from '../gpu/device';
 import { Rng } from '../math/random';
-import { getForwardPipelines, SplatForward, type ForwardPipelines } from './forward';
+import { compileForwardPipelines, getForwardPipelines, SplatForward, type ForwardPipelines } from './forward';
 import { PassProfiler, bindGroup, compileAll, makeBuffer } from './gpu-util';
 import { packParams, paramOffsets, unpackParams } from './layout';
 import { planMcmc } from './mcmc';
@@ -48,8 +49,10 @@ import {
   type SplatModel,
 } from './types';
 import { OPT_BYTES, backwardWGSL, relocateWGSL } from './wgsl/backward';
-import { COLOUR_ADAM_WGSL, COLOUR_CFG_BYTES, COLOUR_FLOATS, LOSS_CFG_BYTES, SSIM_BWD_WGSL, SSIM_FWD_WGSL, TARGET_WGSL } from './wgsl/loss';
+import { COLOUR_ADAM_WGSL, COLOUR_CFG_BYTES, COLOUR_FLOATS, GEO_CFG_BYTES, GEO_LOSS_WGSL, LOSS_CFG_BYTES, SSIM_BWD_WGSL, SSIM_FWD_WGSL, TARGET_WGSL } from './wgsl/loss';
+import { grad2dStride, shaderKey, type SplatShaderConfig } from './wgsl/common';
 import { rasterBackwardWGSL } from './wgsl/raster';
+import type { DepthTarget } from './depth-target';
 
 /**
  * A training image with its pinhole camera (k1 = k2 = 0) and pose — `DenseView` compatible. A
@@ -137,6 +140,24 @@ export interface SplatColourCorrection {
   reg: number;
 }
 
+/**
+ * Geometry supervision from the dense stage's depth maps (`setViewDepth`; DN-Splatter-style):
+ * L = (1 / pixels) Σ w (λ_d |D·z_t − 1| + λ_n ‖N − n_t‖₁) over the target pixels, D = rendered
+ * alpha-blended inverse depth, N = rendered blended normal (smallest-scale axis), z_t / n_t / w the
+ * target depth, normal and weight (depth-target.ts). Weights decay exponentially from `[0]` to
+ * `[1]` over the first `until` of the run (linearly when one end is 0), then 0.
+ */
+export interface SplatGeometryOptions {
+  depth: [number, number];
+  normal: [number, number];
+  /** Fraction of the iterations the losses run for (default 1). */
+  until: number;
+  /** Targets at 1/factor of the training-view size (default 2; memory 8 B per target pixel). */
+  factor: number;
+}
+
+export const DEFAULT_SPLAT_GEOMETRY: SplatGeometryOptions = { depth: [0.5, 0.05], normal: [0.1, 0.01], until: 1, factor: 2 };
+
 export interface SplatTrainerOptions {
   /** Hard cap on the number of Gaussians (memory plan). */
   maxGaussians: number;
@@ -155,6 +176,15 @@ export interface SplatTrainerOptions {
   mcmc?: Partial<SplatMcmcOptions> | false;
   /** Per-view affine colour correction (default on). */
   colourCorrection?: Partial<SplatColourCorrection> | false;
+  /** Depth / normal supervision (default off; targets through `setViewDepth`). */
+  geometry?: Partial<SplatGeometryOptions> | false;
+  /**
+   * Flatten regulariser: weight of the smallest scale's L1 (÷ scene extent, mean over the
+   * Gaussians) — surfel-like discs. Default 0.
+   */
+  flatten?: number;
+  /** Anisotropy cap: penalise ln s_max − ln s_mid above ln(maxRatio) (mean over the Gaussians). Default off. */
+  anisotropy?: { maxRatio: number; weight: number } | false;
   seed?: number;
   /** Tile intersections reserved per Gaussian at the start (default 12; grows on demand). */
   intersectionsPerGaussian?: number;
@@ -196,6 +226,8 @@ export interface SplatTrainerStats {
 
 interface TrainPipelines {
   fwd: ForwardPipelines;
+  /** Geometry loss (only with the geometry channels). */
+  geoLoss: GPUComputePipeline | null;
   rasterBwd: GPUComputePipeline;
   adam: GPUComputePipeline;
   grads: GPUComputePipeline;
@@ -215,9 +247,9 @@ export const BWD_PER_STEP = 1;
 
 const pipelineCache = new WeakMap<GPUDevice, Map<string, Promise<TrainPipelines>>>();
 
-async function compileTrainPipelines(device: GPUDevice, cfg: { shDegree: ShDegree; antialiased: boolean }): Promise<TrainPipelines> {
+async function compileTrainPipelines(device: GPUDevice, cfg: SplatShaderConfig): Promise<TrainPipelines> {
   const lost = device.lost;
-  const [fwd, p] = await Promise.all([
+  const [fwd, p, g] = await Promise.all([
     getForwardPipelines(device, cfg),
     compileAll(
       device,
@@ -235,8 +267,22 @@ async function compileTrainPipelines(device: GPUDevice, cfg: { shDegree: ShDegre
       },
       'splat-train',
     ),
+    cfg.geometry ? compileAll(device, lost, { geoLoss: GEO_LOSS_WGSL }, 'splat-train') : Promise.resolve(null),
   ]);
-  return { fwd, ...p };
+  return { fwd, geoLoss: g?.geoLoss ?? null, ...p };
+}
+
+/**
+ * The plain (no geometry channels) kernels with the geometry run's projection layout, sharing its
+ * layout-independent pipelines (loss, MCMC relocation, sort): used after the geometry losses end.
+ */
+async function compilePostGeometryPipelines(device: GPUDevice, cfg: SplatShaderConfig, geo: TrainPipelines): Promise<TrainPipelines> {
+  const lost = device.lost;
+  const [fwd, p] = await Promise.all([
+    compileForwardPipelines(device, lost, cfg, geo.fwd.sort),
+    compileAll(device, lost, { rasterBwd: rasterBackwardWGSL(cfg, BWD_GROUPS, BWD_PER_STEP), adam: backwardWGSL(cfg, 'adam'), grads: backwardWGSL(cfg, 'grads') }, 'splat-train-post'),
+  ]);
+  return { ...geo, fwd, geoLoss: null, ...p };
 }
 
 export class SplatTrainer {
@@ -246,6 +292,10 @@ export class SplatTrainer {
   private readonly lr: SplatLearningRates;
   private readonly mcmc: SplatMcmcOptions | null;
   private readonly cc: SplatColourCorrection | null;
+  private readonly geo: SplatGeometryOptions | null;
+  /** Geometry run with `until` < 1: the geometry pipelines and the plain ones of the same layout. */
+  private geoPipes: TrainPipelines | null = null;
+  private postPipes: TrainPipelines | null = null;
   private readonly lambda: number;
   private background: [number, number, number];
   private readonly levels: { factor: number; until: number }[];
@@ -269,6 +319,13 @@ export class SplatTrainer {
   private relocU!: GPUBuffer;
   private relocList: GPUBuffer | null = null;
   private images: GPUBuffer[] = [];
+  /** Geometry supervision: uniform, per-workgroup sums, per-view targets (null = none), bind groups. */
+  private geoU: GPUBuffer | null = null;
+  private geoPartial: GPUBuffer | null = null;
+  private geoDummy: GPUBuffer | null = null;
+  private depthTargets: (GPUBuffer | null)[] = [];
+  private depthDims: ({ width: number; height: number; factor: number } | null)[] = [];
+  private bgGeo: GPUBindGroup[] = [];
   private staging: GPUBuffer | null = null;
   private gradsOut: GPUBuffer | null = null;
   private profiler: PassProfiler | null = null;
@@ -305,7 +362,7 @@ export class SplatTrainer {
   private constructor(
     private readonly device: GPUDevice,
     private readonly lost: Promise<unknown>,
-    private readonly pipes: TrainPipelines,
+    private pipes: TrainPipelines,
     readonly opts: SplatTrainerOptions,
   ) {
     this.shDegree = opts.shDegree ?? 0;
@@ -328,6 +385,7 @@ export class SplatTrainer {
             ...(opts.mcmc ?? {}),
           };
     this.cc = opts.colourCorrection === false ? null : { lr: 2e-3, reg: 1e-2, ...(opts.colourCorrection ?? {}) };
+    this.geo = opts.geometry ? { ...DEFAULT_SPLAT_GEOMETRY, ...opts.geometry } : null;
     this.lambda = opts.ssimLambda ?? 0.2;
     this.background = opts.background ?? [0, 0, 0];
     this.levels = opts.resolution ?? [
@@ -343,22 +401,43 @@ export class SplatTrainer {
    */
   static async create(ctx: Pick<GPUContext, 'device'>, opts: SplatTrainerOptions): Promise<SplatTrainer> {
     const device = ctx.device;
-    const cfg = { shDegree: opts.shDegree ?? 0, antialiased: opts.antialiased ?? true };
+    const cfg: SplatShaderConfig = { shDegree: opts.shDegree ?? 0, antialiased: opts.antialiased ?? true, geometry: !!opts.geometry };
     let perDevice = pipelineCache.get(device);
     if (!perDevice) pipelineCache.set(device, (perDevice = new Map()));
-    const key = `${cfg.shDegree}-${cfg.antialiased}`;
+    const key = shaderKey(cfg);
     let pipes = perDevice.get(key);
     if (!pipes) {
       pipes = compileTrainPipelines(device, cfg);
       perDevice.set(key, pipes);
       pipes.catch(() => perDevice!.delete(key));
     }
-    return new SplatTrainer(device, device.lost, await pipes, opts);
+    const t = new SplatTrainer(device, device.lost, await pipes, opts);
+    // geometry losses that end before the run does: plain kernels of the same layout afterwards
+    if (t.geo && t.geo.until < 1) {
+      const wideKey = `${key}:after`;
+      let post = perDevice.get(wideKey);
+      if (!post) {
+        const geoPipes = await pipes;
+        post = compilePostGeometryPipelines(device, { ...cfg, geometry: false, wideProj: true }, geoPipes);
+        perDevice.set(wideKey, post);
+        post.catch(() => perDevice!.delete(wideKey));
+      }
+      t.geoPipes = await pipes;
+      t.postPipes = await post;
+    }
+    return t;
   }
 
-  /** GPU memory plan for these options and views. */
-  static memoryEstimate(opts: Pick<SplatTrainerOptions, 'maxGaussians' | 'shDegree' | 'intersectionsPerGaussian'>, width: number, height: number, views: number): SplatMemoryEstimate {
-    return estimateSplatMemory({ maxGaussians: opts.maxGaussians, shDegree: opts.shDegree ?? 0, width, height, views, intersectionsPerGaussian: opts.intersectionsPerGaussian });
+  /** GPU memory plan for these options and views (`depthViews`: views with a geometry target). */
+  static memoryEstimate(
+    opts: Pick<SplatTrainerOptions, 'maxGaussians' | 'shDegree' | 'intersectionsPerGaussian' | 'geometry'>,
+    width: number,
+    height: number,
+    views: number,
+    depthViews = views,
+  ): SplatMemoryEstimate {
+    const geometry = opts.geometry ? { views: depthViews, factor: opts.geometry.factor ?? DEFAULT_SPLAT_GEOMETRY.factor } : undefined;
+    return estimateSplatMemory({ maxGaussians: opts.maxGaussians, shDegree: opts.shDegree ?? 0, width, height, views, intersectionsPerGaussian: opts.intersectionsPerGaussian, geometry });
   }
 
   memory(): SplatMemoryEstimate {
@@ -371,6 +450,7 @@ export class SplatTrainer {
       height: h,
       views: this.views.length,
       intersectionsPerGaussian: this.fwd ? this.fwd.isectCapacity / this.capacity : this.opts.intersectionsPerGaussian,
+      geometry: this.geo ? { views: this.depthTargets.filter((t) => t).length, factor: this.geo.factor } : undefined,
     });
   }
 
@@ -404,7 +484,7 @@ export class SplatTrainer {
     this.params = makeBuffer(d, layout.total * 4, 'splat-params');
     this.adamM = makeBuffer(d, layout.total * 4, 'splat-adam-m');
     this.adamV = makeBuffer(d, layout.total * 4, 'splat-adam-v');
-    this.grad2d = makeBuffer(d, cap * 9 * 4, 'splat-grad2d');
+    this.grad2d = makeBuffer(d, cap * grad2dStride({ geometry: !!this.geo }) * 4, 'splat-grad2d');
     d.queue.writeBuffer(this.params, 0, packParams({ ...model, count: n }, cap));
     this.views = views.map((v) => ({ cam: splatCamera(v.cam, v.pose), width: v.cam.width, height: v.cam.height }));
     const maxW = Math.max(...views.map((v) => v.cam.width));
@@ -450,6 +530,14 @@ export class SplatTrainer {
     this.bgColourAdam = bindGroup(d, P.colourAdam, [this.colourU, this.colourPartial, this.lossPartial, this.colour, this.statsBuf]);
     this.bgAdam = bindGroup(d, P.adam, [this.fwd.frame, this.optU, this.params, this.adamM, this.adamV, this.grad2d, this.fwd.tileCount]);
     this.makeRasterBwdBindGroups();
+    if (this.geo) {
+      this.geoU = uni(GEO_CFG_BYTES, 'splat-geocfg');
+      this.geoPartial = makeBuffer(d, maxTiles * 16, 'splat-geo-partial');
+      this.geoDummy = makeBuffer(d, 16, 'splat-geo-none');
+      this.depthTargets = views.map(() => null);
+      this.depthDims = views.map(() => null);
+      this.bgGeo = views.map(() => bindGroup(d, P.geoLoss!, [this.fwd.frame, this.geoU!, this.fwd.outGeo!, this.geoDummy!, this.geoPartial!, this.fwd.outColor, this.dLdC]));
+    }
     // scene extent (3DGS): 1.1 × largest distance of a camera centre from the centroid
     if (this.opts.sceneExtent) this.extent = this.opts.sceneExtent;
     else {
@@ -478,6 +566,41 @@ export class SplatTrainer {
     this.missingImages.delete(index);
   }
 
+  /**
+   * Geometry target of training view `index` (depth-target.ts `packDepthTarget` at the trainer's
+   * `geometry.factor` of the view size), or null to drop it. Needs `geometry`.
+   */
+  setViewDepth(index: number, target: DepthTarget | null): void {
+    if (!this.initialised) throw new Error('SplatTrainer: init first');
+    if (!this.geo) throw new Error('SplatTrainer: setViewDepth needs the geometry option');
+    const v = this.views[index];
+    if (!v) throw new Error(`SplatTrainer: no view ${index}`);
+    this.depthTargets[index]?.destroy();
+    this.depthTargets[index] = null;
+    this.depthDims[index] = null;
+    let buf = this.geoDummy!;
+    if (target) {
+      const f = this.geo.factor;
+      if (target.factor !== f || target.width !== Math.max(1, Math.floor(v.width / f)) || target.height !== Math.max(1, Math.floor(v.height / f)))
+        throw new Error(`SplatTrainer: depth target ${target.width}×${target.height} /${target.factor} ≠ view ${index} ${v.width}×${v.height} /${f}`);
+      buf = makeBuffer(this.device, Math.max(16, target.data.byteLength), `splat-depth-${index}`);
+      this.device.queue.writeBuffer(buf, 0, target.data.buffer, target.data.byteOffset, target.data.byteLength);
+      this.depthTargets[index] = buf;
+      this.depthDims[index] = { width: target.width, height: target.height, factor: target.factor };
+    }
+    this.bgGeo[index] = bindGroup(this.device, this.pipes.geoLoss!, [this.fwd.frame, this.geoU!, this.fwd.outGeo!, buf, this.geoPartial!, this.fwd.outColor, this.dLdC]);
+  }
+
+  /** Whether the geometry kernels are active (false after `geometry.until`, or without geometry). */
+  get geometryActive(): boolean {
+    return !!this.pipes.fwd.cfg.geometry;
+  }
+
+  /** Training views with a geometry target. */
+  get depthViews(): number {
+    return this.depthTargets.filter((t) => t).length;
+  }
+
   /** Number of training views. */
   get numViews(): number {
     return this.views.length;
@@ -486,8 +609,37 @@ export class SplatTrainer {
   private makeRasterBwdBindGroups(): void {
     const f = this.fwd;
     this.bgRasterBwd = [0, 1].map((k) =>
-      bindGroup(this.device, this.pipes.rasterBwd, [f.frame, f.ranges, f.isectSort.vals[k], f.proj, f.outColor, f.outN, this.dLdC, this.grad2d]),
+      bindGroup(this.device, this.pipes.rasterBwd, [f.frame, f.ranges, f.isectSort.vals[k], f.proj, f.outColor, f.outN, this.dLdC, this.grad2d, ...(this.pipes.fwd.cfg.geometry ? [f.outGeo!] : [])]),
     );
+  }
+
+  /** Geometry pipelines while the geometry losses run, the plain ones of the same layout after. */
+  private syncPhase(): void {
+    if (!this.geoPipes || !this.postPipes) return;
+    const want = this.iter < this.geoEndIteration() ? this.geoPipes : this.postPipes;
+    if (want === this.pipes) return;
+    this.pipes = want;
+    this.fwd.setPipelines(want.fwd);
+    this.makeRasterBwdBindGroups();
+    this.bgAdam = bindGroup(this.device, want.adam, [this.fwd.frame, this.optU, this.params, this.adamM, this.adamV, this.grad2d, this.fwd.tileCount]);
+  }
+
+  /** First iteration without the geometry losses (Infinity: they run to the end). */
+  private geoEndIteration(): number {
+    const g = this.geo;
+    if (!g || g.until >= 1) return Infinity;
+    return Math.max(1, this.opts.iterations) * Math.max(0, g.until);
+  }
+
+  /** Geometry-loss weights (depth, normal) at iteration `it`. */
+  geometryWeightsAt(it: number): [number, number] {
+    const g = this.geo;
+    if (!g) return [0, 0];
+    const T = Math.max(1, this.opts.iterations) * Math.max(0, Math.min(1, g.until));
+    if (!(it < T)) return [0, 0];
+    const f = it / T;
+    const interp = ([a, b]: [number, number]): number => (a > 0 && b > 0 ? Math.exp(Math.log(a) * (1 - f) + Math.log(b) * f) : a + (b - a) * f);
+    return [interp(g.depth), interp(g.normal)];
   }
 
   private nextView(): number {
@@ -531,7 +683,18 @@ export class SplatTrainer {
     of.set([1 - Math.pow(b1, t), 1 - Math.pow(b2, t), 0, 0], 12);
     of.set([mc ? mc.opacityReg / N : 0, mc ? mc.scaleReg / (3 * N * this.extent) : 0, 0, 0], 16);
     ou.set([(Math.imul(it + 1, 0x9e3779b1) ^ 0x7f4a7c15) >>> 0, 0, 0, 0], 20);
+    const an = this.opts.anisotropy;
+    of.set([(this.opts.flatten ?? 0) / (N * this.extent), an ? an.weight / N : 0, an ? Math.log(Math.max(1, an.maxRatio)) : 0, 0], 24);
     d.queue.writeBuffer(this.optU, 0, opt);
+    if (this.geo) {
+      const t = this.depthDims[view];
+      const [wd, wn] = this.geometryWeightsAt(it);
+      const gb = new ArrayBuffer(GEO_CFG_BYTES);
+      new Uint32Array(gb).set([t?.width ?? 0, t?.height ?? 0, factor, t?.factor ?? 1], 0);
+      new Float32Array(gb).set([wd, wn, 1 / (cam.width * cam.height)], 4);
+      new Uint32Array(gb)[7] = t ? 1 : 0;
+      d.queue.writeBuffer(this.geoU!, 0, gb);
+    }
     const v = this.views[view];
     const lc = new ArrayBuffer(LOSS_CFG_BYTES);
     new Uint32Array(lc).set([view, v.width, v.height, factor], 0);
@@ -550,6 +713,7 @@ export class SplatTrainer {
   }
 
   private encodeIteration(view: number): GPUCommandEncoder {
+    this.syncPhase();
     const factor = this.levelAt(this.iter);
     const cam = downscaleSplatCamera(this.views[view].cam, factor);
     this.fwd.setFrame(cam, this.count, this.background);
@@ -570,6 +734,11 @@ export class SplatTrainer {
     pass.setPipeline(P.ssimBwd);
     pass.setBindGroup(0, this.bgSsimBwd);
     pass.dispatchWorkgroups(tx, ty);
+    if (P.geoLoss) {
+      pass.setPipeline(P.geoLoss);
+      pass.setBindGroup(0, this.bgGeo[view]);
+      pass.dispatchWorkgroups(tx, ty);
+    }
     pass.setPipeline(P.colourAdam);
     pass.setBindGroup(0, this.bgColourAdam);
     pass.dispatchWorkgroups(1);
@@ -980,20 +1149,28 @@ export class SplatTrainer {
   }
 
   /**
-   * Test hook: parameter gradients of L = Σ dLdC · C (RGB per pixel) for camera `cam` through
-   * the GPU rasteriser backward and projection backward (no loss kernels, no update).
+   * Test hook: parameter gradients of L = Σ dLdC · C (RGB per pixel) [+ Σ dLdG · G, the geometry
+   * channels: 4 per pixel] for camera `cam` through the GPU rasteriser backward and projection
+   * backward (no loss kernels, no update). Also returns the rendered geometry channels.
    */
-  async debugGradients(cam: SplatCamera, dLdC: Float32Array): Promise<{ grad2d: Float32Array; grads: SplatModel }> {
+  async debugGradients(cam: SplatCamera, dLdC: Float32Array, dLdG?: Float32Array, dLdA?: Float32Array): Promise<{ grad2d: Float32Array; grads: SplatModel; geo: Float32Array | null }> {
     const d = this.device;
     const f = this.fwd;
     f.setFrame(cam, this.count, this.background);
     const px = cam.width * cam.height;
     const g4 = new Float32Array(4 * px);
-    for (let i = 0; i < px; i++) g4.set([dLdC[3 * i], dLdC[3 * i + 1], dLdC[3 * i + 2], 0], 4 * i);
+    for (let i = 0; i < px; i++) g4.set([dLdC[3 * i], dLdC[3 * i + 1], dLdC[3 * i + 2], dLdA ? dLdA[i] : 0], 4 * i);
     d.queue.writeBuffer(this.dLdC, 0, g4);
+    if (f.outGeo) {
+      // [2o + 1] = ∂L/∂G (the forward pass of this submission fills [2o])
+      const g8 = new Float32Array(8 * px);
+      if (dLdG) for (let i = 0; i < px; i++) g8.set(dLdG.subarray(4 * i, 4 * i + 4), 8 * i + 4);
+      d.queue.writeBuffer(f.outGeo, 0, g8);
+    }
     const lay = paramOffsets(this.capacity, this.shDegree);
     if (!this.gradsOut) this.gradsOut = makeBuffer(d, lay.total * 4, 'splat-grads-out');
-    const g2Bytes = this.count * 36;
+    const G2 = grad2dStride(this.pipes.fwd.cfg);
+    const g2Bytes = this.count * 4 * G2;
     const g2Copy = makeBuffer(d, g2Bytes, 'splat-grad2d-copy');
     const bg = bindGroup(d, this.pipes.grads, [f.frame, this.params, this.grad2d, f.tileCount, this.gradsOut]);
     const enc = d.createCommandEncoder();
@@ -1014,7 +1191,57 @@ export class SplatTrainer {
     const g2 = new Float32Array(await this.readBuffer(g2Copy, 0, g2Bytes));
     g2Copy.destroy();
     const gr = new Float32Array(await this.readBuffer(this.gradsOut, 0, lay.total * 4));
-    return { grad2d: g2, grads: unpackParams(gr, this.count, this.capacity, this.shDegree) };
+    let geo: Float32Array | null = null;
+    if (f.outGeo) {
+      const g8 = new Float32Array(await this.readBuffer(f.outGeo, 0, 32 * px));
+      geo = new Float32Array(4 * px);
+      for (let i = 0; i < px; i++) geo.set(g8.subarray(8 * i, 8 * i + 4), 4 * i);
+    }
+    return { grad2d: g2, grads: unpackParams(gr, this.count, this.capacity, this.shDegree), geo };
+  }
+
+  /**
+   * Test hook: forward + geometry loss of training view `view` at level `factor` with the weights
+   * of iteration `it`: the rendered geometry channels (4 per pixel), ∂L/∂(them) and the summed
+   * per-workgroup partials (depth, normal, pixels, weight).
+   */
+  async debugGeoLoss(view: number, factor = 1, it = 0): Promise<{ geo: Float32Array; alpha: Float32Array; grad: Float32Array; gradA: Float32Array; sums: [number, number, number, number]; width: number; height: number }> {
+    if (!this.geo || !this.pipes.geoLoss) throw new Error('SplatTrainer: no geometry option');
+    const cam = downscaleSplatCamera(this.views[view].cam, factor);
+    this.fwd.setFrame(cam, this.count, this.background);
+    const iter = this.iter;
+    this.iter = it;
+    this.writeUniforms(view, cam, factor);
+    this.iter = iter;
+    const enc = this.device.createCommandEncoder();
+    this.fwd.encode(enc, null);
+    const pass = enc.beginComputePass();
+    pass.setPipeline(this.pipes.geoLoss);
+    pass.setBindGroup(0, this.bgGeo[view]);
+    pass.dispatchWorkgroups(this.fwd.tilesX, this.fwd.tilesY);
+    pass.end();
+    this.device.queue.submit([enc.finish()]);
+    const px = cam.width * cam.height;
+    const g8 = new Float32Array(await this.readBuffer(this.fwd.outGeo!, 0, 32 * px));
+    const geo = new Float32Array(4 * px);
+    const grad = new Float32Array(4 * px);
+    for (let i = 0; i < px; i++) {
+      geo.set(g8.subarray(8 * i, 8 * i + 4), 4 * i);
+      grad.set(g8.subarray(8 * i + 4, 8 * i + 8), 4 * i);
+    }
+    const tiles = this.fwd.tilesX * this.fwd.tilesY;
+    const gp = new Float32Array(await this.readBuffer(this.geoPartial!, 0, tiles * 16));
+    const sums: [number, number, number, number] = [0, 0, 0, 0];
+    for (let i = 0; i < tiles; i++) for (let k = 0; k < 4; k++) sums[k] += gp[4 * i + k];
+    const col = new Float32Array(await this.readBuffer(this.fwd.outColor, 0, px * 16));
+    const dc = new Float32Array(await this.readBuffer(this.dLdC, 0, px * 16));
+    const alpha = new Float32Array(px);
+    const gradA = new Float32Array(px);
+    for (let i = 0; i < px; i++) {
+      alpha[i] = 1 - col[4 * i + 3];
+      gradA[i] = dc[4 * i + 3];
+    }
+    return { geo, alpha, grad, gradA, sums, width: cam.width, height: cam.height };
   }
 
   /**
@@ -1068,6 +1295,8 @@ export class SplatTrainer {
     this.staging?.destroy();
     this.gradsOut?.destroy();
     this.profiler?.destroy();
+    for (const b of [this.geoU, this.geoPartial, this.geoDummy, ...this.depthTargets]) b?.destroy();
+    this.depthTargets = [];
     this.images = [];
     this.initialised = false;
   }
