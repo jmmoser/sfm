@@ -15,6 +15,12 @@ const h = vi.hoisted(() => ({
   pipelines: [] as FakePipeline[],
   lost: [] as ((info: GPUDeviceLostInfo) => void)[],
   adapter: true,
+  releaseSift: vi.fn<() => void>(),
+}));
+
+vi.mock('../features/sift-cpu', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../features/sift-cpu')>()),
+  releaseSiftCPUMemory: h.releaseSift,
 }));
 
 vi.mock('../gpu/device', async (importOriginal) => ({
@@ -137,12 +143,14 @@ describe('engine worker: feature pipeline hand-over and GPU device loss', () => 
 describe('engine worker: close', () => {
   const S1 = { ...SCAN, sessionId: 's1' };
 
-  it('close lets go of that session only: its engine is gone, its pipeline is destroyed by dispose', async () => {
+  it('close lets go of that session only: its engine and CPU scratch are gone, its pipeline is destroyed by dispose', async () => {
     await freshWorker();
     expect(await call('init', S1)).toMatchObject({ ok: true });
     expect(await call('close', { sessionId: 'other' })).toMatchObject({ ok: true, result: false });
     expect(await call('finishCapture')).toMatchObject({ ok: true });
+    h.releaseSift.mockClear();
     expect(await call('close', { sessionId: 's1' })).toMatchObject({ ok: true, result: true });
+    expect(h.releaseSift).toHaveBeenCalled(); // the CPU SIFT scratch goes with the session
     expect(await call('finishCapture')).toMatchObject({ ok: false, error: { name: 'EngineNotInitializedError' } });
     expect(h.pipelines[0].destroy).not.toHaveBeenCalled();
     await call('dispose');

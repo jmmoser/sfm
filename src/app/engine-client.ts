@@ -434,8 +434,11 @@ export class EngineClient implements EngineLike {
 
   async closeSession(id: string): Promise<void> {
     this.assertUsable();
+    // every init / loadSession replaces the worker's engine: with a setup naming another session
+    // the worker cannot hold this one (no round trip that a busy worker could time out and restart)
     const s = this.setup;
-    if (s && (s.kind === 'init' ? s.options.sessionId : s.id) === id) this.setup = null;
+    if (s && (s.kind === 'init' ? s.options.sessionId : s.id) !== id) return;
+    this.setup = null;
     if (!this.worker) return;
     // (a worker that does not answer is stuck: restarted, like on a stuck init)
     const closed = await this.call('close', { sessionId: id }, { timeoutMs: this.opts.callTimeoutMs, bypassGate: true, fatalOnTimeout: true });

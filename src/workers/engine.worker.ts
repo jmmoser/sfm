@@ -29,6 +29,7 @@
 import { PhotogrammetryEngine, pipelineKey } from '../engine/engine';
 import type { EngineConfig } from '../engine/types';
 import type { FeaturePipeline } from '../features/extractor';
+import { releaseSiftCPUMemory } from '../features/sift-cpu';
 import { onDeviceLost } from '../gpu/device';
 import type { CancelToken, ProgressEvent } from '../core/types';
 import {
@@ -253,6 +254,9 @@ async function dispatch(req: EngineRequest): Promise<{ result: unknown; transfer
       if (!engine || engine.options.sessionId !== (req.params as { sessionId: string }).sessionId) return { result: false, transfer: false };
       for (const t of tokens.values()) t.cancelled = true;
       closeEngine();
+      // CPU SIFT scratch: the disposed engine's idle timer no longer frees it (extraction is
+      // synchronous, so no frame is using it now)
+      releaseSiftCPUMemory();
       return { result: true, transfer: false };
     }
     case 'dispose': {

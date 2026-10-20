@@ -240,12 +240,22 @@ describe('EngineClient', () => {
   it('closeSession: the worker lets go of that session only (the worker stays); a later restart does not re-open it', async () => {
     const { c, spawned } = client('ok');
     await c.init({ mode: 'object', quality: 'fast', sessionId: 's1' });
-    await c.closeSession('other');
+    await c.closeSession('other'); // the engine holds s1: nothing to ask the worker
     expect(c.status.state).toBe('ready');
     await c.closeSession('s1');
     expect(c.status).toMatchObject({ state: 'idle', reason: 'closed' });
-    expect((await c.loadSession('probe')).stats.closes).toBe('other:false,s1:true');
+    expect((await c.loadSession('probe')).stats.closes).toBe('s1:true');
     expect(spawned).toEqual(['ok']);
+
+    // a discard forgot the setup: the worker is asked, and lets go of its own session only
+    const discarded = client('ok');
+    await discarded.c.init({ mode: 'object', quality: 'fast', sessionId: 's1' });
+    expect(await discarded.c.abortLongOperation({ reinit: false })).toBe('none');
+    await discarded.c.closeSession('other');
+    expect(discarded.c.status.state).toBe('ready');
+    await discarded.c.closeSession('s1');
+    expect(discarded.c.status).toMatchObject({ state: 'idle', reason: 'closed' });
+    expect((await discarded.c.loadSession('probe')).stats.closes).toBe('other:false,s1:true');
 
     const deleted = client('ok');
     await deleted.c.init({ mode: 'object', quality: 'fast', sessionId: 's1' });
