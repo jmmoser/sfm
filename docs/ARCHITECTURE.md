@@ -96,13 +96,15 @@ src/
                          pair selection, retrieval, keyframe selection, inertial & GPS alignment
   dense/                 undistortion, view selection, PatchMatch MVS (WebGPU + CPU),
                          depth-map fusion, TSDF + marching cubes, point-cloud filters
+  splat/                 3D Gaussian Splatting: WebGPU trainer + renderer, CPU reference,
+                         splat PLY, point-cloud initialisation, MCMC densification (§6)
   sensors/               camera capture, motion, compass, geolocation, wake lock, frame orientation
   io/                    PLY / GLB / COLMAP export, ZIP writer, IndexedDB session storage, share/download
   viewer/                three.js viewer (points as splats + EDL, mesh, cameras, measure tool)
   engine/                PhotogrammetryEngine (pipeline orchestration, runs in a worker)
   workers/               engine.worker.ts + typed message protocol
   app/                   mobile UI (vanilla TS + CSS), screens, state machine
-  harness/               test harness pages: synthetic dataset generator, engine e2e, dense GT
+  harness/               test harness pages: synthetic dataset generator, engine e2e, dense GT, splat GT
   main.ts                app entry
 e2e/                     synthetic dataset generator, end-to-end runner, metrics
 docs/                    this file, research notes

@@ -38,7 +38,7 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     return;
   }
   proj[3u * i] = vec4f(pr.mean2d, pr.depth, pr.opacity);
-  proj[3u * i + 1u] = vec4f(pr.conic, 0.0);
+  proj[3u * i + 1u] = vec4f(pr.conic, log(pr.opacity / ALPHA_MIN));
   proj[3u * i + 2u] = vec4f(pr.colour, 0.0);
   rects[i] = vec2u(pr.rect.x | (pr.rect.y << 16u), pr.rect.z | (pr.rect.w << 16u));
   let tau = 2.0 * log(pr.opacity / ALPHA_MIN);
@@ -209,7 +209,7 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec
         let d = pf - s.xy;
         let cn = sB[k];
         let sigma = 0.5 * (cn.x * d.x * d.x + cn.z * d.y * d.y) + cn.y * d.x * d.y;
-        if (sigma < 0.0) { continue; }
+        if (sigma < 0.0 || sigma > cn.w) { continue; }
         let alpha = min(ALPHA_MAX, s.w * exp(-sigma));
         if (alpha < ALPHA_MIN) { continue; }
         let Tn = T * (1.0 - alpha);
@@ -269,7 +269,7 @@ export function rasterBackwardWGSL(cfg: SplatShaderConfig, groups = 2, perStep =
             let cn = ringB[slot];
             let d = pf - sa.xy;
             let sigma = 0.5 * (cn.x * d.x * d.x + cn.z * d.y * d.y) + cn.y * d.x * d.y;
-            if (sigma >= 0.0) {
+            if (sigma >= 0.0 && sigma <= cn.w) {
               let G = exp(-sigma);
               let a0 = sa.w * G;
               if (a0 >= ALPHA_MIN) {
@@ -314,6 +314,7 @@ const NT: u32 = ${NT}u;
 var<workgroup> pixT: array<f32, ${NT}>;
 var<workgroup> pixR: array<f32, ${NT}>;
 var<workgroup> pixN: array<u32, ${NT}>;
+var<workgroup> pixG: array<vec4f, ${NT}>;
 var<workgroup> ringA: array<vec4f, ${RING}>;
 var<workgroup> ringB: array<vec4f, ${RING}>;
 var<workgroup> ringC: array<vec4f, ${RING}>;
@@ -343,12 +344,15 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u
   if (ipx < W && ipy < H) {
     let o = ipy * W + ipx;
     let nn = outN[o];
-    pixR[li] = dot(dLdC[o].xyz, outColor[o].xyz);
+    let gp = dLdC[o];
+    pixR[li] = dot(gp.xyz, outColor[o].xyz);
     pixN[li] = nn;
+    pixG[li] = gp;
     atomicMax(&kmax, nn);
   } else {
     pixR[li] = 0.0;
     pixN[li] = 0u;
+    pixG[li] = vec4f(0.0);
   }
   workgroupBarrier();
   if (li == 0u) { kSnap = vec2u(atomicLoad(&kmax), ranges[2u * tile]); }
@@ -382,7 +386,7 @@ ${accDecl}
         let lx = (p0 + lp) & 15u;
         let ly = (p0 + lp) >> 4u;
         let pf = vec2f(f32(ox + lx), f32(oy + ly));
-        let gp = dLdC[(oy + ly) * W + ox + lx].xyz;
+        let gp = pixG[lp].xyz;
         var T = pixT[lp];
         var r = pixR[lp];
 ${qs.map(evalSplat).join('\n')}

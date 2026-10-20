@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { getGPU, type GPUContext } from '../gpu/device';
+import { pipelineCompileLimits } from '../features/gpu-common';
 import { renderCPU } from './cpu-reference';
 import { SplatRenderer } from './renderer';
 import { randomScene, testCamera } from './testutil';
@@ -11,6 +12,8 @@ const renderers = new Map<string, SplatRenderer>();
 beforeAll(async () => {
   const c = await getGPU();
   if (!c) throw new Error('WebGPU unavailable in the test browser');
+  // SwiftShader compiles these pipelines for minutes: no async → sync fallback (it compiles twice)
+  if (c.isSoftware) pipelineCompileLimits.timeoutMs = 600_000;
   ctx = c;
 }, 600_000);
 

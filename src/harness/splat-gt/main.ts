@@ -137,6 +137,11 @@ export interface SplatGTResult {
     log: { iteration: number; loss: number; count: number; itPerSec: number }[];
   };
   memory: { totalMB: number; breakdownMB: Record<string, number> };
+  /**
+   * Learned per-view colour matrices vs the dataset's GT exposure × white balance (training
+   * views): Pearson correlation and slope of log M_cc against log(gain·wb_c), mean |M − [I|0]|.
+   */
+  colour: { corr: number; slope: number; meanAbsDev: number } | null;
   _model: SplatModel | null;
   _panels: { frame: number; png: Blob }[];
 }
@@ -172,6 +177,9 @@ interface FrameLite {
   pose: { R: number[]; t: number[] };
   f?: number;
   depthFile?: string;
+  /** GT exposure gain and white-balance gains (linear light) of the -real datasets. */
+  gain?: number;
+  wb?: number[];
 }
 
 // ------------------------------------------------------------------ helpers
@@ -596,6 +604,34 @@ async function runSplatGT(config: SplatGTConfig): Promise<SplatGTResult> {
     panels.push({ frame: v.id, png: await panelPNG([{ img: v.image, label: `GT ${v.id}` }, { img: toRGBA(img), label: `splat ${s.psnr.toFixed(2)} dB` }, { img: errorImage(img, v.image), label: '|error|' }], 3) });
   }
   const finalModel = await trainer.readModel();
+  let colour: SplatGTResult['colour'] = null;
+  {
+    const mats = await trainer.readColourMatrices();
+    const xs: number[] = [];
+    const ys: number[] = [];
+    let dev = 0;
+    mats.forEach((M, v) => {
+      const f = byIndex.get(trainIdx[v])!;
+      for (let k = 0; k < 12; k++) dev += Math.abs(M[k] - (k % 5 === 0 ? 1 : 0));
+      if (f.gain && f.wb) for (let c = 0; c < 3; c++) if (M[5 * c] > 0) (xs.push(Math.log(f.gain * f.wb[c])), ys.push(Math.log(M[5 * c])));
+    });
+    let corr = NaN;
+    let slope = NaN;
+    if (xs.length > 2) {
+      const mx = xs.reduce((a, b) => a + b, 0) / xs.length;
+      const my = ys.reduce((a, b) => a + b, 0) / ys.length;
+      let sxy = 0, sxx = 0, syy = 0;
+      for (let i = 0; i < xs.length; i++) {
+        sxy += (xs[i] - mx) * (ys[i] - my);
+        sxx += (xs[i] - mx) ** 2;
+        syy += (ys[i] - my) ** 2;
+      }
+      corr = sxy / Math.sqrt(sxx * syy);
+      slope = sxy / sxx;
+    }
+    colour = { corr, slope, meanAbsDev: dev / (12 * Math.max(1, mats.length)) };
+    log(`[splat-gt] colour matrices: corr(log M_cc, log GT gain·wb) ${corr.toFixed(3)}, slope ${slope.toFixed(3)}, mean |M − I| ${colour.meanAbsDev.toFixed(4)}`);
+  }
   trainer.destroy();
   const result: SplatGTResult = {
     dataset: meta.name,
@@ -622,6 +658,7 @@ async function runSplatGT(config: SplatGTConfig): Promise<SplatGTResult> {
       log: trainLog,
     },
     memory: { totalMB: mem.total / 2 ** 20, breakdownMB: Object.fromEntries(Object.entries(mem.breakdown).map(([k, v]) => [k, v / 2 ** 20])) },
+    colour,
     _model: finalModel,
     _panels: panels,
   };

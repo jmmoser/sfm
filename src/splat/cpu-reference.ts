@@ -13,7 +13,8 @@
  * (`ellipseRectMin`); colour from SH at the view direction, clamped at 0.
  *
  * Raster (per pixel, front to back over its tile's splats sorted by (depth, index)):
- * σ = ½ dᵀ conic d; skip σ < 0; α = min(ALPHA_MAX, o e^{−σ}); skip α < alphaMin; stop before
+ * σ = ½ dᵀ conic d; skip σ < 0 or σ > ln(o / alphaMin) (no exp: α would be < alphaMin);
+ * α = min(ALPHA_MAX, o e^{−σ}); skip α < alphaMin; stop before
  * T(1 − α) < T_MIN; C += c α T; the background is added with the final T. `n` = index of the
  * last contributing splat in the tile list + 1 (what the backward pass re-traverses).
  *
@@ -302,7 +303,7 @@ export function renderCPU(model: SplatModel, cam: SplatCamera, opts: RenderOptio
         const dx = px - s.mean2d[0];
         const dy = py - s.mean2d[1];
         const sigma = 0.5 * (s.conic[0] * dx * dx + s.conic[2] * dy * dy) + s.conic[1] * dx * dy;
-        if (sigma < 0) continue;
+        if (sigma < 0 || sigma > s.tau / 2) continue;
         const alpha = Math.min(ALPHA_MAX, s.opacity * Math.exp(-sigma));
         if (alpha < alphaMin) continue;
         const Tn = T * (1 - alpha);
@@ -363,7 +364,7 @@ export function rasterBackwardCPU(fwd: CPURender, dLdC: ArrayLike<number>, opts:
         const dx = px - s.mean2d[0];
         const dy = py - s.mean2d[1];
         const sigma = 0.5 * (s.conic[0] * dx * dx + s.conic[2] * dy * dy) + s.conic[1] * dx * dy;
-        if (sigma < 0) continue;
+        if (sigma < 0 || sigma > s.tau / 2) continue;
         const G = Math.exp(-sigma);
         const a0 = s.opacity * G;
         if (a0 < alphaMin) continue;

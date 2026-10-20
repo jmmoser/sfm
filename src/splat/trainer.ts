@@ -24,6 +24,7 @@ import { getForwardPipelines, SplatForward, type ForwardPipelines } from './forw
 import { PassProfiler, bindGroup, compileAll, makeBuffer } from './gpu-util';
 import { packParams, paramOffsets, unpackParams } from './layout';
 import { planMcmc } from './mcmc';
+import { encodeSplatPLY } from './ply';
 import type { SplatImage } from './renderer';
 import {
   downscaleSplatCamera,
@@ -668,6 +669,11 @@ export class SplatTrainer {
     const lay = paramOffsets(this.capacity, this.shDegree);
     const d = new Float32Array(await this.readBuffer(this.params, 0, lay.total * 4));
     return unpackParams(d, this.count, this.capacity, this.shDegree);
+  }
+
+  /** The current model as an INRIA-layout splat PLY (ply.ts). */
+  async exportPLY(comments: string[] = []): Promise<Uint8Array> {
+    return encodeSplatPLY(await this.readModel(), { antialiased: this.antialiased, comments });
   }
 
   /** The learned per-view colour matrices (row-major 3×4 each). */
