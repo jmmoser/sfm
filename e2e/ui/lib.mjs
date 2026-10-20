@@ -4,6 +4,7 @@
  */
 import { createServer } from 'vite';
 import { chromium } from 'playwright';
+import { launchOptions } from '../lib/launch.mjs';
 import { createServer as createNetServer } from 'node:net';
 import { mkdir } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
@@ -63,7 +64,7 @@ export async function launch({ verbose = false, contextOptions = {}, iphoneUA = 
     optimizeDeps: { entries: ['index.html'] },
   });
   await server.listen();
-  const browser = await chromium.launch({ headless: true, args: CHROMIUM_ARGS });
+  const browser = await chromium.launch(launchOptions(CHROMIUM_ARGS));
   const consoleErrors = [];
   /** A fresh iPhone-sized context + page (isolated storage) on the same browser. */
   const newPage = async ({ iphoneUA: ua = iphoneUA, contextOptions: extra = {}, initScript = null } = {}) => {
