@@ -20,7 +20,7 @@
 import type { CameraIntrinsics, Pose, RGBAImage } from '../core/types';
 import type { GPUContext } from '../gpu/device';
 import { Rng } from '../math/random';
-import { compileForwardPipelines, SplatForward, type ForwardPipelines } from './forward';
+import { getForwardPipelines, SplatForward, type ForwardPipelines } from './forward';
 import { PassProfiler, bindGroup, compileAll, makeBuffer } from './gpu-util';
 import { packParams, paramOffsets, unpackParams } from './layout';
 import { planMcmc } from './mcmc';
@@ -155,6 +155,32 @@ interface TrainPipelines {
 
 const STAT_SLOTS = 64;
 
+const pipelineCache = new WeakMap<GPUDevice, Map<string, Promise<TrainPipelines>>>();
+
+async function compileTrainPipelines(device: GPUDevice, cfg: { shDegree: ShDegree; antialiased: boolean }): Promise<TrainPipelines> {
+  const lost = device.lost;
+  const [fwd, p] = await Promise.all([
+    getForwardPipelines(device, cfg),
+    compileAll(
+      device,
+      lost,
+      {
+        rasterBwd: rasterBackwardWGSL(cfg),
+        adam: backwardWGSL(cfg, 'adam'),
+        grads: backwardWGSL(cfg, 'grads'),
+        target: TARGET_WGSL,
+        ssimFwd: SSIM_FWD_WGSL,
+        ssimBwd: SSIM_BWD_WGSL,
+        colourAdam: COLOUR_ADAM_WGSL,
+        relocCopy: relocateWGSL(cfg, 'copy'),
+        relocUpdate: relocateWGSL(cfg, 'update'),
+      },
+      'splat-train',
+    ),
+  ]);
+  return { fwd, ...p };
+}
+
 export class SplatTrainer {
   readonly shDegree: ShDegree;
   readonly antialiased: boolean;
@@ -244,31 +270,23 @@ export class SplatTrainer {
     this.rng = new Rng(opts.seed ?? 1);
   }
 
-  /** Compiles every pipeline (call at stage start; compilation blocks the queue on Safari). */
+  /**
+   * Compiles every pipeline (call at stage start; compilation blocks the queue on Safari).
+   * Pipelines are cached per device and shader configuration.
+   */
   static async create(ctx: Pick<GPUContext, 'device'>, opts: SplatTrainerOptions): Promise<SplatTrainer> {
     const device = ctx.device;
-    const lost = device.lost;
     const cfg = { shDegree: opts.shDegree ?? 0, antialiased: opts.antialiased ?? true };
-    const [fwd, p] = await Promise.all([
-      compileForwardPipelines(device, lost, cfg),
-      compileAll(
-        device,
-        lost,
-        {
-          rasterBwd: rasterBackwardWGSL(cfg),
-          adam: backwardWGSL(cfg, 'adam'),
-          grads: backwardWGSL(cfg, 'grads'),
-          target: TARGET_WGSL,
-          ssimFwd: SSIM_FWD_WGSL,
-          ssimBwd: SSIM_BWD_WGSL,
-          colourAdam: COLOUR_ADAM_WGSL,
-          relocCopy: relocateWGSL(cfg, 'copy'),
-          relocUpdate: relocateWGSL(cfg, 'update'),
-        },
-        'splat-train',
-      ),
-    ]);
-    return new SplatTrainer(device, lost, { fwd, ...p }, opts);
+    let perDevice = pipelineCache.get(device);
+    if (!perDevice) pipelineCache.set(device, (perDevice = new Map()));
+    const key = `${cfg.shDegree}-${cfg.antialiased}`;
+    let pipes = perDevice.get(key);
+    if (!pipes) {
+      pipes = compileTrainPipelines(device, cfg);
+      perDevice.set(key, pipes);
+      pipes.catch(() => perDevice!.delete(key));
+    }
+    return new SplatTrainer(device, device.lost, await pipes, opts);
   }
 
   /** GPU memory plan for these options and views. */

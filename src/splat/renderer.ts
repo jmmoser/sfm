@@ -4,7 +4,7 @@
  * kernels (`SplatForward`) on its live parameters.
  */
 import type { GPUContext } from '../gpu/device';
-import { compileForwardPipelines, SplatForward, type ForwardPipelines } from './forward';
+import { getForwardPipelines, SplatForward, type ForwardPipelines } from './forward';
 import { PassProfiler, makeBuffer } from './gpu-util';
 import { packParams, paramOffsets } from './layout';
 import type { ShDegree, SplatCamera, SplatModel } from './types';
@@ -55,11 +55,10 @@ export class SplatRenderer {
     private readonly opts: SplatRendererOptions,
   ) {}
 
-  /** Compiles the pipelines (do this at stage start: compilation blocks the queue on Safari). */
+  /** Compiles the pipelines, cached per device (do this at stage start: compilation blocks the queue on Safari). */
   static async create(ctx: Pick<GPUContext, 'device'>, opts: SplatRendererOptions): Promise<SplatRenderer> {
-    const lost = ctx.device.lost;
-    const pipes = await compileForwardPipelines(ctx.device, lost, { shDegree: opts.shDegree ?? 0, antialiased: opts.antialiased ?? true });
-    return new SplatRenderer(ctx.device, lost, pipes, opts);
+    const pipes = await getForwardPipelines(ctx.device, { shDegree: opts.shDegree ?? 0, antialiased: opts.antialiased ?? true });
+    return new SplatRenderer(ctx.device, ctx.device.lost, pipes, opts);
   }
 
   /** Uploads a model (re-allocates when it exceeds the capacity). */

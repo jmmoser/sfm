@@ -39,6 +39,22 @@ export async function compileForwardPipelines(device: GPUDevice, lost: Promise<u
   return { cfg, sort: s, ...p };
 }
 
+const forwardCache = new WeakMap<GPUDevice, Map<string, Promise<ForwardPipelines>>>();
+
+/** Forward pipelines for a device and shader configuration, compiled once and cached. */
+export function getForwardPipelines(device: GPUDevice, cfg: SplatShaderConfig): Promise<ForwardPipelines> {
+  let perDevice = forwardCache.get(device);
+  if (!perDevice) forwardCache.set(device, (perDevice = new Map()));
+  const key = `${cfg.shDegree}-${cfg.antialiased}`;
+  let p = perDevice.get(key);
+  if (!p) {
+    p = compileForwardPipelines(device, device.lost, cfg);
+    perDevice.set(key, p);
+    p.catch(() => perDevice!.delete(key));
+  }
+  return p;
+}
+
 export interface SplatForwardOptions {
   /** Gaussian capacity of the parameter layout. */
   capacity: number;
