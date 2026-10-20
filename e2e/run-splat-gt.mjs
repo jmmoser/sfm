@@ -3,7 +3,7 @@
  * Gaussian-splat training with ground-truth poses (headless), src/splat without the SfM engine.
  *
  *   node e2e/run-splat-gt.mjs [<dataset> ...] [--max-size N] [--iterations N] [--max-gaussians N]
- *        [--init cloud|gt|random] [--cloud PATH] [--init-count N] [--shell N] [--shell-radius R]
+ *        [--init cloud|gt|random] [--cloud PATH] [--init-count N] [--sparse N] [--shell N] [--shell-radius R]
  *        [--train-stride N] [--train-frames i,j,...] [--test-every N] [--eval-at i,j,...]
  *        [--sh 0|1] [--no-colour-correction] [--no-mcmc] [--profile] [--panels N]
  *        [--tag NAME] [--out DIR] [--set key=json ...] [--verbose]
@@ -32,7 +32,7 @@ import { CHROMIUM_ARGS } from './run-dense-gt.mjs';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 const USAGE = `usage: node e2e/run-splat-gt.mjs [<dataset> ...] [--max-size N] [--iterations N] [--max-gaussians N]
-       [--init cloud|gt|random] [--cloud PATH] [--init-count N] [--shell N] [--shell-radius R]
+       [--init cloud|gt|random] [--cloud PATH] [--init-count N] [--sparse N] [--shell N] [--shell-radius R]
        [--train-stride N] [--train-frames i,j,...] [--test-every N] [--eval-at i,j,...] [--sh 0|1]
        [--no-colour-correction] [--no-mcmc] [--profile] [--panels N] [--tag NAME] [--out DIR] [--set key=json ...] [--verbose]`;
 
@@ -69,6 +69,7 @@ export function parseArgs(argv) {
       o.cfg.init.kind = 'cloud';
       o.cfg.init.url = '/' + relative(ROOT, abs).split(sep).join('/');
     } else if (a === '--init-count') o.cfg.init.count = num(1);
+    else if (a === '--sparse') o.cfg.init.sparse = num(0);
     else if (a === '--shell') setPath(o.cfg, 'shell.count', num(0));
     else if (a === '--shell-radius') setPath(o.cfg, 'shell.radius', num(0));
     else if (a === '--train-stride') o.cfg.trainStride = num(1);

@@ -111,6 +111,11 @@ export interface SplatTrainerOptions {
   intersectionsPerGaussian?: number;
   /** Record per-pass GPU times (timestamp queries) for every step. */
   profile?: boolean;
+  /**
+   * Iteration command buffers allowed in flight (default 1, the iOS rule; 2 hides the host
+   * encode / completion latency on desktop GPUs). Profiling forces 1.
+   */
+  inFlight?: 1 | 2;
 }
 
 export interface SplatStepResult {
@@ -154,6 +159,9 @@ interface TrainPipelines {
 }
 
 const STAT_SLOTS = 64;
+/** Rasteriser backward: pixel groups (32 pixels each) per workgroup, splats per thread step (wgsl/raster.ts). */
+export const BWD_GROUPS = 2;
+export const BWD_PER_STEP = 1;
 
 const pipelineCache = new WeakMap<GPUDevice, Map<string, Promise<TrainPipelines>>>();
 
@@ -165,7 +173,7 @@ async function compileTrainPipelines(device: GPUDevice, cfg: { shDegree: ShDegre
       device,
       lost,
       {
-        rasterBwd: rasterBackwardWGSL(cfg),
+        rasterBwd: rasterBackwardWGSL(cfg, BWD_GROUPS, BWD_PER_STEP),
         adam: backwardWGSL(cfg, 'adam'),
         grads: backwardWGSL(cfg, 'grads'),
         target: TARGET_WGSL,
@@ -484,7 +492,7 @@ export class SplatTrainer {
     pass = prof ? prof.pass(enc, 'raster-bwd') : enc.beginComputePass({ label: 'raster-bwd' });
     pass.setPipeline(P.rasterBwd);
     pass.setBindGroup(0, this.bgRasterBwd[this.fwd.isectResult]);
-    pass.dispatchWorkgroups(tx, ty);
+    pass.dispatchWorkgroups(tx, ty, 8 / BWD_GROUPS);
     pass.end();
     pass = prof ? prof.pass(enc, 'adam') : enc.beginComputePass({ label: 'adam' });
     pass.setPipeline(P.adam);
@@ -528,12 +536,33 @@ export class SplatTrainer {
     const t0 = performance.now();
     let refinements = 0;
     let overflow = false;
+    const inFlight = this.opts.inFlight ?? 1;
+    const m = this.mcmc;
+    const refineDue = (it: number): boolean => !!m && it >= m.start && it <= m.stop && it % m.refineEvery === 0;
+    // host work after iteration `it` that must see its result (and may change buffers / the count)
+    const syncAfter = (it: number, k: number): boolean => k === n - 1 || it % 25 === 0 || refineDue(it);
+    let prev: Promise<void> | null = null;
+    let enc: GPUCommandEncoder | null = null;
     for (let k = 0; k < n; k++) {
-      const view = this.nextView();
-      const enc = this.encodeIteration(view);
+      if (!enc) enc = this.encodeIteration(this.nextView());
       this.profiler?.resolve(enc);
       this.device.queue.submit([enc.finish()]);
-      await this.waitGPU();
+      enc = null;
+      const done = this.waitGPU();
+      const it = this.iter + 1;
+      this.iter = it;
+      const sync = syncAfter(it, k);
+      if (inFlight <= 1 || this.profiler || sync) {
+        // encode the next iteration while this one runs (still one command buffer in flight)
+        if (!sync) enc = this.encodeIteration(this.nextView());
+        await done;
+        if (prev) await prev;
+        prev = null;
+      } else {
+        // keep this iteration queued behind the previous one (two command buffers in flight)
+        if (prev) await prev;
+        prev = done;
+      }
       if (this.profiler) {
         const t = await this.profiler.read();
         if (t) {
@@ -541,10 +570,8 @@ export class SplatTrainer {
           this.profiledIterations++;
         }
       }
-      this.iter++;
-      if (this.iter % 25 === 0 || k === n - 1) overflow = (await this.checkIntersections()) || overflow;
-      const m = this.mcmc;
-      if (m && this.iter >= m.start && this.iter <= m.stop && this.iter % m.refineEvery === 0) {
+      if (it % 25 === 0 || k === n - 1) overflow = (await this.checkIntersections()) || overflow;
+      if (refineDue(it)) {
         await this.refine();
         refinements++;
       }
@@ -689,7 +716,7 @@ export class SplatTrainer {
     let pass = enc.beginComputePass();
     pass.setPipeline(this.pipes.rasterBwd);
     pass.setBindGroup(0, this.bgRasterBwd[f.isectResult]);
-    pass.dispatchWorkgroups(f.tilesX, f.tilesY);
+    pass.dispatchWorkgroups(f.tilesX, f.tilesY, 8 / BWD_GROUPS);
     pass.end();
     enc.copyBufferToBuffer(this.grad2d, 0, g2Copy, 0, Math.ceil(g2Bytes / 16) * 16);
     pass = enc.beginComputePass();

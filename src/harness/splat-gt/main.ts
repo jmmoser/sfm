@@ -62,6 +62,11 @@ export interface SplatGTConfig {
     url?: string;
     /** Gaussians taken from the source (default: maxGaussians / 2). */
     count?: number;
+    /**
+     * Extra GT surface samples over the whole scene (coloured from the GT-depth frames), a
+     * stand-in for the sparse SfM points the engine has: MVS clouds cover only the near field.
+     */
+    sparse?: number;
     opacity?: number;
     normalRatio?: number;
     scaleFactor?: number;
@@ -100,6 +105,10 @@ export interface EvalPoint {
   ssimCC: number;
   /** Mean render time per test view (ms, incl. readback). */
   renderMs: number;
+  /** GPU ms per training iteration and pass since the previous evaluation point (profile mode). */
+  gpuMs: Record<string, number> | null;
+  /** Training iterations / s since the previous evaluation point. */
+  segmentItPerSec: number;
   views: ViewScore[];
 }
 
@@ -397,6 +406,35 @@ async function initGt(base: string, meta: MetaLite, frames: FrameLite[], count: 
   return { count: pos.length / 3, positions: Float32Array.from(pos), colors: Uint8Array.from(col), normals: Float32Array.from(nrm) };
 }
 
+function subsampleCloud(pc: PointCloud, n: number, rng: Rng): PointCloud {
+  if (pc.count <= n) return pc;
+  const pick = Array.from(rng.sample(pc.count, n)).sort((a, b) => a - b);
+  const take = <T extends Float32Array | Uint8Array>(a: T | undefined, k: number): T | undefined => {
+    if (!a) return undefined;
+    const out = new (a.constructor as { new (n: number): T })(n * k);
+    for (let i = 0; i < n; i++) for (let c = 0; c < k; c++) out[k * i + c] = a[k * pick[i] + c];
+    return out;
+  };
+  return { count: n, positions: take(pc.positions, 3)!, colors: take(pc.colors, 3)!, normals: take(pc.normals, 3), radii: take(pc.radii, 1), confidence: take(pc.confidence, 1) };
+}
+
+function mergeClouds(a: PointCloud, b: PointCloud): PointCloud {
+  const n = a.count + b.count;
+  const cat = <T extends Float32Array | Uint8Array>(x: T | undefined, y: T | undefined, k: number, Ctor: { new (n: number): T }): T => {
+    const out = new Ctor(n * k);
+    if (x) out.set(x.subarray(0, a.count * k));
+    if (y) out.set(y.subarray(0, b.count * k), a.count * k);
+    return out;
+  };
+  return {
+    count: n,
+    positions: cat(a.positions, b.positions, 3, Float32Array),
+    colors: cat(a.colors, b.colors, 3, Uint8Array),
+    normals: a.normals || b.normals ? cat(a.normals, b.normals, 3, Float32Array) : undefined,
+    radii: a.radii || b.radii ? cat(a.radii, b.radii, 1, Float32Array) : undefined,
+  };
+}
+
 function initRandom(meta: MetaLite, count: number, shDegree: ShDegree, rng: Rng): SplatModel {
   const m = allocSplatModel(count, shDegree);
   const lo = meta.roi.min;
@@ -455,9 +493,10 @@ async function runSplatGT(config: SplatGTConfig): Promise<SplatGTResult> {
   const io = { maxCount: initCount, shDegree, opacity: config.init.opacity, normalRatio: config.init.normalRatio, scaleFactor: config.init.scaleFactor, seed: config.seed };
   if (config.init.kind === 'cloud') {
     if (!config.init.url) throw new Error('init.kind = cloud needs init.url');
-    const pc = await initCloud(config.init.url);
-    log(`[splat-gt] cloud ${config.init.url}: ${pc.count} points`);
-    model = initFromPointCloud(pc, io);
+    let pc = subsampleCloud(await initCloud(config.init.url), initCount, rng);
+    log(`[splat-gt] cloud ${config.init.url}: ${pc.count} points used`);
+    if (config.init.sparse) pc = mergeClouds(pc, await initGt(base, meta, frames, config.init.sparse, rng, perFrameFocal));
+    model = initFromPointCloud(pc, { ...io, maxCount: pc.count });
   } else if (config.init.kind === 'gt') {
     const pc = await initGt(base, meta, frames, initCount, rng, perFrameFocal);
     model = initFromPointCloud(pc, io);
@@ -486,7 +525,15 @@ async function runSplatGT(config: SplatGTConfig): Promise<SplatGTResult> {
   const mem = trainer.memory();
 
   const evals: EvalPoint[] = [];
+  let segStart = { it: 0, ms: 0 };
   const evaluate = async (trainMs: number): Promise<void> => {
+    const sst = trainer.stats();
+    const gpuSeg = sst.profiledIterations ? Object.fromEntries(Object.entries(sst.gpuMs).map(([k, v]) => [k, v / sst.profiledIterations])) : null;
+    for (const [k, v] of Object.entries(sst.gpuMs)) gpuTotal[k] = (gpuTotal[k] ?? 0) + v;
+    gpuIters += sst.profiledIterations;
+    trainer.resetProfile();
+    const segItPerSec = trainer.iteration > segStart.it ? (1000 * (trainer.iteration - segStart.it)) / Math.max(1, trainMs - segStart.ms) : 0;
+    segStart = { it: trainer.iteration, ms: trainMs };
     const views: ViewScore[] = [];
     let rms = 0;
     for (const v of test) {
@@ -507,12 +554,17 @@ async function runSplatGT(config: SplatGTConfig): Promise<SplatGTResult> {
       psnrCC: mean('psnrCC'),
       ssimCC: mean('ssimCC'),
       renderMs: rms / Math.max(1, test.length),
+      gpuMs: gpuSeg,
+      segmentItPerSec: segItPerSec,
       views,
     };
     evals.push(e);
+    if (gpuSeg) log(`[splat-gt]   GPU ms / iteration since the last evaluation: ${Object.entries(gpuSeg).map(([k, v]) => `${k} ${v.toFixed(2)}`).join(', ')} (total ${Object.values(gpuSeg).reduce((a, b) => a + b, 0).toFixed(2)}); ${segItPerSec.toFixed(1)} it/s`);
     log(`[splat-gt] it ${e.iteration}: PSNR ${e.psnr.toFixed(2)} dB SSIM ${e.ssim.toFixed(4)} | colour-fit PSNR ${e.psnrCC.toFixed(2)} SSIM ${e.ssimCC.toFixed(4)} | ${e.count} Gaussians, train ${(trainMs / 1000).toFixed(1)} s, render ${e.renderMs.toFixed(1)} ms/view`);
   };
 
+  const gpuTotal: Record<string, number> = {};
+  let gpuIters = 0;
   const chunk = config.chunk ?? 100;
   let trainMs = 0;
   const trainLog: SplatGTResult['train']['log'] = [];
@@ -531,8 +583,8 @@ async function runSplatGT(config: SplatGTConfig): Promise<SplatGTResult> {
     await evaluate(trainMs);
   }
   const st = trainer.stats();
-  const gpuMs = st.profiledIterations ? Object.fromEntries(Object.entries(st.gpuMs).map(([k, v]) => [k, v / st.profiledIterations])) : null;
-  if (gpuMs) log(`[splat-gt] GPU ms / iteration: ${Object.entries(gpuMs).map(([k, v]) => `${k} ${v.toFixed(2)}`).join(', ')} (total ${Object.values(gpuMs).reduce((a, b) => a + b, 0).toFixed(2)})`);
+  const gpuMs = gpuIters ? Object.fromEntries(Object.entries(gpuTotal).map(([k, v]) => [k, v / gpuIters])) : null;
+  if (gpuMs) log(`[splat-gt] GPU ms / iteration (whole run): ${Object.entries(gpuMs).map(([k, v]) => `${k} ${v.toFixed(2)}`).join(', ')} (total ${Object.values(gpuMs).reduce((a, b) => a + b, 0).toFixed(2)})`);
 
   // panels: GT | render | |error| for a few test views (final model)
   const panels: SplatGTResult['_panels'] = [];

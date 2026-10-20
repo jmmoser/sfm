@@ -167,7 +167,7 @@ export class SplatForward {
     const P = this.pipes;
     const S = this.isectSort;
     this.bgBinSetup = bindGroup(d, P.binSetup, [this.frame, this.binCtl, S.ctl]);
-    this.bgEmit = bindGroup(d, P.emit, [this.frame, this.depthSort.vals[0], this.tileCount, this.rects, this.offsets, S.keys[0], S.vals[0]]);
+    this.bgEmit = bindGroup(d, P.emit, [this.frame, this.depthSort.vals[0], this.tileCount, this.rects, this.offsets, S.keys[0], S.vals[0], this.proj]);
     this.bgRanges = [0, 1].map((k) => bindGroup(d, P.ranges, [S.ctl, S.keys[k], this.ranges]));
     this.bgRaster = [0, 1].map((k) => bindGroup(d, P.raster, [this.frame, this.ranges, S.vals[k], this.proj, this.outColor, this.outN]));
   }

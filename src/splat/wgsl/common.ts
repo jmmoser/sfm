@@ -176,6 +176,31 @@ fn projectGaussian(i: u32) -> Proj {
 }
 `;
 
+/**
+ * Exact tile test (cpu-reference.ts `ellipseRectMin` / `tileTouched`): does the ellipse
+ * dᵀ·conic·d ≤ tau reach the pixel-centre rectangle of tile (tx, ty)? Needs `frame`.
+ */
+export const TILE_TEST_WGSL = /* wgsl */ `
+fn quadForm(c: vec3f, dx: f32, dy: f32) -> f32 { return c.x * dx * dx + 2.0 * c.y * dx * dy + c.z * dy * dy; }
+fn tileTouched(m: vec2f, c: vec3f, tau: f32, tx: u32, ty: u32) -> bool {
+  let x0 = f32(tx * TILE);
+  let y0 = f32(ty * TILE);
+  let x1 = min(x0 + f32(TILE - 1u), f32(frame.dims.x - 1u));
+  let y1 = min(y0 + f32(TILE - 1u), f32(frame.dims.y - 1u));
+  if (m.x >= x0 && m.x <= x1 && m.y >= y0 && m.y <= y1) { return true; }
+  var best = 1e30;
+  for (var e = 0u; e < 2u; e++) {
+    let dx = select(x0, x1, e == 1u) - m.x;
+    let dy = clamp(-c.y * dx / c.z, y0 - m.y, y1 - m.y);
+    best = min(best, quadForm(c, dx, dy));
+    let dy2 = select(y0, y1, e == 1u) - m.y;
+    let dx2 = clamp(-c.y * dy2 / c.x, x0 - m.x, x1 - m.x);
+    best = min(best, quadForm(c, dx2, dy2));
+  }
+  return best <= tau;
+}
+`;
+
 /** f32 add on a u32 atomic (compare-exchange loop; WGSL has no float atomics). */
 export const ATOMIC_ADD_F32_WGSL = (buffer: string): string => /* wgsl */ `
 fn atomicAddF32(idx: u32, v: f32) {

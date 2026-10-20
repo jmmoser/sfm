@@ -9,7 +9,8 @@
  * (BLUR_EPS) with the Mip-Splatting opacity compensation √(det Σ₂ / det(Σ₂ + εI)) when
  * `antialiased`; conic = (Σ₂ + εI)⁻¹; opacity o = sigmoid(logit) · comp; screen extent
  * k·√diag with k = √(2 ln(o / alphaMin)) (the ellipse outside which alpha < alphaMin), pixel
- * range → tile rectangle; colour from SH at the view direction, clamped at 0.
+ * range → tile rectangle, keeping only the tiles the ellipse dᵀ·conic·d ≤ k² actually touches
+ * (`ellipseRectMin`); colour from SH at the view direction, clamped at 0.
  *
  * Raster (per pixel, front to back over its tile's splats sorted by (depth, index)):
  * σ = ½ dᵀ conic d; skip σ < 0; α = min(ALPHA_MAX, o e^{−σ}); skip α < alphaMin; stop before
@@ -76,6 +77,8 @@ export interface ProjectedGaussian {
   radius: [number, number];
   /** Tile rectangle, inclusive: x0, y0, x1, y1. */
   rect: [number, number, number, number];
+  /** k² = 2 ln(o / alphaMin): the splat touches pixels with dᵀ·conic·d ≤ k². */
+  tau: number;
   dir: [number, number, number];
   dist: number;
   colourRaw: [number, number, number];
@@ -176,6 +179,7 @@ export function projectGaussian(model: SplatModel, i: number, cam: SplatCamera, 
   const y1 = Math.min(cam.height - 1, Math.floor(mean2d[1] + radius[1]));
   out.mean2d = mean2d;
   out.radius = radius;
+  out.tau = k * k;
   if (!(x0 <= x1 && y0 <= y1)) return out;
   out.rect = [Math.floor(x0 / TILE_SIZE), Math.floor(y0 / TILE_SIZE), Math.floor(x1 / TILE_SIZE), Math.floor(y1 / TILE_SIZE)];
   // colour
@@ -224,7 +228,38 @@ export interface CPURender {
   tilesY: number;
 }
 
-/** Visible Gaussians binned into tiles, each list sorted by (depth, index). */
+/**
+ * Minimum of dᵀ Q d over the rectangle [x0, x1] × [y0, y1] with d = p − (mx, my) and the
+ * positive-definite Q = [[A, B], [B, C]]: 0 when the centre is inside, else the smallest of the
+ * four edge minima (closed form, clamped to the edge).
+ */
+export function ellipseRectMin(mx: number, my: number, A: number, B: number, C: number, x0: number, x1: number, y0: number, y1: number): number {
+  if (mx >= x0 && mx <= x1 && my >= y0 && my <= y1) return 0;
+  const f = (dx: number, dy: number): number => A * dx * dx + 2 * B * dx * dy + C * dy * dy;
+  let best = Infinity;
+  for (const X of [x0, x1]) {
+    const dx = X - mx;
+    const dy = Math.min(y1 - my, Math.max(y0 - my, (-B * dx) / C));
+    best = Math.min(best, f(dx, dy));
+  }
+  for (const Y of [y0, y1]) {
+    const dy = Y - my;
+    const dx = Math.min(x1 - mx, Math.max(x0 - mx, (-B * dy) / A));
+    best = Math.min(best, f(dx, dy));
+  }
+  return best;
+}
+
+/** Whether splat `s` can reach a pixel centre of tile (tx, ty). */
+export function tileTouched(s: ProjectedGaussian, tx: number, ty: number, width: number, height: number): boolean {
+  const x0 = tx * TILE_SIZE;
+  const y0 = ty * TILE_SIZE;
+  const x1 = Math.min(x0 + TILE_SIZE - 1, width - 1);
+  const y1 = Math.min(y0 + TILE_SIZE - 1, height - 1);
+  return ellipseRectMin(s.mean2d[0], s.mean2d[1], s.conic[0], s.conic[1], s.conic[2], x0, x1, y0, y1) <= s.tau;
+}
+
+/** Visible Gaussians binned into the tiles they touch, each list sorted by (depth, index). */
 export function binTiles(proj: ProjectedGaussian[], width: number, height: number): { lists: Int32Array[]; tilesX: number; tilesY: number } {
   const tilesX = Math.ceil(width / TILE_SIZE);
   const tilesY = Math.ceil(height / TILE_SIZE);
@@ -237,7 +272,7 @@ export function binTiles(proj: ProjectedGaussian[], width: number, height: numbe
   const tmp: number[][] = Array.from({ length: tilesX * tilesY }, () => []);
   for (const i of order) {
     const [x0, y0, x1, y1] = proj[i].rect;
-    for (let ty = y0; ty <= y1; ty++) for (let tx = x0; tx <= x1; tx++) tmp[ty * tilesX + tx].push(i);
+    for (let ty = y0; ty <= y1; ty++) for (let tx = x0; tx <= x1; tx++) if (tileTouched(proj[i], tx, ty, width, height)) tmp[ty * tilesX + tx].push(i);
   }
   return { lists: tmp.map((l) => Int32Array.from(l)), tilesX, tilesY };
 }
