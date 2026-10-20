@@ -229,6 +229,7 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
   }
 
   function showPreview(): void {
+    if (resultsStale) return; // the previous scan's model: run() shows this one's after the load
     const r = app.results;
     if (r.dense) {
       const v = ensureViewer();
@@ -264,7 +265,10 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
     cancelBtn.disabled = false;
     if (!(await app.ensureSessionLoaded(route.sessionId))) {
       running = false;
-      if (!closed) showError('Couldn’t open the scan', 'The stored data could not be loaded.', false);
+      if (closed) return;
+      // Stopped during the load: leave now (the failure was toasted), not at the 8 s fallback.
+      if (cancelling) finishProcessing(true);
+      else showError('Couldn’t open the scan', 'The stored data could not be loaded.', false);
       return;
     }
     if (closed) return;

@@ -16,7 +16,8 @@
  *   storage-write-error-capture  a non-quota write failure → capture pauses, not "Storage is full"
  *   engine-dead      EngineClient gave up (respawn cap) → error card, no toast storm
  *   export-reopen    export finishes while its sheet is closed → the reopened sheet shows Save
- *   open-other-session processing a stored scan after viewing another: no stale name / stages
+ *   open-other-session processing a stored scan after viewing another: no stale name / stages /
+ *                    preview
  *   focus            keyboard navigation moves focus to the new screen's heading
  *   raw-overlay      a RAW sensor buffer (landscape bitmap in the portrait UI: the headless fake
  *                    camera) gets its keypoint overlay turned onto the upright preview
@@ -37,7 +38,7 @@
  *                    denseResumableQuality): the resume uses that preset
  *   info-sheet       Model info: magnetic-north note for compass yaw, engine memory section
  *   processing-stop  Stop while the scan is still being opened, or after the running step already
- *                    finished: no further step starts
+ *                    finished: no further step starts; a load that fails after a Stop leaves at once
  *   open-failed      a scan that cannot be loaded after viewing another: "Back to home", not the
  *                    other scan's "Open model"
  *   viewer-loading   the viewer's tools do nothing while the opened scan loads (no sheet of the
@@ -397,7 +398,12 @@ await scenario('open-other-session', async () => {
   await page.waitForSelector('.processing');
   const early = await page.evaluate(() => document.querySelector('.processing .topbar-title')?.textContent);
   check(early !== 'Alpha vase', `processing never shows the previous scan's name (got "${early}")`);
+  const caption = () => page.evaluate(() => document.querySelector('.proc-preview-caption')?.textContent ?? '');
+  const earlyCaption = await caption();
   await page.waitForFunction(() => document.querySelector('.processing .topbar-title')?.textContent === 'Beta yard', null, { timeout: 15000 });
+  // Beta has no dense cloud: a "Dense cloud" preview is Alpha's.
+  const loadedCaption = await caption();
+  check(![earlyCaption, loadedCaption].some((c) => c.startsWith('Dense cloud')), `the preview never shows the previous scan's model (got "${earlyCaption}", then "${loadedCaption}")`);
   const st = await page.evaluate(() => ({
     depth: document.querySelector('[data-testid="stage-depth_maps"]')?.getAttribute('data-status'),
     sub: document.querySelector('.processing .topbar-sub')?.textContent,
@@ -789,6 +795,29 @@ await scenario('processing-stop', async () => {
   const started = (await steps(b.page)).join(', ');
   check(started === 'densify', `the mesh does not start after a Stop that the densify did not see (ran: ${started})`);
   await b.context.close();
+
+  // Stop while a load runs that then fails: leave when it fails (it is toasted), not at the 8 s fallback.
+  const c = await newPage();
+  await c.page.goto(`${base}?mock=1`);
+  await by(c.page, 'new-scan').waitFor();
+  await seedSession(c.page, { id: 'stop-broken', name: 'Stop shed', mode: 'scene', status: 'captured', stats: { quality: 'fast', keyframes: 20 } });
+  await c.page.reload();
+  await by(c.page, 'session-item').first().waitFor();
+  await c.page.evaluate(() => {
+    globalThis.__sfmApp.engine.loadSession = async () => {
+      await new Promise((r) => setTimeout(r, 2500));
+      throw new Error('Stored data is damaged');
+    };
+  });
+  await by(c.page, 'session-item').first().tap();
+  await c.page.waitForSelector('.processing');
+  await by(c.page, 'processing-cancel').tap();
+  await by(c.page, 'dialog-confirm').tap();
+  const t1 = Date.now();
+  await by(c.page, 'new-scan').waitFor({ timeout: 15000 });
+  const dt1 = Date.now() - t1;
+  check(dt1 < 6000, `a Stop during a load that fails leaves when it fails, not at the 8 s fallback (${(dt1 / 1000).toFixed(1)} s)`);
+  await c.context.close();
 });
 
 await scenario('open-failed', async () => {
