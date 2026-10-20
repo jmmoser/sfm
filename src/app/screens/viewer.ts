@@ -327,6 +327,9 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
         return { ok: false, sub: 'Nothing to export yet' };
       case 'colmap-zip':
         return r.sparse ? { ok: true, sub: `Cameras, sparse model and ${r.sparse.cameras.length} photos` } : { ok: false, sub: 'No sparse model yet' };
+      case 'ply-splat':
+        // not in EXPORTS yet (the splat UI adds it with the engine's `splat` result)
+        return { ok: false, sub: 'Train Gaussian splats first' };
     }
   }
 

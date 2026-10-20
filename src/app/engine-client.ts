@@ -44,6 +44,9 @@ import {
   type MeshOptions,
   type SessionSummary,
   type SparseResult,
+  type SplatModelPayload,
+  type SplatOptions,
+  type SplatResult,
 } from '../workers/protocol';
 
 // ---------------------------------------------------------------------------------------------
@@ -85,6 +88,13 @@ export interface EngineLike {
   refine(onProgress?: ProgressCallback): Promise<SparseResult>;
   densify(options?: DenseOptions, onProgress?: ProgressCallback): Promise<PointCloud>;
   mesh(options?: MeshOptions, onProgress?: ProgressCallback): Promise<TriangleMesh>;
+  /**
+   * Train Gaussian splats (long; progress stages SPLAT_STAGES, 'splat_training' events carry a
+   * SplatTrainingDetail in `detail`; cancel keeps a checkpoint: the next call resumes it).
+   */
+  splat(options?: SplatOptions, onProgress?: ProgressCallback): Promise<SplatResult>;
+  /** The stored splat model for the viewer (null when none). */
+  splatModel(): Promise<SplatModelPayload | null>;
   exportModel(format: ExportFormat): Promise<Blob>;
   loadSession(id: string, options?: Partial<EngineOptions>): Promise<SessionSummary>;
   /** Cancel the running long operation (it rejects with CancelledError). */
@@ -336,6 +346,14 @@ export class EngineClient implements EngineLike {
 
   mesh(options?: MeshOptions, onProgress?: ProgressCallback): Promise<TriangleMesh> {
     return this.call('mesh', options, { onProgress });
+  }
+
+  splat(options?: SplatOptions, onProgress?: ProgressCallback): Promise<SplatResult> {
+    return this.call('splat', options, { onProgress });
+  }
+
+  splatModel(): Promise<SplatModelPayload | null> {
+    return this.call('splatModel', undefined);
   }
 
   exportModel(format: ExportFormat): Promise<Blob> {
@@ -629,6 +647,7 @@ export class EngineClient implements EngineLike {
       case 'progress': {
         const pe: ProgressEvent = { stage: ev.stage, progress: ev.progress };
         if (ev.message !== undefined) pe.message = ev.message;
+        if (ev.detail) pe.detail = ev.detail;
         const targetId = ev.requestId ?? this.longOp;
         const p = targetId !== null && targetId !== undefined ? this.pending.get(targetId) : undefined;
         if (p) {

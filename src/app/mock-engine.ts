@@ -2,8 +2,8 @@
  * MockEngine: an in-page EngineLike for UI development and tests (`?mock=1`). It fakes the
  * live pipeline (keyframe decisions, tracking state, guidance, a growing sparse cloud and
  * camera trajectory, keypoint overlays that are projections of the scene into the current
- * mock camera), runs refine / densify / mesh as timed stages with progress, and returns REAL
- * PointCloud / TriangleMesh objects and export Blobs encoded with src/io.
+ * mock camera), runs refine / densify / mesh / splat as timed stages with progress, and returns
+ * REAL PointCloud / TriangleMesh / Gaussian-splat objects and export Blobs encoded with src/io.
  *
  * Time base: the mock trajectory advances with the frame timestamps (`FrameInput.t`) times
  * `speed`, so pauses in frame delivery pause the scan.
@@ -12,8 +12,11 @@ import type { MetricInfo, PointCloud, ProgressCallback, ProgressEvent, TriangleM
 import { createColmapZipBlob, encodeGLB, encodeMeshPLY, encodePLY, type ColmapModelInput } from '../io';
 import { SessionStore, type SessionMeta } from '../io/storage';
 import { Rng } from '../math/random';
+import { encodeSplatPLY } from '../splat/ply';
+import { SH_C0, allocSplatModel, logit, type SplatModel } from '../splat/types';
 import {
   ENGINE_ERRORS,
+  SPLAT_STAGES,
   namedError,
   type DenseOptions,
   type EngineOptions,
@@ -30,6 +33,9 @@ import {
   type SessionSummary,
   type SparseCamera,
   type SparseResult,
+  type SplatModelPayload,
+  type SplatOptions,
+  type SplatResult,
   type TrackingState,
 } from '../workers/protocol';
 import { ABORT_REASON_PREFIX, Emitter, type AbortOutcome, type EngineErrorInfo, type EngineLike, type EngineStatus } from './engine-client';
@@ -42,7 +48,7 @@ export interface MockEngineOptions {
   /** Session metadata source for loadSession (default: SessionStore.open()). */
   sessions?: () => Promise<SessionStore | null>;
   /** Make a method fail (tests / error UI). */
-  failOn?: Partial<Record<'init' | 'frame' | 'refine' | 'densify' | 'mesh' | 'export' | 'loadSession', string>>;
+  failOn?: Partial<Record<'init' | 'frame' | 'refine' | 'densify' | 'mesh' | 'splat' | 'export' | 'loadSession', string>>;
   /**
    * Make a long operation hang and IGNORE cancel (a stuck worker): it only ends through
    * `abortLongOperation` (simulated engine restart) or dispose. Tests the abort UI.
@@ -107,6 +113,9 @@ export class MockEngine implements EngineLike {
   private sparse: SparseResult | null = null;
   private denseCloud: PointCloud | null = null;
   private meshModel: TriangleMesh | null = null;
+  private splatOut: { model: SplatModel; info: SplatResult } | null = null;
+  /** A splat run was cancelled at this iteration: the next one resumes there (stats.splatResumableIteration). */
+  private splatResumable: number | null = null;
   private sessionId: string | null = null;
   private sessionName = 'Mock scan';
   private readonly live = new Emitter<LiveUpdate>();
@@ -188,6 +197,8 @@ export class MockEngine implements EngineLike {
     this.sparse = null;
     this.denseCloud = null;
     this.meshModel = null;
+    this.splatOut = null;
+    this.splatResumable = null;
     this.cancelled = false;
     this.memoryLimitHit = false;
     this.denseResumablePass = null;
@@ -480,6 +491,8 @@ export class MockEngine implements EngineLike {
       this.captureDone = true;
       this.denseResumablePass = null; // refine invalidates stored depth maps
       this.denseResumableQuality = null;
+      this.splatOut = null; // … and the splats
+      this.splatResumable = null;
       return this.sparse;
     });
   }
@@ -539,6 +552,95 @@ export class MockEngine implements EngineLike {
     });
   }
 
+  /**
+   * Like the real stage: 'splat_prepare' → 'splat_training' (progress `detail`: iteration,
+   * iterations, loss, itPerSec, gaussians) → 'splat_finishing'; a cancel keeps the iteration for
+   * a resume. The model: one isotropic Gaussian per point of the dense (else sparse) cloud.
+   */
+  splat(options?: SplatOptions, onProgress?: ProgressCallback): Promise<SplatResult> {
+    return this.longRun(async () => {
+      this.check('splat');
+      this.ensureScene();
+      if (!this.sparse) throw new Error('Run refine() first');
+      const q = options?.quality ?? this.options?.quality ?? 'balanced';
+      const iterations = options?.iterations ?? (q === 'fast' ? 3000 : q === 'max' ? 7000 : 5000);
+      const t0 = performance.now();
+      const emit = (e: ProgressEvent): void => {
+        try {
+          onProgress?.(e);
+        } catch (err) {
+          console.error(err);
+        }
+        this.progressE.emit(e);
+      };
+      await this.stage(SPLAT_STAGES.prepare, 700, onProgress, 'initial Gaussians');
+      const start = options?.restart ? 0 : (this.splatResumable ?? 0);
+      const ms = (2600 * (q === 'fast' ? 0.6 : q === 'max' ? 1.6 : 1)) / this.speed;
+      let elapsed = (ms * start) / iterations;
+      let it = start;
+      while (it < iterations) {
+        if (this.cancelled) {
+          this.splatResumable = it;
+          throw namedError(ENGINE_ERRORS.cancelled, 'Cancelled');
+        }
+        if (this.disposed) throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');
+        await sleep(80);
+        if (this.hidden) continue;
+        elapsed += 80;
+        it = Math.min(iterations, Math.round((iterations * elapsed) / ms));
+        const loss = 0.04 + 0.2 * Math.exp((-5 * it) / iterations);
+        emit({ stage: SPLAT_STAGES.training, progress: it / iterations, message: `iteration ${it}/${iterations}`, detail: { iteration: it, iterations, loss, itPerSec: Math.round((1000 * iterations) / ms), gaussians: 20_000 + Math.round(it * 10) } });
+      }
+      this.splatResumable = null;
+      // like the engine: a cancel arriving now is ignored (the training is complete)
+      emit({ stage: SPLAT_STAGES.finishing, progress: 0, message: 'saving' });
+      await sleep(300 / this.speed);
+      emit({ stage: SPLAT_STAGES.finishing, progress: 1 });
+      const model = this.mockSplats(this.denseCloud ?? this.sparse.points);
+      const info: SplatResult = {
+        count: model.count,
+        iterations,
+        ms: Math.round(performance.now() - t0),
+        shDegree: 0,
+        bytes: 56 * model.count,
+        antialiased: true,
+        stats: { splatViews: this.sparse.cameras.length, splatIterations: iterations, splatItPerSec: 40, ...(start ? { splatResumedFrom: start } : {}) },
+      };
+      this.splatOut = { model, info };
+      return info;
+    });
+  }
+
+  /** One isotropic Gaussian per point (σ from the point radius, else 0.4 % of the scene). */
+  private mockSplats(pc: PointCloud): SplatModel {
+    const n = Math.min(pc.count, 60_000);
+    const step = pc.count / n;
+    const m = allocSplatModel(n, 0);
+    const sigma = (this.scene?.scale ?? 1) * 0.004;
+    for (let i = 0; i < n; i++) {
+      const k = Math.floor(i * step);
+      m.means.set(pc.positions.subarray(3 * k, 3 * k + 3), 3 * i);
+      m.logScales.fill(Math.log(pc.radii?.[k] || sigma), 3 * i, 3 * i + 3);
+      m.opacities[i] = logit(0.8);
+      for (let c = 0; c < 3; c++) m.sh[3 * i + c] = (pc.colors[3 * k + c] / 255 - 0.5) / SH_C0;
+    }
+    return m;
+  }
+
+  async splatModel(): Promise<SplatModelPayload | null> {
+    await sleep(120 / this.speed);
+    const s = this.splatOut;
+    if (!s) return null;
+    const m = s.model;
+    // a copy, like the worker's fresh (transferred) arrays
+    return {
+      model: { ...m, means: m.means.slice(), logScales: m.logScales.slice(), quats: m.quats.slice(), opacities: m.opacities.slice(), sh: m.sh.slice() },
+      antialiased: true,
+      background: [0, 0, 0],
+      iterations: s.info.iterations,
+    };
+  }
+
   async exportModel(format: ExportFormat): Promise<Blob> {
     this.check('export');
     await sleep(350 / this.speed);
@@ -561,6 +663,11 @@ export class MockEngine implements EngineLike {
       }
       case 'colmap-zip':
         return this.colmapZip();
+      case 'ply-splat': {
+        if (!this.splatOut) throw new Error('Train Gaussian splats first');
+        const ply = encodeSplatPLY(this.splatOut.model, { comments: [`exported by sfm mock engine: ${name}`] });
+        return new Blob([ply as Uint8Array<ArrayBuffer>], { type: 'application/octet-stream' });
+      }
     }
   }
 
@@ -681,8 +788,10 @@ export class MockEngine implements EngineLike {
         sparse: this.sparse,
         dense: this.denseCloud,
         mesh: this.meshModel,
+        splat: this.splatOut?.info ?? null,
         stats: {
           ...(this.sparse?.stats ?? {}),
+          ...(this.splatResumable !== null ? { splatResumableIteration: this.splatResumable } : {}),
           ...(this.denseResumablePass !== null ? { denseResumablePass: this.denseResumablePass } : {}),
           ...(this.denseResumablePass !== null && this.denseResumableQuality ? { denseResumableQuality: this.denseResumableQuality } : {}),
         },
@@ -745,6 +854,8 @@ export class MockEngine implements EngineLike {
     this.sparse = null;
     this.denseCloud = null;
     this.meshModel = null;
+    this.splatOut = null;
+    this.splatResumable = null;
     this.denseResumablePass = null;
     this.denseResumableQuality = null;
   }

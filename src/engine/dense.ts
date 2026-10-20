@@ -409,10 +409,7 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
       const tl = now();
       perf.decodes++;
       const g = geomById.get(id)!;
-      const stored = await deps.store.getFrameImage(id);
-      if (!stored) throw new Error(`keyframe image ${id} missing`);
-      const rgba = await decodeStoredImage(stored, g.cam.width, g.cam.height);
-      const und = denseViewImage(rgba, g.distorted, maxSize, model, id);
+      const und = await loadDenseViewImage(deps.store, model, id, g.distorted, maxSize);
       const view: DenseView = { id, cam: und.cam, pose: g.pose, image: und.image };
       if (!colour.has(id)) {
         // colour thumbnail of the SAME (rolling-shutter corrected) image: fusion / TSDF sample it
@@ -435,10 +432,7 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
       const tl = now();
       perf.decodes++;
       const g = geomById.get(id)!;
-      const stored = await deps.store.getFrameImage(id);
-      if (!stored) throw new Error(`keyframe image ${id} missing`);
-      const hc = undistortedCamera(g.distorted, halfSize);
-      const und = denseViewImage(await decodeStoredImage(stored, hc.width, hc.height), g.distorted, halfSize, model, id);
+      const und = await loadDenseViewImage(deps.store, model, id, g.distorted, halfSize);
       perf.load += now() - tl;
       return { id, cam: und.cam, pose: g.pose, image: und.image };
     });
@@ -719,6 +713,17 @@ export function denseViewImage(rgba: RGBAImage, distorted: CameraIntrinsics, max
   const rs = model.rollingShutter;
   const w = rs ? rs.omega[id] : undefined;
   return { cam: und.cam, image: rs && w ? rsCorrectPinholeImage(und.image, und.cam, w, rs, rs.nu?.[id] ?? null) : und.image };
+}
+
+/**
+ * A stored keyframe as a dense view image: decoded at the undistorted size, undistorted and
+ * rolling-shutter corrected (`denseViewImage`) — the views of PatchMatch and of the splat stage.
+ */
+export async function loadDenseViewImage(store: EngineStore, model: SparseModel, id: number, distorted: CameraIntrinsics, maxSize: number): Promise<{ image: RGBAImage; cam: CameraIntrinsics }> {
+  const stored = await store.getFrameImage(id);
+  if (!stored) throw new Error(`keyframe image ${id} missing`);
+  const c = undistortedCamera(distorted, maxSize);
+  return denseViewImage(await decodeStoredImage(stored, c.width, c.height), distorted, maxSize, model, id);
 }
 
 export interface MeshDeps {

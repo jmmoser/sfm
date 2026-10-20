@@ -205,6 +205,42 @@ describe('MockEngine', () => {
     expect(sum.stats.yawSource).toBe('compass');
   });
 
+  it('splat: prepare → training (detail) → finishing; a cancel is resumable; model and ply-splat export', async () => {
+    const e = new MockEngine({ speed: 2, sessions: async () => null });
+    await e.init({ mode: 'object', quality: 'fast', sessionId: 's1' });
+    for (let i = 0; i < 40; i++) await e.processFrame(frame(100 + i * 400));
+    await e.refine();
+    await expect(e.splatModel()).resolves.toBeNull();
+    let cancelAt = 0;
+    const s = e.splat(undefined, (p) => {
+      if (p.stage === 'splat_training' && p.detail && p.detail.iteration > 500 && !cancelAt) {
+        cancelAt = p.detail.iteration;
+        e.cancel();
+      }
+    });
+    await expect(s).rejects.toMatchObject({ name: 'CancelledError' });
+    expect((await e.loadSession('s1')).stats.splatResumableIteration).toBe(cancelAt);
+    const stages: string[] = [];
+    const details: Record<string, number>[] = [];
+    const info = await e.splat(undefined, (p) => {
+      if (!stages.includes(p.stage)) stages.push(p.stage);
+      if (p.detail) details.push(p.detail);
+    });
+    expect(stages).toEqual(['splat_prepare', 'splat_training', 'splat_finishing']);
+    expect(details[0].iteration).toBeGreaterThanOrEqual(cancelAt);
+    expect(details[details.length - 1]).toMatchObject({ iteration: 3000, iterations: 3000 });
+    expect(info).toMatchObject({ iterations: 3000, shDegree: 0, antialiased: true });
+    expect(info.stats.splatResumedFrom).toBe(cancelAt);
+    const payload = await e.splatModel();
+    expect(payload?.model.count).toBe(info.count);
+    expect((await e.loadSession('s1')).splat?.count).toBe(info.count);
+    const ply = new TextDecoder().decode(new Uint8Array(await (await e.exportModel('ply-splat')).arrayBuffer()).subarray(0, 400));
+    expect(ply).toContain(`element vertex ${info.count}`);
+    expect(ply).toContain('property float f_dc_0');
+    await e.refine(); // new poses: the splats are gone
+    await expect(e.splatModel()).resolves.toBeNull();
+  });
+
   it('failOn makes a method fail (error UI)', async () => {
     const e = new MockEngine({ speed: 50, failOn: { refine: 'out of memory' }, sessions: async () => null });
     await e.init({ mode: 'object', quality: 'fast' });

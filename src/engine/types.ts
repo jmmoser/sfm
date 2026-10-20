@@ -14,9 +14,10 @@ import type { KeyframeSelectorOptions } from '../sfm/keyframes';
 import type { RollingShutterDevice, RollingShutterEstimateOptions } from '../sfm/rolling-shutter';
 import type { LiveMapperOptions } from '../sfm/live';
 import type { MapperOptions } from '../sfm/mapper';
+import type { SplatTrainer, SplatTrainerOptions } from '../splat/trainer';
 import type { LiveUpdate, LogLevel, SparseCamera, SparseResult } from '../workers/protocol';
 import type { EngineStore } from './persistence';
-import type { DensePresetConfig } from './presets';
+import type { DensePresetConfig, SplatPresetConfig } from './presets';
 
 /**
  * `SparseCamera` plus the capture time and the source frame index (FrameInput.index, or the
@@ -80,6 +81,14 @@ export interface EngineConfig {
   vocabulary?: { trainAfter?: number; words?: number; refineWords?: number };
   /** Dense preset overrides. */
   dense?: Partial<DensePresetConfig>;
+  /**
+   * Splat stage overrides: preset fields (iterations, maxGaussians, maxImageSize, maxViews,
+   * denseInitFraction, shellCount, shDegree, checkpointEvery, chunk) and `trainer` options passed
+   * to SplatTrainer (learning rates, MCMC, colour correction, seed, inFlight, …).
+   */
+  splat?: Partial<SplatPresetConfig> & { trainer?: Partial<SplatTrainerOptions> };
+  /** TEST-ONLY (inline engine; functions do not cross the worker boundary): called with every trainer the splat stage creates. */
+  splatDebug?: { onTrainer?(trainer: SplatTrainer): void };
   /**
    * Diagnostics: time the PatchMatch compute passes with GPU timestamp queries (when the adapter
    * has 'timestamp-query'); the dense timing log then reports GPU time. Default false.

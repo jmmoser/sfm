@@ -5,9 +5,10 @@
  *  - `init` creates a new engine (the previous one is disposed; its feature pipeline is reused
  *    when the SIFT configuration matches, so a new scan does not recompile the GPU pipelines).
  *    `loadSession` works without `init` (an engine is created from the stored session).
- *  - Long operations (finishCapture / refine / densify / mesh / export / loadSession) report
- *    `progress` events with their `requestId` (throttled) and are cancelled by `cancel`
- *    (target = request id, default: the running long operation).
+ *  - Long operations (finishCapture / refine / densify / mesh / splat / export / loadSession)
+ *    report `progress` events with their `requestId` (throttled; `detail` passed through) and are
+ *    cancelled by `cancel` (target = request id, default: the running long operation).
+ *  - `splatModel`: the stored splat model, decoded into fresh arrays and transferred.
  *  - Engine `live` events (background keyframe mapping) and `log` / non-fatal `error` events are
  *    forwarded. Frame responses are NOT repeated as `live` events.
  *  - Results are posted with transfer lists (collectTransferables). Results the engine keeps
@@ -41,6 +42,7 @@ import {
   type FrameInput,
   type LogLevel,
   type MeshOptions,
+  type SplatOptions,
   type WorkerToMainMessage,
 } from './protocol';
 
@@ -145,6 +147,7 @@ function progressFor(id: number): (p: ProgressEvent) => void {
     lastStage = p.stage;
     const ev: EngineEvent = { type: 'progress', requestId: id, stage: p.stage, progress: p.progress };
     if (p.message !== undefined) ev.message = p.message;
+    if (p.detail) ev.detail = { ...p.detail };
     postEvent(ev);
   };
 }
@@ -212,6 +215,16 @@ async function dispatch(req: EngineRequest): Promise<{ result: unknown; transfer
       const persistent = !!e.engineStore?.persistent;
       if (persistent) e.releaseResultMemory('mesh');
       return { result: m, transfer: persistent };
+    }
+    case 'splat': {
+      const e = requireEngine();
+      // small info object (the model stays in the store: splatModel)
+      return { result: await longOp(req.id, (p, c) => e.splat(req.params as SplatOptions | undefined, p, c)), transfer: false };
+    }
+    case 'splatModel': {
+      const e = requireEngine();
+      // decoded from the store into fresh arrays: transfer them
+      return { result: await e.splatModel(), transfer: true };
     }
     case 'export': {
       const e = requireEngine();

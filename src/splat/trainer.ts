@@ -826,16 +826,22 @@ export class SplatTrainer {
   }
 
   /**
-   * Continues a checkpoint: call after `init(params, views)` with the checkpoint's parameters as
-   * the model (same views, same options). Writes the Adam moments (zero when absent), colour
-   * state and background, and sets the iteration (schedules, Adam bias correction). The view order
-   * and the MCMC sampling restart from a seed derived from the iteration.
+   * Continues a checkpoint: after `init(params, views)` with the checkpoint's parameters as the
+   * model, or on a running trainer with `params` (rolls it back in place: the view images stay).
+   * Same views and options. Writes the Adam moments (zero when absent), colour state and
+   * background, and sets the iteration (schedules, Adam bias correction). The view order and the
+   * MCMC sampling restart from a seed derived from the iteration.
    */
-  restore(state: SplatTrainerState, moments?: { m: SplatModel; v: SplatModel } | null): void {
+  restore(state: SplatTrainerState, moments?: { m: SplatModel; v: SplatModel } | null, params?: SplatModel): void {
     if (!this.initialised) throw new Error('SplatTrainer: init first');
+    const d = this.device;
+    if (params) {
+      if (params.count > this.capacity || params.shDegree !== this.shDegree) throw new Error('SplatTrainer.restore: parameters do not fit the trainer');
+      d.queue.writeBuffer(this.params, 0, packParams(params, this.capacity));
+      this.count = params.count;
+    }
     if (state.count !== this.count) throw new Error(`SplatTrainer.restore: state has ${state.count} Gaussians, the model ${this.count}`);
     if (state.colour.length !== this.views.length * COLOUR_FLOATS) throw new Error('SplatTrainer.restore: colour state does not match the views');
-    const d = this.device;
     if (moments) {
       for (const [mm, buf] of [
         [moments.m, this.adamM],
