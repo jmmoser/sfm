@@ -151,6 +151,7 @@ export function patchMatchCPU(
   // colour distance = mean absolute RGB difference in grey levels (0..255)
   const colorCoef = 1 / (3 * 2 * o.sigmaColor * o.sigmaColor);
   const NP = offs.length;
+  const affine = o.affineWindow;
   const offLo = offs[0];
   const offHi = offs[NP - 1];
   const offStep = o.patchStep;
@@ -257,6 +258,70 @@ export function patchMatchCPU(
     let sws = 0;
     let swss = 0;
     let swrs = 0;
+    if (affine) {
+      // window centre's Jacobian (the WGSL affine path); the projective depth must still be
+      // positive at the 4 corners (the GPU's zmin test)
+      if (!(hz + offLo * H6 + offLo * H7 > 1e-9 && hz + offHi * H6 + offLo * H7 > 1e-9 && hz + offLo * H6 + offHi * H7 > 1e-9 && hz + offHi * H6 + offHi * H7 > 1e-9)) {
+        return COST_MAX;
+      }
+      const iz = 1 / hz;
+      const jux = (H0 - cu * H6) * iz;
+      const juy = (H3 - cv * H6) * iz;
+      const jvx = (H1 - cu * H7) * iz;
+      const jvy = (H4 - cv * H7) * iz;
+      // affine ⇒ the window is inside when its 4 corners are
+      let inA = true;
+      for (let c = 0; c < 4 && inA; c++) {
+        const dx = c & 1 ? offHi : offLo;
+        const dy = c & 2 ? offHi : offLo;
+        const u = cu + dx * jux + dy * jvx;
+        const v = cv + dx * juy + dy * jvy;
+        inA = u >= 0 && u < wm1 - 1e-6 && v >= 0 && v < hm1 - 1e-6;
+      }
+      let k = 0;
+      for (let a = 0; a < NP; a++) {
+        const dy = offLo + a * offStep;
+        let u = cu + offLo * jux + dy * jvx;
+        let v = cv + offLo * juy + dy * jvy;
+        for (let b = 0; b < NP; b++, k++) {
+          let uu = u;
+          let vv = v;
+          u += offStep * jux;
+          v += offStep * juy;
+          let x1 = 1;
+          let y1 = w;
+          if (!inA) {
+            uu = uu < 0 ? 0 : uu > wm1 ? wm1 : uu;
+            vv = vv < 0 ? 0 : vv > hm1 ? hm1 : vv;
+            if ((uu | 0) >= wm1) x1 = 0;
+            if ((vv | 0) >= hm1) y1 = 0;
+          }
+          const x0 = uu | 0;
+          const y0 = vv | 0;
+          const fx = uu - x0;
+          const fy = vv - y0;
+          const r0 = y0 * w + x0;
+          const r1 = r0 + y1;
+          const ia = img[r0];
+          const ib = img[r0 + x1];
+          const ic = img[r1];
+          const id = img[r1 + x1];
+          const top = ia + (ib - ia) * fx;
+          const val = top + (ic + (id - ic) * fx - top) * fy;
+          const wt = wk[k];
+          sws += wt * val;
+          swss += wt * val * val;
+          swrs += wrk[k] * val;
+        }
+      }
+      const ms = sws * invSumW;
+      const vs = swss * invSumW - ms * ms;
+      if (vs < minVar) return COST_MAX;
+      const cov = swrs * invSumW - refMean * ms;
+      const ncc = cov / Math.sqrt(refVar * vs);
+      const c = 1 - ncc;
+      return c < 0 ? 0 : c > COST_MAX ? COST_MAX : c;
+    }
     // Fast path: if the 4 window corners project strictly inside the image (and in
     // front of the camera) every sample does (projective maps preserve convexity),
     // so no clamping is needed and the window is walked incrementally.

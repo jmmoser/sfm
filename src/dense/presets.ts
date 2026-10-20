@@ -18,6 +18,14 @@
  * The defaults of the individual functions (`DEFAULT_FUSION_OPTIONS`, …) are unchanged for
  * compatibility (existing tests pin them); these presets are the tuned combination.
  *
+ * Multi-scale (2026-10, real GPU): ½-resolution photometric (`iterations`) → full-resolution
+ * prior-initialised photometric (`fullResIterations` 2) → geometric, run by the engine
+ * (src/engine/dense.ts). GT-pose harness at 800 px / 40 views (fast), M4: quality-neutral
+ * (object F 0.9992 → 0.9990, yard 0.6184 → 0.6190) at 1.2–1.5× less GPU time; ARCHITECTURE §6
+ * "Dense on a real GPU". The cheaper kernel (`patchRadius` 6 / `patchStep` 3, `affineWindow`,
+ * 3 proposals) halves the GPU time again but costs yard completeness (e2e yard-real F −0.75 pt),
+ * so the presets keep the 11 px / 36-sample window.
+ *
  * Evidence (480 px, GT poses; P / C at τ): fusion `minViews` 2 + halo filter + normal 15°
  * took object 0.9991 / 0.960 → 0.9996 / 0.988 and yard 0.9885 / 0.231 → 0.979 / 0.347;
  * `depthMarginMin` 0.5 (yard near ground) → yard 0.981 / 0.352; the sky test of the halo filter
@@ -88,7 +96,7 @@ export const DENSE_PRESETS: Readonly<Record<DenseQuality, Readonly<DensePreset>>
     iterations: 4,
     geometricPasses: 1,
     geometricIterations: 2,
-    multiScale: false,
+    multiScale: true,
     fullResIterations: 2,
     cpuMaxImageSize: 320,
     fusionMinViewsObject: 2,
@@ -108,7 +116,7 @@ export const DENSE_PRESETS: Readonly<Record<DenseQuality, Readonly<DensePreset>>
     iterations: 6,
     geometricPasses: 1,
     geometricIterations: 3,
-    multiScale: false,
+    multiScale: true,
     fullResIterations: 2,
     cpuMaxImageSize: 400,
     fusionMinViewsObject: 2,
@@ -128,7 +136,7 @@ export const DENSE_PRESETS: Readonly<Record<DenseQuality, Readonly<DensePreset>>
     iterations: 6,
     geometricPasses: 1,
     geometricIterations: 3,
-    multiScale: false,
+    multiScale: true,
     fullResIterations: 2,
     cpuMaxImageSize: 480,
     fusionMinViewsObject: 2,

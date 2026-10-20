@@ -231,7 +231,8 @@ Metrics (printed as a table and written to `metrics.json`):
     refined point-to-plane with the sample normal. Reported as median and p90.
   * Precision is the fraction of points within τ.
   * Completeness is the fraction of visible GT samples with a result point within τ.
-    It uses the focus set when present, otherwise the base set inside the ROI.
+    It uses the focus set when present, otherwise the base set inside the ROI, and every result point
+    (accuracy / precision use at most `--max-points`, default 3 M, read with a stride).
   * F-score combines precision and completeness.
   * τ defaults to `meta.denseTau`: 1 % of `sceneExtent` for object (about 1.35 cm), 0.1 m for yard.
 
@@ -529,6 +530,50 @@ GPU path (default `featureBackend`, WebGPU SIFT + matcher in the worker; object 
 88/88 registered, ATE 2.0e-4, rotation 0.039°, focal +0.06 %, scale +0.86 %, gravity 0.035°, heading
 −0.99°, principal point 0.20 px — the same accuracy class, but 25 s per frame and 1.5 s per refine pair
 on SwiftShader (capture 38 min, refine 24 min).
+
+### Dense on the real GPU (2026-10, M4 Metal, worker engine)
+
+```sh
+E2E_GPU=host node e2e/run-e2e.mjs object-real --engine worker [--quality balanced] --tag dense-after-fast \
+     --set 'engineConfig={"denseGpuTimestamps":true}'
+```
+
+Every frame, IMU + compass (+ GPS for yard), GPU features, dense at the preset size (fast: 40 views at 800 px;
+balanced: 80 views at 960 px = the datasets' size, fusion step 2). "before" = the code before the dense work
+(+ the stage timing log and GPU timestamps), "after" = footprint-adaptive point cap, multi-scale passes,
+GPU-resident PatchMatch data flow (upload caches, GPU finalisation / prior, 12 B/px readback), native float16,
+serpentine passes, image LRU up to every view (ARCHITECTURE §6 "Dense on a real GPU"). Each before / after pair ran
+back to back (host load 4–8, other agents' GPU jobs running: GPU-pass wall time is 1.2–1.6× the timestamped GPU
+time; exception: the object-real fast "before" ran at load 18–23 while a unit-test run overlapped, so that pair's
+times favour "after"). densify = depth maps + fusion; GPU = PatchMatch execution time from timestamp queries.
+
+| run | densify s | depth maps s (view loads / PatchMatch / halo / store) | GPU s | fusion s (fuse / cap) | points | dense P / C / F | acc p50 / p90 | checks |
+|---|---|---|---|---|---|---|---|---|
+| object-real fast, before | 60.7 | 47.3 (12.7 / 17.2 / 9.7 / 6.4) | 7.8 | 12.3 (10.7 / 1.2) | 3.29 M → 0.57 M | 0.9981 / 0.9966 / 0.9973 | 0.44 / 1.8 mm | pass |
+| object-real fast, after | 51.1 | 37.7 (7.5 / 14.8 / 9.9 / 4.1) | 6.6 | 12.2 (9.6 / 2.4) | 3.34 M → 1.76 M | 0.9995 / 0.9968 / 0.9982 | 0.29 / 0.99 mm | pass |
+| yard-real fast, before | 47.4 | 38.1 (10.4 / 14.5 / 6.0 / 5.7) | 5.5 | 8.3 (7.4 / 0.7) | 4.07 M → 0.75 M | 0.803 / 0.408 / 0.541 | 25 / 175 mm | **FAIL** acc p50 |
+| yard-real fast, after | 36.4 | 26.8 (6.3 / 10.6 / 5.6 / 3.2) | 4.7 | 8.8 (6.6 / 1.9) | 4.12 M → 1.83 M | 0.935 / 0.397 / 0.557 | 8.8 / 62 mm | pass |
+| object-real balanced, before | 181.0 | 154.9 (35.7 / 76.7 / 23.0 / 15.8) | 47.8 | 24.8 (21.6 / 2.7) | 4.82 M → 1.43 M | 0.9987 / 0.9989 / 0.9988 | 0.37 / 1.4 mm | pass |
+| object-real balanced, after | 148.3 | 122.2 (22.6 / 61.6 / 23.6 / 10.2) | 39.8 | 24.7 (20.2 / 3.9) | 4.86 M → 3.54 M | 0.9995 / 0.9989 / 0.9992 | 0.28 / 0.87 mm | pass |
+| yard-real balanced, before | 148.6 | 127.8 (29.5 / 64.2 / 14.9 / 15.7) | 36.2 | 19.7 (17.3 / 1.8) | 6.30 M → 2.27 M | 0.898 / 0.493 / 0.636 | 14 / 102 mm | pass |
+| yard-real balanced, after | 125.9 | 105.0 (23.9 / 52.1 / 15.2 / 10.0) | 31.0 | 19.7 (16.1 / 3.0) | 6.33 M → 3.55 M | 0.953 / 0.483 / 0.641 | 7.3 / 49 mm | pass |
+
+The after-balanced clouds (> 3 M points) are scored with the completeness fix below (the harness's own table printed
+C 0.9986 / 0.433 from every 2nd point). Cap lifted (`--set 'engineConfig={"dense":{"maxPoints":30000000}}'`, after):
+object-real fast (3.29 M points) 0.28 / 0.86 mm, P 0.9998, C 0.9969; yard-real fast (4.07 M) P 0.945, C 0.405, F 0.567,
+p50 8.3 mm; yard-real balanced (6.3 M) P 0.962, C 0.494, F 0.653, p50 7.1 mm (completeness on every point).
+
+* The yard-real `denseAccuracyMedian` check (≤ 20 mm) failed at `fast` only because of the global-voxel point cap
+  (25 mm); it passes with the footprint LOD (8.8 mm; 8.0 mm in a second run).
+* Kernel diet (`--set 'engineConfig={"dense":{"patchMatch":{"patchRadius":6,"patchStep":3,"affineWindow":true,"numSamplesPerIter":3}}}'`,
+  fast, with multi-scale): GPU object-real 7.2 → 3.9 s, yard-real 6.3 → 3.1 s; yard-real P / C / F 0.942 / 0.401 /
+  0.563 → 0.932 / 0.396 / 0.555, p50 8.0 → 9.8 mm; object-real p50 / p90 0.29 / 0.98 → 0.32 / 1.1 mm, C 0.9969 →
+  0.9981. Balanced yard-real: GPU 31.0 → 15.4 s, depth maps 105.0 → 87.3 s, densify 125.9 → 111.2 s, P / C / F
+  0.953 / 0.483 / 0.641 → 0.946 / 0.483 / 0.639, p50 7.3 → 7.8 mm. Not in the presets (a quality cost at fast,
+  within ~1 pt of precision at balanced: a candidate for balanced / max after an on-device check).
+* `metrics-core` scores completeness on every ROI point now; accuracy and precision still use a ≤ `maxPoints`
+  (3 M) strided subsample. Clouds above 3 M points only appear with the new point cap at balanced / max (the global
+  voxel kept ≤ 2.3 M).
 
 ### Real-capture baselines (2026-10, sparse, CPU features, worker engine)
 

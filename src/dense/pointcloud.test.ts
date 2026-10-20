@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { PointCloud } from '../core/types';
 import { Rng } from '../math/random';
 import { KdTree3 } from './kdtree';
-import { filterPointCloud, statisticalOutlierMask, voxelDownsample } from './pointcloud';
+import { filterPointCloud, footprintDownsample, statisticalOutlierMask, voxelDownsample } from './pointcloud';
 
 const log = (...a: unknown[]): void => console.log('[pointcloud]', ...a);
 
@@ -142,6 +142,67 @@ describe('filterPointCloud', () => {
     // why the adaptive mode exists: plain SOR removes far-wall points and keeps the outliers
     expect(count(plain.keep, nNear, nIn)).toBeGreaterThan(0.05 * 2500);
     expect(count(plain.keep, nIn, pts.length)).toBeLessThan(50);
+  });
+
+  it('footprint LOD keeps a close-range object at its own resolution under the point cap', () => {
+    const rng = new Rng(5);
+    const pts: number[][] = [];
+    const radii: number[] = [];
+    // close-range object: sphere r = 5 cm at 0.5 m, ~1 mm spacing (radius 0.7 mm)
+    const nObj = 30_000;
+    for (let i = 0; i < nObj; i++) {
+      const u = 2 * rng.next() - 1;
+      const a = 2 * Math.PI * rng.next();
+      const s = Math.sqrt(1 - u * u);
+      pts.push([0.05 * s * Math.cos(a), 0.05 * s * Math.sin(a), 0.5 + 0.05 * u]);
+      radii.push(0.0007);
+    }
+    // background: wall at 3 m, 6 mm spacing (radius 4 mm), 6 m × 0.6 m
+    for (let i = 0; i < 1000; i++) for (let j = 0; j < 100; j++) {
+      pts.push([-3 + 0.006 * i, -0.3 + 0.006 * j, 3]);
+      radii.push(0.004);
+    }
+    const pc = cloud(pts, radii);
+    const cap = 60_000;
+    const t0 = performance.now();
+    const lod = footprintDownsample(pc, cap);
+    const ms = performance.now() - t0;
+    // the old rule: one voxel from the median radius (the wall's) for the same cap
+    const uni = voxelDownsample(pc, 2 * 0.004 * Math.sqrt(pc.count / cap));
+    const near = (c: PointCloud): number => {
+      let k = 0;
+      for (let i = 0; i < c.count; i++) if (c.positions[3 * i + 2] < 1) k++;
+      return k;
+    };
+    // distance of the merged object points from the sphere
+    const sphereErr = (c: PointCloud): number => {
+      const e: number[] = [];
+      for (let i = 0; i < c.count; i++) {
+        const z = c.positions[3 * i + 2];
+        if (z >= 1) continue;
+        e.push(Math.abs(Math.hypot(c.positions[3 * i], c.positions[3 * i + 1], z - 0.5) - 0.05));
+      }
+      e.sort((a, b) => a - b);
+      return e[Math.floor(0.9 * e.length)];
+    };
+    log(
+      `LOD ${pc.count} → ${lod.count} (cap ${cap}, ${ms.toFixed(0)} ms): object ${near(lod)}/${nObj} points, p90 off-surface ${(1000 * sphereErr(lod)).toFixed(2)} mm; ` +
+        `uniform voxel → ${uni.count}: object ${near(uni)}, p90 ${(1000 * sphereErr(uni)).toFixed(2)} mm`,
+    );
+    expect(lod.count).toBeLessThanOrEqual(cap);
+    expect(lod.count).toBeGreaterThan(0.85 * cap);
+    // both surfaces lose a similar share; the object keeps far more points than with one voxel
+    expect(near(lod)).toBeGreaterThan(0.3 * nObj);
+    expect(near(lod)).toBeGreaterThan(5 * near(uni));
+    expect(sphereErr(lod)).toBeLessThan(0.0005);
+    expect(lod.radii!.every((r) => r >= 0.0007)).toBe(true);
+    // under the cap: unchanged
+    expect(footprintDownsample(pc, pc.count)).toBe(pc);
+    // no radii: uniform searched voxel, still under the cap
+    const noR = cloud(pts);
+    const u2 = footprintDownsample(noR, cap);
+    expect(u2.count).toBeLessThanOrEqual(cap);
+    expect(u2.count).toBeGreaterThan(0.5 * cap);
   });
 
   it('timing: 1M points voxel + SOR', () => {

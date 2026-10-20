@@ -5,14 +5,18 @@
  * Bindings (group 0, explicit layout in patchmatch-gpu.ts):
  *   0  uniform Params (dynamic offset: ring of 256-byte blocks, one per submission)
  *   1  uniform Cams   (16 × SrcCam)
- *   2  texture_2d<f32>       refTex   rgba8unorm, rgb = colour, a = Rec.709 grey
- *   3  texture_2d_array<f32> srcTex   r8unorm grey, one layer per source (linear filtering)
+ *   2  texture_2d<f32>       refTex   rgba8unorm reference image (rgb; the Rec.709 grey is derived in `loadRef`)
+ *   3  texture_2d_array<f32> srcTex   r8unorm grey images (linear filtering); source s reads layer `cams.c[s].b.w`
  *   4  sampler (linear, clamp-to-edge)
- *   5  texture_2d_array<f32> srcDepth r32float source depth maps (geometric mode; textureLoad only)
+ *   5  texture_2d_array<f32> srcDepth r32float source depth maps (geometric mode; textureLoad only); layer `cams.c[s].M0.w`
  *   6  storage rw planes : array<vec4f>  (nx, ny, nz, z) per pixel
- *   7  storage rw costs  : array<f32>    total cost (photometric + geometric) used for propagation
- *   8  storage rw photo  : array<f32>    photometric cost (output)
- *   9  storage rw views  : array<u32>    selected-view bit mask
+ *   7  storage rw costs  : array<f32>    total cost (photometric + geometric) used for propagation;
+ *                                       after `finalize`: output depth (0 = invalid); before
+ *                                       `priorPlanes`: the prior's depth (priorW × priorH)
+ *   8  storage rw photo  : array<f32>    photometric cost (output); before `priorPlanes`: the
+ *                                       prior normal's octahedral x
+ *   9  storage rw views  : array<u32>    selected-view bit mask; after `finalize`: octahedral
+ *                                       normal (pack2x16snorm); before `priorPlanes`: octahedral y (f32 bits)
  *   10 storage rw status : array<u32>    [0] = number of executed dispatches (dropped-work sentinel)
  *
  * Portability / Safari: core WebGPU only, workgroup 8×8, no workgroup memory,
@@ -27,6 +31,8 @@ export interface PatchMatchShaderConfig {
   maxSources: number;
   patchRadius: number;
   patchStep: number;
+  /** Affine window warp (`PatchMatchOptions.affineWindow`): Jacobian at the window centre, no divide per sample. */
+  affine?: boolean;
 }
 
 /** Byte size of the Params uniform block (must match the struct below). */
@@ -78,7 +84,7 @@ const f = (v: number): string => {
  *  f32: f, cx, cy, invF, zMin, zMax, invZMin, invZMax,
  *       tauGood, badCost, pert, npert, lambda, tau, colorCoef, minVar,
  *  u32: topK, numProposals, usePrior, geo,
- *  f32: spatialCoef, pad, pad, pad
+ *  f32: spatialCoef, maxCost; u32: priorW, priorH
  */
 export function patchMatchWGSL(cfg: PatchMatchShaderConfig): string {
   const offs: number[] = [];
@@ -121,7 +127,29 @@ export function patchMatchWGSL(cfg: PatchMatchShaderConfig): string {
 
   // ---- warped source window ----
   let sampleBody: string;
-  if (unroll) {
+  // Affine: the window centre's Jacobian ju / jv (texture units per pixel offset) replaces the
+  // projective divide per sample; clamping to [0, size − 1] px is the same as the projective path.
+  const affineSetup = `  let ic = 1.0 / h.z;
+  let ju = (hu.xy - c * hu.z) * ic * isz;
+  let jv = (hv.xy - c * hv.z) * ic * isz;
+  let b0 = (c + 0.5) * isz;
+  let lo2 = 0.5 * isz;
+  let hi2 = (sz + 0.5) * isz;`;
+  if (unroll && cfg.affine) {
+    const lines: string[] = [];
+    let k = 0;
+    for (const dy of offs) {
+      lines.push(`  br = b0 + ${f(dy)} * jv;`);
+      for (const dx of offs) {
+        lines.push(
+          `  v = textureSampleLevel(srcTex, samp, clamp(br + ${f(dx)} * ju, lo2, hi2), layer, 0.0).r; ` +
+            `sws += wk[${k}] * v; swss += wk[${k}] * v * v; swrs += wrk[${k}] * v;`,
+        );
+        k++;
+      }
+    }
+    sampleBody = `${affineSetup}\n  var br: vec2f;\n  var v: f32;\n${lines.join('\n')}`;
+  } else if (unroll) {
     const lines: string[] = [];
     let k = 0;
     for (const dy of offs) {
@@ -135,6 +163,17 @@ export function patchMatchWGSL(cfg: PatchMatchShaderConfig): string {
       }
     }
     sampleBody = `  var hr: vec3f;\n  var q: vec3f;\n  var v: f32;\n${lines.join('\n')}`;
+  } else if (cfg.affine) {
+    sampleBody = `${affineSetup}
+  var k = 0u;
+  for (var a = 0u; a < ${np}u; a++) {
+    let br = b0 + f32(i32(a) * ${cfg.patchStep} - ${cfg.patchRadius}) * jv;
+    for (var b = 0u; b < ${np}u; b++) {
+      let v = textureSampleLevel(srcTex, samp, clamp(br + f32(i32(b) * ${cfg.patchStep} - ${cfg.patchRadius}) * ju, lo2, hi2), layer, 0.0).r;
+      sws += wk[k] * v; swss += wk[k] * v * v; swrs += wrk[k] * v;
+      k++;
+    }
+  }`;
   } else {
     sampleBody = `  var k = 0u;
   for (var a = 0u; a < ${np}u; a++) {
@@ -180,7 +219,7 @@ struct Params {
   tauGood: f32, badCost: f32, pert: f32, npert: f32,
   lambda: f32, tau: f32, colorCoef: f32, minVar: f32,
   topK: u32, numProposals: u32, usePrior: u32, geo: u32,
-  spatialCoef: f32, pad0: f32, pad1: f32, pad2: f32,
+  spatialCoef: f32, maxCost: f32, priorW: u32, priorH: u32,
 };
 
 struct SrcCam {
@@ -239,9 +278,11 @@ fn randomNormal(ray: vec3f) -> vec3f {
   return n;
 }
 
+// Reference texel: rgb + the Rec.709 grey of the 8-bit colour, rounded to 8 bit (= rgbaToGray8) in a.
 fn loadRef(x: i32, y: i32) -> vec4f {
   let c = vec2i(clamp(x, 0, i32(P.width) - 1), clamp(y, 0, i32(P.height) - 1));
-  return textureLoad(refTex, c, 0);
+  let t = textureLoad(refTex, c, 0).rgb;
+  return vec4f(t, floor(dot(round(t * 255.0), vec3f(0.2126, 0.7152, 0.0722)) + 0.5) * (1.0 / 255.0));
 }
 
 // Bilateral weights + weighted reference statistics of the window at (x, y).
@@ -283,7 +324,7 @@ fn viewCost(s: u32, px: vec2f, hp: vec4f) -> f32 {
   let isz = cams.c[s].size.zw;
   let c = h.xy / h.z;
   if (!(c.x >= 0.0 && c.x <= sz.x && c.y >= 0.0 && c.y <= sz.y)) { return COST_MAX; }
-  let layer = i32(s);
+  let layer = i32(cams.c[s].b.w);
   var sws = 0.0;
   var swss = 0.0;
   var swrs = 0.0;
@@ -307,7 +348,7 @@ fn geoCost(s: u32, px: vec2f, z: f32) -> f32 {
   let ds = cams.c[s].dsize;
   if (ds.z < 1.0 || ds.w < 1.0) { return P.tau; }
   let di = clamp(vec2i(floor((ps + 0.5) * ds.xy)), vec2i(0), vec2i(ds.zw) - vec2i(1));
-  let zs = textureLoad(srcDepth, di, i32(s), 0).r;
+  let zs = textureLoad(srcDepth, di, i32(cams.c[s].M0.w), 0).r;
   if (!(zs > 0.0)) { return P.tau; }
   let ph = vec3f(ps, 1.0);
   let r = zs * vec3f(dot(cams.c[s].M0.xyz, ph), dot(cams.c[s].M1.xyz, ph), dot(cams.c[s].M2.xyz, ph)) + cams.c[s].v.xyz;
@@ -576,6 +617,67 @@ ${regionLines.join('\n')}
   costs[idx] = bestTotal;
   photo[idx] = bestPhoto;
   views[idx] = mask;
+}
+
+// Hypotheses from a prior map (priorToPlanes on the GPU): depth in costs, the normal's
+// octahedral coordinates (f32) in photo and views (bits), priorW × priorH (any resolution),
+// resampled nearest (§2 rule); a plane is re-intersected with this pixel's ray when the sizes
+// differ (kept when nearly edge-on).
+@compute @workgroup_size(${WORKGROUP_X}, ${WORKGROUP_Y})
+fn priorPlanes(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x == 0u && gid.y == 0u) { status[0] = status[0] + 1u; }
+  let x = gid.x;
+  let y = P.rowStart + gid.y;
+  if (x >= P.width || y >= P.rowEnd) { return; }
+  let sx = f32(P.priorW) / f32(P.width);
+  let sy = f32(P.priorH) / f32(P.height);
+  let qx = clamp(floor((f32(x) + 0.5) * sx), 0.0, f32(P.priorW - 1u));
+  let qy = clamp(floor((f32(y) + 0.5) * sy), 0.0, f32(P.priorH - 1u));
+  let j = u32(qy) * P.priorW + u32(qx);
+  var z = costs[j];
+  var pl = vec4f(0.0, 0.0, -1.0, 0.0);
+  if (z > 0.0 && z < 3.0e38) {
+    var o = vec2f(photo[j], bitcast<f32>(views[j]));
+    let oz = 1.0 - abs(o.x) - abs(o.y);
+    if (oz < 0.0) { o = (1.0 - abs(o.yx)) * select(vec2f(-1.0), vec2f(1.0), o >= vec2f(0.0)); }
+    let n = normalize(vec3f(o, oz));
+    if (P.priorW != P.width || P.priorH != P.height) {
+      let cxy = vec2f(P.cx, P.cy);
+      let nrq = dot(n, vec3f(((vec2f(qx, qy) + 0.5) / vec2f(sx, sy) - 0.5 - cxy) * P.invF, 1.0));
+      let nrp = dot(n, vec3f((vec2f(f32(x), f32(y)) - cxy) * P.invF, 1.0));
+      let zp = z * nrq / nrp;
+      if (nrp < 0.0 && nrq < 0.0 && zp > 0.5 * z && zp < 2.0 * z) { z = zp; }
+    }
+    pl = vec4f(n, z);
+  }
+  planes[y * P.width + x] = pl;
+}
+
+// Output of a finished run (planesToDepthMap on the GPU, for a compact readback): costs = depth
+// (0 = invalid: cost > maxCost, z outside the range, no normal), views = octahedral unit normal,
+// photo = cost (non-finite → COST_MAX).
+@compute @workgroup_size(${WORKGROUP_X}, ${WORKGROUP_Y})
+fn finalize(@builtin(global_invocation_id) gid: vec3u) {
+  if (gid.x == 0u && gid.y == 0u) { status[0] = status[0] + 1u; }
+  let x = gid.x;
+  let y = P.rowStart + gid.y;
+  if (x >= P.width || y >= P.rowEnd) { return; }
+  let idx = y * P.width + x;
+  let pl = planes[idx];
+  let c = photo[idx];
+  var depth = 0.0;
+  var nrm = 0u;
+  let len = length(pl.xyz);
+  if (c <= P.maxCost && pl.w >= P.zMin && pl.w <= P.zMax && len > 0.0) {
+    depth = pl.w;
+    let n = pl.xyz / len;
+    var p = n.xy / (abs(n.x) + abs(n.y) + abs(n.z));
+    if (n.z < 0.0) { p = (1.0 - abs(p.yx)) * select(vec2f(-1.0), vec2f(1.0), p >= vec2f(0.0)); }
+    nrm = pack2x16snorm(p);
+  }
+  costs[idx] = depth;
+  views[idx] = nrm;
+  photo[idx] = select(COST_MAX, c, abs(c) <= 3.0e38);
 }
 `;
 }

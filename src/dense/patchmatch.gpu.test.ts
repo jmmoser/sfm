@@ -78,6 +78,26 @@ describe('PatchMatchGPU', () => {
     }
   });
 
+  it('affine 13 px window (preset kernel) on the GPU is statistically equal to the CPU reference', async () => {
+    const W = 256;
+    const H = 192;
+    const ds = makeSyntheticDataset('near', { width: W, height: H });
+    const opts = { patchRadius: 6, patchStep: 3, affineWindow: true, numSamplesPerIter: 3 };
+    const dm = await pm.compute(ds.views[0], ds.views.slice(1), ds.range, opts);
+    log(`near ${W}x${H} GPU affine r6/s3/3 proposals: ${fmtTimings()}`);
+    const dc = patchMatchCPU(ds.views[0], ds.views.slice(1), ds.range, opts);
+    const mask = surfaceMask(ds.views[0].cam, ds.gtDepth[0], ds.gtNormal[0]);
+    const g = evaluateDepthMap(dm, ds.gtDepth[0], ds.gtNormal[0], { mask });
+    const c = evaluateDepthMap(dc, ds.gtDepth[0], ds.gtNormal[0], { mask });
+    log(`  GPU mask: ${formatDepthStats(g)}`);
+    log(`  CPU mask: ${formatDepthStats(c)}`);
+    expect(g.validFraction).toBeGreaterThanOrEqual(0.7);
+    expect(g.accurateFraction).toBeGreaterThanOrEqual(0.8);
+    expect(Math.abs(g.validFraction - c.validFraction)).toBeLessThan(0.03);
+    expect(Math.abs(g.accurateFraction - c.accurateFraction)).toBeLessThan(0.03);
+    expect(Math.abs(g.medianNormalErrorDeg - c.medianNormalErrorDeg)).toBeLessThan(1.5);
+  });
+
   it('far scene (5–60 m) 256×192 works with inverse-depth sampling', async () => {
     const ds = makeSyntheticDataset('far', { width: 256, height: 192 });
     const dm = await pm.compute(ds.views[0], ds.views.slice(1), ds.range);
@@ -162,6 +182,36 @@ describe('PatchMatchGPU', () => {
     } finally {
       pm2.destroy();
       pm3.destroy();
+    }
+  });
+
+  it('upload caches: a repeated source image / depth map is not uploaded again, results are unchanged', async () => {
+    const ds = makeSyntheticDataset('near', { width: 96, height: 72, numSources: 4, supersample: 1 });
+    const fresh = await PatchMatchGPU.create(ctx!);
+    try {
+      const a = await fresh.compute(ds.views[0], ds.views.slice(1), ds.range, { iterations: 2 });
+      const s0 = fresh.cacheStats;
+      expect(s0.imageMisses).toBe(4);
+      // the same sources again (another order) + the reference as a source: 4 hits, 1 upload
+      const b = await fresh.compute(ds.views[1], [ds.views[0], ds.views[4], ds.views[3], ds.views[2]], ds.range, { iterations: 2 });
+      const s1 = fresh.cacheStats;
+      expect(s1.imageHits - s0.imageHits).toBe(3);
+      expect(s1.imageMisses - s0.imageMisses).toBe(1);
+      expect(b.depth.some((z) => z > 0)).toBe(true);
+      // a geometric pass twice with the same depth maps: the second one uploads none of them
+      const geo = { prior: a, sourceDepths: [a, a, a, a].map((m) => ({ ...m, depth: m.depth.slice() })) };
+      const g1 = await fresh.compute(ds.views[0], ds.views.slice(1), ds.range, { geometricIterations: 1 }, geo);
+      const s2 = fresh.cacheStats;
+      const g2 = await fresh.compute(ds.views[0], ds.views.slice(1), ds.range, { geometricIterations: 1 }, geo);
+      const s3 = fresh.cacheStats;
+      expect(s3.depthMisses).toBe(s2.depthMisses);
+      expect(s3.depthHits - s2.depthHits).toBe(4);
+      expect(Array.from(g2.depth)).toEqual(Array.from(g1.depth));
+      // the first result again from cached sources equals a fresh instance's
+      const again = await fresh.compute(ds.views[0], ds.views.slice(1), ds.range, { iterations: 2 });
+      expect(Array.from(again.depth)).toEqual(Array.from(a.depth));
+    } finally {
+      fresh.destroy();
     }
   });
 

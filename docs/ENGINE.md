@@ -80,11 +80,11 @@ class PhotogrammetryEngine {
 Quality presets (effective values: `QUALITY_PRESETS` of `src/engine/presets.ts`, dense part from the
 tuned `DENSE_PRESETS` of `src/dense/presets.ts`):
 
-| preset | feature max side | max features | dense max side | views | sources | PM iterations | geometric passes × iterations |
+| preset | feature max side | max features | dense max side | views | sources | PM iterations (½ res → full res) | geometric passes × iterations |
 |---|---|---|---|---|---|---|---|
-| fast | 1024 | 2048 | 800 | 40 | 5 | 4 | 1 × 2 |
-| balanced | 1600 | 4096 | 1280 | 80 | 8 | 6 | 1 × 3 |
-| max | 2048 | 8192 | 1600 | 150 | 8 | 6 | 1 × 3 |
+| fast | 1024 | 2048 | 800 | 40 | 5 | 4 → 2 | 1 × 2 |
+| balanced | 1600 | 4096 | 1280 | 80 | 8 | 6 → 2 | 1 × 3 |
+| max | 2048 | 8192 | 1600 | 150 | 8 | 6 → 2 | 1 × 3 |
 
 Mode affects keyframe thresholds, TSDF voxel size and depth-range margins; `auto`
 picks object vs scene after initialisation from the scene depth / baseline.
@@ -128,6 +128,12 @@ Views stream from IndexedDB through an LRU image cache; depth maps go through a
 `DepthMapStore` with an LRU memory cache backed by IndexedDB to bound memory on
 phones: the memory planner (`src/engine/memory.ts`) budgets 1.2 GB (600 / 850 MB on 4 / 6 GB
 iPhones); iOS kills a tab at ~1.5 GB (soft) / 2 GB (hard), docs/research/ios-platform.md.
+PatchMatch passes (multi-scale): photometric at ½ resolution for every view, a full-resolution
+photometric pass initialised from it, then the geometric pass(es); full-resolution passes
+alternate direction so the image LRU (sized up to every view when the plan allows) and
+PatchMatchGPU's upload caches stay warm. A fused cloud above the preset's `maxPoints` is merged
+with a footprint-adaptive LOD (cells ∝ each point's radius). Details: ARCHITECTURE §6 "Dense on a
+real GPU".
 
 ## 3. Worker protocol (`src/workers/protocol.ts`)
 

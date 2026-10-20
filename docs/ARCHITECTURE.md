@@ -2180,7 +2180,8 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   * `maxDepthError` 0.02: yard +0.5 C / −0.2 P, object ±0, too small to decide on;
   * applying the halo filter twice: it erodes edges (yard −0.3 pt C);
   * multi-scale: quality-neutral (yard Csub +0.1 / P −0.15, object −0.16 / −0.02), but 25–45 %
-    cheaper in the photometric stage. The engine has no multi-scale driver, so `multiScale: false`;
+    cheaper in the photometric stage. The engine had no multi-scale driver, so `multiScale: false`
+    (since 2026-10 it has one and the presets enable it: "Dense on a real GPU" below);
   * a second geometric pass: +0.6 / +0.9 pt Csub with the reference fusion, but within ±0.2 pt
     with the tuned one (yard +0.2 / P −0.14, object −0.1), for +33 % PatchMatch time. `max`
     therefore keeps one pass.
@@ -2251,7 +2252,7 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
     trees into the sky consistently across views. A PatchMatch-side fix is still needed, such as a
     centre-segment texture test.
   * Low-texture walls in the object room stay sparse.
-  * The engine has no multi-scale driver.
+  * The engine has no multi-scale driver (added 2026-10: "Dense on a real GPU" below).
   * The yard TSDF mesh loses precision to the noisier far points.
   * Not tested: topK, the ACMH thresholds, the perturbation schedule, sigmaColor, window size,
     and relaxing source selection at trajectory turns (yard frame 184 keeps 3 sources).
@@ -2736,6 +2737,91 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
     object at std < 2: 16 % and 14.5 %). The net effect is +0.17 pt whole-scene P for −0.02 pt C. This is the first case
     to re-check on device. If real walls keep good but less coherent depths, lower `skyMinCoherence`. At 0.35 the clean
     yard keeps 1,425 sky-coloured points farther than τ instead of 707 (row 6).
+
+### `src/dense` + `src/engine` — Dense on a real GPU (M4 Metal, 2026-10; amends the PatchMatch, "Dense tuning results" and `src/engine` dense notes above)
+
+* **Setup**: `E2E_GPU=host` (headless Chrome 155, Apple M4 10-core GPU, Metal), host shared with other heavy
+  jobs (load 5–20, wall times ±30 % and more); GPU time from timestamp queries
+  (`EngineConfig.denseGpuTimestamps`, `PatchMatchGPU.create(…, { timestamps: true })`, `lastTimings.gpuMs`),
+  which stay meaningful under load. The engine logs the wall-time split of the depth-map and fusion stages
+  (`dense depth maps … s: view loads …, pass inputs …, PatchMatch … (upload, GPU passes [GPU timestamps], readback),
+  halo filter …, store …` and `dense fusion … s: fuseDepthMaps …, point cap / filter …`).
+* **Where the time went** (before; yard-real `fast`, 40 views at 800×600, load 6–8): depth maps 38.1 s = view loads
+  10.4 s (83 JPEG decodes + undistort + rolling-shutter warp, ~125 ms each), PatchMatch 14.5 s (upload 3.5,
+  GPU passes 7.5 of which 5.5 s GPU execution, readback 3.5), halo filter 6.0 s, IndexedDB store 5.7 s, pass inputs
+  1.4 s; fusion 8.3 s. On a real GPU the kernel is a minority of the stage; at `balanced` (object-real, 80 views
+  720×960) it is half: depth maps 154.9 s with 47.8 s GPU execution.
+* **Point cap: footprint-adaptive LOD** (`footprintDownsample`, src/dense/pointcloud.ts). The engine used to merge a
+  fused cloud above `maxPoints` with ONE voxel size from the median radius of the first 100 k points (dominated by the
+  room / far field), which merged the close-range object ~10× and averaged points across surfaces: object-real
+  `fast` 3.29 M fused → 0.57 M points, accuracy p50 / p90 0.28 / 0.86 mm (cap lifted) → 0.44 / 1.8 mm; yard-real
+  precision 0.945 → 0.80, accuracy p50 8.3 → 25 mm (the failing `denseAccuracyMedian` check). Now every point goes
+  to a cell of s × its own splat radius (half-octave levels, so cells of very different footprints never merge);
+  s is searched on hash-sampled distinct-cell counts (1/16 of the cells in a cache-resident table) so that 0.88–0.97
+  × `maxPoints` remain, then one exact assignment; `mergeCells` counting-sorts by cell (8 B scratch per cell).
+  Offline on the same cap-lifted clouds (cap 2 M): object 0.29 / 0.93 mm, P 0.9997, C 0.9969 (global voxel 0.51 /
+  1.8 mm, P 0.9982; no cap 0.28 / 0.86 mm, P 0.9998, C 0.9969); yard p50 8.9 mm, P 0.931, C 0.390, F 0.550 (global
+  voxel 26 mm, P 0.781, C 0.402, F 0.531; no cap 8.3 mm, P 0.945, C 0.405, F 0.567). Balanced yard (6.3 M fused,
+  cap 4 M): LOD P 0.953, C 0.484, F 0.642, p50 7.1 mm; global voxel 0.898 / 0.494 / 0.637, 13.5 mm; no cap 0.962 /
+  0.494 / 0.653, 7.1 mm. The global voxel's slightly higher C comes from the far field: its cells (2.3 cm there) are
+  far below a 40 m footprint, so it merged the near field ~10× and left the far points alone. Keeping the medoid
+  instead of the mean changes nothing measurable. 1.8–3.9 s for 3.3–6.3 M points in the e2e worker.
+* **Multi-scale driver** (`runDensify` pass kinds `half` / `photo` / `geo`; `DensePresetConfig.multiScale`,
+  `fullResIterations`, now on in every preset): photometric at ½ resolution for all views (`iterations`; views decoded
+  and undistorted at half size, their own LRU), a full-resolution photometric pass initialised from the ½-resolution map
+  (`fullResIterations` 2, `{ geometric: false }` + prior), then the geometric pass(es). Resume keys / progress include
+  the pass kinds. GT-pose harness (fast, 800 px, 40 views; GPU s / P / C / F): object 9.0 → 5.8 s, 0.9999 / 0.9985 /
+  0.9992 → 0.9998 / 0.9981 / 0.9990; yard 4.5 → 3.7 s, 0.9930 / 0.4490 / 0.6184 → 0.9928 / 0.4497 / 0.6190. With only
+  4 photometric iterations (`fast`) the GPU saving is small in the engine (object-real 7.8 → 6.6 s, yard-real 5.5 →
+  4.7 s); `balanced` (6 + 3 iterations) object-real 47.8 → 39.8 s.
+* **GPU-resident PatchMatch data flow** (`PatchMatchGPU`):
+  * Source grey images and source depth maps live in LRU texture-array caches keyed by the uploaded object
+    (`LayerCache`, ids through a WeakMap so no caller data is kept alive): a view that is a source of ~5–8
+    references is converted and uploaded once while resident (N layers + ≤ 4 slack layers of ≤ 8 MB each); the
+    layer of each source is passed in `SrcCam.b.w` / `M0.w`. Callers must not modify an image / depth array in place
+    after passing it.
+  * The reference RGBA is uploaded as is; `loadRef` derives the Rec.709 grey (= `rgbaToGray8`).
+  * `finalize` pass: planes → depth / octahedral normal (`pack2x16snorm`, ≤ 3e-4 rad) / cost on the GPU, read back at
+    12 B/px together with the dropped-work sentinel in one mapping (8 MB staging, row chunks beyond) instead of 20 B/px
+    in ≤ 4 MB chunks + a separate sentinel read + `planesToDepthMap` on the CPU. The range test is repeated in double
+    precision on the CPU (the shader's bounds are f32).
+  * `priorPlanes` pass: the prior map goes up as depth + the normal's octahedral coordinates (f32, 12 B/px at its own
+    size) into the not yet used `costs` / `photo` / `views` buffers and is resampled / re-intersected on the GPU
+    (= `priorToPlanes`) instead of a CPU resampling + a 16 B/px upload at the target size.
+  * Pipelines: init / propagate / finalize / priorPlanes per source bucket and kernel shape; the engine precompiles
+    the shapes of all presets.
+* **CPU-side savings**: native `Float16Array` conversion for float16 depth maps / clouds (5–9× faster than the scalar
+  fallback, bit-identical; Chrome 135+, Safari 18.2+), so the IndexedDB store of a map got ~35 % cheaper;
+  full-resolution passes alternate direction (the last one forward) so the next pass starts on the views the caches
+  still hold; the image LRU may grow into what the PatchMatch stage leaves below the fusion / mesh peak (every view at
+  `fast` and at `balanced` 960 px), so each view is decoded once per resolution (yard-real fast 83 → 80 decodes for
+  three passes instead of two; object-real balanced 210 → 160); `planesToDepthMap` uses `Math.sqrt` (Math.hypot is
+  4–5× slower in V8).
+* **Kernel diet (opt-in, not in the presets)**: `PatchMatchOptions.affineWindow` warps the window with the
+  homography's Jacobian at the window centre (two multiply-adds per sample instead of a projective divide; mirrored
+  in the CPU reference); with `patchRadius` 6 / `patchStep` 3 (symmetric 5×5 = 25 samples over 13 px) and
+  `numSamplesPerIter` 3 it halves the GPU time again (e2e fast, with multi-scale: object-real 7.2 → 3.9 s, yard-real
+  6.3 → 3.1 s) but costs yard quality: e2e yard-real P / C / F 0.942 / 0.401 / 0.563 → 0.932 / 0.396 / 0.555, accuracy
+  p50 8.0 → 9.8 mm; clean yard (GT harness) C 0.4503 → 0.4342. Each part alone (affine + 3 proposals at 11 px, the
+  9 px / 25-sample window, the 13 px window with 6 proposals) costs 0.8–1.0 pt of clean-yard completeness. Object:
+  equal within noise (object-real 0.29 / 0.98 mm → 0.32 / 1.1 mm, C 0.9969 → 0.9981). At `balanced` the cost is
+  smaller: yard-real GPU 31.0 → 15.4 s (densify 125.9 → 111.2 s), P / C / F 0.953 / 0.483 / 0.641 → 0.946 / 0.483 /
+  0.639, p50 7.3 → 7.8 mm — a candidate for balanced / max after an on-device check. At 160×120 the 13 px window
+  spans 8 % of the image and loses 5 pt within 1 % (unit test uses the 11 px window for the affine check).
+* **Results** (e2e, worker engine, before = this branch's base with the timing log, back-to-back, same load):
+  see e2e/README.md "Dense on the real GPU". Summary, densify wall s (depth maps / fusion) and dense quality:
+  object-real fast 60.7 (47.3 / 12.3) → 51.1 (37.7 / 12.2), p50 / p90 0.44 / 1.8 → 0.29 / 0.99 mm; yard-real fast
+  47.4 (38.1 / 8.3) → 36.4 (26.8 / 8.8), P / C / F 0.803 / 0.408 / 0.541 → 0.935 / 0.397 / 0.557, p50 25 → 8.8 mm
+  (`denseAccuracyMedian` FAIL → PASS); object-real balanced 181.0 (154.9 / 24.8) → 148.3 (122.2 / 24.7), 0.37 / 1.4
+  → 0.28 / 0.87 mm; yard-real balanced 148.6 (127.8 / 19.7) → 125.9 (105.0 / 19.7), P / C / F 0.898 / 0.493 / 0.636 →
+  0.953 / 0.483 / 0.641, p50 13.7 → 7.3 mm. Completeness of clouds above 3 M points is scored on every point since
+  this change (`e2e/lib/metrics-core.mjs`; it used to read every 2nd point of a 3.5 M cloud: C 0.434 instead of 0.484).
+* **Remaining**: the CPU stages now dominate the depth-map stage: halo filter (~150–250 ms per 0.5 MP map, on the main
+  path between GPU passes), decode + undistort + rolling-shutter warp (~90 ms per view, two bilinear resamplings), the
+  IndexedDB store, and CPU fusion (7–25 s). Next steps: run halo / store in a helper worker or overlap them with the
+  next view's GPU passes (needs a cooperative halo filter), undistort + RS warp in one GPU resampling, GPU fusion
+  (research candidate 5). The error-scope round trip of `compute()`'s set-up and the ~100 band submissions per call
+  cost 20–30 % over the GPU execution time under contention.
 
 ### Real-capture robustness (gyro gates, forced / best-of-window keyframes, rolling shutter, focus breathing; amends the `src/sfm` and `src/engine` notes above)
 
