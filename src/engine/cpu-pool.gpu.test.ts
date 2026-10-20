@@ -1,14 +1,16 @@
-// CPU helper pool (browser: real workers): the verification and quantisation jobs give exactly the
+// CPU helper pool (browser: real workers): the verification, quantisation and rolling-shutter cost jobs give exactly the
 // results of the engine thread, and a disposed pool rejects its jobs.
 import { describe, expect, it } from 'vitest';
 import { estimateTwoViewGeometry } from '../geometry/twoview';
+import { runIncrementalSfM } from '../sfm/mapper';
+import { RSBundleCost, searchRollingShutter, searchRollingShutterBatched } from '../sfm/rolling-shutter';
 import { buildSyntheticDatabase, generateScene } from '../sfm/synthetic';
 import { VocabularyIndex } from '../sfm/vocab';
 import { Rng } from '../math/random';
 import { CpuPool } from './cpu-pool';
 
 describe('CpuPool', () => {
-  it('verifies pairs and quantises keyframes exactly like the engine thread', async () => {
+  it('verifies pairs, quantises keyframes and scores rolling-shutter hypotheses exactly like the engine thread', async () => {
     const pool = CpuPool.create(2);
     expect(pool).not.toBeNull();
     try {
@@ -45,6 +47,18 @@ describe('CpuPool', () => {
       const vocab = VocabularyIndex.train(sets, { numWords: 32, maxFeaturesPerImage: 200 });
       const words = await Promise.all(sets.map((fs) => pool!.quantize(vocab, fs)));
       sets.forEach((fs, k) => expect(Array.from(words[k])).toEqual(Array.from(vocab.quantize(fs))));
+      // rolling-shutter hypothesis costs (short subset BAs) and the batched search
+      const s2 = generateScene({ kind: 'orbit', numImages: 12, seed: 4, noisePx: 0.3, outlierRatio: 0, descriptors: false });
+      const [rec] = await runIncrementalSfM(buildSyntheticDatabase(s2, { verify: false }).db, { intrinsics: { ...s2.camera } });
+      const ids = rec.registeredImageIds();
+      const kp = new Map(ids.map((id) => [id, rec.images.get(id)!.keypoints!]));
+      const bc = new RSBundleCost(rec, ids, (id) => kp.get(id) ?? null, () => Float64Array.of(0.3, -0.6, 0.1), { maxObsPerImage: 30, maxTrack: 6, refineFocal: true });
+      const models = [0, 8, -8, 15].map((readoutMs) => ({ axis: 'cols' as const, readoutMs }));
+      expect(await pool!.rsCosts(bc, models)).toEqual(models.map((m) => bc.cost(m)));
+      const seq = searchRollingShutter((m) => bc.cost(m), {}, {});
+      const par = await searchRollingShutterBatched((ms) => pool!.rsCosts(bc, ms), {}, {});
+      expect(par.curve).toEqual(seq.curve);
+      expect(par.model).toEqual(seq.model);
     } finally {
       pool!.dispose();
     }

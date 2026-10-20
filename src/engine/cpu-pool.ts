@@ -12,14 +12,16 @@
  */
 import type { CameraIntrinsics, FeatureSet, MatchPairs } from '../core/types';
 import type { TwoViewGeometryResult, TwoViewOptions } from '../geometry/twoview';
+import type { RollingShutterModel, RSBundleCost } from '../sfm/rolling-shutter';
 import type { VocabularyIndex } from '../sfm/vocab';
 import type { CpuWorkerRequest, CpuWorkerResponse } from '../workers/cpu.worker';
 
 interface PoolWorker {
   worker: Worker;
   pending: Map<number, { resolve: (r: CpuWorkerResponse) => void; reject: (e: Error) => void }>;
-  /** Vocabularies whose codebook this worker holds. */
+  /** Vocabularies whose codebook this worker holds, rolling-shutter cost functions it holds. */
   codebooks: Set<number>;
+  rsCosts: Set<number>;
   broken: boolean;
 }
 
@@ -33,13 +35,15 @@ export class CpuPool {
   private readonly workers: PoolWorker[];
   private nextId = 1;
   /** Compute time reported by the workers (ms), per operation. */
-  readonly busyMs = { verify: 0, quantize: 0 };
+  readonly busyMs = { verify: 0, quantize: 0, rsCost: 0 };
   private readonly vocabKeys = new WeakMap<VocabularyIndex, number>();
   private nextVocabKey = 1;
+  private readonly rsKeys = new WeakMap<RSBundleCost, number>();
+  private nextRsKey = 1;
 
   private constructor(workers: Worker[]) {
     this.workers = workers.map((worker) => {
-      const w: PoolWorker = { worker, pending: new Map(), codebooks: new Set(), broken: false };
+      const w: PoolWorker = { worker, pending: new Map(), codebooks: new Set(), rsCosts: new Set(), broken: false };
       worker.onmessage = (ev: MessageEvent<CpuWorkerResponse>) => {
         const job = w.pending.get(ev.data.id);
         if (!job) return;
@@ -132,6 +136,23 @@ export class CpuPool {
     const r = await this.post(w, { id: this.nextId++, op: 'quantize', key, count: features.count, descriptors: features.descriptors, scores: features.scores });
     this.busyMs.quantize += r.ms;
     return CpuPool.result<Uint32Array>(r);
+  }
+
+  /** `bc.cost(m)` for every hypothesis, in parallel over the workers (the cost data sent once per worker). */
+  rsCosts(bc: RSBundleCost, models: RollingShutterModel[]): Promise<number[]> {
+    let key = this.rsKeys.get(bc);
+    if (key === undefined) this.rsKeys.set(bc, (key = this.nextRsKey++));
+    const k = key;
+    return Promise.all(
+      models.map(async (model) => {
+        const w = this.pick();
+        const first = !w.rsCosts.has(k);
+        if (first) w.rsCosts.add(k);
+        const r = await this.post(w, { id: this.nextId++, op: 'rsCost', key: k, model, ...(first ? { data: bc.toData() } : {}) });
+        this.busyMs.rsCost += r.ms;
+        return CpuPool.result<number>(r);
+      }),
+    );
   }
 
   dispose(): void {

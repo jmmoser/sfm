@@ -676,14 +676,14 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
       await mapper.iterativeGlobalRefinement(undefined, cancel, true);
       readjustMs += now() - t0;
     };
-    const estimate = (opts: typeof rsOpts, known: RefineRSResult['applied']): RefineRSResult => {
+    const estimate = async (opts: typeof rsOpts, known: RefineRSResult['applied']): Promise<RefineRSResult> => {
       const t0 = now();
-      const out = refineRollingShutter(rec, st, gyro!, opts, known);
+      const out = await refineRollingShutter(rec, st, gyro!, opts, known, deps.pool ?? null);
       searchMs += now() - t0;
       evaluations += out.estimate?.curve.length ?? 0;
       return out;
     };
-    let r = estimate(rsOpts, live.liveRollingShutter());
+    let r = await estimate(rsOpts, live.liveRollingShutter());
     const first = r;
     if (r.applied || prev) await readjust();
     // further passes on the model re-adjusted with the estimate (the short BAs start from the input
@@ -697,7 +697,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
       // true bias): measured neutral on abl-*-rs / object-real and worse on yard-real (principal
       // point 0.4 → 1.3 px, rotation 0.10 → 0.13°) — ARCHITECTURE "Real-capture robustness"
       const before = r.applied;
-      r = estimate({ ...rsOpts, around: before }, before);
+      r = await estimate({ ...rsOpts, around: before }, before);
       passes = p;
       await readjust();
       if (!r.applied || r.applied.axis !== before.axis || Math.abs(r.applied.readoutMs - before.readoutMs) < 0.5) break;

@@ -297,6 +297,9 @@ export function rsHypothesisCost(images: readonly RSImageObservations[], model: 
 /** Cost of a rolling-shutter hypothesis (lower is better). */
 export type RSCostFunction = (model: RollingShutterModel) => number;
 
+/** Batched cost of rolling-shutter hypotheses (e.g. evaluated in parallel on CPU workers). */
+export type RSCostBatchFunction = (models: RollingShutterModel[]) => Promise<number[]>;
+
 /**
  * Search the readout (axis, signed time) minimising `cost`: 0; ±10 and ±25 ms (for the default
  * 40 ms range) on both axes choose the axis and direction — ±25 ms only along the direction that
@@ -305,19 +308,49 @@ export type RSCostFunction = (model: RollingShutterModel) => number;
  * `minImprovement` and |readout| ≥ `minReadoutMs`. ≈ 10–18 cost evaluations in total.
  */
 export function searchRollingShutter(cost: RSCostFunction, opts: Partial<RollingShutterEstimateOptions> = {}, info: { numImages?: number; numObservations?: number } = {}): RollingShutterEstimate {
+  const steps = rsSearchSteps(opts, info, false);
+  for (let r = steps.next(); ; ) {
+    if (r.done) return r.value;
+    r = steps.next(r.value.map(cost));
+  }
+}
+
+/**
+ * `searchRollingShutter` with the hypotheses that do not depend on each other evaluated as one
+ * batch (0 with the first probes of every direction; the outer probes; both sides of a minimum
+ * check, the second one speculatively): about half the rounds of evaluations. The result is the
+ * same — every decision sees the same costs; a speculative cost the sequential search would not have
+ * evaluated is dropped.
+ */
+export async function searchRollingShutterBatched(
+  costs: RSCostBatchFunction,
+  opts: Partial<RollingShutterEstimateOptions> = {},
+  info: { numImages?: number; numObservations?: number } = {},
+): Promise<RollingShutterEstimate> {
+  const steps = rsSearchSteps(opts, info, true);
+  for (let r = steps.next(); ; ) {
+    if (r.done) return r.value;
+    r = steps.next(await costs(r.value));
+  }
+}
+
+/**
+ * The search of `searchRollingShutter` as a coroutine: yields batches of hypotheses, receives their
+ * costs. With `speculate`, the right side of a minimum check is batched with the left one (its cost
+ * is used only when the left one did not improve, as in the sequential search).
+ */
+function* rsSearchSteps(
+  opts: Partial<RollingShutterEstimateOptions>,
+  info: { numImages?: number; numObservations?: number },
+  speculate: boolean,
+): Generator<RollingShutterModel[], RollingShutterEstimate, number[]> {
   const o = { ...DEFAULT_RS_ESTIMATE, ...opts };
   const curve: RollingShutterEstimate['curve'] = [];
-  const evalH = (axis: 'rows' | 'cols', readoutMs: number): number => {
-    const c = cost({ axis, readoutMs });
-    curve.push({ axis, readoutMs, cost: c });
+  const record = (m: RollingShutterModel, c: number): number => {
+    curve.push({ axis: m.axis, readoutMs: m.readoutMs, cost: c });
     return c;
   };
   const zero: RollingShutterModel = { axis: 'rows', readoutMs: 0 };
-  const cost0 = evalH('rows', 0);
-  let best: RollingShutterModel = zero,
-    bestCost = cost0;
-  let dir: { axis: 'rows' | 'cols'; sign: number } | null = null;
-  let dirCost = Infinity;
   const around = o.around && o.around.readoutMs !== 0 ? o.around : null;
   // axis / direction from probes (or the earlier estimate's)
   const probes = around ? [0.85, 1, 1.15].map((f) => f * Math.abs(around.readoutMs)) : [0.25, 0.625].map((f) => f * o.maxReadoutMs);
@@ -325,15 +358,28 @@ export function searchRollingShutter(cost: RSCostFunction, opts: Partial<Rolling
   for (const axis of around ? [around.axis] : (['rows', 'cols'] as const)) for (const sign of around ? [Math.sign(around.readoutMs)] : [1, -1]) dirs.push({ axis, sign });
   // probe costs per direction, in probe order (NaN = not evaluated)
   const probeCost = dirs.map(() => probes.map(() => NaN));
-  for (let d = 0; d < dirs.length; d++) probeCost[d][0] = evalH(dirs[d].axis, dirs[d].sign * probes[0]);
+  // 0 and the first probe of every direction
+  const first: RollingShutterModel[] = [zero, ...dirs.map((d) => ({ axis: d.axis, readoutMs: d.sign * probes[0] }))];
+  const c1 = yield first;
+  const cost0 = record(zero, c1[0]);
+  for (let d = 0; d < dirs.length; d++) probeCost[d][0] = record(first[d + 1], c1[d + 1]);
+  let best: RollingShutterModel = zero,
+    bestCost = cost0;
+  let dir: { axis: 'rows' | 'cols'; sign: number } | null = null;
+  let dirCost = Infinity;
   // the outer probes of a direction are only needed when the first probes leave the direction open:
   // a direction that is clearly best at the first probe (≥ 10 % below every other one and below 0)
   // keeps being best further out (the other directions move away from the readout)
   const order = dirs.map((_, d) => d).sort((x, y) => probeCost[x][0] - probeCost[y][0] || x - y);
   const clear = dirs.length > 1 && probeCost[order[0]][0] < 0.9 * Math.min(cost0, probeCost[order[1]][0]);
+  const outer: { d: number; k: number; m: RollingShutterModel }[] = [];
   for (let d = 0; d < dirs.length; d++) {
     if (clear && d !== order[0]) continue;
-    for (let k = 1; k < probes.length; k++) probeCost[d][k] = evalH(dirs[d].axis, dirs[d].sign * probes[k]);
+    for (let k = 1; k < probes.length; k++) outer.push({ d, k, m: { axis: dirs[d].axis, readoutMs: dirs[d].sign * probes[k] } });
+  }
+  if (outer.length) {
+    const c2 = yield outer.map((p) => p.m);
+    outer.forEach((p, q) => (probeCost[p.d][p.k] = record(p.m, c2[q])));
   }
   for (let d = 0; d < dirs.length; d++)
     for (let k = 0; k < probes.length; k++) {
@@ -351,13 +397,14 @@ export function searchRollingShutter(cost: RSCostFunction, opts: Partial<Rolling
   if (dir && Number.isFinite(cost0)) {
     // 1-D minimisation of the magnitude along the chosen direction: bracket from the probes, then
     // safeguarded successive parabolic interpolation (Brent-like; bisection when the parabola's
-    // vertex is outside the bracket or on an evaluated point), to `tolMs`
+    // vertex is outside the bracket), to `tolMs`
     const d = dir;
-    const f = (x: number): number => {
-      const c = evalH(d.axis, d.sign * x);
+    const hyp = (x: number): RollingShutterModel => ({ axis: d.axis, readoutMs: d.sign * x });
+    const use = (x: number, c: number): number => {
+      record(hyp(x), c);
       if (c < bestCost) {
         bestCost = c;
-        best = { axis: d.axis, readoutMs: d.sign * x };
+        best = hyp(x);
       }
       return c;
     };
@@ -367,7 +414,7 @@ export function searchRollingShutter(cost: RSCostFunction, opts: Partial<Rolling
     let bi = xs.reduce((k, x, i) => (known.get(x)! < known.get(xs[k])! ? i : k), 0);
     for (let e = 0; e < 4 && bi === xs.length - 1 && xs[bi] < o.maxReadoutMs; e++) {
       const nx = around ? Math.min(o.maxReadoutMs, 1.3 * xs[bi] + 1) : o.maxReadoutMs;
-      known.set(nx, f(nx));
+      known.set(nx, use(nx, (yield [hyp(nx)])[0]));
       xs = [...known.keys()].sort((a, b) => a - b);
       bi = xs.reduce((k, x, i) => (known.get(x)! < known.get(xs[k])! ? i : k), 0);
     }
@@ -386,9 +433,11 @@ export function searchRollingShutter(cost: RSCostFunction, opts: Partial<Rolling
       if (v > a && v < c && Math.abs(v - b) < 0.5 * tol) {
         // the parabola puts the minimum at b: confirm it on both sides at ±tol/2 (Brent's minimum
         // step) instead of bisecting the larger half of the bracket one side at a time
-        const l = b - 0.5 * tol;
+        const l = b - 0.5 * tol,
+          r = b + 0.5 * tol;
+        const both = speculate && l > a && r < c ? yield [hyp(l), hyp(r)] : null;
         if (l > a) {
-          const fl = f(l);
+          const fl = use(l, both ? both[0] : (yield [hyp(l)])[0]);
           if (fl < fb) {
             c = b;
             fc = fb;
@@ -399,9 +448,8 @@ export function searchRollingShutter(cost: RSCostFunction, opts: Partial<Rolling
           a = l;
           fa = fl;
         }
-        const r = b + 0.5 * tol;
         if (r < c) {
-          const fr = f(r);
+          const fr = use(r, both ? both[1] : (yield [hyp(r)])[0]);
           if (fr < fb) {
             a = b;
             fa = fb;
@@ -415,7 +463,7 @@ export function searchRollingShutter(cost: RSCostFunction, opts: Partial<Rolling
         continue;
       }
       if (!(v > a && v < c)) v = b - a > c - b ? 0.5 * (a + b) : 0.5 * (b + c);
-      const fv = f(v);
+      const fv = use(v, (yield [hyp(v)])[0]);
       if (fv < fb) {
         if (v < b) {
           c = b;
@@ -472,6 +520,25 @@ export function estimateRollingShutter(images: readonly RSImageObservations[], o
     return { model: zero, accepted: false, reason: 'no observations', cost0: NaN, costBest: NaN, improvement: 0, best: zero, curve: [], numImages: 0, numObservations: 0 };
   }
   return searchRollingShutter((m) => rsHypothesisCost(images, m, opts), opts, { numImages: images.length, numObservations: nObs });
+}
+
+/** Data of an `RSBundleCost` (`toData` / `fromData`). */
+export interface RSBundleCostData {
+  numObservations: number;
+  obsPose: Uint32Array;
+  obsPoint: Uint32Array;
+  uv0: Float64Array;
+  obsImage: Int32Array;
+  points0: Float64Array;
+  cams: CameraIntrinsics[];
+  imageCamera: Uint32Array;
+  omega: (Vec3 | null)[];
+  velocity: (Float64Array | null)[];
+  obsInvDepth: Float64Array;
+  poseFixed: Uint8Array;
+  tMask: Uint8Array | null;
+  posesRec: Pose[];
+  opts: { iterations?: number; lossScalePx?: number; refineFocal?: boolean; refinePrincipalPoint?: boolean };
 }
 
 /** Subset bundle adjustment scoring rolling-shutter hypotheses on a reconstruction (see the module comment). */
@@ -631,6 +698,34 @@ export class RSBundleCost {
   private tMask: Uint8Array | null;
 
   private readonly posesRec: Pose[];
+
+  /** Everything `cost` reads, as structured-cloneable data (evaluation on a worker: `fromData`). */
+  toData(): RSBundleCostData {
+    return {
+      numObservations: this.numObservations,
+      obsPose: this.obsPose,
+      obsPoint: this.obsPoint,
+      uv0: this.uv0,
+      obsImage: this.obsImage,
+      points0: this.points0,
+      cams: this.cams,
+      imageCamera: this.imageCamera,
+      omega: this.omega,
+      velocity: this.velocity,
+      obsInvDepth: this.obsInvDepth,
+      poseFixed: this.poseFixed,
+      tMask: this.tMask,
+      posesRec: this.posesRec,
+      opts: { iterations: this.opts.iterations, lossScalePx: this.opts.lossScalePx, refineFocal: this.opts.refineFocal, refinePrincipalPoint: this.opts.refinePrincipalPoint },
+    };
+  }
+
+  /** A cost function equal to the one `toData` was taken from (`freeIds` empty). */
+  static fromData(d: RSBundleCostData): RSBundleCost {
+    const bc = Object.create(RSBundleCost.prototype) as RSBundleCost;
+    Object.assign(bc, d, { freeIds: [], poseIds: [] });
+    return bc;
+  }
 
   /** Robust (Cauchy) cost after a short BA with all observations corrected for `model`. */
   cost(model: RollingShutterModel): number {
