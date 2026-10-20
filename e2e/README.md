@@ -1221,3 +1221,251 @@ frames:
   measure extrapolation.
 * A 300-iteration smoke run of the same pipeline (`--splat-iterations 300 --no-mesh`, 6 views) already reaches 25.0 dB
   full frame.
+
+## Breakthrough results (2026-10-20, Apple M4, Metal)
+
+Final before / after measurement of the `claude/breakthrough` work (engine splat stage, faster refine,
+footprint-adaptive dense). **Before** is the user's main at `eb131af` plus only the `E2E_GPU=host` launch patch
+(`bf55e6c`, cherry-picked; no pipeline change). **After** is `claude/breakthrough` at `7e6169c` with the measurement
+tooling of this section (`nvs.mjs --test-dataset / --common`, yard `lateralOffset`). Both ran `E2E_GPU=host node
+e2e/run-e2e.mjs <dataset> --engine worker` (fast preset; after adds `--splat --nvs`) on the same `object-real` /
+`yard-real` files, on an Apple M4 (10 cores, 16 GB) with headless Chrome 155. Jobs ran one at a time, but other apps
+and a parallel agent shared the host, so each run's 1-minute load average is given. Every fast-preset pipeline run was
+repeated (run 1 / run 2). All novel-view scores come from this branch's `nvs.mjs` at the 600×800 dense size with
+`--common`, for the baseline runs too.
+
+### Pipeline
+
+| object-real, fast preset | before (`eb131af`) | after (`claude/breakthrough`) |
+|---|---|---|
+| host load (1-min mean, run 1 / run 2) | 4.8 / 4.2 | 4.8 / 5.0 |
+| pipeline total (s, run 1 / run 2) | 244.9 / 236.1 | 198.5 / 193.2 (without splat 138.8 / 133.7) |
+| · capture (live tracking of every frame) | 35.1 / 34.2 | 34.7 / 34.0 |
+| · post-capture processing | 206.8 / 199.0 | 158.3 / 153.9 (without splat 98.5 / 94.4) |
+| &nbsp;&nbsp;refine (run 1: matching + reconstruction) | 137.9 / 132.8 (25.8 + 111.9) | 40.1 / 38.6 (9.8 + 30.1) |
+| &nbsp;&nbsp;densify (run 1: depth maps + fusion) | 55.3 / 52.1 (46.5 + 8.9) | 44.0 / 42.3 (33.4 + 10.6) |
+| &nbsp;&nbsp;mesh | 12.6 / 13.1 | 13.2 / 12.5 |
+| &nbsp;&nbsp;splat (prepare + training) | — | 59.7 (12.6 + 46.9) / 59.5 (12.1 + 47.1) |
+| splat model | — | 200 000 Gaussians, 3000 it (65.3 it/s), 90 views 600×800, memory plan 810 MB (GPU 301 MB) |
+| registered / input keyframes | 90 / 90 | 90 / 90 |
+| ATE / extent (×1e-4) | 2.88 / 2.87 | 2.88 / 2.89 |
+| rotation error p50 (deg) | 0.056 / 0.052 | 0.056 / 0.056 |
+| focal error (%) | 0.156 / 0.140 | 0.156 / 0.157 |
+| scale error | -0.0037 / -0.0039 | -0.0037 / -0.0039 |
+| gravity error (deg) | 0.021 / 0.021 | 0.021 / 0.021 |
+| heading error (deg) | -0.45 / -0.45 | -0.45 / -0.45 |
+| dense points | 568 k / 562 k | 1787 k / 1761 k |
+| dense precision / completeness / F (run 1) | 0.998 / 0.996 / 0.997 | 1.000 / 0.997 / 0.998 |
+| dense F (run 2) | 0.997 | 0.998 |
+| dense accuracy p50 (mm) | 0.43 / 0.44 | 0.30 / 0.30 |
+| enforced checks (run 1 / run 2) | pass / pass | pass / pass |
+
+| yard-real, fast preset | before (`eb131af`) | after (`claude/breakthrough`) |
+|---|---|---|
+| host load (1-min mean, run 1 / run 2) | 5.0 / 3.8 | 5.0 / 4.4 |
+| pipeline total (s, run 1 / run 2) | 193.9 / 180.0 | 152.2 / 146.9 (without splat 110.3 / 105.2) |
+| · capture (live tracking of every frame) | 36.4 / 33.0 | 32.9 / 32.7 |
+| · post-capture processing | 154.7 / 144.8 | 114.7 / 109.7 (without splat 72.8 / 68.1) |
+| &nbsp;&nbsp;refine (run 1: matching + reconstruction) | 99.1 / 91.2 (34.3 + 64.4) | 27.4 / 23.2 (16.1 + 10.9) |
+| &nbsp;&nbsp;densify (run 1: depth maps + fusion) | 47.1 / 45.5 (37.8 + 9.2) | 36.5 / 36.6 (27.6 + 8.9) |
+| &nbsp;&nbsp;mesh | 7.8 / 7.2 | 8.0 / 7.2 |
+| &nbsp;&nbsp;splat (prepare + training) | — | 41.9 (12.0 + 29.6) / 41.6 (12.1 + 29.3) |
+| splat model | — | 200 000 Gaussians, 3000 it (104.6 it/s), 81 views 800×600, memory plan 758 MB (GPU 284 MB) |
+| registered / input keyframes | 81 / 81 | 81 / 81 |
+| ATE / extent (×1e-4) | 3.05 / 3.13 | 3.05 / 3.06 |
+| rotation error p50 (deg) | 0.074 / 0.073 | 0.076 / 0.075 |
+| focal error (%) | 0.160 / 0.156 | 0.162 / 0.162 |
+| scale error | 0.0089 / 0.0094 | 0.0093 / 0.0098 |
+| gravity error (deg) | 0.061 / 0.061 | 0.061 / 0.061 |
+| heading error (deg) | -0.91 / -0.91 | -0.91 / -0.91 |
+| dense points | 748 k / 752 k | 1760 k / 1837 k |
+| dense precision / completeness / F (run 1) | 0.805 / 0.409 / 0.542 | 0.933 / 0.395 / 0.555 |
+| dense F (run 2) | 0.540 | 0.557 |
+| dense accuracy p50 (mm) | 25.01 / 25.02 | 8.96 / 8.78 |
+| enforced checks (run 1 / run 2) | denseAccuracyMedian 0.0250 FAIL / denseAccuracyMedian 0.0250 FAIL | pass / pass |
+
+* **Post-capture processing is 23 % faster on object-real (25 % on yard-real) with the splat stage included, and 52 %
+  (53 %) faster without it** (object 202.9 → 156.1 s, or 96.5 s without splat; yard 149.8 → 112.2 / 70.4 s; means of
+  the two runs). Refine is 3.4× faster (object 135 → 39 s) and 3.6–3.9× (yard 95 → 25 s). Dense depth maps are 27–28 %
+  faster. Capture (live tracking) and mesh are unchanged.
+* **Sparse accuracy is unchanged**: the same 90 / 81 keyframes register, and ATE, rotation, focal, scale, gravity and
+  heading agree within run-to-run noise.
+* **Dense**: 3.1× / 2.4× more points. Accuracy p50 improves from 0.43 to 0.30 mm (object) and from 25.0 to 8.9 mm
+  (yard). The yard baseline fails its enforced dense-accuracy check (≤ 20 mm) in both runs, as it did in the earlier
+  baseline (24.2 mm); after passes. Yard completeness drops slightly (0.409 → 0.395).
+* **Splat stage**: 59.6 s (object) and 41.8 s (yard). About 12 s of that is preparation, mostly view decoding and upload
+  on the engine thread. Training runs 3 000 iterations at 65 / 105 it/s (18.8 / 11.6 ms per iteration at full
+  resolution). The memory plan peaks at 810 / 758 MB of the 1.2 GB budget.
+
+### Novel views: held-out and off-trajectory
+
+* **Held-out**: the 24 non-keyframes of the run (1–3 frames from a keyframe), with the default keyframe-relative pose.
+  The **Sim3** row maps the same frames through the run's global Sim3, the mapping the off-trajectory sets have to use,
+  so compare those against it.
+* **Off-trajectory**: test datasets of the SAME seeded scene on shifted paths, 24 frames evenly spread over 200 / 240
+  (`--test-dataset`, Sim3 pose). The object set shifts the orbit radius ±5 cm and the height +12 cm, plus a +25 cm
+  stress case. The yard set shifts the walk 1.5 m outward / inward of the loop and its height +0.75 m, plus a +1.5 m
+  stress case. All keep the -real artefacts but drop the three or four fast glance pans, whose frames are heavily
+  blurred (the held-out set likewise skips the frames the capture rejected as blurred). "Nearest training camera" is the mean GT distance and optical-axis angle
+  from each test view to the closest registered keyframe.
+* **Scene identity check**: the geometry and textures depend only on the seed (yard: also on the loop's `center` /
+  `semiAxes`, which `nvs.mjs` checks). Regenerating `object-real` and `yard-real` gave byte-identical JPEGs (200 / 200
+  and 240 / 240). Every off-trajectory set has byte-identical `gt_points.bin` / normals. A yard regeneration with
+  `lateralOffset = 1e-9` keeps 192 of 240 JPEGs byte-identical; the other 48 differ by at most 4 / 255 (72–87 dB).
+* **Columns**: `full` is what the user sees, composited over black (holes count). `covered` uses each renderer's own
+  pixels. `cc full` is after a per-view affine colour fit. `common` is every renderer on the pixels ALL of the run's
+  renderers cover, roughly the mesh's footprint. The app's default view is `mesh-lit`, both before and after (the
+  viewer on this branch does not show splats yet).
+
+| test views (nearest training camera) | renderer | coverage | full PSNR / SSIM | covered PSNR / SSIM | cc full PSNR | common PSNR / SSIM (coverage) | shift px |
+|---|---|---|---|---|---|---|---|
+| held-out (1.8 cm / 2.0°) | before `mesh-lit` | 0.609 | 8.64 / 0.528 | 23.57 / 0.876 | 8.68 | 23.56 / 0.876 (0.61) | 0.12 |
+|  | after `mesh-lit` | 0.610 | 8.65 / 0.531 | 23.55 / 0.877 | 8.68 | 23.55 / 0.877 (0.61) | 0.13 |
+|  | after `mesh-unlit` | 0.610 | 8.71 / 0.552 | 28.65 / 0.915 | 8.72 | 28.66 / 0.915 (0.61) | 0.08 |
+|  | after `splat` | 0.999 | **31.29 / 0.959** | 30.54 / 0.949 | 33.68 | 31.04 / 0.948 (0.61) | 0.08 |
+| held-out (Sim3 pose) (1.8 cm / 2.0°) | before `mesh-lit` | 0.609 | 8.64 / 0.520 | 23.36 / 0.862 | 8.67 | 23.35 / 0.862 (0.61) | 0.49 |
+|  | after `mesh-lit` | 0.610 | 8.64 / 0.522 | 23.34 / 0.863 | 8.67 | 23.34 / 0.863 (0.61) | 0.50 |
+|  | after `mesh-unlit` | 0.610 | 8.70 / 0.543 | 28.02 / 0.900 | 8.71 | 28.03 / 0.900 (0.61) | 0.42 |
+|  | after `splat` | 0.999 | **30.10 / 0.943** | 29.57 / 0.934 | 31.90 | 29.73 / 0.929 (0.61) | 0.40 |
+| −5 cm radius (5.1 cm / 3.4°) | before `mesh-lit` | 0.636 | 8.96 / 0.531 | 22.78 / 0.844 | 9.00 | 22.77 / 0.843 (0.63) | 0.53 |
+|  | after `mesh-lit` | 0.637 | 8.97 / 0.534 | 22.76 / 0.844 | 9.00 | 22.76 / 0.844 (0.64) | 0.53 |
+|  | after `mesh-unlit` | 0.637 | 9.04 / 0.557 | 27.39 / 0.883 | 9.05 | 27.39 / 0.883 (0.64) | 0.46 |
+|  | after `splat` | 1.000 | **30.20 / 0.937** | 29.43 / 0.928 | 31.84 | 29.25 / 0.920 (0.64) | 0.44 |
+| +5 cm radius (5.0 cm / 2.8°) | before `mesh-lit` | 0.587 | 8.38 / 0.503 | 23.70 / 0.866 | 8.41 | 23.68 / 0.865 (0.58) | 0.46 |
+|  | after `mesh-lit` | 0.588 | 8.38 / 0.505 | 23.68 / 0.867 | 8.41 | 23.68 / 0.867 (0.59) | 0.46 |
+|  | after `mesh-unlit` | 0.588 | 8.43 / 0.524 | 28.22 / 0.903 | 8.44 | 28.22 / 0.903 (0.59) | 0.40 |
+|  | after `splat` | 0.996 | **28.63 / 0.937** | 29.06 / 0.930 | 29.72 | 29.59 / 0.925 (0.59) | 0.41 |
+| +12 cm height (11.0 cm / 10.0°) | before `mesh-lit` | 0.648 | 9.54 / 0.561 | 24.19 / 0.876 | 9.57 | 24.15 / 0.875 (0.64) | 0.45 |
+|  | after `mesh-lit` | 0.648 | 9.55 / 0.564 | 24.15 / 0.876 | 9.58 | 24.15 / 0.876 (0.65) | 0.45 |
+|  | after `mesh-unlit` | 0.648 | 9.61 / 0.581 | 28.31 / 0.906 | 9.62 | 28.32 / 0.907 (0.65) | 0.40 |
+|  | after `splat` | 0.992 | **26.80 / 0.913** | 27.39 / 0.906 | 27.45 | 29.18 / 0.921 (0.65) | 0.46 |
+| +25 cm height (stress) (23.7 cm / 19.3°) | before `mesh-lit` | 0.676 | 10.71 / 0.584 | 24.85 / 0.877 | 10.75 | 24.80 / 0.877 (0.66) | 0.41 |
+|  | after `mesh-lit` | 0.678 | 10.73 / 0.587 | 24.81 / 0.878 | 10.76 | 24.80 / 0.878 (0.67) | 0.41 |
+|  | after `mesh-unlit` | 0.678 | 10.79 / 0.602 | 28.19 / 0.901 | 10.80 | 28.21 / 0.902 (0.67) | 0.39 |
+|  | after `splat` | 0.963 | **22.14 / 0.851** | 24.20 / 0.857 | 22.40 | 27.85 / 0.892 (0.67) | 0.47 |
+
+| test views (nearest training camera) | renderer | coverage | full PSNR / SSIM | covered PSNR / SSIM | cc full PSNR | common PSNR / SSIM (coverage) | shift px |
+|---|---|---|---|---|---|---|---|
+| held-out (18.4 cm / 3.0°) | before `mesh-lit` | 0.644 | 9.75 / 0.370 | 23.16 / 0.625 | 9.82 | 23.19 / 0.626 (0.63) | 0.28 |
+|  | after `mesh-lit` | 0.655 | 9.81 / 0.378 | 23.00 / 0.624 | 9.89 | 23.06 / 0.626 (0.64) | 0.42 |
+|  | after `mesh-unlit` | 0.655 | 9.91 / 0.392 | 26.74 / 0.657 | 9.92 | 26.89 / 0.658 (0.64) | 0.38 |
+|  | after `splat` | 1.000 | **31.07 / 0.872** | 30.37 / 0.863 | 32.30 | 31.27 / 0.851 (0.64) | 0.07 |
+| held-out (Sim3 pose) (18.4 cm / 3.0°) | before `mesh-lit` | 0.644 | 9.75 / 0.370 | 23.05 / 0.622 | 9.82 | 23.09 / 0.623 (0.63) | 0.81 |
+|  | after `mesh-lit` | 0.655 | 9.81 / 0.377 | 22.89 / 0.621 | 9.89 | 22.94 / 0.622 (0.64) | 0.94 |
+|  | after `mesh-unlit` | 0.655 | 9.91 / 0.390 | 26.52 / 0.651 | 9.92 | 26.66 / 0.653 (0.64) | 1.02 |
+|  | after `splat` | 1.000 | **29.22 / 0.818** | 28.80 / 0.812 | 30.06 | 29.66 / 0.789 (0.64) | 0.91 |
+| 1.5 m outward (1.51 m / 4.1°) | before `mesh-lit` | 0.679 | 10.13 / 0.387 | 23.12 / 0.613 | 10.21 | 23.16 / 0.614 (0.67) | 1.08 |
+|  | after `mesh-lit` | 0.694 | 10.22 / 0.396 | 22.92 / 0.611 | 10.30 | 22.99 / 0.613 (0.68) | 1.36 |
+|  | after `mesh-unlit` | 0.694 | 10.33 / 0.409 | 26.20 / 0.639 | 10.34 | 26.36 / 0.641 (0.68) | 1.24 |
+|  | after `splat` | 1.000 | **27.91 / 0.774** | 27.60 / 0.769 | 28.51 | 28.45 / 0.739 (0.68) | 1.09 |
+| 1.5 m inward (1.51 m / 4.6°) | before `mesh-lit` | 0.486 | 8.92 / 0.273 | 22.56 / 0.625 | 8.97 | 22.59 / 0.626 (0.48) | 0.83 |
+|  | after `mesh-lit` | 0.496 | 8.97 / 0.279 | 22.39 / 0.623 | 9.02 | 22.44 / 0.624 (0.49) | 0.94 |
+|  | after `mesh-unlit` | 0.496 | 9.04 / 0.291 | 26.47 / 0.662 | 9.04 | 26.63 / 0.664 (0.49) | 0.86 |
+|  | after `splat` | 0.999 | **25.32 / 0.796** | 25.82 / 0.796 | 25.58 | 29.98 / 0.806 (0.49) | 0.77 |
+| +0.75 m height (76.7 cm / 3.3°) | before `mesh-lit` | 0.590 | 8.87 / 0.339 | 23.11 / 0.623 | 8.92 | 23.18 / 0.624 (0.58) | 0.95 |
+|  | after `mesh-lit` | 0.602 | 8.92 / 0.346 | 22.94 / 0.620 | 8.97 | 23.02 / 0.622 (0.59) | 0.93 |
+|  | after `mesh-unlit` | 0.602 | 8.99 / 0.358 | 26.39 / 0.650 | 8.99 | 26.64 / 0.653 (0.59) | 0.89 |
+|  | after `splat` | 0.999 | **20.88 / 0.762** | 21.26 / 0.762 | 21.29 | 28.77 / 0.766 (0.59) | 0.80 |
+| +1.5 m height (stress) (1.51 m / 3.3°) | before `mesh-lit` | 0.502 | 8.33 / 0.278 | 22.53 / 0.607 | 8.37 | 22.62 / 0.609 (0.49) | 1.07 |
+|  | after `mesh-lit` | 0.514 | 8.37 / 0.285 | 22.32 / 0.604 | 8.42 | 22.42 / 0.606 (0.50) | 1.27 |
+|  | after `mesh-unlit` | 0.514 | 8.42 / 0.295 | 25.11 / 0.634 | 8.43 | 25.38 / 0.637 (0.50) | 1.06 |
+|  | after `splat` | 0.984 | **18.19 / 0.707** | 19.07 / 0.721 | 18.74 | 27.25 / 0.729 (0.50) | 0.89 |
+
+* **The splat view wins everywhere on full frame.** On held-out frames it scores 31.3 / 31.1 dB (SSIM 0.959 / 0.872)
+  against 8.6 / 9.8 dB for the app's lit mesh, because it fills the frame (coverage ≥ 0.96 vs 0.49–0.69). Off
+  trajectory the margin over `mesh-lit` is still +9.8 to +21.2 dB.
+* **Splats do extrapolate worse than they interpolate.** Against the held-out Sim3 row, the splat's full-frame PSNR is
+  unchanged at −5 cm radius (+0.1 dB) and falls by 1.5 dB at +5 cm and 3.3 dB at +12 cm height (object). It falls by
+  1.3 / 3.9 dB at 1.5 m outward / inward and 8.3 dB at +0.75 m height (yard). The stress cases lose 8.0 dB (object
+  +25 cm, 24 cm / 19° from the nearest training camera) and 11.0 dB (yard +1.5 m). Height is the weak axis, because
+  both captures hold a nearly constant height (object 10–30 cm above the object centre, yard 1.5 m ± 6 cm). From
+  above, the tree crowns render as open bowls (their tops were never seen), the ground beyond the fence smears into a
+  brown band, and the floor at the bookshelf streaks (see the views below). The geometry renderers barely move:
+  `mesh-unlit` covered stays within 0.7 dB of its held-out Sim3 value (object) and 1.4 dB (yard +1.5 m).
+* **On the mesh's own pixels the splat still leads.** On the `common` pixels the splat beats the unlit mesh by
+  0.9–1.9 dB (object) and 1.9–3.4 dB (yard) off trajectory, and the lit app view by 3.0–7.5 dB. The one exception is
+  object +25 cm, where it trails `mesh-unlit` by 0.4 dB. The off-trajectory loss is therefore mostly in the regions the
+  mesh does not reconstruct at all (walls, sky, far ground, tree tops).
+* **Before vs after mesh**: `mesh-lit` agrees within 0.21 dB and 0.015 coverage on every set. The denser cloud does not
+  change the meshed view.
+* **Pose-mapping sensitivity**: `--pose relative` composes with the keyframe nearest in space. It cuts the residual
+  shift from 0.4–1.4 px to 0.1–0.6 px and raises the splat's full-frame PSNR by 0.1–1.3 dB (object +12 cm 27.27, +25 cm
+  22.26; yard +0.75 m 21.10, +1.5 m 18.30, outward 29.23). The conclusions do not change.
+
+### Balanced preset (object-real, one run each)
+
+`--quality balanced` (after adds `--splat --nvs`). The dense views and splat training views are 720×960, the full
+frame, so the novel views are scored at 720×960 and are not comparable with the fast rows above.
+
+| object-real, balanced | before | after |
+|---|---|---|
+| host load (1-min mean) | 3.6 | 4.3 |
+| pipeline total (s) | 390.5 | 405.9 (273.6 without splat) |
+| post-capture processing (s) | 345.1 | 358.9 (226.6 without splat) |
+| · refine / densify / mesh (s) | 136.0 / 173.4 / 34.4 | 41.7 / 147.6 / 36.0 |
+| · splat (prepare + training, s) | — | 132.3 (17.4 + 114.6): 5 000 it at 44.5 it/s, 300 000 Gaussians, memory plan 1063 MB (GPU 439 MB) |
+| ATE / extent, rot p50, focal, scale | 2.87e-4, 0.051°, 0.150 %, −0.0049 | 2.82e-4, 0.051°, 0.119 %, −0.0048 |
+| dense points, P / C / F, accuracy p50 | 1403 k, 0.999 / 0.999 / 0.999, 0.41 mm | 3518 k, 1.000 / 0.999 / 0.999, 0.27 mm |
+| held-out `mesh-lit` full / covered PSNR, coverage | 8.63 / 23.29 dB, 0.609 | 8.63 / 23.29 dB, 0.610 |
+| held-out `splat` full PSNR / SSIM, covered, cc full | — | **31.71 / 0.956**, 31.26, 34.67 dB (coverage 1.000) |
+
+At balanced, the splat stage (132 s) costs more than refine saves, so post-capture processing is 4 % slower with it
+and 34 % faster without it. The 1063 MB memory plan leaves 137 MB of the 1.2 GB tab budget.
+
+### iPhone estimate (not measured)
+
+These are estimates scaled from the M4 means of the two runs, not measurements. Each M4 time is multiplied by
+peak ratio / sustained fraction, using the given M4 GPU ≈ 1.26× A19 Pro and 1.76× A18 Pro peak, sustained at
+0.55–0.68 of peak: ×1.85–2.29 for an A19 Pro and ×2.59–3.20 for an A18 Pro. The factor is applied to every stage. That
+is optimistic for the CPU-bound parts (refine's bundle adjustment on the CPU pool, view decoding and undistortion in
+dense / splat prepare): they run on 6 phone cores instead of 10. Capture is live and paced by the recording, so it is
+left out.
+
+| stage | M4 (measured) | A19 Pro (est.) | A18 Pro (est.) |
+|---|---|---|---|
+| object-real post-capture processing, before | 202.9 s | 6.3–7.7 min | 8.8–10.8 min |
+| object-real post-capture processing, after | 156.1 s | 4.8–6.0 min | 6.7–8.3 min |
+| · of which splat stage (training) | 59.6 s (47.0 s) | 110–137 s (87–108 s) | 2.6–3.2 min (2.0–2.5 min) |
+| · after, without the splat stage | 96.5 s | 3.0–3.7 min | 4.2–5.1 min |
+| yard-real post-capture processing, before | 149.8 s | 4.6–5.7 min | 6.5–8.0 min |
+| yard-real post-capture processing, after | 112.2 s | 3.5–4.3 min | 4.8–6.0 min |
+| · of which splat stage (training) | 41.8 s (29.4 s) | 77–96 s (55–67 s) | 108–134 s (76–94 s) |
+| splat iteration at full resolution (object / yard) | 18.8 / 11.6 ms | 35–43 / 21–26 ms | 49–60 / 30–37 ms |
+
+Memory is not scaled. The fast splat plan peaks at 758–810 MB of the 1.2 GB tab budget on both scenes. Checkpoints
+write 22 MB every 500 iterations (146–155 ms each here, in Chromium's IndexedDB); their cost on iOS is unmeasured.
+
+### Side-by-side views
+
+GT | splat | `mesh-lit` (app default) panels, 600×800 / 800×600. Views 5, 13 and 21 of the 24 are shown for the held-out
+set and for the height-shifted set (object +12 cm, yard +0.75 m). They were made with `nvs.mjs … --frames <i,j,k>
+--renderers splat,mesh-lit --save-images`, from the middle third (the render) of each `view-<frame>-<renderer>.png`
+panel:
+
+| set | frames | splat / `mesh-lit` full PSNR (dB) |
+|---|---|---|
+| object-real held-out | 31, 106, 172 | 29.75 / 10.06, 30.91 / 7.80, 31.54 / 7.59 |
+| object-real +12 cm | 37, 104, 170 | 24.72 / 11.31, 27.21 / 9.08, 25.91 / 8.36 |
+| yard-real held-out | 45, 125, 204 | 30.97 / 11.54, 33.09 / 10.62, 29.18 / 8.61 |
+| yard-real +0.75 m | 45, 125, 205 | 18.47 / 10.92, 23.59 / 9.64, 19.24 / 8.06 |
+
+On the +0.75 m yard views the splat shows open-bowl tree crowns and a smeared band above the fence where it never saw
+the ground beyond. The mesh has the same bowl crowns and black holes for everything it did not reconstruct.
+
+### Reproduce
+
+```sh
+# before: detached worktree of eb131af + the launch patch
+git worktree add --detach ../sfm-bt-base eb131af && git -C ../sfm-bt-base cherry-pick bf55e6c
+(cd ../sfm-bt-base && E2E_GPU=host node e2e/run-e2e.mjs object-real --engine worker --tag base-final)
+E2E_GPU=host node e2e/nvs.mjs object-real ../sfm-bt-base/e2e/out/e2e/object-real-base-final --common
+# after
+E2E_GPU=host node e2e/run-e2e.mjs object-real --engine worker --splat --nvs --tag final
+# off-trajectory test sets (same seed; the glance pans dropped; ~20–30 s each on the M4)
+E2E_GPU=host node e2e/generate-synth.mjs object-real --name object-real-up12 --depth-every 0 --visibility-every 0 \
+  --set 'trajectory.shake.pans=[]' --set trajectory.heightAbove=0.32    # in5 / out5: trajectory.radius=0.40 / 0.50
+E2E_GPU=host node e2e/generate-synth.mjs yard-real --name yard-real-up75 --depth-every 0 --visibility-every 0 \
+  --set 'trajectory.shake.pans=[]' --set trajectory.height=2.25    # in150 / out150: trajectory.lateralOffset=-1.5 / 1.5
+E2E_GPU=host node e2e/nvs.mjs object-real e2e/out/e2e/object-real-final --test-dataset object-real-up12 --common \
+  --renderers points,mesh-lit,mesh-unlit,splat                            # → <run>/nvs-object-real-up12/nvs.json
+```

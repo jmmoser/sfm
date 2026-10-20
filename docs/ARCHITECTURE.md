@@ -914,7 +914,11 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   24 views; covered-pixel PSNR / coverage): object-real mesh lit (app default) 23.6 dB / 0.61,
   unlit 28.7 dB, points 23.3 dB / 0.75, points + EDL 15.1 dB; yard-real 23.1 / 26.9 / 27.0 /
   18.1 dB at 0.64 / 0.77 coverage; full-frame PSNR 8.6–10.7 dB on both -real sets — the missing
-  background, not the colour, dominates what a viewer of the result sees.
+  background, not the colour, dominates what a viewer of the result sees. `--test-dataset NAME` scores
+  off-trajectory views instead: another dataset of the same seeded scene on a shifted path (object
+  `radius` / `heightAbove`, yard `height` / `lateralOffset`, which leaves the gravel path in place), GT
+  poses through the run's Sim3 (or composed with the keyframe nearest in space); scene / seed / camera
+  mismatches are refused. `--common` adds every renderer's score on the pixels all of them cover.
 
 ### `src/dense` — PatchMatch review notes (corrections to the PatchMatch subsection above)
 
@@ -3323,3 +3327,12 @@ without a dense cloud); protocol and UI contract in ENGINE.md §2 "Splat" / §3 
   (`cpu-pool.ts`) or reuse the dense stage's undistorted views; no iPhone measurement (iteration time, IndexedDB
   checkpoint writes of 22–56 MB every 500 iterations, budget headroom of `max`); 'auto' mode without a resolved mode
   gets no sky shell; the shell radius is a heuristic; the viewer / app UI (next workstream: ENGINE.md §3).
+* **Final before / after measurement** (e2e/README.md "Breakthrough results", fast, M4, two runs each): post-capture
+  processing 202.9 → 156.1 s on object-real and 149.8 → 112.2 s on yard-real with the splat stage (96.5 / 70.4 s without
+  it), sparse accuracy unchanged, dense accuracy p50 0.43 → 0.30 mm / 25.0 → 8.9 mm. The splat view scores 31.3 / 31.1 dB
+  full frame on held-out frames against 8.6 / 9.8 dB for the app's lit mesh. Off trajectory (same seeded scene,
+  shifted paths) it changes by +0.1 to −3.3 dB (object ±5 cm radius, +12 cm height) and 1.3–8.3 dB (yard ±1.5 m sideways,
+  +0.75 m height). The stress cases lose 8.0 dB (+25 cm) and 11.0 dB (+1.5 m). Height is the weak axis: the
+  captures never see tree tops or the ground behind the fence. Even so, it stays 9.8–21.2 dB above `mesh-lit` and
+  ahead of the unlit mesh on the mesh's own pixels except at object +25 cm (−0.4 dB). The off-trajectory sets
+  (`--test-dataset`) can now settle the colour-correction trade-off above; not done here.
