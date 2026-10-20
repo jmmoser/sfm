@@ -28,6 +28,26 @@ import type { EngineConfig, SparseCameraEx, SparseModel, SparseResultEx } from '
 const now = (): number => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
 
+/**
+ * Yield one macrotask (every pending microtask runs first) without the ≥ 4 ms clamp of nested
+ * timers: a message to ourselves. Used to let a queued GPU job encode and submit its work before
+ * the caller blocks the thread with CPU work.
+ */
+const taskChannel = typeof MessageChannel !== 'undefined' ? new MessageChannel() : null;
+const taskQueue: (() => void)[] = [];
+if (taskChannel) {
+  taskChannel.port1.onmessage = () => taskQueue.shift()?.();
+  // (Node: the open port must not keep the process alive)
+  for (const port of [taskChannel.port1, taskChannel.port2]) (port as unknown as { unref?: () => void }).unref?.();
+}
+const yieldTask = (): Promise<void> =>
+  taskChannel
+    ? new Promise((r) => {
+        taskQueue.push(r);
+        taskChannel.port2.postMessage(null);
+      })
+    : tick();
+
 export function cancelledError(stage: string): Error {
   return new SfMCancelledError(stage);
 }
@@ -467,7 +487,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   // per candidate source (sequential, retrieval, spatial — first that proposed it): pairs, verified, verification ms
   const source = new Map<number, number>();
   for (const [k, list] of [seq, ret, spa].entries()) for (const [a, b] of list) if (!source.has(pairKey(a, b))) source.set(pairKey(a, b), k);
-  const bySource = [0, 1, 2].map(() => ({ pairs: 0, verified: 0, ms: 0 }));
+  const bySource = [0, 1, 2].map(() => ({ pairs: 0, verified: 0, ms: 0, failedMs: 0 }));
   const pairs = mergePairs([seq, ret, spa], exclude).filter(([a, b]) => st.db.features.has(a) && st.db.features.has(b));
   stats.candidatePairs = pairs.length;
   const stored: StoredPair[] = [];
@@ -478,8 +498,11 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   let verifyMs = 0,
     matchWaitMs = 0;
   // One-deep prefetch: pair i+1 is matched on the GPU while pair i is verified on the CPU
-  // (the GPU chain still runs one job at a time). Rejections surface when awaited; after a
-  // cancel the queued job skips its match.
+  // (the GPU chain still runs one job at a time). The queued job needs the event loop to encode
+  // and submit its work: one macrotask after pair i's matches arrived lets it reach the GPU
+  // before the (synchronous) verification starts — otherwise the GPU idles during every
+  // verification and the CPU during every match (e2e: 7–10 s of waiting per refine).
+  // Rejections surface when awaited; after a cancel the queued job skips its match.
   const putative = (i: number): Promise<MatchPairs | null> | null => {
     if (i >= pairs.length) return null;
     const p = live.putativeMatches(pairs[i][0], pairs[i][1], cancel);
@@ -499,6 +522,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     try {
       const tw = now();
       const m = await cur;
+      if (next) await yieldTask();
       const tv = now();
       matchWaitMs += tv - tw;
       g = m ? live.verifyPair(a, b, m, { maxIterations: speculative.has(key) ? 1000 : 2000 }) : null;
@@ -507,6 +531,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
       src.pairs++;
       src.ms += now() - tv;
       if (g && g.config !== 'degenerate' && g.inliers.length >> 1 >= ENGINE_DEFAULTS.minPairInliers) src.verified++;
+      else src.failedMs += now() - tv;
     } catch (e) {
       deps.log('warn', `pair ${a}-${b}: ${(e as Error)?.message ?? e}`);
     }
@@ -528,7 +553,9 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   stats.matchingMs = Math.round(now() - tMatch);
   stats.verifyMs = Math.round(verifyMs);
   stats.matchWaitMs = Math.round(matchWaitMs);
-  stats.verifyBySource = ['sequential', 'retrieval', 'spatial'].map((n, k) => `${n} ${bySource[k].verified}/${bySource[k].pairs} ${Math.round(bySource[k].ms)} ms`).join(', ');
+  stats.verifyBySource = ['sequential', 'retrieval', 'spatial']
+    .map((n, k) => `${n} ${bySource[k].verified}/${bySource[k].pairs} ${Math.round(bySource[k].ms)} ms (failed ${Math.round(bySource[k].failedMs)} ms)`)
+    .join(', ');
   report('matching', 1, `${st.db.numPairs} verified pairs`);
 
   // ---------------------------------------------------------------- reconstruction
