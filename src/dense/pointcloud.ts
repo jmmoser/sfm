@@ -92,7 +92,8 @@ const LOD_LEVELS_PER_OCTAVE = 2;
  * its own resolution instead of being merged at one cloud-wide voxel size (which, sized from the
  * median radius, merged a close-range object ~10× and averaged its points across surfaces), and a
  * merged centroid moves by at most about one cell, i.e. a few footprints. `s` is searched so
- * that at most `maxPoints` cells remain (≈ 0.88–0.97 of it), on hash-sampled cell counts. Merged
+ * that at most `maxPoints` cells remain (≈ 0.88–0.97 of it), on hash-sampled cell counts (a cap
+ * below what the coarsest grid reaches — ≤ 8 cells per populated level — returns that). Merged
  * attributes as in `voxelDownsample` (radius ≥ 0.6 × the cell). Points without a finite positive
  * radius use the median radius; without `radii` the grid is uniform (searched voxel size).
  * Non-finite positions are dropped.
@@ -196,11 +197,15 @@ export function footprintDownsample(pc: PointCloud, maxPoints: number): PointClo
   }
   est = null;
   if (!(okS < Infinity)) okS = 2 * s;
-  const table = new CellTable(target + 1);
+  // Cells of different levels never merge: once the finest cell spans the coordinate range
+  // (sMax), every level keeps ≤ 8 cells (sign octants) and a larger s changes nothing. A target
+  // below that count takes the cells at sMax (the table holds them all: an exact assignment).
+  const sMax = (2 * maxAbs) / levelSize[0];
+  const table = new CellTable(Math.max(target, 8 * LOD_LEVELS) + 1);
   const cellOf = new Int32Array(n);
   let cells = pass(okS, table, cellOf, 1);
-  while (cells > target || table.full) {
-    okS *= Math.max(1.01, Math.sqrt(cells / goal));
+  for (let grow = 0; (cells > target || table.full) && okS < sMax; grow++) {
+    okS = grow < 24 ? Math.min(sMax, okS * Math.max(1.01, Math.sqrt(cells / goal))) : sMax;
     cells = pass(okS, table, cellOf, 1);
   }
   // per-cell level (cell size) for the merged radius

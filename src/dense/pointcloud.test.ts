@@ -205,6 +205,33 @@ describe('filterPointCloud', () => {
     expect(u2.count).toBeGreaterThan(0.5 * cap);
   });
 
+  it('footprint LOD terminates when the cap is below what levels that never merge can reach', () => {
+    // radii over 20 octaves (40 levels), each level spread over all 8 sign octants: the coarsest
+    // grid still keeps ≈ 8 × 40 cells, far above these caps (it used to loop forever)
+    const rng = new Rng(7);
+    const pts: number[][] = [];
+    const radii: number[] = [];
+    for (let i = 0; i < 4000; i++) {
+      pts.push([2 * rng.next() - 1, 2 * rng.next() - 1, 2 * rng.next() - 1]);
+      radii.push(1e-4 * Math.pow(2, (i % 40) / 2));
+    }
+    const pc = cloud(pts, radii);
+    for (const cap of [1, 10, 200]) {
+      const lod = footprintDownsample(pc, cap);
+      expect(lod.count).toBeGreaterThan(0);
+      expect(lod.count).toBeLessThanOrEqual(8 * 40);
+      expect(lod.count).toBeLessThan(pc.count);
+      expect(lod.positions.every((v) => Number.isFinite(v) && Math.abs(v) <= 1)).toBe(true);
+      expect(lod.radii!.every((r) => Number.isFinite(r) && r > 0)).toBe(true);
+    }
+    // every point at the origin (zero coordinate range): one cell per populated level
+    const origin = cloud(
+      pts.map(() => [0, 0, 0]),
+      radii,
+    );
+    expect(footprintDownsample(origin, 5).count).toBe(40);
+  });
+
   it('timing: 1M points voxel + SOR', () => {
     const rng = new Rng(4);
     const n = 1_000_000;
