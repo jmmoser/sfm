@@ -263,13 +263,13 @@ export function planDense(p: DensePlanInput): DensePlan {
   const map = MEM.depthMapPx * px;
 
   // ---- PatchMatch passes
-  const imageCacheBytes = Math.max((S + 2) * img, Math.min(0.15 * budget, 24 * img));
+  const imageCacheBase = Math.max((S + 2) * img, Math.min(0.15 * budget, 24 * img));
   const geometric = p.geometricPasses > 0;
   const sourceDepthCacheBytes = geometric ? Math.max((S + 1) * MEM.depthOnlyPx * px, Math.min(0.1 * budget, 32 * MEM.depthOnlyPx * px)) : 0;
   const colourBytes = Math.max(16 * MB, 0.08 * budget);
   const gpuBytes = p.gpu ? MEM.pmGpuRefPx * px + S * px * (MEM.pmGpuSrcPx + (geometric ? MEM.pmGpuGeomSrcPx : 0)) + MEM.pmGpuFixed : 0;
   const pmParts: MemoryBreakdown = {
-    images: imageCacheBytes,
+    images: imageCacheBase,
     sourceDepths: sourceDepthCacheBytes,
     // prior (full map) + the new map + its serialised copy (+ the halo-filtered copy)
     depthMaps: (geometric ? map : 0) + map + MEM.depthStoredPx * px + (p.haloFilter ? map : 0),
@@ -305,6 +305,17 @@ export function planDense(p: DensePlanInput): DensePlan {
     // marching cubes + simplification of ≈ 1–2 M triangles
     mesh: 120 * MB,
   };
+
+  // The image LRU may use what the PatchMatch stage leaves below the larger of the other two
+  // stages' peaks (it never raises the plan's peak): up to every view, so each view is decoded
+  // and undistorted once per resolution instead of once per pass.
+  let imageCacheBytes = imageCacheBase;
+  const otherPeak = Math.max(sumBreakdown(fusionParts), sumBreakdown(meshParts));
+  const pmSlack = otherPeak - sumBreakdown(pmParts);
+  if (pmSlack > 0 && views * img > imageCacheBytes) {
+    imageCacheBytes = Math.min(views * img, imageCacheBytes + pmSlack);
+    pmParts.images = imageCacheBytes;
+  }
 
   const stages: DenseStagePeak[] = [
     { stage: 'patchmatch', bytes: sumBreakdown(pmParts), parts: pmParts },

@@ -92,7 +92,7 @@ const LOD_LEVELS_PER_OCTAVE = 2;
  * its own resolution instead of being merged at one cloud-wide voxel size (which, sized from the
  * median radius, merged a close-range object ~10× and averaged its points across surfaces), and a
  * merged centroid moves by at most about one cell, i.e. a few footprints. `s` is searched so
- * that at most `maxPoints` cells remain (≥ 90 % of it when the search converges). Merged
+ * that at most `maxPoints` cells remain (≈ 0.88–0.97 of it), on hash-sampled cell counts. Merged
  * attributes as in `voxelDownsample` (radius ≥ 0.6 × the cell). Points without a finite positive
  * radius use the median radius; without `radii` the grid is uniform (searched voxel size).
  * Non-finite positions are dropped.
@@ -148,83 +148,93 @@ export function footprintDownsample(pc: PointCloud, maxPoints: number): PointClo
   const levelSize = new Float64Array(LOD_LEVELS);
   for (let l = 0; l < LOD_LEVELS; l++) levelSize[l] = r0 * Math.pow(2, (l + 0.5) / LOD_LEVELS_PER_OCTAVE);
   const inv = new Float64Array(LOD_LEVELS);
-  // a pass stops once it has more cells than `abortAt` (its count is then extrapolated): bounds
-  // the table to ≈ 1.25 × target entries
-  const abortAt = Math.min(nValid, Math.ceil(1.25 * target));
-  const tableRef = (): CellTable => table!;
-  let table: CellTable | null = new CellTable(abortAt + 1);
-  /** Cells at scale `scale` (into `cellOf`); > target ⇒ possibly an extrapolated estimate. */
-  const assign = (scale: number, cellOf: Int32Array): number => {
+  /**
+   * Cells at `scale`. With `cellOf`: exact, assigning every point (a pass stops early, returning
+   * an extrapolated count, once the table is full). Without: a hash-sampled estimate — only the
+   * cells whose key hash is ≡ 0 mod `sample` are kept, so the table holds 1/`sample` of the
+   * cells and stays cache-resident (relative error ≈ (cells / sample)^−½, 0.3 % at 2 M cells).
+   */
+  const pass = (scale: number, table: CellTable, cellOf: Int32Array | null, sample: number): number => {
     for (let l = 0; l < LOD_LEVELS; l++) inv[l] = 1 / (scale * levelSize[l]);
-    const table = tableRef();
     table.clear();
+    const m = sample - 1;
     for (let i = 0; i < n; i++) {
       if (!valid[i]) {
-        cellOf[i] = -1;
+        if (cellOf) cellOf[i] = -1;
         continue;
       }
       const l = level[i];
       const k = inv[l];
-      cellOf[i] = table.getOrInsert(Math.floor(P[3 * i] * k), Math.floor(P[3 * i + 1] * k), Math.floor(P[3 * i + 2] * k) * LOD_LEVELS + l);
-      if (table.size > abortAt) return Math.max(table.size, Math.round((table.size * n) / (i + 1)));
+      const x = Math.floor(P[3 * i] * k);
+      const y = Math.floor(P[3 * i + 1] * k);
+      const z = Math.floor(P[3 * i + 2] * k) * LOD_LEVELS + l;
+      const h = cellHash(x, y, z);
+      if (cellOf) cellOf[i] = table.getOrInsert(x, y, z, h);
+      else if ((h & m) === 0) table.getOrInsert(x, y, z, h);
+      if (table.full) return Math.round((table.size * sample * n) / (i + 1));
     }
-    return table.size;
+    return table.size * sample;
   };
-  // search s (cells fall roughly as 1 / s² on surfaces): secant steps inside a bracket; any count
-  // in [0.9, 1] × target is accepted
-  let cellOf = new Int32Array(n);
-  let spare = new Int32Array(n);
+  // search s on estimates (cells fall roughly as 1 / s² on surfaces): secant steps inside a
+  // bracket, aiming at 0.93 × target and accepting [0.88, 0.97]; then one exact pass (retried
+  // with a larger s in the rare case the estimate was low)
+  const sample = target >= 1 << 16 ? 16 : 1;
+  const goal = 0.93 * target;
+  let est: CellTable | null = new CellTable(Math.ceil(nValid / sample) + 64);
   let s = Math.max(sMin, 1.8 * Math.sqrt(nValid / target));
-  let okS = Infinity; // smallest s seen with cells ≤ target (its assignment is in `cellOf`)
-  let okCells = 0;
-  let failS = sMin; // largest s seen with cells > target
-  for (let it = 0; it < 8; it++) {
-    const cells = assign(s, spare);
-    if (cells <= target) {
-      if (s < okS) {
-        okS = s;
-        okCells = cells;
-        [cellOf, spare] = [spare, cellOf];
-      }
-      if (cells >= 0.9 * target) break;
+  let okS = Infinity; // smallest s estimated ≤ 0.97 × target
+  let failS = sMin; // largest s estimated above it
+  for (let it = 0; it < 10; it++) {
+    const cells = pass(s, est, null, sample);
+    if (cells <= 0.97 * target) {
+      okS = Math.min(okS, s);
+      if (cells >= 0.88 * target) break;
     } else failS = Math.max(failS, s);
-    let next = s * Math.sqrt(cells / (0.9 * target));
+    let next = s * Math.sqrt(cells / goal);
     if (!(next > failS && next < okS)) next = okS < Infinity ? Math.sqrt(failS * okS) : 2 * s;
     s = next;
   }
-  for (s = okS < Infinity ? okS : 2 * s; !(okS < Infinity); s *= 1.5) {
-    // never under the target (degenerate radii): grow until it is
-    const cells = assign(s, cellOf);
-    if (cells <= target) {
-      okS = s;
-      okCells = cells;
-    }
+  est = null;
+  if (!(okS < Infinity)) okS = 2 * s;
+  const table = new CellTable(target + 1);
+  const cellOf = new Int32Array(n);
+  let cells = pass(okS, table, cellOf, 1);
+  while (cells > target || table.full) {
+    okS *= Math.max(1.01, Math.sqrt(cells / goal));
+    cells = pass(okS, table, cellOf, 1);
   }
-  const cells = okCells;
-  // search scratch is garbage now (the merge allocates the output)
-  spare = new Int32Array(0);
-  table = null;
   // per-cell level (cell size) for the merged radius
   const cellLevel = new Uint8Array(cells);
   for (let i = 0; i < n; i++) if (cellOf[i] >= 0) cellLevel[cellOf[i]] = level[i];
   return mergeCells(pc, cellOf, cells, (c) => okS * levelSize[cellLevel[c]]);
 }
 
+/** 32-bit mix of an integer cell (x, y, z). */
+function cellHash(x: number, y: number, z: number): number {
+  let h = Math.imul(x, 0x8da6b343) ^ Math.imul(y, 0xd8163841) ^ Math.imul(z, 0xcb1ab31f);
+  h = Math.imul(h ^ (h >>> 15), 0x2c1b3c6d);
+  return h ^ (h >>> 13);
+}
+
 /**
  * Set of integer cells (x, y, z) → dense index (insertion order): open addressing, linear
- * probing, one interleaved (x, y, z, index) slot per entry (one cache line per probe), sized once
- * and cleared between the scale-search passes (no reallocation).
+ * probing from the hash's high bits, one interleaved (x, y, z, index) slot per entry (one cache
+ * line per probe), sized once (load ≤ 0.6) and cleared between passes. `full` once it holds
+ * `maxEntries`: the caller stops inserting.
  */
 class CellTable {
   private readonly slots: Int32Array;
   private readonly cap: number;
   size = 0;
 
-  /** `maxEntries`: upper bound of the entries (no growth; load factor ≤ 0.6). */
-  constructor(maxEntries: number) {
+  constructor(private readonly maxEntries: number) {
     this.cap = Math.max(1024, Math.ceil(maxEntries / 0.6));
     this.slots = new Int32Array(4 * this.cap);
     this.clear();
+  }
+
+  get full(): boolean {
+    return this.size >= this.maxEntries;
   }
 
   clear(): void {
@@ -233,10 +243,7 @@ class CellTable {
     this.size = 0;
   }
 
-  getOrInsert(x: number, y: number, z: number): number {
-    let h = Math.imul(x, 0x8da6b343) ^ Math.imul(y, 0xd8163841) ^ Math.imul(z, 0xcb1ab31f);
-    h = Math.imul(h ^ (h >>> 15), 0x2c1b3c6d);
-    h ^= h >>> 13;
+  getOrInsert(x: number, y: number, z: number, h: number): number {
     const cap = this.cap;
     const s = this.slots;
     let i = Math.floor(((h >>> 0) / 4294967296) * cap);
