@@ -688,7 +688,14 @@ export class LiveSession {
       this.ref = null;
     }
     this.segment = seg;
-    const verdict = this.orientation.classify({ width: f.bitmap.width, height: f.bitmap.height, screenAngle: f.screenAngle, t: f.t, raw: f.rawBuffer === true });
+    const verdict = this.orientation.classify({
+      width: f.bitmap.width,
+      height: f.bitmap.height,
+      screenAngle: f.screenAngle,
+      t: f.t,
+      raw: f.rawBuffer === true,
+      screenAngleSince: f.screenAngleSince,
+    });
     dbg.srcWidth = f.bitmap.width;
     dbg.srcHeight = f.bitmap.height;
     if (!verdict.ok) {

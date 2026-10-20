@@ -14,8 +14,8 @@ import { parseGLB } from '../io/glb';
 import { decodePLY } from '../io/ply';
 import { readZip } from '../io/zip';
 import { umeyama } from '../math/sim3';
-import { cameraFromDevice, rotateImagePoint } from '../sensors/frame-orientation';
-import type { LiveUpdate } from '../workers/protocol';
+import { cameraFromDevice, rotateImagePoint, type ScreenAngle } from '../sensors/frame-orientation';
+import type { FrameInput, LiveUpdate } from '../workers/protocol';
 import { createCpuFeaturePipeline } from './cpu-pipeline';
 import { PhotogrammetryEngine, frameToBitmap } from './engine';
 import { OrientationTracker, gravityDown, overlayPoints, prepareFrame } from './frame-ingest';
@@ -194,6 +194,28 @@ describe('frame ingest', () => {
     }
   });
 
+  it('the engine dates a UI rotation by FrameInput.screenAngleSince', async () => {
+    const frame = (w: number, h: number, screenAngle: ScreenAngle, t: number, screenAngleSince?: number): FrameInput => ({
+      bitmap: { width: w, height: h, data: new Uint8ClampedArray(w * h * 4) },
+      t,
+      screenAngle,
+      imu: [],
+      ...(screenAngleSince !== undefined ? { screenAngleSince } : {}),
+    });
+    const reason = async (since?: number): Promise<string> => {
+      const e = new PhotogrammetryEngine({ mode: 'object', quality: 'fast', persist: false }, testConfig());
+      await e.init();
+      await e.processFrame(frame(48, 64, 0, 0));
+      await e.processFrame(frame(48, 64, 0, 90));
+      // rotated at 1000 ms; the pump skipped [1000, 1500) itself
+      const u = await e.processFrame(frame(64, 48, 90, 1500, since));
+      e.dispose();
+      return u.debug!.reason;
+    };
+    expect(await reason()).toBe('dropped: within 500 ms of a UI rotation');
+    expect(await reason(1000)).not.toMatch(/^dropped/);
+  });
+
   it('rotates RGBA frames into the canonical orientation and maps the overlay back', () => {
     const W = 40,
       H = 30;
@@ -364,6 +386,11 @@ describe('engine: synthetic orbit, CPU path', () => {
       expect(c.frameIndex).toBeGreaterThanOrEqual(0);
       expect(c.t).toBe(cap.frames[c.frameIndex!].t);
     }
+    // the cameras carry their physical up (the viewer's 'auto' world up): world +Z here
+    for (const { pose: { R }, upCam: u } of res.cameras) {
+      expect(u).toBeDefined();
+      expect(angleDeg([0, 1, 2].map((k) => R[k] * u![0] + R[3 + k] * u![1] + R[6 + k] * u![2]), [0, 0, 1])).toBeLessThan(5);
+    }
     const fTrue = cap.cam.f;
     expect(Math.abs(res.cameras[0].intrinsics.f / fTrue - 1)).toBeLessThan(0.03);
     expect(res.metric.metric).toBe(true);
@@ -448,6 +475,7 @@ describe('engine: synthetic orbit, CPU path', () => {
     expect(sum.quality).toBe('fast');
     expect(sum.sparse!.cameras.length).toBe(res.cameras.length);
     expect((sum.sparse!.cameras[0] as { frameIndex?: number }).frameIndex).toBe(res.cameras[0].frameIndex);
+    expect(sum.sparse!.cameras.map((c) => c.upCam)).toEqual(res.cameras.map((c) => c.upCam));
     expect(sum.dense!.count).toBe(engine.denseCloudResult!.count);
     expect(sum.mesh!.triangleCount).toBe(engine.meshResult!.triangleCount);
     const b = await e2.exportModel('colmap-zip');

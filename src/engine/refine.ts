@@ -19,7 +19,7 @@ import { computeWorldAlignment, type WorldAlignment, type WorldKeyframe } from '
 import { gyroConsistency, timedRotations, type GyroConsistency } from '../sfm/gyro';
 import { median } from '../math/stats';
 import type { ScreenAngle } from '../sensors/frame-orientation';
-import { handEyeCheck, type HandEyeResult, type LiveSession } from './live';
+import { handEyeCheck, keyframeUpCam, type HandEyeResult, type LiveSession } from './live';
 import { refinePerImageFocal, refineRollingShutter, rsStats, sparseRollingShutter, type RefineRSResult } from './refine-camera';
 import { pairToStored, type EngineStore, type StoredPair, type StoredPairs } from './persistence';
 import { ENGINE_DEFAULTS } from './presets';
@@ -628,12 +628,14 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   if (srs) model.rollingShutter = srs;
   const cameras: SparseCameraEx[] = model.images.map((im) => {
     const r = st.records.get(im.id);
+    const upCam = r ? keyframeUpCam(r) : undefined;
     return {
       id: im.id,
       pose: { R: Float64Array.from(im.pose.R), t: Float64Array.from(im.pose.t) },
       intrinsics: { ...model.cameras.get(im.cameraId)! },
       t: r?.t ?? NaN,
       frameIndex: r?.frameIndex ?? -1,
+      ...(upCam ? { upCam } : {}),
     };
   });
   const cam0 = cameras[0]?.intrinsics;
