@@ -13,7 +13,7 @@ import { mergePairs, retrievalPairs, sequentialPairs, spatialPairs, type ImagePa
 import type { CorrespondenceGraph } from '../sfm/correspondence-graph';
 import { pairKey, type FeatureDatabase } from '../sfm/database';
 import { extractColors, IncrementalMapper, runIncrementalSfM, SfMCancelledError, type MapperOptions, type RunSfMOptions } from '../sfm/mapper';
-import type { Reconstruction } from '../sfm/reconstruction';
+import { reprojectionErrorSq, type Reconstruction } from '../sfm/reconstruction';
 import { VocabularyIndex } from '../sfm/vocab';
 import { computeWorldAlignment, type WorldAlignment, type WorldKeyframe } from '../sfm/world';
 import { gyroConsistency, timedRotations, type GyroConsistency } from '../sfm/gyro';
@@ -214,6 +214,97 @@ export function explainedCorrespondenceRatio(rec: Reconstruction, db: FeatureDat
   return total > 0 ? explained / total : 0;
 }
 
+/** Verified pairs of a model whose correspondences it splits between different 3-D points (`splitPairs`). */
+export interface SplitPairStats {
+  /** Verified pairs with both images registered. */
+  pairs: number;
+  /** Their correspondences, and the share with both features on DIFFERENT 3-D points. */
+  correspondences: number;
+  splitRatio: number;
+  /** Pairs with ≥ max(15, 25 %) split correspondences. */
+  splitPairs: number;
+  /** Of those: the pair's verified rotation agrees with the model's relative rotation within `maxRotDeg`. */
+  consistentSplitPairs: number;
+  /** Split correspondences on the consistent split pairs, and their median reprojection error (px) of a's point in b. */
+  consistentSplitCorrespondences: number;
+  consistentSplitReprojPx: number;
+  /** The consistent split pairs (≤ 10, most split first): ids, split / inliers, rotation disagreement, reprojection. */
+  examples: string[];
+}
+
+/**
+ * Split correspondences of verified pairs: both features observe a 3-D point, but different ones.
+ * A model that did not close a loop keeps both ends of it in separate tracks, so the loop pairs'
+ * correspondences are split while the pairs agree with the model's relative rotation (the drift
+ * is mostly translation); a false pair (repeated structure) that the model rightly ignores is split
+ * too, but its rotation disagrees.
+ */
+export function splitPairs(rec: Reconstruction, db: FeatureDatabase, maxRotDeg = 2): SplitPairStats {
+  let pairs = 0,
+    total = 0,
+    split = 0,
+    nSplitPairs = 0,
+    nConsistent = 0,
+    consistentCorr = 0;
+  const reproj: number[] = [];
+  const ex: { key: string; n: number }[] = [];
+  const Rba = new Float64Array(9);
+  for (const [a, b, g] of db.pairs()) {
+    const ia = rec.images.get(a),
+      ib = rec.images.get(b);
+    if (!ia || !ib || !ia.registered || !ib.registered) continue;
+    pairs++;
+    const inl = g.inliers;
+    const n = inl.length >> 1;
+    let ns = 0;
+    for (let k = 0; k < inl.length; k += 2) {
+      const pa = ia.point3D[inl[k]],
+        pb = ib.point3D[inl[k + 1]];
+      if (pa >= 0 && pb >= 0 && pa !== pb) ns++;
+    }
+    total += n;
+    split += ns;
+    if (ns < Math.max(15, 0.25 * n)) continue;
+    nSplitPairs++;
+    if (!g.R) continue;
+    // model relative rotation a → b: R_b R_aᵀ
+    const A = ia.pose.R,
+      B = ib.pose.R;
+    for (let i = 0; i < 3; i++)
+      for (let j = 0; j < 3; j++) Rba[3 * i + j] = B[3 * i] * A[3 * j] + B[3 * i + 1] * A[3 * j + 1] + B[3 * i + 2] * A[3 * j + 2];
+    let tr = 0;
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) tr += Rba[3 * i + j] * g.R[3 * i + j];
+    const errDeg = (Math.acos(Math.max(-1, Math.min(1, (tr - 1) / 2))) * 180) / Math.PI;
+    if (!(errDeg <= maxRotDeg)) continue;
+    nConsistent++;
+    consistentCorr += ns;
+    const cam = rec.cameras.get(ib.cameraId)!;
+    const kp = ib.keypoints;
+    const errs: number[] = [];
+    for (let k = 0; k < inl.length && kp; k += 2) {
+      const pa = ia.point3D[inl[k]],
+        pb = ib.point3D[inl[k + 1]];
+      if (!(pa >= 0 && pb >= 0 && pa !== pb)) continue;
+      const X = rec.points.get(pa)?.xyz;
+      if (X) errs.push(Math.sqrt(reprojectionErrorSq(cam, ib.pose, X[0], X[1], X[2], kp[4 * inl[k + 1]], kp[4 * inl[k + 1] + 1])));
+    }
+    const med = errs.length ? median(errs) : NaN;
+    reproj.push(med);
+    ex.push({ key: `${a}-${b} ${ns}/${n} ${errDeg.toFixed(1)}° ${med.toFixed(1)} px`, n: ns });
+  }
+  ex.sort((x, y) => y.n - x.n);
+  return {
+    pairs,
+    correspondences: total,
+    splitRatio: total > 0 ? split / total : 0,
+    splitPairs: nSplitPairs,
+    consistentSplitPairs: nConsistent,
+    consistentSplitCorrespondences: consistentCorr,
+    consistentSplitReprojPx: reproj.length ? median(reproj) : NaN,
+    examples: ex.slice(0, 10).map((e) => e.key),
+  };
+}
+
 /** Full refine pipeline. */
 export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, cancel?: CancelToken): Promise<RefineOutput> {
   const live = deps.live;
@@ -268,6 +359,9 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   const attempted: number[] = [];
   let verified = 0;
   let lastYield = now();
+  // CPU verification vs waiting for the GPU matcher (the prefetch overlaps them)
+  let verifyMs = 0,
+    matchWaitMs = 0;
   // One-deep prefetch: pair i+1 is matched on the GPU while pair i is verified on the CPU
   // (the GPU chain still runs one job at a time). Rejections surface when awaited; after a
   // cancel the queued job skips its match.
@@ -288,8 +382,12 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     next = putative(i + 1);
     let g: TwoViewGeometry | null = null;
     try {
+      const tw = now();
       const m = await cur;
+      const tv = now();
+      matchWaitMs += tv - tw;
       g = m ? live.verifyPair(a, b, m, { maxIterations: speculative.has(key) ? 1000 : 2000 }) : null;
+      verifyMs += now() - tv;
     } catch (e) {
       deps.log('warn', `pair ${a}-${b}: ${(e as Error)?.message ?? e}`);
     }
@@ -309,6 +407,8 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   stats.newPairs = verified;
   stats.pairs = st.db.numPairs;
   stats.matchingMs = Math.round(now() - tMatch);
+  stats.verifyMs = Math.round(verifyMs);
+  stats.matchWaitMs = Math.round(matchWaitMs);
   report('matching', 1, `${st.db.numPairs} verified pairs`);
 
   // ---------------------------------------------------------------- reconstruction
@@ -333,6 +433,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   // gyro bias / camera–IMU offset from the refined live model (the rolling-shutter estimation needs
   // ω at the right time; the live calibration may be off or stale)
   if (liveRec && liveRec.numRegisteredImages >= 12 && cfg.estimateRollingShutter !== false) live.calibrateGyro('refine');
+  stats.liveRefineMs = Math.round(now() - tRec);
   // Model choice: gyro consistency first (a model whose consecutive keyframes disagree with the
   // gyro beyond isolated outliers is made of fragments joined by a wrong rotation), then the
   // registered images, then the mean reprojection error.
@@ -347,6 +448,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   const rsEnabled = cfg.estimateRollingShutter !== false && !!gyro;
   let rs: RefineRSResult | null = null;
   const runRS = async (rec: Reconstruction, mapper: IncrementalMapper): Promise<void> => {
+    const tRS = now();
     const prev = st.rollingShutter;
     report('reconstruction', 0.08, 'rolling shutter');
     await tick();
@@ -380,6 +482,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     Object.assign(stats, rsStats(r, st.cameraFromDevice()));
     if (first.estimate) stats.rsImprovementPct = Math.round(1000 * first.estimate.improvement) / 10;
     stats.rsPasses = passes;
+    stats.rsMs = Math.round(now() - tRS);
     if (passes > 1 && first.applied) stats.rsPass1 = `${first.applied.axis} ${first.applied.readoutMs.toFixed(1)} ms`;
     deps.log(
       'info',
@@ -403,6 +506,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     ...(cfg.mapper ?? {}),
   };
   let offline: Reconstruction | null = null;
+  const tOff = now();
   try {
     const models = await runIncrementalSfM(
       st.db,
@@ -415,6 +519,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     if ((e as Error)?.name === 'CancelledError') throw e;
     deps.log('warn', `offline SfM failed: ${(e as Error)?.message ?? e}`);
   }
+  stats.offlineSfMMs = Math.round(now() - tOff);
   const score = (r: Reconstruction | null): [number, number] => (r ? [r.numRegisteredImages, r.meanReprojectionError()] : [0, Infinity]);
   const [lr, le] = score(liveRec);
   const [or, oe] = score(offline);
@@ -434,6 +539,18 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     ox = offline ? explainedCorrespondenceRatio(offline, st.db) : 0;
   stats.liveExplained = Math.round(1000 * lx) / 1000;
   stats.offlineExplained = Math.round(1000 * ox) / 1000;
+  const fmtSplit = (sp: SplitPairStats): string =>
+    `${(100 * sp.splitRatio).toFixed(2)} % split, ${sp.splitPairs} split pairs (${sp.consistentSplitPairs} rotation-consistent, ${sp.consistentSplitCorrespondences} corr., reproj p50 ${sp.consistentSplitReprojPx.toFixed(1)} px)${sp.examples.length ? `: ${sp.examples.join('; ')}` : ''}`;
+  if (liveRec) {
+    const sp = splitPairs(liveRec, st.db);
+    stats.liveSplit = fmtSplit(sp);
+    deps.log('info', `refine: live model ${stats.liveSplit}`);
+  }
+  if (offline) {
+    const sp = splitPairs(offline, st.db);
+    stats.offlineSplit = fmtSplit(sp);
+    deps.log('info', `refine: offline model ${stats.offlineSplit}`);
+  }
   const minExplainedGap = cfg.modelChoiceExplainedGap ?? 0.015;
   const liveBetter = (): boolean => {
     if (lb !== ob) return lb < ob;
@@ -478,6 +595,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   const ppMin = cfg.refinePrincipalPoint === false ? Infinity : cfg.refinePrincipalPoint === true ? 3 : ENGINE_DEFAULTS.refinePrincipalPointMinImages;
   if (chosen.numRegisteredImages >= ppMin) {
     report('reconstruction', 0.97, 'final bundle adjustment (principal point)');
+    const tPP = now();
     try {
       const r = await refinePrincipalPoint(chosen, st.db, st.graph, { ...(which === 'live' ? live.mapper.incrementalMapper.opts : mapperOpts) }, cancel);
       if (r.accepted) chosen = r.rec;
@@ -488,10 +606,12 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
       stats.principalPoint = 'kept (BA failed)';
       deps.log('warn', `principal point BA failed: ${(e as Error)?.message ?? e}`);
     }
+    stats.principalPointMs = Math.round(now() - tPP);
   }
   // per-image focal lengths (focus breathing): only when they lower the reprojection error clearly
   if (cfg.perImageFocal !== false && chosen.numRegisteredImages >= 10) {
     report('reconstruction', 0.985, 'per-image focal');
+    const tPF = now();
     try {
       const mo = { ...(which === 'live' ? live.mapper.incrementalMapper.opts : mapperOpts) };
       const ppOn = cfg.refinePrincipalPoint !== false && chosen.numRegisteredImages >= ppMin;
@@ -517,6 +637,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
       stats.perImageFocal = 'kept shared (BA failed)';
       deps.log('warn', `per-image focal BA failed: ${(e as Error)?.message ?? e}`);
     }
+    stats.perImageFocalMs = Math.round(now() - tPF);
   }
   stats.reconstructionMs = Math.round(now() - tRec);
   report('reconstruction', 1, `${which} model: ${chosen.numRegisteredImages}/${order.length} images, ${chosen.numPoints} points`);
