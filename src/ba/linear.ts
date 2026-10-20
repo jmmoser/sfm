@@ -229,31 +229,104 @@ export class SkylineCholesky {
   /**
    * In-place Cholesky of the stored matrix. Returns false if a pivot is ≤ 1e-15 ·
    * (original diagonal) or not finite (matrix not numerically positive definite).
+   *
+   * Row-oriented (L[i][j] = (A[i][j] − Σₖ L[i][k] L[j][k]) / L[j][j]), two rows × two columns at a
+   * time where the envelopes allow it (rows / columns of one BA parameter block share their first
+   * column): four dot products from four loads per step instead of two loads per multiply-add,
+   * which bounds the plain dot product (≈ 1.7× faster for a dense 541 × 541 system, 2.4× at 1200).
    */
   factor(): boolean {
     const n = this.n,
       first = this.first,
       base = this.rowBase,
       v = this.values;
-    for (let i = 0; i < n; i++) {
+    let i = 0;
+    while (i < n) {
       const fi = first[i];
       const ri = base[i];
+      if (i + 1 < n && first[i + 1] === fi) {
+        // rows i and i1 = i + 1
+        const r1 = base[i + 1];
+        let j = fi;
+        for (; j + 1 < i; j += 2) {
+          const fj = first[j];
+          const rj = base[j];
+          if (first[j + 1] !== fj) {
+            rowPairColumn(v, fi, ri, r1, j, first[j], rj);
+            rowPairColumn(v, fi, ri, r1, j + 1, first[j + 1], base[j + 1]);
+            continue;
+          }
+          const rj1 = base[j + 1];
+          let s00 = 0,
+            s01 = 0,
+            s10 = 0,
+            s11 = 0;
+          for (let k = fi > fj ? fi : fj; k < j; k++) {
+            const x0 = v[ri + k],
+              x1 = v[r1 + k],
+              y0 = v[rj + k],
+              y1 = v[rj1 + k];
+            s00 += x0 * y0;
+            s01 += x0 * y1;
+            s10 += x1 * y0;
+            s11 += x1 * y1;
+          }
+          const djj = v[rj + j];
+          const l0 = (v[ri + j] - s00) / djj,
+            l1 = (v[r1 + j] - s10) / djj;
+          v[ri + j] = l0;
+          v[r1 + j] = l1;
+          // column j + 1 also has the k = j term
+          const c = v[rj1 + j],
+            dj1 = v[rj1 + j + 1];
+          v[ri + j + 1] = (v[ri + j + 1] - (s01 + l0 * c)) / dj1;
+          v[r1 + j + 1] = (v[r1 + j + 1] - (s11 + l1 * c)) / dj1;
+        }
+        for (; j < i; j++) rowPairColumn(v, fi, ri, r1, j, first[j], base[j]);
+        // pivot of row i, then L[i1][i], then the pivot of row i1
+        let sd = 0,
+          sx = 0;
+        for (let k = fi; k < i; k++) {
+          const x = v[ri + k];
+          sd += x * x;
+          sx += v[r1 + k] * x;
+        }
+        const aii = v[ri + i];
+        const dii = aii - sd;
+        if (!(dii > 1e-15 * Math.abs(aii)) || dii === Infinity) return false;
+        const lii = Math.sqrt(dii);
+        v[ri + i] = lii;
+        const l1i = (v[r1 + i] - sx) / lii;
+        v[r1 + i] = l1i;
+        let s2 = l1i * l1i;
+        for (let k = fi; k < i; k++) {
+          const x = v[r1 + k];
+          s2 += x * x;
+        }
+        const a11 = v[r1 + i + 1];
+        const d11 = a11 - s2;
+        if (!(d11 > 1e-15 * Math.abs(a11)) || d11 === Infinity) return false;
+        v[r1 + i + 1] = Math.sqrt(d11);
+        i += 2;
+        continue;
+      }
       for (let j = fi; j < i; j++) {
         const fj = first[j];
         const rj = base[j];
-        const k0 = fi > fj ? fi : fj;
-        let s = v[ri + j];
-        for (let k = k0; k < j; k++) s -= v[ri + k] * v[rj + k];
-        v[ri + j] = s / v[rj + j];
+        let s = 0;
+        for (let k = fi > fj ? fi : fj; k < j; k++) s += v[ri + k] * v[rj + k];
+        v[ri + j] = (v[ri + j] - s) / v[rj + j];
       }
       const aii = v[ri + i];
-      let s = aii;
+      let s = 0;
       for (let k = fi; k < i; k++) {
         const l = v[ri + k];
-        s -= l * l;
+        s += l * l;
       }
-      if (!(s > 1e-15 * Math.abs(aii)) || s === Infinity) return false;
-      v[ri + i] = Math.sqrt(s);
+      const d = aii - s;
+      if (!(d > 1e-15 * Math.abs(aii)) || d === Infinity) return false;
+      v[ri + i] = Math.sqrt(d);
+      i++;
     }
     return true;
   }
@@ -277,6 +350,20 @@ export class SkylineCholesky {
       if (xi !== 0) for (let k = first[i]; k < i; k++) b[k] -= v[ri + k] * xi;
     }
   }
+}
+
+/** L[i][j] and L[i1][j] of the row pair (i, i1) sharing the first column `fi` (`SkylineCholesky.factor`). */
+function rowPairColumn(v: Float64Array, fi: number, ri: number, r1: number, j: number, fj: number, rj: number): void {
+  let s0 = 0,
+    s1 = 0;
+  for (let k = fi > fj ? fi : fj; k < j; k++) {
+    const y = v[rj + k];
+    s0 += v[ri + k] * y;
+    s1 += v[r1 + k] * y;
+  }
+  const d = v[rj + j];
+  v[ri + j] = (v[ri + j] - s0) / d;
+  v[r1 + j] = (v[r1 + j] - s1) / d;
 }
 
 /**

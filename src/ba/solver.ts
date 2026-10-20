@@ -1084,42 +1084,48 @@ class BAEngine {
       for (let k1 = 0; k1 < m; k1++) {
         const n1 = bs[ptBlk[e0 + k1]];
         const y1 = 18 * k1;
-        for (let k2 = k1; k2 < m; k2++) {
-          const n2 = bs[ptBlk[e0 + k2]];
-          const w2 = 18 * (e0 + k2);
-          let off = pairOff[pp++];
-          if (n2 === 6) {
-            // pose column block (hot path): W_k2 in registers, unrolled 6 columns
-            const w00 = W[w2],
-              w01 = W[w2 + 1],
-              w02 = W[w2 + 2],
-              w10 = W[w2 + 3],
-              w11 = W[w2 + 4],
-              w12 = W[w2 + 5],
-              w20 = W[w2 + 6],
-              w21 = W[w2 + 7],
-              w22 = W[w2 + 8],
-              w30 = W[w2 + 9],
-              w31 = W[w2 + 10],
-              w32 = W[w2 + 11],
-              w40 = W[w2 + 12],
-              w41 = W[w2 + 13],
-              w42 = W[w2 + 14],
-              w50 = W[w2 + 15],
-              w51 = W[w2 + 16],
-              w52 = W[w2 + 17];
-            for (let r = 0, yo = y1; r < n1; r++, yo += 3, off += 6) {
-              const ya = Y[yo],
-                yb = Y[yo + 1],
-                yc = Y[yo + 2];
-              Sv[off] -= ya * w00 + yb * w01 + yc * w02;
-              Sv[off + 1] -= ya * w10 + yb * w11 + yc * w12;
-              Sv[off + 2] -= ya * w20 + yb * w21 + yc * w22;
-              Sv[off + 3] -= ya * w30 + yb * w31 + yc * w32;
-              Sv[off + 4] -= ya * w40 + yb * w41 + yc * w42;
-              Sv[off + 5] -= ya * w50 + yb * w51 + yc * w52;
+        if (n1 === 6) {
+          // pose row block (hot path): Y_k1 in registers for the whole row, W_k2 one column
+          // (3 values) at a time; every S entry gets the same expression as the generic loop
+          const y00 = Y[y1],
+            y01 = Y[y1 + 1],
+            y02 = Y[y1 + 2],
+            y10 = Y[y1 + 3],
+            y11 = Y[y1 + 4],
+            y12 = Y[y1 + 5],
+            y20 = Y[y1 + 6],
+            y21 = Y[y1 + 7],
+            y22 = Y[y1 + 8],
+            y30 = Y[y1 + 9],
+            y31 = Y[y1 + 10],
+            y32 = Y[y1 + 11],
+            y40 = Y[y1 + 12],
+            y41 = Y[y1 + 13],
+            y42 = Y[y1 + 14],
+            y50 = Y[y1 + 15],
+            y51 = Y[y1 + 16],
+            y52 = Y[y1 + 17];
+          for (let k2 = k1; k2 < m; k2++) {
+            const n2 = bs[ptBlk[e0 + k2]];
+            const off = pairOff[pp++];
+            const n6 = 6 * n2;
+            for (let c = 0, wo = 18 * (e0 + k2), o = off; c < n2; c++, wo += 3, o++) {
+              const wa = W[wo],
+                wb = W[wo + 1],
+                wc = W[wo + 2];
+              Sv[o] -= y00 * wa + y01 * wb + y02 * wc;
+              Sv[o + n2] -= y10 * wa + y11 * wb + y12 * wc;
+              Sv[o + 2 * n2] -= y20 * wa + y21 * wb + y22 * wc;
+              Sv[o + 3 * n2] -= y30 * wa + y31 * wb + y32 * wc;
+              Sv[o + 4 * n2] -= y40 * wa + y41 * wb + y42 * wc;
+              Sv[o + n6 - n2] -= y50 * wa + y51 * wb + y52 * wc;
             }
-          } else {
+          }
+        } else {
+          for (let k2 = k1; k2 < m; k2++) {
+            const n2 = bs[ptBlk[e0 + k2]];
+            const w2 = 18 * (e0 + k2);
+            let off = pairOff[pp++];
             for (let r = 0; r < n1; r++) {
               const ya = Y[y1 + 3 * r],
                 yb = Y[y1 + 3 * r + 1],
