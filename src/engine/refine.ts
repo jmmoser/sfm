@@ -532,10 +532,13 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   };
   // With the CPU pool the verifications run on its workers, up to `maxInflight` at a time, while this
   // thread feeds the GPU matcher; their results are gated and recorded in candidate order (the
-  // same database / graph as verifying here, which is the fallback for a failed job).
+  // same database / graph as verifying here, which is the fallback for a failed job and for every
+  // pair once no worker is left).
   const pool = deps.pool && deps.pool.size > 0 ? deps.pool : null;
   const maxInflight = pool ? 2 * pool.size : 0;
-  type Verification = { geometry: TwoViewGeometry | null; ms: number };
+  let poolGone = false;
+  /** `skipped`: a job failed after a cancel (nothing to record). */
+  type Verification = { geometry: TwoViewGeometry | null; ms: number; skipped?: boolean };
   const verifyHere = (a: number, b: number, m: MatchPairs, maxIterations: number): Verification => {
     const t0 = now();
     const v = live.verifyInputs(a, b, m, { maxIterations });
@@ -546,7 +549,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     const v = live.verifyInputs(a, b, m, { maxIterations });
     if (!v) return Promise.resolve({ geometry: null, ms: 0 });
     return pool!.verify(v.kp1, v.kp2, m, v.cam1, v.cam2, v.opts).catch((e: unknown) => {
-      if (cancel?.cancelled) return { geometry: null, ms: 0 };
+      if (cancel?.cancelled) return { geometry: null, ms: 0, skipped: true };
       deps.log('warn', `pair ${a}-${b}: CPU worker failed (${(e as Error)?.message ?? e}), verifying here`);
       return verifyHere(a, b, m, maxIterations);
     });
@@ -564,6 +567,9 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
       verified++;
     } else src.failedMs += r.ms;
   };
+  // pairs of this loop in st.attempted whose outcome is not recorded (pool jobs in flight, a match
+  // skipped after a cancel): a cancel takes them out again, so a re-run in this session verifies them
+  const unrecorded = new Set<number>();
   const inflight: { a: number; b: number; key: number; done: boolean; result: Promise<Verification> }[] = [];
   const drain = async (keep: number): Promise<void> => {
     while (inflight.length > keep || (inflight.length > 0 && inflight[0].done)) {
@@ -571,42 +577,60 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
       const t0 = now();
       const r = await job.result;
       resultWaitMs += now() - t0;
+      if (r.skipped) continue;
       record(job.a, job.b, job.key, r);
+      unrecorded.delete(job.key);
     }
   };
   let next = putative(0);
-  for (let i = 0; i < pairs.length; i++) {
-    checkCancel(cancel, 'matching');
-    const [a, b] = pairs[i];
-    const key = pairKey(a, b);
-    st.attempted.add(key);
-    attempted.push(key);
-    const cur = next!;
-    next = putative(i + 1);
-    const maxIterations = speculative.has(key) ? 1000 : 2000;
-    try {
-      const tw = now();
-      const m = await cur;
-      if (next) await yieldTask();
-      matchWaitMs += now() - tw;
-      if (pool) {
-        if (m) {
+  try {
+    for (let i = 0; i < pairs.length; i++) {
+      checkCancel(cancel, 'matching');
+      const [a, b] = pairs[i];
+      const key = pairKey(a, b);
+      st.attempted.add(key);
+      attempted.push(key);
+      unrecorded.add(key);
+      const cur = next!;
+      next = putative(i + 1);
+      const maxIterations = speculative.has(key) ? 1000 : 2000;
+      try {
+        const tw = now();
+        const m = await cur;
+        if (next) await yieldTask();
+        matchWaitMs += now() - tw;
+        if (!m) {
+          if (!cancel?.cancelled) unrecorded.delete(key); // else: the match was skipped
+        } else if (pool && pool.size > 0) {
           const job = { a, b, key, done: false, result: verifyPooled(a, b, m, maxIterations) };
           void job.result.then(() => (job.done = true));
           inflight.push(job);
+        } else {
+          if (pool && !poolGone) {
+            poolGone = true;
+            deps.log('warn', 'no usable CPU worker left: verifying the remaining pairs here');
+          }
+          if (inflight.length) await drain(0); // candidate order
+          record(a, b, key, verifyHere(a, b, m, maxIterations));
+          unrecorded.delete(key);
         }
-        await drain(maxInflight);
-      } else if (m) record(a, b, key, verifyHere(a, b, m, maxIterations));
-    } catch (e) {
-      deps.log('warn', `pair ${a}-${b}: ${(e as Error)?.message ?? e}`);
+        if (inflight.length) await drain(maxInflight);
+      } catch (e) {
+        unrecorded.delete(key);
+        deps.log('warn', `pair ${a}-${b}: ${(e as Error)?.message ?? e}`);
+      }
+      if (now() - lastYield > 40) {
+        report('matching', 0.05 + 0.95 * ((i + 1) / pairs.length), `verified ${verified} of ${i + 1}/${pairs.length} pairs`);
+        await tick();
+        lastYield = now();
+      }
     }
-    if (now() - lastYield > 40) {
-      report('matching', 0.05 + 0.95 * ((i + 1) / pairs.length), `verified ${verified} of ${i + 1}/${pairs.length} pairs`);
-      await tick();
-      lastYield = now();
-    }
+    await drain(0);
+    if (unrecorded.size) checkCancel(cancel, 'matching');
+  } catch (e) {
+    for (const key of unrecorded) st.attempted.delete(key);
+    throw e;
   }
-  await drain(0);
   const rec: StoredPairs = { pairs: stored, attempted };
   await deps.store.putValue('refine/pairs', rec).catch((e: unknown) => deps.log('warn', `could not persist refine pairs: ${(e as Error)?.message ?? e}`));
   stats.newPairs = verified;
