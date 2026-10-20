@@ -201,8 +201,10 @@ describe('frames during a GPU recovery', () => {
     const rec = e.recoverGPU();
     await vi.waitFor(() => expect(h.calls).toBe(2));
     const extract = vi.spyOn(p2, 'extract');
+    const gpuJobs = vi.spyOn(e as unknown as { gpu: (fn: () => Promise<unknown>) => Promise<unknown> }, 'gpu');
     const frame = e.processFrame(frames[i]);
-    await new Promise((r) => setTimeout(r, 50)); // the frame's GPU job is queued behind the recovery
+    // the frame's extraction is queued behind the recovery (a fixed delay would not wait for it on a busy machine)
+    await vi.waitFor(() => expect(gpuJobs).toHaveBeenCalled());
     g.open();
     const u = await frame;
     await rec;
