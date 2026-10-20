@@ -88,8 +88,12 @@ export interface SplatGTConfig {
 
 export interface ViewScore {
   frame: number;
+  /** Raw render with the mean training-view colour matrix applied (the model's average appearance). */
   psnr: number;
   ssim: number;
+  /** Raw render, no colour matrix. */
+  psnrRaw: number;
+  /** After a per-view per-channel affine fit to the GT frame. */
   psnrCC: number;
   ssimCC: number;
 }
@@ -101,6 +105,7 @@ export interface EvalPoint {
   count: number;
   psnr: number;
   ssim: number;
+  psnrRaw: number;
   psnrCC: number;
   ssimCC: number;
   /** Mean render time per test view (ms, incl. readback). */
@@ -544,13 +549,21 @@ async function runSplatGT(config: SplatGTConfig): Promise<SplatGTResult> {
     segStart = { it: trainer.iteration, ms: trainMs };
     const views: ViewScore[] = [];
     let rms = 0;
+    // mean colour matrix of the training views (identity without colour correction)
+    const mats = await trainer.readColourMatrices();
+    const Mb = new Float64Array(12);
+    for (const M of mats) for (let k = 0; k < 12; k++) Mb[k] += M[k] / mats.length;
     for (const v of test) {
       const r0 = performance.now();
       const img = await trainer.render(viewCamera(v));
       rms += performance.now() - r0;
       const raw = scoreImage(img.data, v.image, false);
+      const mean = new Float32Array(img.data.length);
+      for (let i = 0; i < img.data.length; i += 4)
+        for (let c = 0; c < 3; c++) mean[i + c] = Mb[4 * c] * img.data[i] + Mb[4 * c + 1] * img.data[i + 1] + Mb[4 * c + 2] * img.data[i + 2] + Mb[4 * c + 3];
+      const am = scoreImage(mean, v.image, false);
       const cc = scoreImage(img.data, v.image, true);
-      views.push({ frame: v.id, psnr: raw.psnr, ssim: raw.ssim, psnrCC: cc.psnr, ssimCC: cc.ssim });
+      views.push({ frame: v.id, psnr: am.psnr, ssim: am.ssim, psnrRaw: raw.psnr, psnrCC: cc.psnr, ssimCC: cc.ssim });
     }
     const mean = (k: keyof ViewScore): number => views.reduce((s, v) => s + v[k], 0) / Math.max(1, views.length);
     const e: EvalPoint = {
@@ -559,6 +572,7 @@ async function runSplatGT(config: SplatGTConfig): Promise<SplatGTResult> {
       count: trainer.gaussians,
       psnr: mean('psnr'),
       ssim: mean('ssim'),
+      psnrRaw: mean('psnrRaw'),
       psnrCC: mean('psnrCC'),
       ssimCC: mean('ssimCC'),
       renderMs: rms / Math.max(1, test.length),
@@ -568,7 +582,7 @@ async function runSplatGT(config: SplatGTConfig): Promise<SplatGTResult> {
     };
     evals.push(e);
     if (gpuSeg) log(`[splat-gt]   GPU ms / iteration since the last evaluation: ${Object.entries(gpuSeg).map(([k, v]) => `${k} ${v.toFixed(2)}`).join(', ')} (total ${Object.values(gpuSeg).reduce((a, b) => a + b, 0).toFixed(2)}); ${segItPerSec.toFixed(1)} it/s`);
-    log(`[splat-gt] it ${e.iteration}: PSNR ${e.psnr.toFixed(2)} dB SSIM ${e.ssim.toFixed(4)} | colour-fit PSNR ${e.psnrCC.toFixed(2)} SSIM ${e.ssimCC.toFixed(4)} | ${e.count} Gaussians, train ${(trainMs / 1000).toFixed(1)} s, render ${e.renderMs.toFixed(1)} ms/view`);
+    log(`[splat-gt] it ${e.iteration}: PSNR ${e.psnr.toFixed(2)} dB SSIM ${e.ssim.toFixed(4)} (no colour matrix: ${e.psnrRaw.toFixed(2)} dB) | colour-fit PSNR ${e.psnrCC.toFixed(2)} SSIM ${e.ssimCC.toFixed(4)} | ${e.count} Gaussians, train ${(trainMs / 1000).toFixed(1)} s, render ${e.renderMs.toFixed(1)} ms/view`);
   };
 
   const gpuTotal: Record<string, number> = {};
@@ -594,6 +608,8 @@ async function runSplatGT(config: SplatGTConfig): Promise<SplatGTResult> {
   const gpuMs = gpuIters ? Object.fromEntries(Object.entries(gpuTotal).map(([k, v]) => [k, v / gpuIters])) : null;
   if (gpuMs) log(`[splat-gt] GPU ms / iteration (whole run): ${Object.entries(gpuMs).map(([k, v]) => `${k} ${v.toFixed(2)}`).join(', ')} (total ${Object.values(gpuMs).reduce((a, b) => a + b, 0).toFixed(2)})`);
 
+  // final model in the mean appearance of the training views (the gauge a viewer / export uses)
+  if (config.trainer?.colourCorrection !== false) await trainer.normaliseAppearance();
   // panels: GT | render | |error| for a few test views (final model)
   const panels: SplatGTResult['_panels'] = [];
   const nPanels = Math.min(config.panels ?? 4, test.length);

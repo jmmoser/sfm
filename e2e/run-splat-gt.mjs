@@ -158,7 +158,7 @@ async function openPage({ verbose, outDir }) {
 }
 
 function fmt(e) {
-  return `it ${String(e.iteration).padStart(5)}  PSNR ${e.psnr.toFixed(2).padStart(6)}  SSIM ${e.ssim.toFixed(4)}  | colour-fit PSNR ${e.psnrCC.toFixed(2).padStart(6)}  SSIM ${e.ssimCC.toFixed(4)}  | ${String(e.count).padStart(7)} Gaussians  train ${(e.trainMs / 1000).toFixed(1).padStart(6)} s`;
+  return `it ${String(e.iteration).padStart(5)}  PSNR ${e.psnr.toFixed(2).padStart(6)}  SSIM ${e.ssim.toFixed(4)} (no M̄ ${e.psnrRaw.toFixed(2).padStart(6)})  | colour-fit PSNR ${e.psnrCC.toFixed(2).padStart(6)}  SSIM ${e.ssimCC.toFixed(4)}  | ${String(e.count).padStart(7)} Gaussians  train ${(e.trainMs / 1000).toFixed(1).padStart(6)} s`;
 }
 
 async function main() {

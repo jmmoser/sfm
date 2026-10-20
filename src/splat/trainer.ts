@@ -27,6 +27,7 @@ import { planMcmc } from './mcmc';
 import { encodeSplatPLY } from './ply';
 import type { SplatImage } from './renderer';
 import {
+  SH_C0,
   downscaleSplatCamera,
   estimateSplatMemory,
   splatCamera,
@@ -198,7 +199,7 @@ export class SplatTrainer {
   private readonly mcmc: SplatMcmcOptions | null;
   private readonly cc: SplatColourCorrection | null;
   private readonly lambda: number;
-  private readonly background: [number, number, number];
+  private background: [number, number, number];
   private readonly levels: { factor: number; until: number }[];
   private readonly rng: Rng;
 
@@ -671,9 +672,75 @@ export class SplatTrainer {
     return unpackParams(d, this.count, this.capacity, this.shDegree);
   }
 
-  /** The current model as an INRIA-layout splat PLY (ply.ts). */
+  /**
+   * The current model as an INRIA-layout splat PLY (ply.ts). With colour correction the
+   * model is first normalised to the mean appearance of the training views
+   * (`normaliseAppearance`), so other viewers show the average exposure.
+   */
   async exportPLY(comments: string[] = []): Promise<Uint8Array> {
+    if (this.cc) await this.normaliseAppearance();
     return encodeSplatPLY(await this.readModel(), { antialiased: this.antialiased, comments });
+  }
+
+  /**
+   * Gauge transform of the per-view colour correction: with M̄ = (A, b) the mean of the
+   * training views' colour matrices, the splat colours become A·c + b (SH band 0 affine, higher
+   * bands × A), the background A·bg + b and every view matrix M_v ∘ M̄⁻¹, so the corrected
+   * renders of the training views are unchanged while the raw render shows the average
+   * exposure / white balance (what a held-out view or a viewer should get). Returns M̄
+   * (row-major 3×4), or null when it is not invertible.
+   */
+  async normaliseAppearance(): Promise<Float64Array | null> {
+    const V = this.views.length;
+    const col = new Float32Array(await this.readBuffer(this.colour, 0, V * COLOUR_FLOATS * 4));
+    const Mb = new Float64Array(12);
+    for (let v = 0; v < V; v++) for (let k = 0; k < 12; k++) Mb[k] += col[v * COLOUR_FLOATS + k] / V;
+    const A = [Mb[0], Mb[1], Mb[2], Mb[4], Mb[5], Mb[6], Mb[8], Mb[9], Mb[10]];
+    const b = [Mb[3], Mb[7], Mb[11]];
+    const det = A[0] * (A[4] * A[8] - A[5] * A[7]) - A[1] * (A[3] * A[8] - A[5] * A[6]) + A[2] * (A[3] * A[7] - A[4] * A[6]);
+    if (!(Math.abs(det) > 1e-6)) return null;
+    const Ai = [
+      (A[4] * A[8] - A[5] * A[7]) / det,
+      (A[2] * A[7] - A[1] * A[8]) / det,
+      (A[1] * A[5] - A[2] * A[4]) / det,
+      (A[5] * A[6] - A[3] * A[8]) / det,
+      (A[0] * A[8] - A[2] * A[6]) / det,
+      (A[2] * A[3] - A[0] * A[5]) / det,
+      (A[3] * A[7] - A[4] * A[6]) / det,
+      (A[1] * A[6] - A[0] * A[7]) / det,
+      (A[0] * A[4] - A[1] * A[3]) / det,
+    ];
+    const mul = (M: number[], x: number[]): number[] => [0, 1, 2].map((r) => M[3 * r] * x[0] + M[3 * r + 1] * x[1] + M[3 * r + 2] * x[2]);
+    // splat colours
+    const lay = paramOffsets(this.capacity, this.shDegree);
+    const SN = 3 * (this.shDegree === 0 ? 1 : 4);
+    const sh = new Float32Array(await this.readBuffer(this.params, lay.sh * 4, this.count * SN * 4));
+    for (let i = 0; i < this.count; i++) {
+      const o = i * SN;
+      const c = mul(A, [0, 1, 2].map((k) => SH_C0 * sh[o + k] + 0.5));
+      for (let k = 0; k < 3; k++) sh[o + k] = (c[k] + b[k] - 0.5) / SH_C0;
+      for (let q = 3; q < SN; q += 3) {
+        const f = mul(A, [sh[o + q], sh[o + q + 1], sh[o + q + 2]]);
+        for (let k = 0; k < 3; k++) sh[o + q + k] = f[k];
+      }
+    }
+    this.device.queue.writeBuffer(this.params, lay.sh * 4, sh);
+    // view matrices: M_v ∘ M̄⁻¹ = (A_v A⁻¹, b_v − A_v A⁻¹ b)
+    for (let v = 0; v < V; v++) {
+      const o = v * COLOUR_FLOATS;
+      const Av = [col[o], col[o + 1], col[o + 2], col[o + 4], col[o + 5], col[o + 6], col[o + 8], col[o + 9], col[o + 10]];
+      const bv = [col[o + 3], col[o + 7], col[o + 11]];
+      const An = [0, 1, 2].flatMap((r) => [0, 1, 2].map((c) => Av[3 * r] * Ai[c] + Av[3 * r + 1] * Ai[3 + c] + Av[3 * r + 2] * Ai[6 + c]));
+      const bn = mul(An, b).map((x, k) => bv[k] - x);
+      for (let r = 0; r < 3; r++) {
+        for (let c = 0; c < 3; c++) col[o + 4 * r + c] = An[3 * r + c];
+        col[o + 4 * r + 3] = bn[r];
+      }
+    }
+    this.device.queue.writeBuffer(this.colour, 0, col);
+    const bg = mul(A, this.background);
+    this.background = [bg[0] + b[0], bg[1] + b[1], bg[2] + b[2]];
+    return Mb;
   }
 
   /** The learned per-view colour matrices (row-major 3×4 each). */

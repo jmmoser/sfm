@@ -150,6 +150,53 @@ describe('SplatTrainer optimisation', () => {
     for (const v of model.means) expect(Number.isFinite(v)).toBe(true);
   });
 
+  it('normaliseAppearance: corrected training renders unchanged, mean colour matrix → identity', async () => {
+    const gt = randomScene({ count: 150, seed: 71, opacity: [0.6, 0.9] });
+    const W = 48;
+    const H = 40;
+    const views: SplatTrainingView[] = [];
+    const cams: SplatCamera[] = [];
+    for (let k = 0; k < 6; k++) {
+      const a = (2 * Math.PI * k) / 6;
+      const { R, t } = lookAt([2.4 * Math.sin(a), -2.4 * Math.cos(a), 0.5], [0, 0, 0]);
+      const cam: SplatCamera = { width: W, height: H, fx: 50, fy: 50, cx: 23.5, cy: 19.5, R, t };
+      const r = renderCPU(gt, cam, { background: [0.1, 0.1, 0.1] });
+      const gain = 0.8 + 0.08 * k; // exposure drift between views
+      const img = new Uint8ClampedArray(4 * W * H);
+      for (let i = 0; i < W * H; i++) {
+        for (let c = 0; c < 3; c++) img[4 * i + c] = Math.round(255 * Math.min(1, gain * r.color[3 * i + c]));
+        img[4 * i + 3] = 255;
+      }
+      cams.push(cam);
+      views.push(viewOf(cam, img, k));
+    }
+    const t = await trainer(gt, views, { iterations: 200, resolution: [], mcmc: false, colourCorrection: { lr: 0.02, reg: 0 }, background: [0.1, 0.1, 0.1] });
+    await t.step(200);
+    const corrected = async (v: number): Promise<Float32Array> => {
+      const img = await t.render(cams[v]);
+      const M = (await t.readColourMatrices())[v];
+      const x = new Float32Array(3 * W * H);
+      for (let i = 0; i < W * H; i++)
+        for (let c = 0; c < 3; c++) x[3 * i + c] = M[4 * c] * img.data[4 * i] + M[4 * c + 1] * img.data[4 * i + 1] + M[4 * c + 2] * img.data[4 * i + 2] + M[4 * c + 3];
+      return x;
+    };
+    const before = [await corrected(0), await corrected(5)];
+    const before0 = (await t.readColourMatrices()).map((M) => M[0]);
+    const Mb = await t.normaliseAppearance();
+    expect(Mb).not.toBeNull();
+    const after = [await corrected(0), await corrected(5)];
+    let d = 0;
+    for (let k = 0; k < 2; k++) for (let i = 0; i < before[k].length; i++) d = Math.max(d, Math.abs(after[k][i] - before[k][i]));
+    const mats = await t.readColourMatrices();
+    const mean = new Float64Array(12);
+    for (const M of mats) for (let k = 0; k < 12; k++) mean[k] += M[k] / mats.length;
+    console.log(`[splat] normaliseAppearance: M̄ ${Array.from(Mb!, (v) => v.toFixed(3)).join(' ')}; view gains before ${before0.map((v) => v.toFixed(3)).join(' ')}; max corrected-render change ${d.toExponential(2)}`);
+    expect(d).toBeLessThan(2e-3);
+    for (let k = 0; k < 12; k++) expect(Math.abs(mean[k] - (k % 5 === 0 ? 1 : 0))).toBeLessThan(1e-4);
+    // the learned gains (render → image) follow the exposure drift: darker views get smaller gains
+    expect(before0[0]).toBeLessThan(before0[5]);
+  });
+
   it('renders the trained model identically through SplatRenderer', async () => {
     const m = randomScene({ count: 120, seed: 61 });
     const cam = testCamera(80, 60);
