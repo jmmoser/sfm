@@ -150,6 +150,12 @@ export interface EngineConfig {
    * unmerged loop-closure pairs: `liveModelHealth` in refine.ts); 'always' runs it every time.
    */
   refineOfflineSfM?: 'auto' | 'always';
+  /**
+   * CPU helper workers (nested in the engine worker) that verify refine's candidate pairs and
+   * quantise its vocabulary in parallel (default: hardware threads − 2, at most 3; 0 = everything
+   * on the engine thread). Same results either way.
+   */
+  cpuWorkers?: number;
   /** Per-image focal lengths tied to the shared focal in the final refinement (default true; kept only if it helps). */
   perImageFocal?: boolean;
   /** Prior σ of the per-image focal (relative, default 0.005) and the required reprojection improvement (default 0.005). */

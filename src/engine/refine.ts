@@ -10,6 +10,7 @@
  * Progress stages: 'matching', 'reconstruction', 'alignment' (src/app/stages.ts).
  */
 import type { CancelToken, MatchPairs, PointCloud, ProgressCallback, TwoViewGeometry } from '../core/types';
+import { estimateTwoViewGeometry } from '../geometry/twoview';
 import { mergePairs, retrievalPairs, sequentialPairs, spatialPairs, type ImagePair, type SpatialCamera } from '../sfm/pairs';
 import type { CorrespondenceGraph } from '../sfm/correspondence-graph';
 import { pairKey, type FeatureDatabase } from '../sfm/database';
@@ -22,6 +23,7 @@ import { median } from '../math/stats';
 import { handEyeCheck, type LiveSession } from './live';
 import { refinePerImageFocal, refineRollingShutter, rsStats, sparseRollingShutter, type RefineRSResult } from './refine-camera';
 import { pairToStored, type EngineStore, type StoredPair, type StoredPairs } from './persistence';
+import type { CpuPool } from './cpu-pool';
 import { ENGINE_DEFAULTS } from './presets';
 import type { EngineConfig, SparseCameraEx, SparseModel, SparseResultEx } from './types';
 
@@ -60,6 +62,8 @@ export interface RefineDeps {
   live: LiveSession;
   config: EngineConfig;
   store: EngineStore;
+  /** CPU helper workers for the pair verification and the vocabulary indexing (null / absent: this thread). */
+  pool?: CpuPool | null;
   log(level: 'debug' | 'info' | 'warn' | 'error', message: string, data?: unknown): void;
   /** Await visibility between GPU batches (the engine's gate does it per call). */
 }
@@ -190,21 +194,36 @@ export async function refinePrincipalPoint(
   return { rec: work, accepted: true, reason: `offset from the image centre ${shifts.join(', ')}; reprojection ${before.toFixed(3)} → ${after.toFixed(3)} px` };
 }
 
-/** Add the not-yet-indexed keyframes to a vocabulary index, yielding every ~30 ms. */
+/**
+ * Add the not-yet-indexed keyframes to a vocabulary index, yielding every ~30 ms. With a CPU pool
+ * the keyframes are quantised on its workers (≤ 2 per worker in flight) and added here in order:
+ * the same index as quantising here (exact quantiser), which is also the fallback for a failed job.
+ */
 async function indexVocabulary(
   vocab: VocabularyIndex,
   ids: readonly number[],
   db: FeatureDatabase,
   cancel: CancelToken | undefined,
   onProgress?: (done: number) => void,
+  pool?: CpuPool | null,
 ): Promise<void> {
   let last = now();
-  for (let k = 0; k < ids.length; k++) {
-    const fs = db.features.get(ids[k]);
-    if (fs && !vocab.has(ids[k])) vocab.add(ids[k], fs);
+  const todo = ids.filter((id) => db.features.has(id) && !vocab.has(id));
+  const jobs: Promise<Uint32Array | null>[] = [];
+  const launch = (): void => {
+    const fs = db.features.get(todo[jobs.length])!;
+    jobs.push(pool!.quantize(vocab, fs).catch(() => null));
+  };
+  if (pool && pool.size > 0) while (jobs.length < Math.min(todo.length, 2 * pool.size)) launch();
+  for (let k = 0; k < todo.length; k++) {
+    const fs = db.features.get(todo[k])!;
+    const words = k < jobs.length ? await jobs[k] : null;
+    if (k < jobs.length && jobs.length < todo.length) launch();
+    if (words) vocab.addBow(todo[k], vocab.bowFromWords(words));
+    else vocab.add(todo[k], fs);
     if (now() - last > 30) {
       checkCancel(cancel, 'matching');
-      onProgress?.(k + 1);
+      onProgress?.(ids.length - todo.length + k + 1);
       await tick();
       last = now();
     }
@@ -458,12 +477,12 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
         const vocab = VocabularyIndex.train(sources, { numWords: vc.refineWords ?? ENGINE_DEFAULTS.refineVocabularyWords });
         // indexing quantises every feature (≈ 35 ms per 4k-feature keyframe with SIMD, 260 ms in
         // JS): yield between keyframes so cancel / progress / visibility messages get through
-        await indexVocabulary(vocab, order, st.db, cancel, (k) => report('matching', 0.04 * (k / order.length), `vocabulary ${k}/${order.length}`));
+        await indexVocabulary(vocab, order, st.db, cancel, (k) => report('matching', 0.04 * (k / order.length), `vocabulary ${k}/${order.length}`), deps.pool);
         st.vocab = vocab;
         st.vocabTrainedOn = order.slice();
         void deps.store.putBinary('vocab', st.vocab.exportCodebook()).catch(() => undefined);
       }
-    } else await indexVocabulary(st.vocab, order, st.db, cancel);
+    } else await indexVocabulary(st.vocab, order, st.db, cancel, undefined, deps.pool);
   } catch (e) {
     if ((e as Error)?.name === 'CancelledError') throw e;
     deps.log('warn', `vocabulary failed: ${(e as Error)?.message ?? e}`);
@@ -494,9 +513,11 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   const attempted: number[] = [];
   let verified = 0;
   let lastYield = now();
-  // CPU verification vs waiting for the GPU matcher (the prefetch overlaps them)
+  // verification compute time (engine thread or pool workers), waiting for the GPU matcher, and
+  // (pool) waiting for verification results
   let verifyMs = 0,
-    matchWaitMs = 0;
+    matchWaitMs = 0,
+    resultWaitMs = 0;
   // One-deep prefetch: pair i+1 is matched on the GPU while pair i is verified on the CPU
   // (the GPU chain still runs one job at a time). The queued job needs the event loop to encode
   // and submit its work: one macrotask after pair i's matches arrived lets it reach the GPU
@@ -509,6 +530,49 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     p.catch(() => undefined);
     return p;
   };
+  // With the CPU pool the verifications run on its workers, up to `window` at a time, while this
+  // thread feeds the GPU matcher; their results are gated and recorded in candidate order (the
+  // same database / graph as verifying here, which is the fallback for a failed job).
+  const pool = deps.pool && deps.pool.size > 0 ? deps.pool : null;
+  const window = pool ? 2 * pool.size : 0;
+  type Verification = { geometry: TwoViewGeometry | null; ms: number };
+  const verifyHere = (a: number, b: number, m: MatchPairs, maxIterations: number): Verification => {
+    const t0 = now();
+    const v = live.verifyInputs(a, b, m, { maxIterations });
+    const geometry = v ? estimateTwoViewGeometry(v.kp1, v.kp2, m, v.cam1, v.cam2, v.opts) : null;
+    return { geometry, ms: now() - t0 };
+  };
+  const verifyPooled = (a: number, b: number, m: MatchPairs, maxIterations: number): Promise<Verification> => {
+    const v = live.verifyInputs(a, b, m, { maxIterations });
+    if (!v) return Promise.resolve({ geometry: null, ms: 0 });
+    return pool!.verify(v.kp1, v.kp2, m, v.cam1, v.cam2, v.opts).catch((e: unknown) => {
+      deps.log('warn', `pair ${a}-${b}: CPU worker failed (${(e as Error)?.message ?? e}), verifying here`);
+      return verifyHere(a, b, m, maxIterations);
+    });
+  };
+  const record = (a: number, b: number, key: number, r: Verification): void => {
+    const g = r.geometry ? live.gatePair(a, b, r.geometry) : null;
+    const src = bySource[source.get(key) ?? 0];
+    src.pairs++;
+    src.ms += r.ms;
+    verifyMs += r.ms;
+    if (g && g.config !== 'degenerate' && g.inliers.length >> 1 >= ENGINE_DEFAULTS.minPairInliers) {
+      src.verified++;
+      live.addPair(a, b, g);
+      stored.push(pairToStored(a, b, g));
+      verified++;
+    } else src.failedMs += r.ms;
+  };
+  const inflight: { a: number; b: number; key: number; done: boolean; result: Promise<Verification> }[] = [];
+  const drain = async (keep: number): Promise<void> => {
+    while (inflight.length > keep || (inflight.length > 0 && inflight[0].done)) {
+      const job = inflight.shift()!;
+      const t0 = now();
+      const r = await job.result;
+      resultWaitMs += now() - t0;
+      record(job.a, job.b, job.key, r);
+    }
+  };
   let next = putative(0);
   for (let i = 0; i < pairs.length; i++) {
     checkCancel(cancel, 'matching');
@@ -518,27 +582,22 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     attempted.push(key);
     const cur = next!;
     next = putative(i + 1);
-    let g: TwoViewGeometry | null = null;
+    const maxIterations = speculative.has(key) ? 1000 : 2000;
     try {
       const tw = now();
       const m = await cur;
       if (next) await yieldTask();
-      const tv = now();
-      matchWaitMs += tv - tw;
-      g = m ? live.verifyPair(a, b, m, { maxIterations: speculative.has(key) ? 1000 : 2000 }) : null;
-      verifyMs += now() - tv;
-      const src = bySource[source.get(key) ?? 0];
-      src.pairs++;
-      src.ms += now() - tv;
-      if (g && g.config !== 'degenerate' && g.inliers.length >> 1 >= ENGINE_DEFAULTS.minPairInliers) src.verified++;
-      else src.failedMs += now() - tv;
+      matchWaitMs += now() - tw;
+      if (pool) {
+        if (m) {
+          const job = { a, b, key, done: false, result: verifyPooled(a, b, m, maxIterations) };
+          void job.result.then(() => (job.done = true));
+          inflight.push(job);
+        }
+        await drain(window);
+      } else if (m) record(a, b, key, verifyHere(a, b, m, maxIterations));
     } catch (e) {
       deps.log('warn', `pair ${a}-${b}: ${(e as Error)?.message ?? e}`);
-    }
-    if (g && g.config !== 'degenerate' && g.inliers.length >> 1 >= ENGINE_DEFAULTS.minPairInliers) {
-      live.addPair(a, b, g);
-      stored.push(pairToStored(a, b, g));
-      verified++;
     }
     if (now() - lastYield > 40) {
       report('matching', 0.05 + 0.95 * ((i + 1) / pairs.length), `verified ${verified} of ${i + 1}/${pairs.length} pairs`);
@@ -546,6 +605,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
       lastYield = now();
     }
   }
+  await drain(0);
   const rec: StoredPairs = { pairs: stored, attempted };
   await deps.store.putValue('refine/pairs', rec).catch((e: unknown) => deps.log('warn', `could not persist refine pairs: ${(e as Error)?.message ?? e}`));
   stats.newPairs = verified;
@@ -553,6 +613,10 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   stats.matchingMs = Math.round(now() - tMatch);
   stats.verifyMs = Math.round(verifyMs);
   stats.matchWaitMs = Math.round(matchWaitMs);
+  if (pool) {
+    stats.cpuWorkers = pool.size;
+    stats.verifyResultWaitMs = Math.round(resultWaitMs);
+  }
   stats.verifyBySource = ['sequential', 'retrieval', 'spatial']
     .map((n, k) => `${n} ${bySource[k].verified}/${bySource[k].pairs} ${Math.round(bySource[k].ms)} ms (failed ${Math.round(bySource[k].failedMs)} ms)`)
     .join(', ');
