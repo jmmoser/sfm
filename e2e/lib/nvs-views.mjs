@@ -26,10 +26,14 @@ export function cameraCenter(pose) {
   return [-c[0], -c[1], -c[2]];
 }
 
-/** Registered images of a result (`images`, else `sparse.images`), sorted by frame index. */
+/**
+ * Registered images of a result (`images`, else `sparse.images`), sorted by frame index, with the
+ * refined per-image focal `f` of `sparse.images` (the metrics input `images` has none).
+ */
 export function registeredImages(result) {
   const list = result.images ?? result.sparse?.images ?? [];
-  return [...list].sort((a, b) => a.index - b.index);
+  const focal = new Map((result.sparse?.images ?? []).filter((im) => im.f > 0).map((im) => [im.index, im.f]));
+  return list.map((im) => (im.f > 0 || !focal.has(im.index) ? im : { ...im, f: focal.get(im.index) })).sort((a, b) => a.index - b.index);
 }
 
 /** Sim3 run → GT (X_gt = s·R·X_run + t) from the camera centres; throws with < 3 images. */

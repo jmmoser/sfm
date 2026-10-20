@@ -310,6 +310,12 @@ describe('nvs views', () => {
       const kf = (760 * im.f) / fs[fs.length >> 1];
       expect(v.camera.f).toBeCloseTo((kf * frames[v.index].f) / frames[k].f, 9);
     }
+    // the per-image focal comes from sparse.images when the metrics-input images have none
+    const split = { ...result, images: result.images.map(({ index, pose }) => ({ index, pose })), sparse: { images: result.images } };
+    const tk = testViews({ meta, frames }, split, { frames: [7], focal: 'keyframe' }).views[0];
+    const fs7 = result.images.map((x) => x.f).sort((a, b) => a - b);
+    expect(tk.camera.f).toBeCloseTo((760 * result.images.find((x) => x.index === 6)!.f) / fs7[fs7.length >> 1], 9);
+    expect(tk.camera.f).not.toBe(760);
     const shared = testViews({ meta, frames }, result, { frames: [7], focal: 'shared', pose: 'sim3' });
     expect(shared.views[0].camera.f).toBe(760);
     expect(shared.views[0].index).toBe(7);
