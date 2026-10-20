@@ -848,6 +848,9 @@ export class CameraCapture {
     this.restarting = true;
     this.setState('restarting', reason);
     try {
+      // A frame callback armed on the old source would fire for the new stream's first frames
+      // with the old segment while this still runs: ensureLoop() below arms a fresh one.
+      this.cancelLoop();
       this.releaseStream();
       stream = await navigator.mediaDevices.getUserMedia({ video: this.constraints, audio: false });
       if (superseded()) {

@@ -122,6 +122,22 @@ describe('CompassSensor (iOS: arbitrary alpha + webkitCompassHeading)', () => {
     feedIOS(c, 10, 100, pose, topAzimuth, 60, 5000);
     expect(c.yawOffsetDeg).toBeNull();
     expect(c.stats.rejectedAccuracy).toBe(100);
+    expect(c.headingAt(5500)).toBeNull();
+    expect(c.latest()!.accuracy).toBe(60); // raw value kept for diagnostics
+  });
+
+  it('headingAt skips inaccurate readings: a disturbed compass falls back to the ψ-corrected attitude', () => {
+    const c = new CompassSensor({ target: null, screenAngle: () => 0 });
+    const pose = (i: number): Float64Array => mul(rz(-(100 + 0.15 * i)), rx(30));
+    feedIOS(c, 40, 150, pose, topAzimuth, 10);
+    expect(angDiff(c.yawOffsetDeg!, 40)).toBeLessThan(0.5);
+    // near steel: the platform reports a heading 180° off with accuracy 90
+    const bad = feedIOS(c, 40, 50, (i) => pose(i + 150), (R) => topAzimuth(R) + 180, 90, 1000 + 150 * (1000 / 60));
+    const { t, Renu } = bad[45];
+    const h = c.headingAt(t)!;
+    expect(h.source).toBe('attitude');
+    expect(h.accuracy).toBeLessThanOrEqual(25);
+    expect(angDiff(h.heading, topAzimuth(Renu))).toBeLessThan(3);
   });
 
   it('switches to the UI-top heading model when that one is consistent across UI rotations', () => {
