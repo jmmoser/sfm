@@ -383,13 +383,24 @@ function lumaHalf(img, w, h, mask) {
  * Residual image shift between a render and the ground truth (diagnostic of pose / intrinsics /
  * projection errors): the integer shift (on 2× downsampled luma, ±radius) minimising the
  * mean-removed SSD over pixels valid in both, refined by a parabola through the neighbours.
- * Returns { dx, dy } in FULL-resolution pixels (render(x) ≈ gt(x + d)), or null when no shift
- * overlaps min(1000, ¼ of the half-resolution image) pixels.
+ * Returns { dx, dy } in FULL-resolution pixels (render(x) ≈ gt(x + d)), or null for a flat render
+ * (luma variance < 1) or when no shift overlaps min(1000, ¼ of the half-resolution image) pixels.
  */
 export function alignmentShift(render, renderMask, gt, gtMask, w, h, radius = 3) {
   const A = lumaHalf(render, w, h, renderMask);
   const B = lumaHalf(gt, w, h, gtMask);
   const { W, H } = A;
+  // a flat render has no defined shift
+  let n0 = 0,
+    s1 = 0,
+    s2 = 0;
+  for (let i = 0; i < A.L.length; i++)
+    if (A.M[i]) {
+      n0++;
+      s1 += A.L[i];
+      s2 += A.L[i] * A.L[i];
+    }
+  if (!n0 || s2 / n0 - (s1 / n0) ** 2 < 1) return null;
   const minOverlap = Math.min(1000, (W * H) >> 2);
   const S = 2 * radius + 1;
   const cost = new Float64Array(S * S).fill(Infinity);
