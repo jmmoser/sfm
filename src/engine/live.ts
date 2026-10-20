@@ -23,11 +23,11 @@ import { estimateTwoViewGeometry } from '../geometry/twoview';
 import { mat3Mul, mat3MulTranspose } from '../math/mat3';
 import { rotationAngle } from '../math/rotation';
 import { median } from '../math/stats';
-import { cameraFromDevice, type ScreenAngle } from '../sensors/frame-orientation';
+import { cameraFromDevice, snapScreenAngle, type ScreenAngle } from '../sensors/frame-orientation';
 import { angularSpeedAt, integrateGyro } from '../sensors/motion';
 import { CorrespondenceGraph } from '../sfm/correspondence-graph';
 import { FeatureDatabase, pairKey } from '../sfm/database';
-import { checkPairRotation, checkPoseRotation, GyroReference, type GyroToleranceOptions, type TimedRotation } from '../sfm/gyro';
+import { checkPairRotation, checkPoseRotation, GyroReference, IMU_MAX_GAP_MS, type GyroToleranceOptions, type TimedRotation } from '../sfm/gyro';
 import { estimateTimeOffset, type InertialKeyframe } from '../sfm/inertial';
 import { KeyframeSelector, rotationCompensatedParallax, type KeyframeCandidate } from '../sfm/keyframes';
 import { LiveMapper } from '../sfm/live';
@@ -131,11 +131,23 @@ export class ImuLog {
     this.persisted = this.samples.length;
   }
 
-  /** True when the samples cover [t0, t1] (within `slackMs`). */
+  /** True when the samples cover [t0, t1] (within `slackMs`) without a gap > IMU_MAX_GAP_MS (as GyroReference.covers). */
   covers(t0: number, t1: number, slackMs = 60): boolean {
     const n = this.samples.length;
     if (n < 2) return false;
-    return this.samples[0].t <= Math.min(t0, t1) + slackMs && this.samples[n - 1].t >= Math.max(t0, t1) - slackMs;
+    const lo = Math.min(t0, t1) + slackMs,
+      hi = Math.max(t0, t1) - slackMs;
+    if (!(this.samples[0].t <= lo && this.samples[n - 1].t >= hi)) return false;
+    // first sample after lo, then every sample interval that starts before hi
+    let a = 1,
+      b = n;
+    while (a < b) {
+      const mid = (a + b) >> 1;
+      if (this.samples[mid].t <= lo) a = mid + 1;
+      else b = mid;
+    }
+    for (let i = a; i < n && this.samples[i - 1].t < hi; i++) if (this.samples[i].t - this.samples[i - 1].t > IMU_MAX_GAP_MS) return false;
+    return true;
   }
 }
 
@@ -294,6 +306,23 @@ export function handEyeCheck(
   let best = 0;
   for (let h = 1; h < 4; h++) if (med[h] < med[best]) best = h;
   return { medianErrDeg: med, pairs: n, best: (best * 90) as ScreenAngle };
+}
+
+/** Direction pointing up (device frame) in a phone held in UI rotation θ: (sin θ, cos θ, 0). */
+const DEVICE_UP: Record<ScreenAngle, [number, number, number]> = { 0: [0, 1, 0], 90: [1, 0, 0], 180: [0, -1, 0], 270: [-1, 0, 0] };
+
+/**
+ * Physical up in the camera frame of a keyframe (unit; LiveCamera.upCam): −gravityCam when gravity
+ * is known, else up for the UI rotation the frame was captured in, R_cam_device · DEVICE_UP[θ_ui].
+ * The canonical image is upright for θ₀, not for θ_ui (raw sensor buffers: θ₀ = 90 in a portrait UI).
+ */
+export function keyframeUpCam(r: KeyframeRecord): [number, number, number] | undefined {
+  const g = r.info.gravityCam;
+  const gn = g ? Math.hypot(g[0], g[1], g[2]) : 0;
+  if (g && gn > 1e-9) return [-g[0] / gn, -g[1] / gn, -g[2] / gn];
+  if (!Number.isFinite(r.screenAngle)) return undefined;
+  const u = rotateVec(r.info.R_cam_device, DEVICE_UP[snapScreenAngle(r.screenAngle)]);
+  return [u[0], u[1], u[2]];
 }
 
 /** Decide 'object' vs 'scene' from the registered cameras (optical-axis convergence). */
@@ -1566,7 +1595,8 @@ export class LiveSession {
     for (const { id, pose } of snap.poses.sort((a, b) => a.id - b.id)) {
       const cam = rec.cameras.get(rec.images.get(id)!.cameraId)!;
       const r = st.records.get(id);
-      cams.push({ pose, intrinsics: { ...cam }, ...(r ? { t: r.t + offset } : {}) });
+      const upCam = r ? keyframeUpCam(r) : undefined;
+      cams.push({ pose, intrinsics: { ...cam }, ...(r ? { t: r.t + offset } : {}), ...(upCam ? { upCam } : {}) });
     }
     u.cameras = cams;
     u.R_cam_device = Float64Array.from(st.cameraFromDevice());

@@ -145,6 +145,12 @@ export interface LiveCamera {
   intrinsics: CameraIntrinsics;
   /** Capture time of the keyframe on the IMU clock (camera time + estimated camera–IMU offset), ms. */
   t?: number;
+  /**
+   * Physical up in the camera frame (unit): −gravity when known, else up for a phone held in the
+   * frame's UI rotation. The images are upright for the session's θ₀, not for how the phone was
+   * held (raw sensor buffers: θ₀ = 90 in a portrait UI), so image up (−y) need not be up.
+   */
+  upCam?: [number, number, number];
 }
 
 export interface LiveUpdate {
@@ -213,6 +219,8 @@ export interface SparseCamera {
   id: number;
   pose: Pose;
   intrinsics: CameraIntrinsics;
+  /** Physical up in the camera frame (unit), as LiveCamera.upCam; absent = unknown. */
+  upCam?: [number, number, number];
 }
 
 export interface SparseResult {

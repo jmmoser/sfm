@@ -5,7 +5,9 @@
  * large scale, render-loop termination, GPU resource leaks, context loss and
  * error handling.
  */
+/// <reference types="@vitest/browser-playwright" />
 import { afterEach, describe, expect, it } from 'vitest';
+import { cdp } from 'vitest/browser';
 import type { CameraIntrinsics, PointCloud, Pose, TriangleMesh } from '../core/types';
 import { Viewer, type ViewerOptions } from './viewer';
 
@@ -626,6 +628,25 @@ describe('device pixel ratio 2 (iPhone path: DPR 3 capped to 2)', () => {
     for (let y = px.height / 2 - 60; y < px.height / 2 + 60; y++)
       for (let x = px.width / 2 - 60; x < px.width / 2 + 60; x++) if (px.data[4 * (y * px.width + x)] > 128) c++;
     expect(Math.abs(2 * Math.sqrt(c / Math.PI) - 30)).toBeLessThan(2);
+  });
+  it('a pixel ratio change alone (window moved to another screen) resizes the canvas', async () => {
+    const v = makeViewer({ autoFit: 'off' });
+    expect(v.getStats().pixelRatio).toBe(1);
+    const setDpr = (deviceScaleFactor: number) => cdp().send('Emulation.setDeviceMetricsOverride', { width: 0, height: 0, deviceScaleFactor, mobile: false });
+    try {
+      // the container keeps its CSS size: no ResizeObserver callback
+      await setDpr(2);
+      for (let i = 0; i < 5 && v.getStats().pixelRatio !== 2; i++) await nextFrame();
+      expect(v.getStats().pixelRatio).toBe(2);
+      expect(v.readPixels().width).toBe(2 * W);
+      // and back (the query re-armed itself for the new ratio)
+      await setDpr(1);
+      for (let i = 0; i < 5 && v.getStats().pixelRatio !== 1; i++) await nextFrame();
+      expect(v.getStats().pixelRatio).toBe(1);
+      expect(v.readPixels().width).toBe(W);
+    } finally {
+      await cdp().send('Emulation.clearDeviceMetricsOverride');
+    }
   });
 });
 

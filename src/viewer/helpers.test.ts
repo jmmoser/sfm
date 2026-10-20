@@ -20,6 +20,7 @@ import {
 } from './helpers';
 import { frustumCorners, writeFrustumLines, VERTICES_PER_CAMERA } from './cameras';
 import type { Mat3, Pose } from '../core/types';
+import { cameraFromDevice } from '../sensors/frame-orientation';
 
 // Small deterministic PRNG for test data (mulberry32).
 function rng(seed: number) {
@@ -59,6 +60,10 @@ function camRotation(yaw: number, pitch: number, roll: number): Float64Array {
   const d = [f[1] * r[2] - f[2] * r[1], f[2] * r[0] - f[0] * r[2], f[0] * r[1] - f[1] * r[0]];
   const R = new Float64Array([...r, ...d, ...f]);
   return mul3(axisAngle([0, 0, 1], roll), R); // roll about the optical axis (camera frame)
+}
+
+function rotate(R: ArrayLike<number>, v: ArrayLike<number>): number[] {
+  return [0, 1, 2].map((r) => R[3 * r] * v[0] + R[3 * r + 1] * v[1] + R[3 * r + 2] * v[2]);
 }
 
 function angleDeg(a: ArrayLike<number>, b: ArrayLike<number>): number {
@@ -199,6 +204,34 @@ describe('estimateUpVector', () => {
       expect(angleDeg(estimateUpVector(poses)!, trueUp)).toBeLessThan(1);
     });
   }
+
+  // Canonical images upright for θ₀, the phone held in portrait (raw iOS buffers: θ₀ = 90): image up
+  // is not physical up; the camera's up axis upCam = R_cam_device(θ₀) · (0, 1, 0) (device +y) is.
+  for (const theta0 of [90, 180, 270]) {
+    it(`portrait half orbit of images upright for θ₀ = ${theta0} — up from upCam`, () => {
+      const r = rng(6);
+      const W = axisAngle([0.3, -1, 0.5], 1.1);
+      const trueUp = [W[2], W[5], W[8]];
+      const Wt = new Float64Array([W[0], W[3], W[6], W[1], W[4], W[7], W[2], W[5], W[8]]);
+      // R = R_cam_device(θ₀) · R_wdᵀ, the device frame of an upright camera: R_wdᵀ = R_cam_device(0) · R
+      const toCanonical = mul3(cameraFromDevice(theta0), cameraFromDevice(0));
+      const upCam = rotate(cameraFromDevice(theta0), [0, 1, 0]);
+      const poses: Pose[] = [];
+      for (let i = 0; i < 12; i++) poses.push({ R: mul3(toCanonical, mul3(camRotation((i / 12) * Math.PI, -0.3 + 0.1 * r(), 0.03 * (r() - 0.5)), Wt)) as Mat3, t: new Float64Array(3) });
+      expect(angleDeg(estimateUpVector(poses.map((p) => ({ R: p.R, upCam })))!, trueUp)).toBeLessThan(1);
+      // camera −y (image up) is horizontal here
+      expect(angleDeg(estimateUpVector(poses)!, trueUp)).toBeGreaterThan(45);
+    });
+  }
+
+  it('upCam = camera −y gives exactly the result without upCam', () => {
+    const r = rng(7);
+    const poses: Pose[] = [];
+    for (let i = 0; i < 30; i++) poses.push({ R: camRotation(r() * 2 * Math.PI, -0.3 + 0.2 * r(), i % 10 === 0 ? 0.5 : 0.03 * (r() - 0.5)) as Mat3, t: new Float64Array(3) });
+    const up = estimateUpVector(poses)!;
+    expect(angleDeg(up, [0, 0, 1])).toBeLessThan(2);
+    expect(estimateUpVector(poses.map((p) => ({ R: p.R, upCam: [0, -1, 0] })))).toEqual(up);
+  });
 
   it('single camera returns its up vector; empty returns null', () => {
     const R = camRotation(0.3, 0, 0);

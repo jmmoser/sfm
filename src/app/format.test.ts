@@ -72,6 +72,11 @@ describe('counts and numbers', () => {
     expect(formatCount(1_250_000)).toBe('1.25M');
     expect(formatCount(42_000_000)).toBe('42M');
     expect(formatCount(undefined)).toBe('–');
+    // the unit follows the rounded value: no '1000k'
+    expect(formatCount(999_499)).toBe('999k');
+    expect(formatCount(999_500)).toBe('1M');
+    expect(formatCount(999_999)).toBe('1M');
+    expect(formatCount(-999_999)).toBe('-1M');
   });
   it('plural', () => {
     expect(plural(1, 'photo')).toBe('1 photo');

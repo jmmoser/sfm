@@ -35,7 +35,7 @@ import {
   type LineBasicMaterial,
   type Material,
 } from 'three';
-import type { CameraIntrinsics, PointCloud, Pose, TriangleMesh, Vec3 } from '../core/types';
+import type { PointCloud, Pose, TriangleMesh, Vec3 } from '../core/types';
 import { CameraOverlay, type ViewerCamera } from './cameras';
 import { createOrbitControls, TapDetector, TargetAnimator, type OrbitControls, type TapInfo } from './controls';
 import { EDLPass, ZOOM_SIZE } from './edl';
@@ -210,6 +210,8 @@ export class Viewer {
   private readonly tap: TapDetector;
   private readonly targetAnim: TargetAnimator;
   private readonly resizeObserver: ResizeObserver | null;
+  /** Matches the current devicePixelRatio: a change (window moved to another screen) resizes. */
+  private dprQuery: MediaQueryList | null = null;
   private readonly maxPointSize: number;
   /** Original inline `position` of the container when the viewer made it relative. */
   private readonly restorePosition: string | null;
@@ -271,6 +273,8 @@ export class Viewer {
   /** setViewPose(): the camera is placed from outside, the orbit controls are off. */
   private viewLocked = false;
   private autoFitFirst = true;
+  /** The view direction was picked by a fit before any camera was known, and the view has not been moved since. */
+  private dirWithoutCams = false;
   private viewAnim: { fromPos: Vector3; toPos: Vector3; fromTarget: Vector3; toTarget: Vector3; t0: number } | null = null;
   private gridActive = false;
   private lastPickMode: 'gpu' | 'cpu' = 'gpu';
@@ -390,6 +394,8 @@ export class Viewer {
     this.resizeObserver = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => this.resize()) : null;
     this.resizeObserver?.observe(container);
     if (!this.resizeObserver) this.listen(window, 'resize', (() => this.resize()) as EventListener);
+    // the container's CSS size need not change with the pixel ratio: no ResizeObserver callback
+    this.watchDpr();
     this.resize();
   }
 
@@ -591,7 +597,7 @@ export class Viewer {
   }
 
   /** Camera frustums (≈3 % of the scene radius) + trajectory polyline; last one highlighted. */
-  setCameras(cams: { pose: Pose; intrinsics: CameraIntrinsics }[], highlightLast = true): void {
+  setCameras(cams: ViewerCamera[], highlightLast = true): void {
     if (this.disposed) return;
     this.cams = cams.slice();
     this.highlightLast = highlightLast;
@@ -601,7 +607,7 @@ export class Viewer {
     this.onContentChanged();
   }
 
-  /** 'z': world is gravity aligned (Z up). 'auto': estimate up from the camera poses. */
+  /** 'z': world is gravity aligned (Z up). 'auto': estimate up from the camera poses (and their `upCam`). */
   setWorldUp(up: 'z' | 'auto'): void {
     if (this.disposed) return;
     this.worldUpMode = up;
@@ -621,7 +627,7 @@ export class Viewer {
   }
 
   private updateAutoUp(force = false): void {
-    const up = estimateUpVector(this.cams.map((c) => c.pose)) ?? new Float64Array([0, 0, 1]);
+    const up = estimateUpVector(this.cams.map((c) => ({ R: c.pose.R, upCam: c.upCam }))) ?? new Float64Array([0, 0, 1]);
     const dot = up[0] * this.upWorld[0] + up[1] * this.upWorld[1] + up[2] * this.upWorld[2];
     if (!force && dot > Math.cos((1 * Math.PI) / 180)) return; // < 1° change: keep the view stable
     this.upWorld = Float64Array.from(up);
@@ -686,6 +692,7 @@ export class Viewer {
     if (!anyContent) {
       this.autoFitArmed = true;
       this.autoFitFirst = true;
+      this.dirWithoutCams = false;
     } else if (this.autoFitArmed && this.opts.autoFit !== 'off') {
       const follow = this.opts.autoFit === 'follow';
       this.fitToContent(follow && !this.autoFitFirst);
@@ -824,8 +831,8 @@ export class Viewer {
 
   /**
    * Frame the robust bounds of the content (points / mesh; cameras when nothing else). The view
-   * direction is kept, except on the first fit or with `overview`: then from above, on the side the
-   * photos were taken from.
+   * direction is kept, except on the first fit (again on the first one with cameras, unless the view
+   * was moved since) or with `overview`: then from above, on the side the photos were taken from.
    */
   fitToContent(animate = false, overview = false): void {
     // locked to a camera pose (setViewPose): framing is the caller's, after unlocking
@@ -848,10 +855,13 @@ export class Viewer {
     const fmin = Math.min(fovV, fovH);
     const dist = (r / Math.sin(fmin / 2)) * 1.05;
 
-    // Direction: keep the current one unless this is the first fit; prefer the
-    // side the photos were taken from when the cameras are off-centre.
+    // Direction: keep the current one unless this is the first fit, or the first with
+    // cameras (content usually arrives before them, and so before their 'auto' up) while
+    // the view was not moved; prefer the side the photos were taken from when the cameras
+    // are off-centre.
     const dir = new Vector3();
-    if (this.frames > 0 && !this.autoFitFirst && !overview) {
+    const redoDir = this.dirWithoutCams && this.camCenters.length > 0;
+    if (this.frames > 0 && !this.autoFitFirst && !overview && !redoDir) {
       dir.copy(this.camera.position).sub(this.controls.target);
     }
     if (dir.lengthSq() < 1e-20) {
@@ -865,6 +875,7 @@ export class Viewer {
         m.y = 0;
         if (m.length() > 0.3 * r) dir.copy(m.normalize()).multiplyScalar(Math.cos(0.5)).setY(Math.sin(0.5));
       }
+      this.dirWithoutCams = this.camCenters.length === 0;
     }
     this.autoFitFirst = false;
     dir.normalize();
@@ -1048,11 +1059,27 @@ export class Viewer {
     if (!this.contextLost) this.renderFrame(false);
   }
 
+  private readonly onDprChange = (): void => {
+    this.watchDpr();
+    this.resize();
+  };
+
+  /** (Re-)arm the media query for the current devicePixelRatio. */
+  private watchDpr(): void {
+    this.dprQuery?.removeEventListener?.('change', this.onDprChange);
+    this.dprQuery = null;
+    if (this.disposed || typeof matchMedia !== 'function' || typeof devicePixelRatio !== 'number' || !(devicePixelRatio > 0)) return;
+    this.dprQuery = matchMedia(`(resolution: ${devicePixelRatio}dppx)`);
+    this.dprQuery.addEventListener?.('change', this.onDprChange);
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
     this.cancelFrame();
     this.resizeObserver?.disconnect();
+    this.dprQuery?.removeEventListener?.('change', this.onDprChange);
+    this.dprQuery = null;
     for (const [t, type, fn] of this.listeners) t.removeEventListener(type, fn);
     this.listeners.length = 0;
     this.tap.dispose();
@@ -1540,6 +1567,7 @@ export class Viewer {
   private readonly onControlsStart = (): void => {
     this.interacting = true;
     this.viewAnim = null;
+    this.dirWithoutCams = false;
     if (this.opts.autoFit === 'follow') this.autoFitArmed = false;
     this.targetAnim.cancel();
     this.requestRender();
@@ -1586,6 +1614,7 @@ export class Viewer {
     this.viewLocked = true;
     this.controls.enabled = false;
     this.viewAnim = null;
+    this.dirWithoutCams = false;
     this.targetAnim.cancel();
     const R = pose.R;
     const c = cameraCenter(pose);

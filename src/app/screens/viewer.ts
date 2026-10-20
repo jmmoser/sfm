@@ -132,7 +132,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     else if (r.sparse) viewer.setPointCloud(r.sparse.points, { pointSizePx: 3, splats: false });
     else viewer.setPointCloud(null);
     viewer.setMesh(r.mesh);
-    viewer.setCameras(r.sparse ? r.sparse.cameras.map((c) => ({ pose: c.pose, intrinsics: c.intrinsics })) : [], false);
+    viewer.setCameras(r.sparse ? r.sparse.cameras.map((c) => ({ pose: c.pose, intrinsics: c.intrinsics, upCam: c.upCam })) : [], false);
     if (first) {
       display.mesh = !!r.mesh;
       display.points = !r.mesh;

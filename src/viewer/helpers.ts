@@ -281,31 +281,60 @@ function normalize3(v: Float64Array): boolean {
  * Estimate the world "up" direction from camera orientations (for models that
  * are not gravity aligned).
  *
- * Base estimate: the mean of the camera up vectors (−y camera axis in world,
- * −Rᵀ e_y). People hold the phone level, so the camera x axes (image right,
- * Rᵀ e_x) are nearly horizontal: when they span two directions (the user turned
- * around / orbited), up is the direction most orthogonal to all of them (smallest
+ * Camera up: `upCam` (unit, camera frame: −gravity, or up for the UI rotation the photo
+ * was taken in) when given, else the −y axis (image up, which is not up when the images
+ * are upright for another rotation, e.g. raw sensor buffers in a portrait UI); camera
+ * right: e_z × up (the x axis for −y).
+ *
+ * Base estimate: the mean of the camera up vectors in the world (Rᵀ up).
+ * People hold the phone level, so the camera right axes (in the world) are
+ * nearly horizontal: when they span two directions (the user turned around /
+ * orbited), up is the direction most orthogonal to all of them (smallest
  * eigenvector of Σ w x xᵀ, IRLS with Cauchy weights to ignore rolled frames),
  * which — unlike the mean up vector — is unbiased by the camera pitch on partial
- * orbits. If the x axes are (nearly) parallel (no yaw change: the tilt about that
+ * orbits. If the right axes are (nearly) parallel (no yaw change: the tilt about that
  * axis is unobservable), the mean up vector made orthogonal to them is used; if
  * they are not near-horizontal at all (phone rolled arbitrarily), the mean up
  * vector. The sign always agrees with the mean up vector. Null if no cameras.
  */
-export function estimateUpVector(rotations: ArrayLike<{ R: Mat3 }>): Vec3 | null {
+export function estimateUpVector(rotations: ArrayLike<{ R: Mat3; upCam?: ArrayLike<number> | null }>): Vec3 | null {
   const n = rotations.length;
   if (n === 0) return null;
+  // Per camera in the world: up (Rᵀ u) and right (Rᵀ (e_z × u)); without upCam −R row 1 and R row 0.
+  const ups = new Float64Array(3 * n);
+  const rights = new Float64Array(3 * n);
+  for (let i = 0; i < n; i++) {
+    const { R, upCam: u } = rotations[i];
+    if (!u) {
+      ups.set([-R[3], -R[4], -R[5]], 3 * i);
+      rights.set([R[0], R[1], R[2]], 3 * i);
+      continue;
+    }
+    let rx = -u[1];
+    let ry = u[0];
+    const rn = Math.hypot(rx, ry);
+    // Looking along up: every image axis is horizontal.
+    if (rn > 1e-6) {
+      rx /= rn;
+      ry /= rn;
+    } else {
+      rx = 1;
+      ry = 0;
+    }
+    for (let k = 0; k < 3; k++) {
+      ups[3 * i + k] = R[k] * u[0] + R[3 + k] * u[1] + R[6 + k] * u[2];
+      rights[3 * i + k] = R[k] * rx + R[3 + k] * ry;
+    }
+  }
   const meanUp = new Float64Array(3);
   for (let i = 0; i < n; i++) {
-    const R = rotations[i].R;
-    meanUp[0] -= R[3];
-    meanUp[1] -= R[4];
-    meanUp[2] -= R[5];
+    meanUp[0] += ups[3 * i];
+    meanUp[1] += ups[3 * i + 1];
+    meanUp[2] += ups[3 * i + 2];
   }
   if (!normalize3(meanUp)) {
     // Up vectors cancel (pathological). Fall back to the first camera.
-    const R = rotations[0].R;
-    meanUp.set([-R[3], -R[4], -R[5]]);
+    meanUp.set(ups.subarray(0, 3));
     normalize3(meanUp);
   }
   if (n < 2) return meanUp;
@@ -317,11 +346,10 @@ export function estimateUpVector(rotations: ArrayLike<{ R: Mat3 }>): Vec3 | null
     M.fill(0);
     let wsum = 0;
     for (let i = 0; i < n; i++) {
-      const R = rotations[i].R;
       const w = weights[i];
-      const x0 = R[0];
-      const x1 = R[1];
-      const x2 = R[2];
+      const x0 = rights[3 * i];
+      const x1 = rights[3 * i + 1];
+      const x2 = rights[3 * i + 2];
       M[0] += w * x0 * x0;
       M[1] += w * x0 * x1;
       M[2] += w * x0 * x2;
@@ -349,7 +377,7 @@ export function estimateUpVector(rotations: ArrayLike<{ R: Mat3 }>): Vec3 | null
       cand = new Float64Array([meanUp[0] - d * e2[0], meanUp[1] - d * e2[1], meanUp[2] - d * e2[2]]);
       if (!normalize3(cand)) cand = meanUp.slice();
     } else {
-      // Phone not held level (random roll): x axes say nothing about up.
+      // Phone not held level (random roll): right axes say nothing about up.
       cand = meanUp.slice();
     }
     if (cand[0] * meanUp[0] + cand[1] * meanUp[1] + cand[2] * meanUp[2] < 0) {
@@ -360,8 +388,7 @@ export function estimateUpVector(rotations: ArrayLike<{ R: Mat3 }>): Vec3 | null
     up = cand;
     // Cauchy re-weighting on |x · up| (scale ≈ 0.1 rad of roll/tilt).
     for (let i = 0; i < n; i++) {
-      const R = rotations[i].R;
-      const r = (R[0] * up[0] + R[1] * up[1] + R[2] * up[2]) / 0.1;
+      const r = (rights[3 * i] * up[0] + rights[3 * i + 1] * up[1] + rights[3 * i + 2] * up[2]) / 0.1;
       weights[i] = 1 / (1 + r * r);
     }
   }

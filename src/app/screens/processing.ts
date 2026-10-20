@@ -236,7 +236,7 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
       if (!v) return;
       v.setWorldUp(r.sparse?.metric.gravityAligned ? 'z' : 'auto');
       v.setPointCloud(r.dense);
-      if (r.sparse) v.setCameras(r.sparse.cameras.map((c) => ({ pose: c.pose, intrinsics: c.intrinsics })), false);
+      if (r.sparse) v.setCameras(r.sparse.cameras.map((c) => ({ pose: c.pose, intrinsics: c.intrinsics, upCam: c.upCam })), false);
       previewCaption.textContent = `Dense cloud · ${formatCount(r.dense.count)} points`;
     } else if (r.sparse) {
       const v = ensureViewer();
@@ -245,7 +245,7 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
       const pc: PointCloud = r.sparse.points;
       const dec = decimate(pc.positions, pc.colors, 200_000);
       v.setPointCloud({ count: dec.positions.length / 3, positions: dec.positions, colors: dec.colors }, { pointSizePx: 2.5, splats: false });
-      v.setCameras(r.sparse.cameras.map((c) => ({ pose: c.pose, intrinsics: c.intrinsics })), false);
+      v.setCameras(r.sparse.cameras.map((c) => ({ pose: c.pose, intrinsics: c.intrinsics, upCam: c.upCam })), false);
       previewCaption.textContent = `Sparse model · ${formatCount(pc.count)} points · ${r.sparse.cameras.length} photos`;
     } else if (r.liveSparse && r.liveSparse.positions.length) {
       const v = ensureViewer();

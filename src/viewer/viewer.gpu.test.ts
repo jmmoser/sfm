@@ -335,6 +335,26 @@ describe('Viewer framing', () => {
     expect(Array.from(v.getWorldUp())).toEqual([0, 0, 1]);
   });
 
+  it("setWorldUp('auto') takes each camera's upCam (images upright for another rotation)", () => {
+    const v = makeViewer();
+    v.setWorldUp('auto');
+    // a half orbit in the Y-up reconstruction, images turned a quarter about the optical axis (raw
+    // landscape buffers of a phone held in portrait): image up is horizontal, camera −x is up
+    const cams = ringCameras(12, 3, 1)
+      .slice(0, 6)
+      .map(({ pose, intrinsics }) => {
+        const R = pose.R;
+        const Ry = [R[0], R[2], -R[1], R[3], R[5], -R[4], R[6], R[8], -R[7]];
+        // rows (y, −x, z): Rz(−90°) · R
+        const Rn = new Float64Array([Ry[3], Ry[4], Ry[5], -Ry[0], -Ry[1], -Ry[2], Ry[6], Ry[7], Ry[8]]);
+        return { pose: { R: Rn, t: Float64Array.of(pose.t[1], -pose.t[0], pose.t[2]) }, intrinsics, upCam: [-1, 0, 0] };
+      });
+    v.setCameras(cams);
+    expect(v.getWorldUp()[1]).toBeGreaterThan(Math.cos((2 * Math.PI) / 180));
+    v.setCameras(cams.map(({ pose, intrinsics }) => ({ pose, intrinsics })));
+    expect(Math.abs(v.getWorldUp()[1])).toBeLessThan(0.5);
+  });
+
   it('fitToContent(overview) frames from above whatever the current view direction', () => {
     const v = makeViewer();
     v.setPointCloud(planeCloud(2, 0.25, 0, [200, 200, 200]));
@@ -351,6 +371,78 @@ describe('Viewer framing', () => {
     v.controls.update();
     v.fitToContent(false);
     expect(Math.abs(v.camera.position.clone().sub(v.controls.target).normalize().y)).toBeLessThan(0.01);
+  });
+
+  describe('first fit from the side the photos were taken from, after the cameras arrive', () => {
+    // A small cloud with cameras on an arc on its +X side, in a frame with up = −Y (e.g. the first
+    // camera's): (x, y, z) → (x, −z, y). The screens set the content first, then the cameras.
+    const q = (p: ArrayLike<number>) => [p[0], -p[2], p[1]];
+    function content(side = 1) {
+      const n = 400;
+      const positions = new Float32Array(3 * n);
+      for (let i = 0; i < n; i++) positions.set(q([0.3 * Math.cos(i), 0.3 * Math.sin(1.7 * i), 0.3 * Math.cos(2.3 * i)]), 3 * i);
+      const pc: PointCloud = { count: n, positions, colors: new Uint8Array(3 * n).fill(200) };
+      const cams = [];
+      for (let i = 0; i < 9; i++) {
+        const a = ((i - 4) / 4) * 0.7;
+        const { R, t } = lookAtPose([side * 3 * Math.cos(a), 3 * Math.sin(a), 1], [0, 0, 0]);
+        // R' = R Qᵀ, t' = t
+        cams.push({ pose: { R: new Float64Array([R[0], -R[2], R[1], R[3], -R[5], R[4], R[6], -R[8], R[7]]), t }, intrinsics: intr });
+      }
+      return { pc, cams };
+    }
+    /** View direction (world, from the target) and its elevation above the world up (deg). */
+    function view(v: Viewer): { d: number[]; elevDeg: number } {
+      const p = v.camera.position.clone();
+      (v as unknown as { contentRoot: { worldToLocal(p: unknown): void } }).contentRoot.worldToLocal(p);
+      const c = v.getOrbitTarget();
+      const d = [p.x - c[0], p.y - c[1], p.z - c[2]];
+      const n = Math.hypot(d[0], d[1], d[2]);
+      const u = v.getWorldUp();
+      const dn = d.map((x) => x / n);
+      return { d: dn, elevDeg: (Math.asin(dn[0] * u[0] + dn[1] * u[1] + dn[2] * u[2]) * 180) / Math.PI };
+    }
+
+    it("viewer screen order: content, cameras, then fitToContent ('auto' up)", () => {
+      const v = makeViewer();
+      const { pc, cams } = content();
+      v.setWorldUp('auto');
+      v.setPointCloud(pc);
+      v.setMesh(null);
+      v.setCameras(cams, false);
+      v.fitToContent();
+      expect(v.getWorldUp()[1]).toBeLessThan(-0.99);
+      const { d, elevDeg } = view(v);
+      expect(d[0]).toBeGreaterThan(0.5); // towards the cameras (+X)
+      expect(Math.abs(elevDeg - 28.6)).toBeLessThan(5);
+    });
+
+    it("processing preview order: autoFit 'follow' refits when the cameras arrive", async () => {
+      const v = makeViewer({ autoFit: 'follow' });
+      const { pc, cams } = content();
+      v.setWorldUp('auto');
+      v.setPointCloud(pc);
+      v.setCameras(cams, false);
+      for (let i = 0; i < 60 && v.framePending; i++) await nextFrame();
+      const { d, elevDeg } = view(v);
+      expect(d[0]).toBeGreaterThan(0.5);
+      expect(Math.abs(elevDeg - 28.6)).toBeLessThan(5);
+    });
+
+    it('a view the user moved is kept when other cameras arrive', () => {
+      const v = makeViewer();
+      const { pc } = content();
+      v.setWorldUp('auto');
+      v.setPointCloud(pc);
+      v.controls.dispatchEvent({ type: 'start' });
+      v.controls.dispatchEvent({ type: 'end' });
+      const before = view(v).d;
+      v.setCameras(content().cams, false);
+      v.fitToContent();
+      // the auto up turned the view with the content: its direction relative to the content is kept
+      const after = view(v).d;
+      expect(after[0] * before[0] + after[1] * before[1] + after[2] * before[2]).toBeGreaterThan(0.999);
+    });
   });
 
   it('setViewPose puts the view at a camera pose (x right, y down, z forward) and gives it back', async () => {
