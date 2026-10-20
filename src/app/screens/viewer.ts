@@ -75,6 +75,8 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   let measuring = false;
   const display: DisplayState = { layer: 'points', cameras: true, edl: true, grid: true, meshLighting: false };
   const exports = new Map<ExportFormat, ExportState>();
+  /** Bumped when a photoreal build replaces the model: a splat PLY prepared before is stale. */
+  let splatVersion = 0;
   /** The viewer's splat layer ('none' until a model is set; 'unavailable': no WebGPU / failed). */
   let splatState: SplatDisplayState = 'none';
   /** engine.splatModel() is being fetched. */
@@ -684,11 +686,14 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   }
 
   async function prepare(format: ExportFormat): Promise<void> {
+    const version = splatVersion;
     exports.set(format, { status: 'building' });
     renderExports?.();
     try {
       const blob = await app.engine.exportModel(format);
-      exports.set(format, { status: 'ready', blob });
+      // a photoreal build replaced the model meanwhile: the file may hold the previous one
+      if (format === 'ply-splat' && version !== splatVersion) exports.delete(format);
+      else exports.set(format, { status: 'ready', blob });
     } catch (e) {
       exports.set(format, { status: 'error', error: (e as Error)?.message ?? String(e) });
     }
@@ -772,8 +777,12 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       for (const k of ['splatPrepareMs', 'splatTrainMs', 'splatFinishMs']) if (typeof res.stats[k] === 'number') timings[k] = res.stats[k] as number;
       r.stats = { ...r.stats, ...timings, splatQuality: q };
       clearSplatResume(r.stats);
+      // a splat PLY prepared before holds the previous model
+      splatVersion++;
+      exports.delete('ply-splat');
       void app.updateSession(sessionId, { stats: { splatGaussians: res.count, splatIterations: res.iterations, splatQuality: q } });
       if (closed) return;
+      renderExports?.();
       toast(`Photoreal model ready · ${formatCount(res.count)} Gaussians`, { tone: 'good', icon: 'splats' });
       // a new model: show it (also replaces an older one in the viewer)
       void loadSplats(true);
