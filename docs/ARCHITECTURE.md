@@ -3276,7 +3276,10 @@ without a dense cloud); protocol and UI contract in ENGINE.md §2 "Splat" / §3 
   `step` reads the 65 slots once and throws `SplatWorkDroppedError` when a stamp of its last ≤ 64 iterations or of its
   relocation is missing. A dropped relocation would leave grown slots uninitialised (zero log-scale = 1 world unit),
   so the engine rolls back to the last checkpoint in place (`restore(state, moments, params)`: the view images stay on
-  the GPU) rather than counting lost iterations. A device loss (`waitGPU` / readback race `device.lost`) destroys the
+  the GPU) rather than counting lost iterations. Every readback (`readBuffer`) also copies a fresh stamp behind its
+  data in the same command buffer and throws `SplatWorkDroppedError` when it is missing (mapAsync resolves on a dropped
+  copy with the previous staging contents); the engine reads checkpoints and the final model again once visible
+  (`normaliseAppearance` throws before it changes anything), so stale data is never committed. A device loss (`waitGPU` / readback race `device.lost`) destroys the
   trainer, takes the new device (`getGPU`), recompiles, re-uploads the views and restores the checkpoint; twice at
   most, then `GPUDeviceLostError` 'gpu-lost' (the worker posts it fatal, the client respawns).
 * **Checkpoints**: every 500 iterations (and at iteration 0 = the initial Gaussians; on cancel when ≥ 100 iterations

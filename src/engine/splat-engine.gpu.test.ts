@@ -2,21 +2,25 @@
  * The engine's splat stage on a tiny synthetic orbit (src/engine/testutil.ts, CPU features, GPU
  * PatchMatch + splats; run on the host GPU: E2E_GPU=host — SwiftShader compiles the splat
  * pipelines for minutes):
- *  - persistent session (real IndexedDB): densify, splat cancelled mid-training, the engine
- *    dropped without cleanup ("killed"), a NEW engine reports the resumable iteration, resumes from
- *    the checkpoint, persists the model, clears the checkpoints and exports 'ply-splat';
+ *  - persistent session (real IndexedDB): densify, splat cancelled mid-training (the readbacks of
+ *    its checkpoint dropped first: read again, never stored stale), the engine dropped without
+ *    cleanup ("killed"), a NEW engine reports the resumable iteration, resumes from the
+ *    checkpoint, persists the model, clears the checkpoints and exports 'ply-splat';
  *  - in-memory session without a dense cloud: dropped GPU work rolls back to the last checkpoint,
- *    a destroyed device is replaced and training continues from the checkpoint.
+ *    a destroyed device is replaced and training continues from the checkpoint; dropped readbacks
+ *    of the appearance normalisation are read again.
  */
 import { beforeAll, describe, expect, it } from 'vitest';
 import type { ProgressEvent } from '../core/types';
 import { getGPU } from '../gpu/device';
 import { SessionStore } from '../io/storage';
 import { decodeSplatPLY } from '../splat/ply';
+import type { SplatTrainer } from '../splat/trainer';
+import { COLOUR_FLOATS } from '../splat/wgsl/loss';
 import type { EngineOptions, SplatTrainingDetail } from '../workers/protocol';
 import { createCpuFeaturePipeline } from './cpu-pipeline';
 import { PhotogrammetryEngine } from './engine';
-import type { EngineStateRecord } from './persistence';
+import { unpackSplatParams, type EngineStateRecord } from './persistence';
 import { frameInputs, makeCapture, type SynthCapture } from './testutil';
 import type { EngineConfig } from './types';
 
@@ -52,7 +56,8 @@ describe('engine splat stage', () => {
     const id = `splat-resume-${Date.now()}`;
     const opts: EngineOptions = { mode: 'object', quality: 'fast', persist: true, sessionId: id, hfovPriorDeg: 60 };
     try {
-      const a = new PhotogrammetryEngine(opts, config());
+      let trainerA: SplatTrainer | null = null;
+      const a = new PhotogrammetryEngine(opts, config({ splatDebug: { onTrainer: (t) => (trainerA = t) } }));
       await captureAndRefine(a);
       const cloud = await a.densify();
       expect(cloud.count).toBeGreaterThan(500);
@@ -64,6 +69,9 @@ describe('engine splat stage', () => {
         const d = training(p);
         if (!d) return;
         seen.push(d);
+        // the checkpoint at iteration 100 (written right after this report) loses its first two
+        // readbacks (iOS: the app went to the background): its staging data would be stale
+        if (d.iteration === 100) trainerA!.simulateDroppedWork({ readbacks: 2 });
         if (d.iteration >= 150) cancel.cancelled = true;
       };
       await expect(a.splat(undefined, onProgress, cancel)).rejects.toMatchObject({ name: 'CancelledError' });
@@ -73,6 +81,12 @@ describe('engine splat stage', () => {
       const prog = await a.engineStore!.getValue<{ iteration: number; slot: number }>('splat/progress');
       expect(prog?.iteration).toBe(100);
       expect((await a.engineStore!.listBinaryKeys(`splat/ckpt${prog!.slot}/`)).length).toBe(4);
+      // the checkpoint holds the trainer's data, not stale staging contents (loss sums, stamps)
+      const colour = new Float32Array((await a.engineStore!.getBinary(`splat/ckpt${prog!.slot}/colour`))!);
+      for (let v = 0; v < colour.length / COLOUR_FLOATS; v++)
+        for (const k of [0, 5, 10]) expect(Math.abs(colour[v * COLOUR_FLOATS + k] - 1)).toBeLessThan(0.5);
+      const params = unpackSplatParams((await a.engineStore!.getBinary(`splat/ckpt${prog!.slot}/params`))!);
+      expect(params.means.every((x) => Number.isFinite(x) && Math.abs(x) < 100)).toBe(true);
       a.dispose(); // "killed": no cleanup
 
       // reload: a new engine opens the session and resumes
@@ -119,11 +133,13 @@ describe('engine splat stage', () => {
 
   it('rolls back dropped work and survives a device loss (sparse init + sky shell)', async () => {
     let drops = 0;
+    let current: SplatTrainer | null = null;
     const e = new PhotogrammetryEngine(
       { mode: 'object', quality: 'fast', persist: false, hfovPriorDeg: 60 },
       config({
         splatDebug: {
           onTrainer: (t) => {
+            current = t;
             // the first trainer drops the command buffers of two iterations of its first chunk
             if (drops++ === 0) t.simulateDroppedWork({ iterations: 2 });
           },
@@ -133,6 +149,8 @@ describe('engine splat stage', () => {
     await captureAndRefine(e);
     let lost = false;
     const info = await e.splat({ backgroundShell: true }, (p) => {
+      // the colour-state readbacks of the appearance normalisation are dropped twice
+      if (p.stage === 'splat_finishing' && p.progress === 0) current!.simulateDroppedWork({ readbacks: 2 });
       const d = training(p);
       if (d && d.iteration >= 140 && !lost) {
         lost = true;
@@ -143,6 +161,9 @@ describe('engine splat stage', () => {
     expect(info.iterations).toBe(300);
     expect(info.stats.splatDroppedWork).toBe(1);
     expect(info.stats.splatDeviceLosses).toBe(1);
+    expect(info.stats.splatReadRetries).toBe(2);
+    // the mean colour matrix of the training views (stale staging data: loss sums, stamps)
+    expect(Math.abs(Number(info.stats.splatMeanColourGain) - 1)).toBeLessThan(0.5);
     expect(info.stats.splatInitDense).toBe(0);
     expect(Number(info.stats.splatShell)).toBeGreaterThan(0);
     expect(drops).toBe(2); // the trainer was rebuilt once

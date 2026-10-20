@@ -286,5 +286,30 @@ describe('SplatTrainer checkpoints and dropped work', () => {
     expect((e2 as SplatWorkDroppedError).relocation).toBe(true);
     expect((await t.step(10)).iteration).toBe(120);
   });
+
+  it('a dropped readback throws SplatWorkDroppedError instead of returning stale staging data (review)', async () => {
+    const gt = randomScene({ count: 100, seed: 97 });
+    const views = orbit(gt, 3, 32, 24);
+    const t = await trainer(gt, views, { iterations: 200, maxGaussians: 200, resolution: [], mcmc: false });
+    await t.step(10);
+    const model = await t.readModel();
+    const state = await t.readState();
+    // the copy of the means is dropped: the staging buffer still holds the last section read (SH)
+    t.simulateDroppedWork({ readbacks: 1 });
+    expect(await t.readModel().catch((e: unknown) => e)).toBeInstanceOf(SplatWorkDroppedError);
+    expect(fieldsEqual(await t.readModel(), model)).toBe(true);
+    t.simulateDroppedWork({ readbacks: 1 });
+    expect(await t.readState().catch((e: unknown) => e)).toBeInstanceOf(SplatWorkDroppedError);
+    expect(Array.from((await t.readState()).colour)).toEqual(Array.from(state.colour));
+    // normaliseAppearance: a dropped colour or SH read changes nothing; called again it works
+    for (const drop of [1, 2]) {
+      t.simulateDroppedWork({ readbacks: drop });
+      if (drop === 2) await t.normaliseAppearance().catch(() => undefined); // drops the colour read
+      expect(await t.normaliseAppearance().catch((e: unknown) => e)).toBeInstanceOf(SplatWorkDroppedError);
+      expect(fieldsEqual(await t.readModel(), model)).toBe(true);
+      expect(t.backgroundColour).toEqual([0, 0, 0]);
+    }
+    expect(await t.normaliseAppearance()).not.toBeNull();
+  });
 });
 

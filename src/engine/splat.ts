@@ -13,8 +13,9 @@
  *             cancel between chunks; a checkpoint (f32 parameters, bf16 Adam moments, colour state)
  *             every `checkpointEvery` iterations in the session store (resume after a kill or a
  *             cancel) or the scratch store; dropped work (`SplatWorkDroppedError`) rolls back to
- *             the last checkpoint in place; a lost device rebuilds the trainer on the new one
- *             from it (twice at most, then 'gpu-lost').
+ *             the last checkpoint in place; a dropped readback of a checkpoint or of the final
+ *             model is read again once visible (stale data is never stored); a lost device
+ *             rebuilds the trainer on the new one from it (twice at most, then 'gpu-lost').
  *   finishing appearance normalisation (mean training-view colour matrix folded into the colours),
  *             read-back; the engine persists the model (`packSplatModel`) and clears the checkpoints.
  */
@@ -48,6 +49,8 @@ export const SPLAT_PROGRESS_KEY = 'splat/progress';
 const ckptKey = (slot: number, part: 'params' | 'm' | 'v' | 'colour'): string => `splat/ckpt${slot}/${part}`;
 /** Long side of the view thumbnails that colour the background shell. */
 const THUMB_SIZE = 160;
+/** Attempts of a trainer readback whose copy was dropped (SplatWorkDroppedError) before the stage fails. */
+const MAX_READ_ATTEMPTS = 5;
 
 export interface SplatDeps {
   /** Keyframe images. */
@@ -369,16 +372,33 @@ export async function runSplat(deps: SplatDeps, opts: SplatOptions = {}, progres
     let lastCkpt: { iteration: number; slot: 0 | 1 } | null = resume ? { iteration: resume.state.iteration, slot: resume.slot } : null;
     let ckptMs = 0;
     let ckpts = 0;
+    let readRetries = 0;
+    /**
+     * A trainer readback under the GPU lock, read again (once the page is visible) when its copy
+     * was dropped: stale staging data must never become a checkpoint or the saved model.
+     */
+    const readBack = async <T>(what: string, fn: (t: SplatTrainer) => Promise<T>): Promise<T> => {
+      const t = trainer;
+      for (let attempt = 1; ; attempt++) {
+        try {
+          return await deps.gpuLock(() => fn(t));
+        } catch (e) {
+          if (!(e instanceof SplatWorkDroppedError) || attempt >= MAX_READ_ATTEMPTS) throw e;
+          readRetries++;
+          deps.log('warn', `splat: ${what}: ${e.message} — reading again`);
+          await deps.waitVisible();
+        }
+      }
+    };
     const writeCheckpoint = async (): Promise<void> => {
       const tc = now();
-      const t = trainer;
       const next: 0 | 1 = slot === 0 ? 1 : 0;
-      const state = await deps.gpuLock(() => t.readState());
-      await ckStore.putBinary(ckptKey(next, 'params'), packSplatParams(await deps.gpuLock(() => t.readModel())));
+      const state = await readBack('checkpoint', (t) => t.readState());
+      await ckStore.putBinary(ckptKey(next, 'params'), packSplatParams(await readBack('checkpoint', (t) => t.readModel())));
       const moments = state.iteration > 0;
       if (moments) {
-        await ckStore.putBinary(ckptKey(next, 'm'), packSplatMoments(await deps.gpuLock(() => t.readMoments('m'))));
-        await ckStore.putBinary(ckptKey(next, 'v'), packSplatMoments(await deps.gpuLock(() => t.readMoments('v'))));
+        await ckStore.putBinary(ckptKey(next, 'm'), packSplatMoments(await readBack('checkpoint', (t) => t.readMoments('m'))));
+        await ckStore.putBinary(ckptKey(next, 'v'), packSplatMoments(await readBack('checkpoint', (t) => t.readMoments('v'))));
       }
       await ckStore.putBinary(ckptKey(next, 'colour'), state.colour);
       const rec: SplatProgressRecord = {
@@ -480,11 +500,12 @@ export async function runSplat(deps: SplatDeps, opts: SplatOptions = {}, progres
     // ---- finishing (a cancel arriving now is ignored: the training is complete)
     report(SPLAT_STAGES.finishing, 0, 'normalising appearance');
     const tf = now();
-    const t = trainer;
-    const mean = await deps.gpuLock(() => t.normaliseAppearance());
+    // (a dropped readback of normaliseAppearance throws before it changes anything: read again)
+    const mean = await readBack('appearance normalisation', (t) => t.normaliseAppearance());
     if (mean) stats.splatMeanColourGain = Math.round(((mean[0] + mean[5] + mean[10]) / 3) * 1000) / 1000;
     report(SPLAT_STAGES.finishing, 0.4, 'reading the model');
-    const out = await deps.gpuLock(() => t.readModel());
+    const out = await readBack('model read-back', (t) => t.readModel());
+    if (readRetries) stats.splatReadRetries = readRetries;
     stats.splatCount = out.count;
     stats.splatFinishMs = Math.round(now() - tf);
     stats.splatMs = Math.round(now() - t0);

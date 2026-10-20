@@ -22,8 +22,11 @@
  * iteration stamps its stats slot with a submission counter and every MCMC relocation copies its
  * own stamp next to them; `step` checks the stamps of its iterations and throws
  * `SplatWorkDroppedError` when one is missing (the caller restores a checkpoint: a dropped
- * relocation leaves grown slots uninitialised). Checkpoints: `readState` + `readMoments` +
- * `readModel`, restored by `init(params, views)` + `restore(state, moments)`.
+ * relocation leaves grown slots uninitialised). Every readback copies its own stamp behind the
+ * data: a dropped one throws `SplatWorkDroppedError` instead of returning stale staging contents
+ * (`readState` / `readModel` / `readMoments` / `normaliseAppearance` can then simply be called
+ * again). Checkpoints: `readState` + `readMoments` + `readModel`, restored by
+ * `init(params, views)` + `restore(state, moments)`.
  */
 import type { CameraIntrinsics, Pose, RGBAImage } from '../core/types';
 import type { GPUContext } from '../gpu/device';
@@ -299,8 +302,11 @@ export class SplatTrainer {
   private stamps = 0;
   /** Stamp of the last MCMC relocation (copied into slot STAT_SLOTS by its command buffer). */
   private relocStamp = 0;
+  /** Stamp of the last readback (copied behind its data, see readBuffer) and its source buffer. */
+  private readStamp = 0;
+  private readStampBuf: GPUBuffer | null = null;
   /** Test hook: command buffers to discard instead of submitting (simulated dropped work). */
-  private dropNext = { iterations: 0, relocations: 0 };
+  private dropNext = { iterations: 0, relocations: 0, readbacks: 0 };
 
   private constructor(
     private readonly device: GPUDevice,
@@ -600,15 +606,33 @@ export class SplatTrainer {
     return this.staging;
   }
 
+  /**
+   * Reads `bytes` of `src` back. The same command buffer copies a fresh stamp behind the data:
+   * a dropped copy (iOS drops work submitted while the app goes to the background, and mapAsync
+   * still resolves) leaves the previous staging contents and throws `SplatWorkDroppedError`
+   * instead of returning them. Nothing on the GPU changes, so the read can simply be repeated.
+   */
   private async readBuffer(src: GPUBuffer, offset: number, bytes: number): Promise<ArrayBuffer> {
-    const st = this.ensureStaging(bytes);
+    const size = Math.ceil(bytes / 4) * 4;
+    const st = this.ensureStaging(size + 4);
+    if (!this.readStampBuf) this.readStampBuf = this.device.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST, label: 'splat-read-stamp' });
+    this.readStamp = (this.readStamp % 0xfffffff0) + 1;
+    const stamp = this.readStamp;
+    this.device.queue.writeBuffer(this.readStampBuf, 0, new Uint32Array([stamp]));
     const enc = this.device.createCommandEncoder({ label: 'splat-readback' });
-    enc.copyBufferToBuffer(src, offset, st, 0, Math.ceil(bytes / 4) * 4);
-    this.device.queue.submit([enc.finish()]);
-    const r = await Promise.race([st.mapAsync(GPUMapMode.READ, 0, Math.ceil(bytes / 4) * 4).then(() => 'ok' as const), this.lost.then(() => 'lost' as const)]);
+    enc.copyBufferToBuffer(src, offset, st, 0, size);
+    enc.copyBufferToBuffer(this.readStampBuf, 0, st, size, 4);
+    if (this.dropNext.readbacks > 0) {
+      this.dropNext.readbacks--;
+      enc.finish();
+    } else this.device.queue.submit([enc.finish()]);
+    const r = await Promise.race([st.mapAsync(GPUMapMode.READ, 0, size + 4).then(() => 'ok' as const), this.lost.then(() => 'lost' as const)]);
     if (r === 'lost') throw new Error('GPU device lost during readback');
-    const out = st.getMappedRange(0, Math.ceil(bytes / 4) * 4).slice(0);
+    const mapped = st.getMappedRange(0, size + 4);
+    const got = new Uint32Array(mapped, size, 1)[0];
+    const out = mapped.slice(0, size);
     st.unmap();
+    if (got !== stamp) throw new SplatWorkDroppedError('splat readback: GPU work was not executed (page hidden?)', 0, false);
     return out;
   }
 
@@ -893,7 +917,8 @@ export class SplatTrainer {
    * bands × A), the background A·bg + b and every view matrix M_v ∘ M̄⁻¹, so the corrected
    * renders of the training views are unchanged while the raw render shows the average
    * exposure / white balance (what a held-out view or a viewer should get). Returns M̄
-   * (row-major 3×4), or null when it is not invertible.
+   * (row-major 3×4), or null when it is not invertible. A dropped readback throws
+   * `SplatWorkDroppedError` before anything is changed (it can be called again).
    */
   async normaliseAppearance(): Promise<Float64Array | null> {
     const V = this.views.length;
@@ -967,11 +992,12 @@ export class SplatTrainer {
   }
 
   /**
-   * Test hook: the next `iterations` iteration command buffers and `relocations` MCMC relocation
-   * command buffers are discarded instead of submitted (work dropped while the page is hidden).
+   * Test hook: the next `iterations` iteration command buffers, `relocations` MCMC relocation
+   * command buffers and `readbacks` readback command buffers are discarded instead of submitted
+   * (work dropped while the page is hidden).
    */
-  simulateDroppedWork(o: { iterations?: number; relocations?: number }): void {
-    this.dropNext = { iterations: Math.max(0, o.iterations ?? 0), relocations: Math.max(0, o.relocations ?? 0) };
+  simulateDroppedWork(o: { iterations?: number; relocations?: number; readbacks?: number }): void {
+    this.dropNext = { iterations: Math.max(0, o.iterations ?? 0), relocations: Math.max(0, o.relocations ?? 0), readbacks: Math.max(0, o.readbacks ?? 0) };
   }
 
   resetProfile(): void {
@@ -1066,6 +1092,8 @@ export class SplatTrainer {
       b.destroy();
     this.relocList?.destroy();
     this.staging?.destroy();
+    this.readStampBuf?.destroy();
+    this.readStampBuf = null;
     this.gradsOut?.destroy();
     this.profiler?.destroy();
     this.images = [];

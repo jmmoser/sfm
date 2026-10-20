@@ -168,8 +168,10 @@ densify — or after refine when there is no dense cloud. One long operation wit
    moments, colour-correction state, plan — goes to the session store (persistent) or the scratch store
    (`splat/ckpt<0|1>/…` + `splat/progress`, two slots so a kill mid-write keeps the previous one); a cancel ≥ 100
    iterations after the last checkpoint writes one more. Dropped GPU work (`SplatWorkDroppedError`: iteration /
-   relocation stamps missing) rolls the trainer back to the last checkpoint in place; a device loss rebuilds the
-   trainer on the new device from it (twice; then `GPUDeviceLostError`, code 'gpu-lost').
+   relocation stamps missing) rolls the trainer back to the last checkpoint in place; a dropped readback (its own
+   stamp missing) is read again once the page is visible, so a checkpoint or the saved model never holds stale
+   staging data; a device loss rebuilds the trainer on the new device from it (twice; then `GPUDeviceLostError`,
+   code 'gpu-lost').
 3. `splat_finishing`: appearance normalisation (the mean training-view colour matrix folded into the colours),
    read-back, persisted compactly (`splat/model`: f32 means, f16 rest ≈ 34 B per Gaussian + `splat/meta`);
    checkpoints cleared.
