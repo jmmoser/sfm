@@ -113,10 +113,12 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   // ---- content -----------------------------------------------------------------------------------
   function applyContent(first: boolean): void {
     const r = app.results;
+    // (an empty dense cloud, from a fusion that kept nothing, shows the sparse one, as exports do)
+    const dense = r.dense && r.dense.count > 0 ? r.dense : null;
     titleEl.textContent = r.name;
     const parts: string[] = [];
     if (r.mesh) parts.push(`${formatCount(r.mesh.triangleCount)} triangles`);
-    if (r.dense) parts.push(`${formatCount(r.dense.count)} points`);
+    if (dense) parts.push(`${formatCount(dense.count)} points`);
     else if (r.sparse) parts.push(`${formatCount(r.sparse.points.count)} points`);
     if (r.sparse) parts.push(`${r.sparse.cameras.length} photos`);
     subEl.textContent = parts.join(' · ');
@@ -128,7 +130,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     const metric = r.sparse?.metric;
     viewer.setWorldUp(metric?.gravityAligned ? 'z' : 'auto');
     viewer.setUnits(!!metric?.metric);
-    if (r.dense) viewer.setPointCloud(r.dense);
+    if (dense) viewer.setPointCloud(dense);
     else if (r.sparse) viewer.setPointCloud(r.sparse.points, { pointSizePx: 3, splats: false });
     else viewer.setPointCloud(null);
     viewer.setMesh(r.mesh);

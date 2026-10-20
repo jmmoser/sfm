@@ -231,7 +231,7 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
   function showPreview(): void {
     if (resultsStale) return; // the previous scan's model: run() shows this one's after the load
     const r = app.results;
-    if (r.dense) {
+    if (r.dense && r.dense.count > 0) {
       const v = ensureViewer();
       if (!v) return;
       v.setWorldUp(r.sparse?.metric.gravityAligned ? 'z' : 'auto');

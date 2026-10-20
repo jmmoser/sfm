@@ -81,7 +81,9 @@ const SCENARIOS = [
   'open-failed',
   'viewer-loading',
   'camera-error-init',
+  'camera-error-init-retry',
   'memory-limit-background',
+  'empty-dense',
 ];
 const args = process.argv.slice(2).filter((a) => !a.startsWith('--'));
 // A misspelled name would run nothing and still pass.
@@ -948,6 +950,68 @@ await scenario('memory-limit-background', async () => {
   await by(page, 'resume').tap();
   await by(page, 'capture-memory-limit').waitFor({ timeout: 15000 });
   check((await phaseOf(page)) === 'paused', 'the memory prompt comes once the capture runs again');
+  await context.close();
+});
+
+await scenario('camera-error-init-retry', async () => {
+  const { page, context } = await newPage();
+  await page.goto(`${base}?mock=1&mockSpeed=3`);
+  await by(page, 'new-scan').waitFor();
+  // The first engine init fails after a while (GPU programs that do not compile); the retry works.
+  await page.evaluate(() => {
+    const e = globalThis.__sfmApp.engine;
+    const orig = e.init.bind(e);
+    let calls = 0;
+    e.init = async (o) => {
+      if (++calls === 1) {
+        await new Promise((r) => setTimeout(r, 3000));
+        throw new Error('GPU programs failed to compile');
+      }
+      return orig(o);
+    };
+  });
+  await by(page, 'new-scan').tap();
+  await by(page, 'start-capture').tap();
+  await page.locator('.capture-card-title', { hasText: 'Preparing 3D engine' }).waitFor({ timeout: 30000 });
+  // The camera stops during the init (its automatic restart fails), then the init fails: the
+  // engine card replaces the camera card, and "Try again" succeeds while the camera is still stopped.
+  await page.evaluate(() => {
+    navigator.mediaDevices.getUserMedia = () => Promise.reject(new DOMException('Could not start video source', 'NotReadableError'));
+    document.querySelector('video').srcObject.getVideoTracks()[0].dispatchEvent(new Event('ended'));
+  });
+  await page.locator('[data-testid="capture-error"]', { hasText: 'The camera stopped' }).waitFor({ timeout: 5000 });
+  await page.locator('[data-testid="capture-error"]', { hasText: 'Processing engine unavailable' }).waitFor({ timeout: 15000 });
+  await by(page, 'capture-retry').tap();
+  await page.locator('[data-testid="capture-error"]', { hasText: 'The camera stopped' }).waitFor({ timeout: 10000 });
+  check((await page.locator('.capture-card-title', { hasText: 'Preparing 3D engine' }).count()) === 0, 'no "Preparing 3D engine" spinner left once the engine is ready');
+  check(/Reconnect camera/.test((await by(page, 'capture-retry').textContent()) ?? ''), 'the camera card offers "Reconnect camera" again');
+  await page.evaluate(() => {
+    delete navigator.mediaDevices.getUserMedia;
+  });
+  await by(page, 'capture-retry').tap();
+  await page.waitForFunction(() => Number(document.querySelector('[data-testid="kf-count"]')?.textContent) >= 2, null, { timeout: 30000 });
+  check((await phaseOf(page)) === 'running', '"Reconnect camera" starts the scan');
+  await context.close();
+});
+
+await scenario('empty-dense', async () => {
+  // A densify whose fusion kept no point: the viewer shows the sparse cloud (as exports do).
+  const { page, context } = await newPage();
+  await page.goto(`${base}?mock=1`);
+  await by(page, 'new-scan').waitFor();
+  await seedSession(page, { id: 'seed-empty-dense', name: 'Empty dense', mode: 'object', status: 'dense', stats: { quality: 'fast', keyframes: 20 } });
+  await page.reload();
+  await by(page, 'new-scan').waitFor();
+  await page.evaluate(() => {
+    const e = globalThis.__sfmApp.engine;
+    const orig = e.loadSession.bind(e);
+    e.loadSession = async (...a) => ({ ...(await orig(...a)), dense: { count: 0, positions: new Float32Array(0), colors: new Uint8Array(0) } });
+  });
+  await by(page, 'session-item').first().tap();
+  // (the title is set with the content, once the scan is loaded)
+  await page.locator('.viewer-title', { hasText: 'Empty dense' }).waitFor({ timeout: 30000 });
+  const sub = (await page.locator('.viewer-sub').textContent()) ?? '';
+  check(/points/.test(sub) && !/^0 points/.test(sub), `the subtitle counts the sparse points, not the empty dense cloud (got "${sub}")`);
   await context.close();
 });
 

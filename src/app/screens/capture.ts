@@ -907,9 +907,14 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       videoFrameOrientation: camRes?.apple ? 'raw' : 'upright',
       onError: (e) => console.warn('[capture] pump error', e),
     });
-    // The camera failed during the init: keep its error card; "Reconnect camera" (or the camera
-    // coming back by itself) starts the pump.
-    if (phase === 'error' && camera.state !== 'running') return;
+    // The camera failed during the init: show its state again (this init's spinner, or an engine
+    // error card a retry came from, covers it); "Reconnect camera", or the camera coming back by
+    // itself (onCameraState 'running'), starts the pump.
+    if (phase === 'error' && camera.state !== 'running') {
+      if (camera.state === 'error') errorCard('The camera stopped', 'Tap to reconnect the camera.', () => void reconnect(), 'Reconnect camera');
+      else showCard(infoCard({ spinner: true, title: 'Reconnecting camera…' }));
+      return;
+    }
     showCard(null);
     pump.start();
     setPhase('running');
