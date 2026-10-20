@@ -191,7 +191,12 @@ export class SplatLayer {
     if (!this.presenter || this.presenter.device !== device) {
       this.presenter?.destroy();
       this.presenter = null;
-      this.presenter = await SplatPresenter.create(device, this.format);
+      const p = await SplatPresenter.create(device, this.format);
+      if (this.disposed) {
+        p.destroy();
+        return;
+      }
+      this.presenter = p;
     }
     if (!reuse) {
       const w = Math.max(16, this.canvas.width);

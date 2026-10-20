@@ -1020,6 +1020,70 @@ export class Viewer {
     this.requestRender();
   }
 
+  /**
+   * Frame the view from a capture camera (`setCameras`; default the middle one): looking along
+   * its optical axis, the orbit target at the median depth of the content in its view (robust
+   * samples of the points / mesh; else the content centre's depth), the eye pulled back by
+   * `pullBack` × that depth (default 0.15) for context. The orbit controls stay on. Gaussian
+   * splats are best seen near the photos they were trained on (far outside the capture they show
+   * unconstrained floaters). Returns false without cameras.
+   */
+  viewFromCamera(index?: number, opts: { pullBack?: number; animate?: boolean } = {}): boolean {
+    if (this.disposed || this.viewLocked || !this.cams.length || this.width === 0 || this.height === 0) return false;
+    this.recomputeBounds();
+    const cam = this.cams[Math.min(this.cams.length - 1, Math.max(0, index ?? Math.floor(this.cams.length / 2)))];
+    const { R, t } = cam.pose;
+    const C = cameraCenter(cam.pose);
+    const K = cam.intrinsics;
+    // depths of the content samples inside this camera's image
+    const depths: number[] = [];
+    for (const l of [this.dense, this.meshLayer, this.sparse, this.splatBounds]) {
+      if (!l || depths.length > 2000) continue;
+      const S = l.samples;
+      for (let i = 0; i + 2 < S.length; i += 3) {
+        const x = R[0] * S[i] + R[1] * S[i + 1] + R[2] * S[i + 2] + t[0];
+        const y = R[3] * S[i] + R[4] * S[i + 1] + R[5] * S[i + 2] + t[1];
+        const z = R[6] * S[i] + R[7] * S[i + 1] + R[8] * S[i + 2] + t[2];
+        if (z <= 0) continue;
+        const u = (K.f * x) / z + K.cx;
+        const v = (K.f * y) / z + K.cy;
+        if (u >= 0 && v >= 0 && u < K.width && v < K.height) depths.push(z);
+      }
+    }
+    let d: number;
+    if (depths.length >= 20) {
+      depths.sort((a, b) => a - b);
+      d = depths[depths.length >> 1];
+    } else {
+      const b = this.contentBounds;
+      const c = b?.center ?? C;
+      d = Math.max(R[6] * (c[0] - C[0]) + R[7] * (c[1] - C[1]) + R[8] * (c[2] - C[2]), 0.1 * (b?.radius ?? 1));
+    }
+    const pull = opts.pullBack ?? 0.15;
+    // camera z axis in the world = row 2 of R
+    const eye = new Vector3(C[0] - pull * d * R[6], C[1] - pull * d * R[7], C[2] - pull * d * R[8]);
+    const target = new Vector3(C[0] + d * R[6], C[1] + d * R[7], C[2] + d * R[8]);
+    this.contentRoot.localToWorld(eye);
+    this.contentRoot.localToWorld(target);
+    const r = this.contentBounds?.radius ?? d;
+    this.controls.minDistance = Math.min(r, d) * 1e-4;
+    this.controls.maxDistance = Math.max(r, d) * 200;
+    this.targetAnim.cancel();
+    this.autoFitFirst = false;
+    this.autoFitArmed = false;
+    this.pendingFit = false;
+    if (opts.animate) {
+      this.viewAnim = { fromPos: this.camera.position.clone(), toPos: eye, fromTarget: this.controls.target.clone(), toTarget: target, t0: performance.now() };
+    } else {
+      this.viewAnim = null;
+      this.camera.position.copy(eye);
+      this.controls.target.copy(target);
+      this.controls.update();
+    }
+    this.requestRender();
+    return true;
+  }
+
   private stepViewAnim(now: number): boolean {
     const a = this.viewAnim;
     if (!a) return false;

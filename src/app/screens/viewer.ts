@@ -211,10 +211,12 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       // the photoreal model when there is one (points meanwhile, while it loads), else the mesh
       display.layer = r.splat ? 'splats' : r.mesh ? 'mesh' : 'points';
       display.grid = !!metric?.gravityAligned;
+      // splats have no depth for the frustums to hide behind: they would cover the view
+      display.cameras = !r.splat;
     }
     if (display.layer !== 'splats' || !r.splat) display.layer = fallbackLayer();
     applyDisplay();
-    if (first) viewer.fitToContent();
+    if (first) frameView(false);
     if (r.splat && splatState === 'none' && !splatFetching) void loadSplats(false);
   }
 
@@ -261,6 +263,16 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     });
     renderLayerSwitch();
     renderSub();
+  }
+
+  /**
+   * Default view: with splats, from the middle photo (they are photoreal near the capture and show
+   * floaters far outside it); otherwise the whole content.
+   */
+  function frameView(animate: boolean): void {
+    if (!viewer) return;
+    if (display.layer === 'splats' && viewer.viewFromCamera(undefined, { animate })) return;
+    viewer.fitToContent(animate);
   }
 
   function setDisplay(patch: Partial<DisplayState>): void {
@@ -319,6 +331,11 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       const ok = await viewer.setSplats(payload);
       if (closed || token !== splatLoadToken) return;
       if (ok && (show || !userPickedLayer)) display.layer = 'splats';
+      if (ok && show) {
+        // a model just built: show it from the photos, without the frustums in front of it
+        display.cameras = false;
+        frameView(true);
+      }
       if (!ok && display.layer === 'splats') display.layer = fallbackLayer();
       applyDisplay();
     } catch (e) {
@@ -404,7 +421,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       }),
       switchRow({ label: 'Ground grid', icon: 'target', description: 'Not with splats', checked: display.grid, disabled: !r.sparse?.metric.gravityAligned, onChange: (v) => setDisplay({ grid: v }) }),
     ];
-    const reset = button({ label: 'Reset view', icon: 'target', variant: 'secondary', size: 'md', block: true, onClick: () => viewer?.fitToContent(true) });
+    const reset = button({ label: 'Reset view', icon: 'target', variant: 'secondary', size: 'md', block: true, onClick: () => frameView(true) });
     openSheet({
       title: 'Display',
       content: [section('Show', layers.el, h('p', { class: 'section-note', text: note })), group(...rows.map((r) => r.el)), h('div', { class: 'sheet-footer' }, reset)],
