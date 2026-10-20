@@ -691,7 +691,8 @@ export class MockEngine implements EngineLike {
       case 'glb': {
         const pts = this.denseCloud ?? this.sparse?.points;
         if (!this.meshModel && !pts) throw new Error('Nothing to export yet');
-        const glb = encodeGLB(this.meshModel ? { mesh: this.meshModel, extras: { mock: true } } : { points: pts!, extras: { mock: true } });
+        // unlit like the engine's export: the vertex colours are photo colours
+        const glb = encodeGLB(this.meshModel ? { mesh: this.meshModel, unlitMesh: true, extras: { mock: true } } : { points: pts!, extras: { mock: true } });
         return new Blob([glb], { type: 'model/gltf-binary' });
       }
       case 'colmap-zip':
