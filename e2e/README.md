@@ -567,7 +567,9 @@ p50 8.3 mm; yard-real balanced (6.3 M) P 0.962, C 0.494, F 0.653, p50 7.1 mm (co
 * Kernel diet (`--set 'engineConfig={"dense":{"patchMatch":{"patchRadius":6,"patchStep":3,"affineWindow":true,"numSamplesPerIter":3}}}'`,
   fast, with multi-scale): GPU object-real 7.2 → 3.9 s, yard-real 6.3 → 3.1 s; yard-real P / C / F 0.942 / 0.401 /
   0.563 → 0.932 / 0.396 / 0.555, p50 8.0 → 9.8 mm; object-real p50 / p90 0.29 / 0.98 → 0.32 / 1.1 mm, C 0.9969 →
-  0.9981. Not in the presets.
+  0.9981. Balanced yard-real: GPU 31.0 → 15.4 s, depth maps 105.0 → 87.3 s, densify 125.9 → 111.2 s, P / C / F
+  0.953 / 0.483 / 0.641 → 0.946 / 0.483 / 0.639, p50 7.3 → 7.8 mm. Not in the presets (a quality cost at fast,
+  within ~1 pt of precision at balanced: a candidate for balanced / max after an on-device check).
 * `metrics-core` scores completeness on every ROI point now; accuracy and precision still use a ≤ `maxPoints`
   (3 M) strided subsample. Clouds above 3 M points only appear with the new point cap at balanced / max (the global
   voxel kept ≤ 2.3 M).

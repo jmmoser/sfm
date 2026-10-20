@@ -2802,7 +2802,9 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   6.3 → 3.1 s) but costs yard quality: e2e yard-real P / C / F 0.942 / 0.401 / 0.563 → 0.932 / 0.396 / 0.555, accuracy
   p50 8.0 → 9.8 mm; clean yard (GT harness) C 0.4503 → 0.4342. Each part alone (affine + 3 proposals at 11 px, the
   9 px / 25-sample window, the 13 px window with 6 proposals) costs 0.8–1.0 pt of clean-yard completeness. Object:
-  equal within noise (object-real 0.29 / 0.98 mm → 0.32 / 1.1 mm, C 0.9969 → 0.9981). At 160×120 the 13 px window
+  equal within noise (object-real 0.29 / 0.98 mm → 0.32 / 1.1 mm, C 0.9969 → 0.9981). At `balanced` the cost is
+  smaller: yard-real GPU 31.0 → 15.4 s (densify 125.9 → 111.2 s), P / C / F 0.953 / 0.483 / 0.641 → 0.946 / 0.483 /
+  0.639, p50 7.3 → 7.8 mm — a candidate for balanced / max after an on-device check. At 160×120 the 13 px window
   spans 8 % of the image and loses 5 pt within 1 % (unit test uses the 11 px window for the affine check).
 * **Results** (e2e, worker engine, before = this branch's base with the timing log, back-to-back, same load):
   see e2e/README.md "Dense on the real GPU". Summary, densify wall s (depth maps / fusion) and dense quality:
