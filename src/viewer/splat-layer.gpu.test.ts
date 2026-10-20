@@ -11,6 +11,7 @@ import { pipelineCompileLimits } from '../features/gpu-common';
 import { getGPU } from '../gpu/device';
 import { lookAt } from '../splat/testutil';
 import { SH_C0, allocSplatModel, logit, type SplatModel } from '../splat/types';
+import type { SplatView } from './splat-layer';
 import { Viewer, type ViewerOptions } from './viewer';
 
 const containers: HTMLElement[] = [];
@@ -203,6 +204,48 @@ describe('Viewer splat layer', () => {
     let red = 0;
     for (let i = 0; i < d.length; i += 4) if (d[i] > 150 && d[i + 1] < 60 && d[i + 3] === 255) red++;
     expect(red).toBeGreaterThan(5);
+  });
+
+  it('a layer that gave up after a device loss moves to a new device on the next setModel (review)', async () => {
+    const { SplatLayer } = await import('./splat-layer');
+    const el = document.createElement('div');
+    el.style.cssText = 'position:fixed;left:0;top:0;width:160px;height:120px';
+    document.body.appendChild(el);
+    containers.push(el);
+    const states: string[] = [];
+    const layer = await SplatLayer.create(el, null, { allowSoftware: true, maxPixelRatio: 1, maxRecoveries: 0, onState: (s) => states.push(s) });
+    try {
+      // three.js camera at the origin looking down −z (identity view), 60° vertical fov
+      const [W, H, near, far] = [160, 120, 0.01, 100];
+      const f = 1 / Math.tan(Math.PI / 6);
+      const view: SplatView = {
+        view: [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+        projection: [f / (W / H), 0, 0, 0, 0, f, 0, 0, 0, 0, (far + near) / (near - far), -1, 0, 0, (2 * far * near) / (near - far), 0],
+        cssWidth: W,
+        cssHeight: H,
+        near,
+        background: [0, 0, 0],
+        interactive: false,
+      };
+      const redPixels = async (): Promise<number> => {
+        layer.draw(view);
+        const px = await layer.readPixels();
+        let n = 0;
+        if (px) for (let i = 0; i < px.data.length; i += 4) if (px.data[i] > 150 && px.data[i + 1] < 60) n++;
+        return n;
+      };
+      await layer.setModel(dots([[0, 0, -2]], [[1, 0, 0]], 0.05));
+      expect(await redPixels()).toBeGreaterThan(20);
+      (await getGPU())!.device.destroy();
+      for (let i = 0; i < 200 && layer.stats().state !== 'unavailable'; i++) await new Promise((r) => setTimeout(r, 10));
+      expect(states).toEqual(['ready', 'unavailable']);
+      // a new model: built on a fresh device (not on the lost one, reporting 'ready' while drawing nothing)
+      await layer.setModel(dots([[0, 0, -2]], [[1, 0, 0]], 0.05));
+      expect(layer.stats().state).toBe('ready');
+      expect(await redPixels()).toBeGreaterThan(20);
+    } finally {
+      layer.dispose();
+    }
   });
 
   it('a disposed viewer with splats is garbage-collected: the shared device does not keep it (review)', async () => {

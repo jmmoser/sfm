@@ -16,8 +16,9 @@
  *
  * Pipelines are compiled when the model is set. While the page is hidden nothing is submitted
  * (iOS may drop such work); on return the frame is redrawn. A device loss rebuilds the layer on
- * the new device from the host copy of the model (twice), then reports 'unavailable'. Software
- * adapters (SwiftShader) are refused: compiling and drawing would block for minutes.
+ * the new device from the host copy of the model (twice), then reports 'unavailable' (the next
+ * `setModel` starts over on a new device). Software adapters (SwiftShader) are refused:
+ * compiling and drawing would block for minutes.
  */
 import { getGPU, type GPUContext } from '../gpu/device';
 import { SplatPresenter } from '../splat/present';
@@ -97,6 +98,8 @@ export class SplatLayer {
   private visible = true;
   private disposed = false;
   private recoveries = 0;
+  /** `gpu`'s device was lost and the layer has not moved to a new one (it gave up: 'unavailable'). */
+  private deviceLost = false;
   private readonly lastSig = new Float64Array(SIG).fill(NaN);
   private readonly sig = new Float64Array(SIG);
   private lastView: SplatView | null = null;
@@ -187,6 +190,8 @@ export class SplatLayer {
     if (this.disposed) throw new Error('SplatLayer disposed');
     this.model = model;
     this.antialiased = antialiased;
+    // a layer that gave up after a device loss starts over on a new device (throws without one)
+    if (this.deviceLost && !(await this.moveToNewDevice())) return;
     await this.build();
     this.modelVersion++;
     this.lastSig.fill(NaN);
@@ -412,6 +417,7 @@ export class SplatLayer {
   }
 
   private async recover(reason: string): Promise<void> {
+    this.deviceLost = true;
     this.inFlight = false;
     this.pending = null;
     this.renderer = null; // its buffers died with the device
@@ -424,12 +430,7 @@ export class SplatLayer {
     this.recoveries++;
     this.setState('lost', reason);
     try {
-      const gpu = await getGPU();
-      if (this.disposed) return;
-      if (!gpu || (gpu.isSoftware && !this.opts.allowSoftware)) throw new Error('no WebGPU device after the loss');
-      this.gpu = gpu;
-      this.configure();
-      this.watchDevice(gpu.device);
+      if (!(await this.moveToNewDevice())) return;
       await this.build();
       if (this.disposed) return;
       this.modelVersion++;
@@ -438,6 +439,19 @@ export class SplatLayer {
     } catch (e) {
       if (!this.disposed) this.setState('unavailable', (e as Error)?.message ?? String(e));
     }
+  }
+
+  /** Adopts the shared context's new device after a loss (false: disposed meanwhile; throws without a usable one). */
+  private async moveToNewDevice(): Promise<boolean> {
+    const gpu = await getGPU();
+    if (this.disposed) return false;
+    if (!this.deviceLost) return true; // moved meanwhile (a recovery and a setModel at once)
+    if (!gpu || gpu.device === this.gpu.device || (gpu.isSoftware && !this.opts.allowSoftware)) throw new Error('no WebGPU device after the loss');
+    this.gpu = gpu;
+    this.deviceLost = false;
+    this.configure();
+    this.watchDevice(gpu.device);
+    return true;
   }
 
   dispose(): void {
