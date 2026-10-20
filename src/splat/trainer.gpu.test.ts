@@ -5,7 +5,10 @@ import { Rng } from '../math/random';
 import { backwardCPU, lossCPU, renderCPU } from './cpu-reference';
 import { SplatRenderer } from './renderer';
 import { cloneModel, lookAt, randomScene, testCamera } from './testutil';
-import { SplatTrainer, type SplatTrainingView } from './trainer';
+import type { RGBAImage } from '../core/types';
+import { SplatTrainer, SplatWorkDroppedError, type SplatTrainingView as TrainerView } from './trainer';
+
+type SplatTrainingView = TrainerView & { image: RGBAImage };
 import type { SplatCamera, SplatModel } from './types';
 
 let ctx: GPUContext;
@@ -211,3 +214,77 @@ describe('SplatTrainer optimisation', () => {
     expect(d).toBeLessThan(1e-6);
   });
 });
+
+describe('SplatTrainer checkpoints and dropped work', () => {
+  /** A small orbit of rendered views of a random scene. */
+  function orbit(gt: SplatModel, n: number, W: number, H: number): SplatTrainingView[] {
+    const views: SplatTrainingView[] = [];
+    for (let k = 0; k < n; k++) {
+      const a = (2 * Math.PI * k) / n;
+      const { R, t } = lookAt([2.4 * Math.sin(a), -2.4 * Math.cos(a), 0.5], [0, 0, 0]);
+      const cam: SplatCamera = { width: W, height: H, fx: 50, fy: 50, cx: (W - 1) / 2, cy: (H - 1) / 2, R, t };
+      const r = renderCPU(gt, cam, { background: [0, 0, 0] });
+      const img = new Uint8ClampedArray(4 * W * H);
+      for (let i = 0; i < W * H; i++) {
+        for (let c = 0; c < 3; c++) img[4 * i + c] = Math.round(255 * Math.min(1, (0.9 + 0.04 * k) * r.color[3 * i + c]));
+        img[4 * i + 3] = 255;
+      }
+      views.push(viewOf(cam, img, k));
+    }
+    return views;
+  }
+
+  const fieldsEqual = (a: SplatModel, b: SplatModel): boolean =>
+    a.count === b.count && (['means', 'logScales', 'quats', 'opacities', 'sh'] as const).every((k) => a[k].length === b[k].length && a[k].every((v, i) => v === b[k][i]));
+
+  it('a new trainer restored from readState / readModel / readMoments continues the run', async () => {
+    const gt = randomScene({ count: 160, seed: 81, opacity: [0.5, 0.9] });
+    const views = orbit(gt, 6, 48, 40);
+    const init = cloneModel(gt);
+    for (let i = 0; i < init.count; i++) init.opacities[i] = 0;
+    const opts = { iterations: 300, maxGaussians: 400, resolution: [], mcmc: { start: 50, stop: 250, refineEvery: 50 } };
+    const a = await trainer(init, views, opts);
+    // views uploaded one by one (the engine path): same as passing the images to init
+    await a.step(120);
+    const params = await a.readModel();
+    const m = await a.readMoments('m');
+    const v = await a.readMoments('v');
+    const state = await a.readState();
+    expect(state.iteration).toBe(120);
+    expect(state.count).toBeGreaterThan(160); // MCMC grew it
+    const b = await trainer(params, views.map((x) => ({ ...x, image: null })) as never, opts);
+    views.forEach((x, i) => b.setViewImage(i, x.image));
+    b.restore(state, { m, v });
+    expect(fieldsEqual(await b.readModel(), params)).toBe(true);
+    expect(fieldsEqual(await b.readMoments('m'), m)).toBe(true);
+    expect(fieldsEqual(await b.readMoments('v'), v)).toBe(true);
+    const sb = await b.readState();
+    expect(sb.iteration).toBe(120);
+    expect(Array.from(sb.colour)).toEqual(Array.from(state.colour));
+    const ra = await a.step(60);
+    const rb = await b.step(60);
+    console.log(`[splat] restored run: loss ${ra.loss.toFixed(4)} (original) vs ${rb.loss.toFixed(4)} (restored), count ${ra.count} / ${rb.count}`);
+    expect(rb.iteration).toBe(180);
+    expect(Number.isFinite(rb.loss)).toBe(true);
+    expect(rb.loss).toBeLessThan(1.5 * ra.loss + 0.01);
+  });
+
+  it('step throws SplatWorkDroppedError for dropped iterations and relocations', async () => {
+    const gt = randomScene({ count: 120, seed: 91 });
+    const views = orbit(gt, 4, 40, 32);
+    const t = await trainer(gt, views, { iterations: 400, maxGaussians: 300, resolution: [], mcmc: { start: 100, stop: 300, refineEvery: 100 } });
+    await t.step(20);
+    t.simulateDroppedWork({ iterations: 3 });
+    const e1 = await t.step(20).catch((e: unknown) => e);
+    expect(e1).toBeInstanceOf(SplatWorkDroppedError);
+    expect((e1 as SplatWorkDroppedError).iterations).toBe(3);
+    expect((e1 as SplatWorkDroppedError).relocation).toBe(false);
+    await t.step(30); // iteration 70: stamps fine again
+    t.simulateDroppedWork({ relocations: 1 });
+    const e2 = await t.step(40).catch((e: unknown) => e); // relocation at iteration 100
+    expect(e2).toBeInstanceOf(SplatWorkDroppedError);
+    expect((e2 as SplatWorkDroppedError).relocation).toBe(true);
+    expect((await t.step(10)).iteration).toBe(120);
+  });
+});
+

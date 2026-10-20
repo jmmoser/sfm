@@ -36,9 +36,12 @@ import {
   type SplatImage,
   type SplatModel,
   type SplatTrainerOptions,
-  type SplatTrainingView,
+  type SplatTrainingView as TrainerView,
 } from '../../splat';
 import { panelPNG } from '../dense-gt/depth-eval';
+
+/** A loaded frame: a trainer view with its image. */
+type SplatTrainingView = TrainerView & { image: RGBAImage };
 
 // ------------------------------------------------------------------ types
 

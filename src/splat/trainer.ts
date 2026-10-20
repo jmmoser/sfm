@@ -13,9 +13,17 @@
  * resolution schedule (default ¼ for the first 10 % of the iterations, ½ until 30 %, then full).
  *
  * Driving it: `create` compiles every pipeline (stage start), `init` uploads the initial model
- * and the views, then `step(n)` runs n iterations — one command buffer each, awaited before the
- * next (one heavy command buffer in flight, iOS rule) — and can be called repeatedly in time
- * slices from a worker. `render`, `readModel` / `exportPLY` (ply.ts), `memory()`.
+ * and the views (images now or one by one with `setViewImage`, so the host never holds them all),
+ * then `step(n)` runs n iterations — one command buffer each, awaited before the next (one heavy
+ * command buffer in flight, iOS rule) — and can be called repeatedly in time slices from a worker.
+ * `render`, `readModel` / `exportPLY` (ply.ts), `memory()`.
+ *
+ * Dropped work (iOS may silently drop command buffers submitted while the page is hidden): every
+ * iteration stamps its stats slot with a submission counter and every MCMC relocation copies its
+ * own stamp next to them; `step` checks the stamps of its iterations and throws
+ * `SplatWorkDroppedError` when one is missing (the caller restores a checkpoint: a dropped
+ * relocation leaves grown slots uninitialised). Checkpoints: `readState` + `readMoments` +
+ * `readModel`, restored by `init(params, views)` + `restore(state, moments)`.
  */
 import type { CameraIntrinsics, Pose, RGBAImage } from '../core/types';
 import type { GPUContext } from '../gpu/device';
@@ -28,8 +36,10 @@ import { encodeSplatPLY } from './ply';
 import type { SplatImage } from './renderer';
 import {
   SH_C0,
+  allocSplatModel,
   downscaleSplatCamera,
   estimateSplatMemory,
+  shCoeffCount,
   splatCamera,
   TILE_SIZE,
   type ShDegree,
@@ -41,12 +51,49 @@ import { OPT_BYTES, backwardWGSL, relocateWGSL } from './wgsl/backward';
 import { COLOUR_ADAM_WGSL, COLOUR_CFG_BYTES, COLOUR_FLOATS, LOSS_CFG_BYTES, SSIM_BWD_WGSL, SSIM_FWD_WGSL, TARGET_WGSL } from './wgsl/loss';
 import { rasterBackwardWGSL } from './wgsl/raster';
 
-/** A training image with its pinhole camera (k1 = k2 = 0) and pose — `DenseView` compatible. */
+/**
+ * A training image with its pinhole camera (k1 = k2 = 0) and pose — `DenseView` compatible. A
+ * null / absent image is uploaded later with `SplatTrainer.setViewImage` (before `step`).
+ */
 export interface SplatTrainingView {
   id: number;
   cam: CameraIntrinsics;
   pose: Pose;
-  image: RGBAImage;
+  image?: RGBAImage | null;
+}
+
+/**
+ * GPU work of `step` was not executed (command buffers dropped while the page was hidden, or a
+ * stale readback). Transient: the trainer state is inconsistent — restore a checkpoint (or start
+ * over) and continue.
+ */
+export class SplatWorkDroppedError extends Error {
+  readonly transient = true;
+  constructor(
+    message: string,
+    /** Iterations of the checked window whose stamp was missing. */
+    readonly iterations: number,
+    /** The MCMC relocation of this call was not executed. */
+    readonly relocation: boolean,
+  ) {
+    super(message);
+    this.name = 'GPUWorkDroppedError';
+  }
+}
+
+/**
+ * Small part of a training checkpoint (the rest: `readModel()` parameters and `readMoments()`
+ * Adam moments, in the `SplatModel` layout).
+ */
+export interface SplatTrainerState {
+  iteration: number;
+  count: number;
+  background: [number, number, number];
+  /** Per-view colour-correction state (`COLOUR_FLOATS` per view: 3×4 matrix, Adam m, v, step). */
+  colour: Float32Array;
+  mcmc: { refinements: number; relocated: number; added: number };
+  /** Largest intersection count seen (pre-sizes the reservation after a restore). */
+  maxIntersections: number;
 }
 
 export interface SplatLearningRates {
@@ -160,6 +207,7 @@ interface TrainPipelines {
   relocUpdate: GPUComputePipeline;
 }
 
+/** Ring of per-iteration loss / stamp slots; slot STAT_SLOTS holds the last relocation's stamp. */
 const STAT_SLOTS = 64;
 /** Rasteriser backward: pixel groups (32 pixels each) per workgroup, splats per thread step (wgsl/raster.ts). */
 export const BWD_GROUPS = 2;
@@ -201,7 +249,7 @@ export class SplatTrainer {
   private readonly lambda: number;
   private background: [number, number, number];
   private readonly levels: { factor: number; until: number }[];
-  private readonly rng: Rng;
+  private rng: Rng;
 
   private fwd!: SplatForward;
   private params!: GPUBuffer;
@@ -244,6 +292,15 @@ export class SplatTrainer {
   private profiledIterations = 0;
   private mcmcStats = { refinements: 0, relocated: 0, added: 0 };
   private initialised = false;
+  /** Views whose image has not been uploaded yet. */
+  private missingImages = new Set<number>();
+  /** Stamp written by the iteration of each stats slot, and the submission counter. */
+  private readonly slotStamp = new Uint32Array(STAT_SLOTS);
+  private stamps = 0;
+  /** Stamp of the last MCMC relocation (copied into slot STAT_SLOTS by its command buffer). */
+  private relocStamp = 0;
+  /** Test hook: command buffers to discard instead of submitting (simulated dropped work). */
+  private dropNext = { iterations: 0, relocations: 0 };
 
   private constructor(
     private readonly device: GPUDevice,
@@ -329,7 +386,10 @@ export class SplatTrainer {
     return this.extent;
   }
 
-  /** Uploads the initial model and the training views (RGBA8 images, pinhole cameras). */
+  /**
+   * Uploads the initial model and the training views (pinhole cameras; RGBA8 images now or later
+   * through `setViewImage`).
+   */
   init(model: SplatModel, views: SplatTrainingView[]): void {
     if (this.initialised) throw new Error('SplatTrainer: init called twice');
     if (model.shDegree !== this.shDegree) throw new Error(`SplatTrainer: model SH degree ${model.shDegree}, trainer ${this.shDegree}`);
@@ -372,20 +432,19 @@ export class SplatTrainer {
       col[v * COLOUR_FLOATS + 10] = 1;
     }
     d.queue.writeBuffer(this.colour, 0, col);
-    this.statsBuf = makeBuffer(d, STAT_SLOTS * 16, 'splat-stats');
-    const uni = (bytes: number, label: string): GPUBuffer => d.createBuffer({ size: bytes, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label });
+    this.statsBuf = makeBuffer(d, (STAT_SLOTS + 1) * 16, 'splat-stats');
+    const uni = (bytes: number, label: string, extra = 0): GPUBuffer => d.createBuffer({ size: bytes, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST | extra, label });
     this.optU = uni(OPT_BYTES, 'splat-opt');
     this.lossU = uni(LOSS_CFG_BYTES, 'splat-losscfg');
     this.colourU = uni(COLOUR_CFG_BYTES, 'splat-colourcfg');
-    this.relocU = uni(16, 'splat-reloccfg');
-    for (const v of views) {
-      const img = v.image;
-      if (img.width !== v.cam.width || img.height !== v.cam.height) throw new Error(`SplatTrainer: view ${v.id} image ${img.width}×${img.height} ≠ camera ${v.cam.width}×${v.cam.height}`);
-      const b = makeBuffer(d, img.width * img.height * 4, `splat-view-${v.id}`);
-      d.queue.writeBuffer(b, 0, img.data.buffer, img.data.byteOffset, img.width * img.height * 4);
+    // copied into the stats buffer by each relocation (its dropped-work stamp)
+    this.relocU = uni(16, 'splat-reloccfg', GPUBufferUsage.COPY_SRC);
+    views.forEach((v, i) => {
+      const b = makeBuffer(d, v.cam.width * v.cam.height * 4, `splat-view-${v.id}`);
       this.images.push(b);
       this.bgTarget.push(bindGroup(d, P.target, [this.fwd.frame, this.lossU, b, this.target]));
-    }
+      this.missingImages.add(i);
+    });
     this.bgSsimFwd = bindGroup(d, P.ssimFwd, [this.fwd.frame, this.lossU, this.fwd.outColor, this.target, this.colour, this.pqr, this.lossPartial]);
     this.bgSsimBwd = bindGroup(d, P.ssimBwd, [this.fwd.frame, this.lossU, this.fwd.outColor, this.target, this.colour, this.pqr, this.dLdC, this.colourPartial]);
     this.bgColourAdam = bindGroup(d, P.colourAdam, [this.colourU, this.colourPartial, this.lossPartial, this.colour, this.statsBuf]);
@@ -404,6 +463,24 @@ export class SplatTrainer {
     }
     if (this.opts.profile && PassProfiler.supported(d)) this.profiler = new PassProfiler(d);
     this.initialised = true;
+    views.forEach((v, i) => {
+      if (v.image) this.setViewImage(i, v.image);
+    });
+  }
+
+  /** Uploads the RGBA8 image of training view `index` (camera size); the host copy can be dropped afterwards. */
+  setViewImage(index: number, img: RGBAImage): void {
+    if (!this.initialised) throw new Error('SplatTrainer: init first');
+    const v = this.views[index];
+    if (!v) throw new Error(`SplatTrainer: no view ${index}`);
+    if (img.width !== v.width || img.height !== v.height) throw new Error(`SplatTrainer: view ${index} image ${img.width}×${img.height} ≠ camera ${v.width}×${v.height}`);
+    this.device.queue.writeBuffer(this.images[index], 0, img.data.buffer, img.data.byteOffset, img.width * img.height * 4);
+    this.missingImages.delete(index);
+  }
+
+  /** Number of training views. */
+  get numViews(): number {
+    return this.views.length;
   }
 
   private makeRasterBwdBindGroups(): void {
@@ -461,8 +538,14 @@ export class SplatTrainer {
     new Float32Array(lc).set([this.lambda, 1 / (3 * cam.width * cam.height)], 4);
     d.queue.writeBuffer(this.lossU, 0, lc);
     const cc = new ArrayBuffer(COLOUR_CFG_BYTES);
-    new Uint32Array(cc).set([Math.ceil(cam.width / TILE_SIZE) * Math.ceil(cam.height / TILE_SIZE), view, this.cc ? 1 : 0, it % STAT_SLOTS], 0);
+    const slot = it % STAT_SLOTS;
+    // dropped-work stamp of this iteration (exact as f32 below 2²⁴ submissions)
+    this.stamps = (this.stamps % 0xfffff0) + 1;
+    this.slotStamp[slot] = this.stamps;
+    const ccu = new Uint32Array(cc);
+    ccu.set([Math.ceil(cam.width / TILE_SIZE) * Math.ceil(cam.height / TILE_SIZE), view, this.cc ? 1 : 0, slot], 0);
     new Float32Array(cc).set([this.cc?.lr ?? 0, 0.9, 0.999, 1e-15, this.cc?.reg ?? 0], 4);
+    ccu[9] = this.stamps;
     d.queue.writeBuffer(this.colourU, 0, cc);
   }
 
@@ -531,11 +614,15 @@ export class SplatTrainer {
 
   /**
    * Runs `n` iterations (one command buffer each, awaited in turn). Returns the loss of the
-   * last one; MCMC refinements and intersection-capacity checks happen in between.
+   * last one; MCMC refinements and intersection-capacity checks happen in between. Throws
+   * `SplatWorkDroppedError` when the stamps show that one of the last ≤ 64 iterations or this
+   * call's relocation did not execute (restore a checkpoint before continuing).
    */
   async step(n = 1): Promise<SplatStepResult> {
     if (!this.initialised) throw new Error('SplatTrainer: init first');
+    if (this.missingImages.size) throw new Error(`SplatTrainer: ${this.missingImages.size} view image(s) not uploaded (setViewImage)`);
     const t0 = performance.now();
+    const reloc0 = this.relocStamp;
     let refinements = 0;
     let overflow = false;
     const inFlight = this.opts.inFlight ?? 1;
@@ -548,7 +635,10 @@ export class SplatTrainer {
     for (let k = 0; k < n; k++) {
       if (!enc) enc = this.encodeIteration(this.nextView());
       this.profiler?.resolve(enc);
-      this.device.queue.submit([enc.finish()]);
+      if (this.dropNext.iterations > 0) {
+        this.dropNext.iterations--;
+        enc.finish();
+      } else this.device.queue.submit([enc.finish()]);
       enc = null;
       const done = this.waitGPU();
       const it = this.iter + 1;
@@ -579,10 +669,27 @@ export class SplatTrainer {
       }
     }
     const ms = performance.now() - t0;
-    const s = new Float32Array(await this.readBuffer(this.statsBuf, ((this.iter - 1) % STAT_SLOTS) * 16, 16));
-    const nv = Math.max(1, s[2]);
-    const l1 = s[0] / (3 * nv);
-    const ssim = s[1] / (3 * nv);
+    // every stats slot of this call's last ≤ 64 iterations + the relocation stamp, one readback
+    const raw = await this.readBuffer(this.statsBuf, 0, (STAT_SLOTS + 1) * 16);
+    const stats = new Float32Array(raw);
+    const checked = Math.min(n, STAT_SLOTS);
+    let dropped = 0;
+    for (let i = this.iter - checked; i < this.iter; i++) {
+      const slot = i % STAT_SLOTS;
+      if (stats[4 * slot + 3] !== this.slotStamp[slot]) dropped++;
+    }
+    const relocDropped = this.relocStamp !== reloc0 && new Uint32Array(raw)[4 * STAT_SLOTS + 3] !== this.relocStamp;
+    if (dropped || relocDropped) {
+      throw new SplatWorkDroppedError(
+        `splat training: GPU work was not executed (${dropped} of the last ${checked} iterations${relocDropped ? ', an MCMC relocation' : ''}; page hidden?)`,
+        dropped,
+        relocDropped,
+      );
+    }
+    const so = 4 * ((this.iter - 1) % STAT_SLOTS);
+    const nv = Math.max(1, stats[so + 2]);
+    const l1 = stats[so] / (3 * nv);
+    const ssim = stats[so + 1] / (3 * nv);
     return {
       iteration: this.iter,
       count: this.count,
@@ -633,7 +740,8 @@ export class SplatTrainer {
     list.set(plan.copies.subarray(0, 4 * plan.nCopies), 0);
     list.set(plan.updates, 4 * plan.nCopies);
     d.queue.writeBuffer(this.relocList, 0, list);
-    d.queue.writeBuffer(this.relocU, 0, new Uint32Array([plan.nCopies, plan.nUpdates, this.capacity, 0]));
+    this.relocStamp = (this.relocStamp % 0x7ffffff0) + 1;
+    d.queue.writeBuffer(this.relocU, 0, new Uint32Array([plan.nCopies, plan.nUpdates, this.capacity, this.relocStamp]));
     const enc = d.createCommandEncoder({ label: 'splat-mcmc' });
     const pass = enc.beginComputePass({ label: 'mcmc' });
     pass.setPipeline(this.pipes.relocCopy);
@@ -643,7 +751,12 @@ export class SplatTrainer {
     pass.setBindGroup(0, this.bgReloc[1]);
     pass.dispatchWorkgroups(Math.ceil(plan.nUpdates / 64));
     pass.end();
-    d.queue.submit([enc.finish()]);
+    // dropped-work stamp: [nCopies, nUpdates, capacity, relocStamp] → stats slot STAT_SLOTS
+    enc.copyBufferToBuffer(this.relocU, 0, this.statsBuf, STAT_SLOTS * 16, 16);
+    if (this.dropNext.relocations > 0) {
+      this.dropNext.relocations--;
+      enc.finish();
+    } else d.queue.submit([enc.finish()]);
     await this.waitGPU();
     this.count = plan.count;
   }
@@ -666,10 +779,96 @@ export class SplatTrainer {
   }
 
   /** The current model (host copy). */
-  async readModel(): Promise<SplatModel> {
+  readModel(): Promise<SplatModel> {
+    return this.readLayout(this.params);
+  }
+
+  /**
+   * Adam first ('m') or second ('v') moments of the live Gaussians in the `SplatModel` layout
+   * (each field holds the moments of that parameter) — part of a training checkpoint.
+   */
+  readMoments(which: 'm' | 'v'): Promise<SplatModel> {
+    return this.readLayout(which === 'm' ? this.adamM : this.adamV);
+  }
+
+  /** The first `count` entries of each section of a parameter-layout buffer (one readback per section). */
+  private async readLayout(buf: GPUBuffer): Promise<SplatModel> {
     const lay = paramOffsets(this.capacity, this.shDegree);
-    const d = new Float32Array(await this.readBuffer(this.params, 0, lay.total * 4));
-    return unpackParams(d, this.count, this.capacity, this.shDegree);
+    const n = this.count;
+    const SN = 3 * shCoeffCount(this.shDegree);
+    const read = async (off: number, floats: number): Promise<Float32Array> => (floats ? new Float32Array(await this.readBuffer(buf, off * 4, floats * 4)) : new Float32Array(0));
+    const m = allocSplatModel(n, this.shDegree);
+    const mean = await read(lay.mean, 4 * n);
+    const scale = await read(lay.scale, 4 * n);
+    for (let i = 0; i < n; i++) {
+      for (let k = 0; k < 3; k++) {
+        m.means[3 * i + k] = mean[4 * i + k];
+        m.logScales[3 * i + k] = scale[4 * i + k];
+      }
+    }
+    m.quats.set(await read(lay.quat, 4 * n));
+    m.opacities.set(await read(lay.opacity, n));
+    m.sh.set(await read(lay.sh, SN * n));
+    return m;
+  }
+
+  /** Iteration, count, colour correction, background and counters (with readModel + readMoments: a checkpoint). */
+  async readState(): Promise<SplatTrainerState> {
+    const colour = new Float32Array(await this.readBuffer(this.colour, 0, this.views.length * COLOUR_FLOATS * 4));
+    return {
+      iteration: this.iter,
+      count: this.count,
+      background: [...this.background] as [number, number, number],
+      colour,
+      mcmc: { ...this.mcmcStats },
+      maxIntersections: this.maxIsect,
+    };
+  }
+
+  /**
+   * Continues a checkpoint: call after `init(params, views)` with the checkpoint's parameters as
+   * the model (same views, same options). Writes the Adam moments (zero when absent), colour
+   * state and background, and sets the iteration (schedules, Adam bias correction). The view order
+   * and the MCMC sampling restart from a seed derived from the iteration.
+   */
+  restore(state: SplatTrainerState, moments?: { m: SplatModel; v: SplatModel } | null): void {
+    if (!this.initialised) throw new Error('SplatTrainer: init first');
+    if (state.count !== this.count) throw new Error(`SplatTrainer.restore: state has ${state.count} Gaussians, the model ${this.count}`);
+    if (state.colour.length !== this.views.length * COLOUR_FLOATS) throw new Error('SplatTrainer.restore: colour state does not match the views');
+    const d = this.device;
+    if (moments) {
+      for (const [mm, buf] of [
+        [moments.m, this.adamM],
+        [moments.v, this.adamV],
+      ] as const) {
+        if (mm.count !== this.count || mm.shDegree !== this.shDegree) throw new Error('SplatTrainer.restore: moments do not match the model');
+        d.queue.writeBuffer(buf, 0, packParams(mm, this.capacity));
+      }
+    } else {
+      const zero = new Float32Array(paramOffsets(this.capacity, this.shDegree).total);
+      d.queue.writeBuffer(this.adamM, 0, zero);
+      d.queue.writeBuffer(this.adamV, 0, zero);
+    }
+    d.queue.writeBuffer(this.colour, 0, state.colour);
+    this.background = [...state.background] as [number, number, number];
+    this.iter = state.iteration;
+    this.mcmcStats = { ...state.mcmc };
+    this.maxIsect = state.maxIntersections;
+    if (this.maxIsect > 0.85 * this.fwd.isectCapacity) {
+      const next = Math.ceil(this.maxIsect * 1.5);
+      if (next * 4 <= d.limits.maxStorageBufferBindingSize && next <= 64 * 1024 * 1024) {
+        this.fwd.resizeIntersections(next);
+        this.makeRasterBwdBindGroups();
+      }
+    }
+    this.rng = new Rng((this.opts.seed ?? 1) + 7919 * (state.iteration + 1));
+    this.order = [];
+    this.orderPos = 0;
+  }
+
+  /** Training background colour (changes with `normaliseAppearance`). */
+  get backgroundColour(): [number, number, number] {
+    return [...this.background] as [number, number, number];
   }
 
   /**
@@ -759,6 +958,14 @@ export class SplatTrainer {
       profiledIterations: this.profiledIterations,
       mcmc: { ...this.mcmcStats },
     };
+  }
+
+  /**
+   * Test hook: the next `iterations` iteration command buffers and `relocations` MCMC relocation
+   * command buffers are discarded instead of submitted (work dropped while the page is hidden).
+   */
+  simulateDroppedWork(o: { iterations?: number; relocations?: number }): void {
+    this.dropNext = { iterations: Math.max(0, o.iterations ?? 0), relocations: Math.max(0, o.relocations ?? 0) };
   }
 
   resetProfile(): void {

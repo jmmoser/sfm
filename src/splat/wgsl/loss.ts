@@ -303,7 +303,9 @@ export const COLOUR_CFG_BYTES = 48;
 
 /**
  * One workgroup: sums the per-workgroup colour gradients and loss sums, takes an Adam step on
- * the view's colour matrix (with an L2 pull towards [I | 0]) and stores the loss sums.
+ * the view's colour matrix (with an L2 pull towards [I | 0]) and stores the loss sums with the
+ * iteration's stamp in .w (`stamp`, a per-trainer submission counter < 2²⁴: the host compares it
+ * with what it submitted to detect command buffers dropped while the page was hidden).
  */
 export const COLOUR_ADAM_WGSL = /* wgsl */ `
 struct ColourCfg {
@@ -316,7 +318,7 @@ struct ColourCfg {
   beta2: f32,
   eps: f32,
   reg: f32,
-  pad0: f32,
+  stamp: u32,
   pad1: f32,
   pad2: f32,
 }
@@ -352,7 +354,7 @@ fn main(@builtin(local_invocation_index) li: u32) {
     }
     workgroupBarrier();
   }
-  if (li == 0u) { stats[cc.statSlot] = red[768]; }
+  if (li == 0u) { stats[cc.statSlot] = vec4f(red[768].xyz, f32(cc.stamp)); }
   if (cc.enabled != 0u && li < 12u) {
     let r = li / 4u;
     let k = li % 4u;
