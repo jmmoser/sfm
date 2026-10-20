@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { Mat3 } from '../core/types';
+import type { ImuSample, Mat3 } from '../core/types';
 import { mat3Mul, mat3MulTranspose, mat3Transpose } from '../math/mat3';
 import { Rng } from '../math/random';
 import { rotationAngle, rotvecToMat3 } from '../math/rotation';
@@ -204,5 +204,30 @@ describe('IMU gaps', () => {
     expect(inc.covers(a.t, b.t)).toBe(false);
     inc.sync(imu); // the missing samples inserted: rebuilt
     expect(inc.covers(a.t, b.t)).toBe(true);
+  });
+
+  it('a time within the slack of a gap end holds ω of the sample after it (not the step interpolated across the gap)', () => {
+    // hand-held pan rates (≈ 1 rad/s) at both ends of a 15 s gap
+    const imu: ImuSample[] = [];
+    for (let t = 5000; t < 40000; t += 1000 / 60) {
+      const s = t / 1000;
+      imu.push({ t, gyro: [0.8 * Math.sin(s / 0.7), 0.8 * Math.cos(s / 1.1), 0.8 * Math.sin(s / 1.9)], accel: null, accelG: null });
+    }
+    const full = new GyroReference(imu);
+    const gapped = imu.filter((s) => s.t < 12000 || s.t > 27000);
+    const g = new GyroReference(gapped);
+    const e = gapped.find((s) => s.t > 27000)!.t,
+      s0 = gapped.filter((s) => s.t < 12000).pop()!.t;
+    // an image up to the slack (60 ms) before the first sample after the gap, or after the last one before it
+    for (const [ta, tb] of [
+      [e - 10, e + 800],
+      [e - 55, e + 800],
+      [s0 - 800, s0 + 55],
+    ]) {
+      expect(rotationAngle(mat3MulTranspose(g.relative(ta, tb)!, full.relative(ta, tb)!))).toBeLessThan(0.5 * DEG);
+    }
+    const w = g.angularVelocityCam(e + 3)!,
+      wf = full.angularVelocityCam(e + 3)!;
+    expect(Math.hypot(w[0] - wf[0], w[1] - wf[1], w[2] - wf[2])).toBeLessThan(0.05);
   });
 });

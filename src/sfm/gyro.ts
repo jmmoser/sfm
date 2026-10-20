@@ -282,7 +282,10 @@ export class GyroReference {
     return a === ge.length || this.t[ge[a] - 1] >= hi;
   }
 
-  /** Q(t) at IMU time t into out[o..o+3] (ω held constant outside the samples). */
+  /**
+   * Q(t) at IMU time t into out[o..o+3] (ω held constant outside the samples, and inside a gap
+   * > IMU_MAX_GAP_MS from its nearer end: `covers`' slack reaches that far into a gap).
+   */
   private quatAt(tm: number, out: Float64Array, o: number): void {
     const n = this.n;
     if (n === 0) {
@@ -291,10 +294,7 @@ export class GyroReference {
       return;
     }
     if (n === 1 || tm <= this.t[0] || tm >= this.t[n - 1]) {
-      const i = n === 1 || tm <= this.t[0] ? 0 : n - 1;
-      const h = (tm - this.t[i]) / 1000;
-      qexpInto(h * this.w[3 * i], h * this.w[3 * i + 1], h * this.w[3 * i + 2], this.tq, 4);
-      qmulInto(this.q, 4 * i, this.tq, 4, out, o);
+      this.holdAt(n === 1 || tm <= this.t[0] ? 0 : n - 1, tm, out, o);
       return;
     }
     let lo = 0,
@@ -306,11 +306,23 @@ export class GyroReference {
     }
     const i = lo;
     const span = this.t[i + 1] - this.t[i];
+    if (span > IMU_MAX_GAP_MS) {
+      // the step interpolated across a whole gap is no measurement
+      this.holdAt(tm - this.t[i] <= this.t[i + 1] - tm ? i : i + 1, tm, out, o);
+      return;
+    }
     const a = span > 0 ? (tm - this.t[i]) / span : 0;
     const ex = this.w[3 * i] + a * (this.w[3 * i + 3] - this.w[3 * i]);
     const ey = this.w[3 * i + 1] + a * (this.w[3 * i + 4] - this.w[3 * i + 1]);
     const ez = this.w[3 * i + 2] + a * (this.w[3 * i + 5] - this.w[3 * i + 2]);
     this.step(i, (tm - this.t[i]) / 1000, ex, ey, ez, out, o);
+  }
+
+  /** Q(t) = Q_i ⊗ exp((t − t_i) ω_i): ω of sample i held constant. */
+  private holdAt(i: number, tm: number, out: Float64Array, o: number): void {
+    const h = (tm - this.t[i]) / 1000;
+    qexpInto(h * this.w[3 * i], h * this.w[3 * i + 1], h * this.w[3 * i + 2], this.tq, 4);
+    qmulInto(this.q, 4 * i, this.tq, 4, out, o);
   }
 
   /**
