@@ -2,12 +2,13 @@
  * The viewer screen's photoreal build (createViewerScreen with a fake App and a fake engine whose
  * splat() / exportModel() the test settles, in Chromium: the real Viewer, WebGL and — on a
  * hardware adapter, E2E_GPU=host — the WebGPU splat layer): a rebuild drops the Gaussian-splat
- * PLY prepared from the previous model.
+ * PLY prepared from the previous model; a build settling after the screen was left does not take
+ * the wake lock / busy flag of the next screen.
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import { lookAt } from '../../splat/testutil';
 import { SH_C0, allocSplatModel, logit } from '../../splat/types';
-import type { ExportFormat, SparseResult, SplatModelPayload, SplatOptions, SplatResult } from '../../workers/protocol';
+import { ENGINE_ERRORS, namedError, type ExportFormat, type SparseResult, type SplatModelPayload, type SplatOptions, type SplatResult } from '../../workers/protocol';
 import type { App, Results } from '../app';
 import { closeAllModals } from '../components/layers';
 import { createViewerScreen } from './viewer';
@@ -199,5 +200,34 @@ describe('viewer screen: photoreal build', () => {
     await waitFor(() => !!q('export-ply-splat'));
     expect(q('export-save-ply-splat')).toBeNull();
     expect(q('export-prepare-ply-splat')).not.toBeNull();
+  });
+
+  it('a build that settles after the screen was left keeps the next screen’s wake lock and busy flag (review)', async () => {
+    const engine = new FakeEngine();
+    const app = fakeApp(engine, null);
+    // an interrupted densify: its Resume in the Build sheet waits while the photoreal model trains
+    app.results.stats = { denseResumablePass: 1 };
+    const screen = mount(app);
+    await loaded(app, screen);
+    await startBuild('fast');
+    expect(engine.builds.length).toBe(1);
+    expect(app.wakeLock.active).toBe(true);
+    expect(app.busy).toBe(true);
+    await tap('tool-build');
+    await waitFor(() => !!q('build-dense-resume'));
+    expect((q('build-dense') as HTMLButtonElement).disabled).toBe(true);
+    await closeSheets();
+    // the user leaves: the build is aborted, the next screen takes the lock and the busy flag at once
+    leave(screen);
+    expect(engine.aborts).toEqual([{ graceMs: 8000, method: 'splat' }]);
+    expect(app.wakeLock.active).toBe(false);
+    expect(app.busy).toBe(false);
+    await app.wakeLock.acquire();
+    app.busy = true;
+    // the aborted build settles later
+    engine.builds[0].reject(namedError(ENGINE_ERRORS.cancelled, 'Cancelled'));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(app.wakeLock.active).toBe(true);
+    expect(app.busy).toBe(true);
   });
 });

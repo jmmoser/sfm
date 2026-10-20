@@ -557,6 +557,8 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
         variant: 'primary',
         size: 'sm',
         testId: 'build-dense',
+        // like the other builds: not while the photoreal model trains (leaving would stop it)
+        disabled: building,
         onClick: () => {
           // Another quality starts over (the engine discards the stored maps of the other settings).
           if (q !== quality0) clearDenseResume(app.results.stats);
@@ -795,9 +797,12 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     } finally {
       building = false;
       cancelling = false;
-      app.busy = false;
-      void app.wakeLock.release();
-      if (!closed) renderBadges();
+      // once the screen was left, leave() released them and the next screen may hold them now
+      if (!closed) {
+        app.busy = false;
+        void app.wakeLock.release();
+        renderBadges();
+      }
     }
   }
 
