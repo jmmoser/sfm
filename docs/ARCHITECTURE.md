@@ -1902,13 +1902,12 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   turns), `stages` (name mapping, ETA), `protocol` (transferables, envelopes, errors), `env`,
   `mock-engine` (+ scene geometry, exports decode), `engine-client` (Node, scripted fake workers:
   overlapping respawns, a frame waiting across them, superseded init / load) and `app`
-  (ensureSessionLoaded: failed, superseded, released, new-scan and deleted loads).
-  Browser — `engine-client.gpu.test.ts` with
-  `engine-client.worker-fixture.ts` (transfers, progress routing, cancel, timeouts, respawn +
-  resume, CPU fallback, respawn cap, startup failure, visibility, dispose). E2E —
-  `node e2e/ui/smoke.mjs` (full mock flow at 393×852 @3x with the fake camera, downloads checked,
-  screenshots in `e2e/out/ui/`) and `node e2e/ui/states.mjs` (engine missing, install hint, CPU
-  mode, Lockdown, camera denied, landscape, interruption, processing error).
+  (ensureSessionLoaded: failed, superseded, released, new-scan and deleted loads). Browser —
+  `engine-client.gpu.test.ts` with `engine-client.worker-fixture.ts` (transfers, progress routing,
+  cancel, timeouts, respawn + resume, CPU fallback, respawn cap, startup failure, visibility,
+  dispose). E2E — `node e2e/ui/smoke.mjs` (full mock flow at 393×852 @3x with the fake camera,
+  downloads checked, screenshots in `e2e/out/ui/`) and `node e2e/ui/states.mjs` (engine missing,
+  install hint, CPU mode, Lockdown, camera denied, landscape, interruption, processing error).
 * **Headless caveat**: under SwiftShader, `createImageBitmap(video)` at 10 Hz (and even a bare
   fake-camera `<video>`) saturates the GPU process so that screenshots slow down progressively;
   the e2e scripts call `app.debug.holdFrames(true)` (stops the pump, pauses the `<video>`) around
@@ -2371,12 +2370,12 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
     pass store keeps ONE full map (write-through), geometric-pass sources come from a depth-only LRU (sources read
     only `depth`: 4 instead of 20 B/px); a previous-pass map is deleted after its last use (peak storage ≈ one pass +
     the filtered maps instead of two passes); PatchMatchGPU is destroyed after the passes, also when they end by a
-    cancel or an error (≈ 140 MB GPU at 1600 px);
-    fusion gets `maxNeighbours` (lowered from the preset only when the resident maps alone exceed 65 % of the share),
-    a pixel `step` sized so ≈ 0.2 × views × px / step² fused points fit the remaining share, and `maxPoints` as a
-    hard stop (logged). The 25 %-of-budget LRUs of the PatchMatch / filtered depth stores (up to 3 × 300 MB in
-    flight) are gone. When even that does not fit, the image size drops in × 0.85 steps (≥ 480 px; 4 GB phones at
-    `max`). e2e sizes (480 px, 40 views) keep step 1 and the preset's neighbours (results unchanged).
+    cancel or an error (≈ 140 MB GPU at 1600 px); fusion gets `maxNeighbours` (lowered from the preset only when the
+    resident maps alone exceed 65 % of the share), a pixel `step` sized so ≈ 0.2 × views × px / step² fused points
+    fit the remaining share, and `maxPoints` as a hard stop (logged). The 25 %-of-budget LRUs of the PatchMatch /
+    filtered depth stores (up to 3 × 300 MB in flight) are gone. When even that does not fit, the image size drops
+    in × 0.85 steps (≥ 480 px; 4 GB phones at `max`). e2e sizes (480 px, 40 views) keep step 1 and the preset's
+    neighbours (results unchanged).
   * *Before densify*: CPU SIFT arena + GPU SIFT pyramids / matcher cache released (also at finishCapture), and on a
     persistent store the whole live session (≈ 1–2 MB / keyframe) — `refine` restores it from IndexedDB, exports
     read features from the store.
@@ -2863,11 +2862,11 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   queried at CAMERA times (IMU = camera + offset), rotations camera(ta) → camera(tb) = R_cd · R_wd(tb)ᵀR_wd(ta) · R_cdᵀ;
   an interval spanning an IMU sample gap > `IMU_MAX_GAP_MS` (500 ms: page hidden, worker respawn, ring-buffer overflow)
   is not covered, so no rotation and no gyro check (every gate passes it); within the 60 ms slack of a gap edge ω is
-  held constant from that edge's sample, as at the ends of the log;
-  `angularVelocityCam`. Tolerance = 5° + 0.3°/s·|Δt| + 5 % of the rotation (`EngineConfig.gyroTolerance`; NOT tightened
-  when a bias is known: the bias estimate comes from RS-biased vision rotations — yard-real x component 0.5 instead of 3.0
-  mrad/s ⇒ 5° over a 32 s loop closure — and 0.1°/s rejected correct loop-closure pairs). Gates
-  (active once R_cam_device is verified — a wrong mapping would reject every correct pair — `EngineConfig.gyroGate`):
+  held constant from that edge's sample, as at the ends of the log; `angularVelocityCam`. Tolerance = 5° + 0.3°/s·|Δt| +
+  5 % of the rotation (`EngineConfig.gyroTolerance`; NOT tightened when a bias is known: the bias estimate comes from
+  RS-biased vision rotations — yard-real x component 0.5 instead of 3.0 mrad/s ⇒ 5° over a 32 s loop closure — and 0.1°/s
+  rejected correct loop-closure pairs). Gates (active once R_cam_device is verified — a wrong mapping would reject every
+  correct pair — `EngineConfig.gyroGate`):
   * verified pairs (live matching, the per-frame tracking geometry, refine matching — `LiveSession.gatePair`): rejected
     when the rotation disagrees; a planar pair whose ambiguous `planarAlternative` agrees is switched to it;
   * registrations and initial pairs (live and offline mapping): `MapperOptions.rotationCheck` (new, generic hook) —
