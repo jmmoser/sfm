@@ -146,3 +146,38 @@ describe('EngineClient: overlapping respawns', () => {
     expect(statuses.some((s) => s.state === 'idle')).toBe(false);
   });
 });
+
+describe('EngineClient: superseded init / loadSession', () => {
+  it('a load that ends after a newer init started leaves the status to that init', async () => {
+    const { c, workers, statuses } = client();
+    const load = c.loadSession('A');
+    await flush();
+    const init = c.init({ mode: 'object', quality: 'fast', sessionId: 'B' });
+    await flush();
+    expect(workers[0].methods).toEqual(['loadSession', 'init']);
+    // the worker replaced A's engine with B's: A's load rejects while B's init is still running
+    const req = workers[0].posted.find((r) => r.method === 'loadSession')!;
+    workers[0].emit({ id: req.id, ok: false, error: { name: 'EngineCrashedError', message: 'Engine disposed' } });
+    await expect(load).rejects.toMatchObject({ message: 'Engine disposed' });
+    expect(c.status.state).toBe('starting');
+    workers[0].reply('init', initResult('w1'));
+    await init;
+    expect(c.status.state).toBe('ready');
+    expect(statuses.some((s) => s.state === 'idle')).toBe(false);
+  });
+
+  it('an init that succeeds after a newer load started does not report ready for it', async () => {
+    const { c, workers, statuses } = client();
+    const init = c.init({ mode: 'object', quality: 'fast', sessionId: 'A' });
+    await flush();
+    const load = c.loadSession('B');
+    await flush();
+    workers[0].reply('init', initResult('w1'));
+    await init;
+    expect(c.status.state).toBe('starting');
+    workers[0].reply('loadSession', { id: 'B' });
+    await load;
+    expect(c.status.state).toBe('ready');
+    expect(statuses.filter((s) => s.state === 'ready')).toHaveLength(1);
+  });
+});

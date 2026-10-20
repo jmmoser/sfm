@@ -228,6 +228,8 @@ export class EngineClient implements EngineLike {
   private gate: Promise<void> = Promise.resolve();
   /** Bumped by every restart: only the replay of the latest one sets the state. */
   private replayEpoch = 0;
+  /** Bumped by every init / loadSession: a superseded one leaves the status to the newer one. */
+  private setupSeq = 0;
   private respawnTimes: number[] = [];
   private gpuFailures = 0;
   private frameBusy = false;
@@ -303,14 +305,15 @@ export class EngineClient implements EngineLike {
     await this.settleAborts();
     this.assertUsable();
     this.setup = { kind: 'init', options: { ...options } };
+    const seq = ++this.setupSeq;
     this.gpuFailures = 0;
     this.setState('starting');
     try {
       const res = await this.call('init', options, { timeoutMs: this.opts.initTimeoutMs, bypassGate: true, fatalOnTimeout: true });
-      this.setState('ready', undefined, res);
+      if (seq === this.setupSeq) this.setState('ready', undefined, res);
       return res;
     } catch (e) {
-      if (this.st.state === 'starting') this.setState('idle', (e as Error)?.message ?? String(e));
+      if (seq === this.setupSeq && this.st.state === 'starting') this.setState('idle', (e as Error)?.message ?? String(e));
       throw e;
     }
   }
@@ -356,13 +359,14 @@ export class EngineClient implements EngineLike {
     await this.settleAborts();
     this.assertUsable();
     this.setup = { kind: 'load', id, options };
+    const seq = ++this.setupSeq;
     this.setState('starting');
     try {
       const res = await this.call('loadSession', { id, options }, { bypassGate: true });
-      this.setState('ready');
+      if (seq === this.setupSeq) this.setState('ready');
       return res;
     } catch (e) {
-      if (this.st.state === 'starting') this.setState('idle', (e as Error)?.message ?? String(e));
+      if (seq === this.setupSeq && this.st.state === 'starting') this.setState('idle', (e as Error)?.message ?? String(e));
       throw e;
     }
   }
