@@ -299,9 +299,10 @@ export type RSCostFunction = (model: RollingShutterModel) => number;
 
 /**
  * Search the readout (axis, signed time) minimising `cost`: 0; ±10 and ±25 ms (for the default
- * 40 ms range) on both axes choose the axis and direction; along it, successive parabola fits
- * (≤ 3 more evaluations). Accepted when the relative decrease against 0 reaches `minImprovement`
- * and |readout| ≥ `minReadoutMs`. ≈ 12–18 cost evaluations in total.
+ * 40 ms range) on both axes choose the axis and direction — ±25 ms only along the direction that
+ * is clearly best at ±10 ms, when one is (3 evaluations fewer, same result); along it, successive
+ * parabola fits (≤ 3 more evaluations). Accepted when the relative decrease against 0 reaches
+ * `minImprovement` and |readout| ≥ `minReadoutMs`. ≈ 10–18 cost evaluations in total.
  */
 export function searchRollingShutter(cost: RSCostFunction, opts: Partial<RollingShutterEstimateOptions> = {}, info: { numImages?: number; numObservations?: number } = {}): RollingShutterEstimate {
   const o = { ...DEFAULT_RS_ESTIMATE, ...opts };
@@ -320,18 +321,31 @@ export function searchRollingShutter(cost: RSCostFunction, opts: Partial<Rolling
   const around = o.around && o.around.readoutMs !== 0 ? o.around : null;
   // axis / direction from probes (or the earlier estimate's)
   const probes = around ? [0.85, 1, 1.15].map((f) => f * Math.abs(around.readoutMs)) : [0.25, 0.625].map((f) => f * o.maxReadoutMs);
-  for (const axis of around ? [around.axis] : (['rows', 'cols'] as const))
-    for (const sign of around ? [Math.sign(around.readoutMs)] : [1, -1]) {
-      for (const p of probes) {
-        const c = evalH(axis, sign * p);
-        if (c < dirCost) {
-          dirCost = c;
-          dir = { axis, sign };
-        }
-        if (c < bestCost) {
-          bestCost = c;
-          best = { axis, readoutMs: sign * p };
-        }
+  const dirs: { axis: 'rows' | 'cols'; sign: number }[] = [];
+  for (const axis of around ? [around.axis] : (['rows', 'cols'] as const)) for (const sign of around ? [Math.sign(around.readoutMs)] : [1, -1]) dirs.push({ axis, sign });
+  // probe costs per direction, in probe order (NaN = not evaluated)
+  const probeCost = dirs.map(() => probes.map(() => NaN));
+  for (let d = 0; d < dirs.length; d++) probeCost[d][0] = evalH(dirs[d].axis, dirs[d].sign * probes[0]);
+  // the outer probes of a direction are only needed when the first probes leave the direction open:
+  // a direction that is clearly best at the first probe (≥ 10 % below every other one and below 0)
+  // keeps being best further out (the other directions move away from the readout)
+  const order = dirs.map((_, d) => d).sort((x, y) => probeCost[x][0] - probeCost[y][0] || x - y);
+  const clear = dirs.length > 1 && probeCost[order[0]][0] < 0.9 * Math.min(cost0, probeCost[order[1]][0]);
+  for (let d = 0; d < dirs.length; d++) {
+    if (clear && d !== order[0]) continue;
+    for (let k = 1; k < probes.length; k++) probeCost[d][k] = evalH(dirs[d].axis, dirs[d].sign * probes[k]);
+  }
+  for (let d = 0; d < dirs.length; d++)
+    for (let k = 0; k < probes.length; k++) {
+      const c = probeCost[d][k];
+      if (!(c === c)) continue;
+      if (c < dirCost) {
+        dirCost = c;
+        dir = dirs[d];
+      }
+      if (c < bestCost) {
+        bestCost = c;
+        best = { axis: dirs[d].axis, readoutMs: dirs[d].sign * probes[k] };
       }
     }
   if (dir && Number.isFinite(cost0)) {
