@@ -588,11 +588,15 @@ describe('error handling / platform', () => {
 
 describe('device pixel ratio 2 (iPhone path: DPR 3 capped to 2)', () => {
   function withDpr<T>(dpr: number, f: () => T): T {
+    // devicePixelRatio is an own accessor of window (no prototype copy): put it back, a delete would
+    // leave it undefined for the rest of the file
+    const native = Object.getOwnPropertyDescriptor(window, 'devicePixelRatio');
     Object.defineProperty(window, 'devicePixelRatio', { value: dpr, configurable: true, writable: true });
     try {
       return f();
     } finally {
-      delete (window as unknown as Record<string, unknown>).devicePixelRatio;
+      if (native) Object.defineProperty(window, 'devicePixelRatio', native);
+      else delete (window as unknown as Record<string, unknown>).devicePixelRatio;
     }
   }
   for (const dpr of [2, 1.5]) {
