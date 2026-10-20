@@ -4,6 +4,7 @@ export class NvsArgError extends Error {}
 export interface NvsArgs {
   dataset: string | null;
   runDir: string | null;
+  testDataset: string | null;
   renderers: string[] | null;
   views: number;
   frames: number[] | null;
@@ -15,6 +16,7 @@ export interface NvsArgs {
   keepBlurred: boolean;
   background: number[];
   ssim: boolean;
+  common: boolean;
   saveImages: boolean;
   out: string | null;
   verbose: boolean;

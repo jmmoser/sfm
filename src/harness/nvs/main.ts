@@ -17,7 +17,7 @@ import type { CameraIntrinsics, PointCloud, RGBAImage, TriangleMesh } from '../.
 import { undistortImage, undistortedSize } from '../../dense/undistort';
 import { decodePLY } from '../../io/ply';
 import { rsCorrectPinholeImage, type RollingShutterModel } from '../../sfm/rolling-shutter';
-import { prepareGroundTruth, scoreView, triptych } from '../../../e2e/lib/nvs-metrics.mjs';
+import { prepareGroundTruth, scoreCommon, scoreView, triptych } from '../../../e2e/lib/nvs-metrics.mjs';
 import { VIEWER_RENDERERS, ViewerRenderers, loadSplatRenderer, type NvsCamera, type NvsRenderer } from './renderers';
 
 export interface NvsPageConfig {
@@ -36,6 +36,8 @@ export interface NvsPageConfig {
   saveImages: boolean;
   /** Compute SSIM (the slow part). */
   ssim: boolean;
+  /** Also score every renderer on the pixels all of them cover (scoreCommon). */
+  common?: boolean;
   /** Distorted camera of the first view: sizes the viewer before the first render. */
   camera: CameraIntrinsics;
 }
@@ -73,6 +75,8 @@ export interface NvsViewResult {
   scoreMs: Record<string, number>;
   scores: Record<string, Omit<ScoreResult, 'images'>>;
   errors: Record<string, string>;
+  /** With config.common: fraction of the valid pixels every renderer covers. */
+  commonCoverage?: number;
 }
 
 type WriteFn = (path: string, data: string, encoding: 'base64' | 'utf8') => Promise<void>;
@@ -204,11 +208,13 @@ async function view(v: NvsPageView): Promise<NvsViewResult> {
   };
   const gtData = gt.data instanceof Uint8ClampedArray ? gt.data : new Uint8ClampedArray(gt.data.buffer, gt.data.byteOffset, gt.data.length);
   const prepared = prepareGroundTruth(gtData, W, H);
+  const images: Record<string, Uint8Array> = {};
   for (const [name, r] of renderers) {
     try {
       const t1 = performance.now();
       const img = await r.render(cam);
       if (img.length !== 4 * W * H) throw new Error(`renderer returned ${img.length} bytes, expected ${4 * W * H}`);
+      if (cfg.common) images[name] = img.slice();
       const t2 = performance.now();
       const s = scoreView(img, prepared, W, H, { background: cfg.background, ssim: cfg.ssim, keepImages: cfg.saveImages });
       res.renderMs[name] = Math.round(10 * (t2 - t1)) / 10;
@@ -222,6 +228,12 @@ async function view(v: NvsPageView): Promise<NvsViewResult> {
     } catch (e) {
       res.errors[name] = (e as Error)?.message ?? String(e);
     }
+  }
+  const scored = Object.keys(images).filter((name) => res.scores[name]);
+  if (cfg.common && scored.length >= 2) {
+    const c = scoreCommon(Object.fromEntries(scored.map((name) => [name, images[name]])), prepared, W, H, { ssim: cfg.ssim });
+    res.commonCoverage = c.coverage;
+    for (const name of scored) res.scores[name].common = { coverage: c.coverage, ...c.scores[name] };
   }
   log(`view ${v.index}: ${Object.entries(res.scores).map(([n, s]) => `${n} ${s.full.psnr.toFixed(2)} dB`).join(', ')}`);
   return res;

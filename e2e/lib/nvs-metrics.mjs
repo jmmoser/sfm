@@ -496,6 +496,38 @@ export function scoreView(render, gtImage, w, h, opts = {}) {
   return res;
 }
 
+/**
+ * Scores on the COMMON pixels: the valid GT pixels that every given render covers (alpha ≥ 0.5),
+ * un-premultiplied colour as `covered`, plus the PSNR after a per-renderer affine colour fit on
+ * those pixels. A renderer's own `covered` score uses its own pixel set (a mesh that draws only the
+ * well-reconstructed surfaces is scored on those); this compares renderers on the same pixels.
+ * renders: { name: premultiplied RGBA8 } → { coverage, pixels, scores: { name: { psnr, ssim, ccPsnr } } }.
+ */
+export function scoreCommon(renders, gtImage, w, h, opts = {}) {
+  const n = w * h;
+  const G = gtImage.ssimCache ? gtImage : prepareGroundTruth(gtImage, w, h);
+  const parts = Object.entries(renders).map(([name, r]) => [name, unpremultiply(r, n)]);
+  let mask = G.valid;
+  for (const [, u] of parts) mask = and(mask, u.covered);
+  const pixels = count(mask);
+  const scores = {};
+  for (const [name, { straight }] of parts) {
+    if (!pixels) {
+      scores[name] = { psnr: NaN, ssim: NaN, ccPsnr: NaN };
+      continue;
+    }
+    const affine = pixels >= 16 ? fitAffineColour(straight, G.data, n, mask) : AFFINE_IDENTITY.slice();
+    const cc = applyAffineColour(Uint8ClampedArray.from(straight), n, affine, mask);
+    scores[name] = {
+      psnr: psnr(straight, G.data, n, mask),
+      ssim: opts.ssim !== false ? ssim(straight, G.data, w, h, mask, G.ssimCache) : null,
+      ccPsnr: psnr(cc, G.data, n, mask),
+    };
+  }
+  G.ssimCache.delete(mask);
+  return { coverage: G.nValid ? pixels / G.nValid : 0, pixels, scores };
+}
+
 /** Side-by-side panel: GT | render (full frame) | |render − GT| × gain (RGBA8, 3w × h). */
 export function triptych(gt, full, w, h, gain = 3) {
   const out = new Uint8ClampedArray(4 * 3 * w * h);
@@ -540,5 +572,6 @@ export function aggregateScores(scores) {
       covered: { psnr: pick((s) => s.cc?.covered.psnr), ssim: pick((s) => s.cc?.covered.ssim) },
     },
     shiftPx: pick((s) => (s.shift ? Math.hypot(s.shift.dx, s.shift.dy) : NaN)),
+    common: { coverage: pick((s) => s.common?.coverage), psnr: pick((s) => s.common?.psnr), ssim: pick((s) => s.common?.ssim), ccPsnr: pick((s) => s.common?.ccPsnr) },
   };
 }

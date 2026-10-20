@@ -8,7 +8,8 @@ export interface TestView {
   file: string;
   tTrue?: number;
   nearestKeyframe: number;
-  gap: number;
+  gap: number | null;
+  nearest: { keyframe: number; distM: number; axisDeg: number } | null;
   pose: PoseJSON;
   camera: { f: number; cx: number; cy: number; k1: number; k2: number; width: number; height: number };
   omega: number[] | null;
@@ -22,6 +23,7 @@ export interface TestViewOptions {
   keepBlurred?: boolean;
   frames?: number[];
   rsTranslation?: boolean;
+  test?: { meta: any; frames: FrameJSON[]; imu?: { t: number; gyro: number[] }[] | null } | null;
 }
 export function cameraCenter(pose: PoseJSON): number[];
 export function registeredImages(result: unknown): RunImage[];
@@ -29,6 +31,8 @@ export function runToGtSim3(images: RunImage[], framesByIndex: Map<number, Frame
 export function heldOutFrames<T extends { index: number }>(frames: T[], result: unknown, opts?: { keepBlurred?: boolean }): T[];
 export function selectEvenly<T>(list: T[], n: number): T[];
 export function nearestImage<T extends { index: number }>(sorted: T[], index: number): T | null;
+export function sceneMismatch(meta: any, testMeta: any): string[];
+export function nearestInSpace<T>(gtCentres: { im: T; c: number[]; axis: number[] }[], pose: PoseJSON): { im: T; distM: number; axisDeg: number } | null;
 export function mapPoseRelative(gtFrame: PoseJSON, gtKey: PoseJSON, runKey: PoseJSON, s: number): PoseJSON;
 export function mapPoseSim3(gtFrame: PoseJSON, sim: Sim3): PoseJSON;
 export function gyroAt(imu: { t: number; gyro: number[] }[], t: number): number[] | null;
