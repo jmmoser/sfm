@@ -24,7 +24,8 @@
  */
 import { createServer } from 'vite';
 import { chromium } from 'playwright';
-import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { access, mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { loadavg } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -48,6 +49,42 @@ async function exists(p) {
 
 const readJSON = async (p) => JSON.parse(await readFile(p, 'utf8'));
 const f2 = (v, d = 2) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(d) : '—');
+
+/**
+ * Vite plugin: serves directories outside the repository (the run, the dataset) under URL prefixes,
+ * streamed from disk. Served by Vite rather than page.route: a route.fulfill body travels through
+ * the DevTools protocol, and the page dies on a 123 MB dense.ply (balanced preset, 3.5 M points).
+ */
+function serveDirs(dirs) {
+  return {
+    name: 'nvs-serve-dirs',
+    configureServer(server) {
+      for (const [prefix, dir] of Object.entries(dirs)) {
+        server.middlewares.use(prefix, (req, res) => {
+          let file;
+          try {
+            file = safeJoin(dir, decodeURIComponent(new URL(req.url ?? '', 'http://x').pathname.slice(1)));
+          } catch {
+            res.statusCode = 400;
+            return res.end();
+          }
+          stat(file).then(
+            (st) => {
+              if (!st.isFile()) throw new Error('not a file');
+              res.setHeader('content-type', 'application/octet-stream');
+              res.setHeader('content-length', String(st.size));
+              createReadStream(file).pipe(res);
+            },
+            () => {
+              res.statusCode = 404;
+              res.end();
+            },
+          );
+        });
+      }
+    },
+  };
+}
 
 /** Dataset directory of a name under e2e/data or a path. */
 async function datasetDir(name) {
@@ -150,6 +187,7 @@ export async function runNvs(o, { log = (m) => console.log(`[nvs] ${m}`) } = {})
     clearScreen: false,
     server: { port, strictPort: true, host: '127.0.0.1', hmr: false, open: false },
     optimizeDeps: { entries: ['nvs.html'] },
+    plugins: [serveDirs({ '/__nvs/run': runDir, '/__nvs/data': gtDir })],
   });
   await server.listen();
   const base = `http://127.0.0.1:${port}`;
@@ -163,20 +201,6 @@ export async function runNvs(o, { log = (m) => console.log(`[nvs] ${m}`) } = {})
       if (m.type() === 'error' || m.type() === 'warning' || o.verbose) log(`[page:${m.type()}] ${m.text()}`);
     });
     page.on('pageerror', (e) => log(`[page:exception] ${e.message}`));
-    // run and dataset files, served from Node (they may live outside the repository)
-    const serve = (prefix, dir) =>
-      page.route(`${base}${prefix}**`, async (route) => {
-        try {
-          const rel = decodeURIComponent(new URL(route.request().url()).pathname.slice(prefix.length));
-          const file = safeJoin(dir, rel);
-          if (!(await exists(file))) return route.fulfill({ status: 404, body: '' });
-          return route.fulfill({ path: file, headers: { 'content-type': 'application/octet-stream' } });
-        } catch {
-          return route.fulfill({ status: 400, body: '' });
-        }
-      });
-    await serve('/__nvs/run/', runDir);
-    await serve('/__nvs/data/', gtDir);
     await page.exposeFunction('__nvsLog', (m) => {
       if (o.verbose) log(String(m));
     });
