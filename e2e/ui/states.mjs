@@ -598,7 +598,7 @@ await scenario('dense-resume-quality', async () => {
   await by(page, 'build-dense-resume').waitFor({ timeout: 5000 });
   const item = await by(page, 'build-dense-resume').textContent();
   check(/Resume dense reconstruction/.test(item ?? '') && /continues from the saved depth maps/.test(item ?? ''), 'Build sheet: resume at the interrupted quality');
-  check((await page.locator('.segment[aria-checked="true"]').first().getAttribute('data-value')) === 'max', 'the quality selector starts at the interrupted run’s Max');
+  check((await page.locator('.segmented[aria-label="Quality"] .segment[aria-checked="true"]').first().getAttribute('data-value')) === 'max', 'the quality selector starts at the interrupted run’s Max');
   await page.locator('.segment[data-value="balanced"]').tap();
   check(/Starts over at Balanced quality \(the interrupted run used Max\)/.test((await by(page, 'build-dense-resume').textContent()) ?? ''), 'the scan’s own quality starts over');
   await page.keyboard.press('Escape');
