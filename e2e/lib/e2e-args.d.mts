@@ -9,6 +9,9 @@ export interface E2EArgs {
   denseOpts: { maxImageSize?: number; maxViews?: number };
   meshOpts: { voxelSize?: number; targetTriangles?: number };
   exports: boolean | string[];
+  /** Run the novel-view evaluation (e2e/nvs.mjs) on the output. */
+  nvs: boolean;
+  nvsViews: number;
   timeoutMin: number;
   out: string | null;
   tag: string | null;

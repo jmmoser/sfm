@@ -40,6 +40,10 @@ describe('parseArgs', () => {
     expect(d.config.mesh).toEqual({ targetTriangles: 50000 });
     expect(d.config.exports).toEqual(['glb', 'ply-points']);
     expect(d.config.logFrames).toBe(false);
+    expect(d.nvs).toBe(false);
+    const nv = parseArgs(['object-real', '--nvs', '--nvs-views', '8']);
+    expect(nv.nvs).toBe(true);
+    expect(nv.nvsViews).toBe(8);
   });
 
   it('rejects bad input', () => {
