@@ -105,6 +105,21 @@ describe('SplatRenderer (GPU) vs CPU reference', () => {
     expect(g.intersections).toBeGreaterThan(0);
   });
 
+  it('grows the intersection reservation when a frame needs more', async () => {
+    const m = randomScene({ count: 300, seed: 25, logScale: [-1.2, -0.8], opacity: [0.2, 0.4] }); // large splats
+    const cam = testCamera(160, 128);
+    const r = await SplatRenderer.create(ctx, { maxWidth: 160, maxHeight: 128, isectCapacity: 4096 });
+    r.setModel(m);
+    const g = await r.render(cam, { withStats: true });
+    r.destroy();
+    const c = renderCPU(m, cam);
+    let d = 0;
+    for (let i = 0; i < cam.width * cam.height; i++) for (let ch = 0; ch < 3; ch++) d = Math.max(d, Math.abs(g.data[4 * i + ch] - c.color[3 * i + ch]));
+    console.log(`[splat] intersections ${g.intersections} (reserved 4096 → grown), max diff ${d.toExponential(2)}`);
+    expect(g.intersections).toBeGreaterThan(4096);
+    expect(d).toBeLessThan(1e-4);
+  });
+
   it('empty model and a model outside the view render the background', async () => {
     const m = randomScene({ count: 10, seed: 24 });
     for (let i = 0; i < 10; i++) m.means.set([0, 50, 0], 3 * i); // far behind

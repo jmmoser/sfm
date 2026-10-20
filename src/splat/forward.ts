@@ -60,7 +60,7 @@ export interface SplatForwardOptions {
   capacity: number;
   maxWidth: number;
   maxHeight: number;
-  /** Tile intersections reserved (default 12 per Gaussian, at least 2^16). */
+  /** Tile intersections reserved (default 12 per Gaussian, at least 4096). */
   isectCapacity?: number;
   /** Parameter buffer (wgsl/common.ts layout for `capacity`). */
   params: GPUBuffer;
@@ -148,7 +148,7 @@ export class SplatForward {
     this.outN = makeBuffer(device, maxPx * 4, `${label}-n`);
     if (N > 1024 * 1024) throw new Error('SplatForward: capacity above 1M Gaussians');
     this.depthSort = new RadixSorter(device, pipes.sort, N, `${label}-depthsort`);
-    this.isectSort = new RadixSorter(device, pipes.sort, Math.max(1 << 16, opts.isectCapacity ?? 12 * N), `${label}-isectsort`);
+    this.isectSort = new RadixSorter(device, pipes.sort, Math.max(4096, opts.isectCapacity ?? 12 * N), `${label}-isectsort`);
     const P = pipes;
     this.bgProject = bindGroup(device, P.project, [this.frame, opts.params, this.proj, this.rects, this.tileCount, this.depthSort.keys[0], this.depthSort.vals[0]]);
     this.bgGather = bindGroup(device, P.gather, [this.binCtl, this.depthSort.vals[0], this.tileCount, this.offsets]);

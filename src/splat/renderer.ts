@@ -82,7 +82,22 @@ export class SplatRenderer {
     this.count = model.count;
   }
 
+  /**
+   * Renders the model. When the frame needs more tile intersections than reserved, the
+   * reservation grows and the frame is rendered again.
+   */
   async render(cam: SplatCamera, o: RenderCallOptions = {}): Promise<SplatImage> {
+    const r = await this.renderOnce(cam, o);
+    const f = this.fwd!;
+    if (r.intersections! > f.isectCapacity && r.intersections! * 4 <= this.device.limits.maxStorageBufferBindingSize) {
+      f.resizeIntersections(Math.ceil(r.intersections! * 1.25));
+      return this.renderOnce(cam, o);
+    }
+    if (!o.withStats) delete r.intersections;
+    return r;
+  }
+
+  private async renderOnce(cam: SplatCamera, o: RenderCallOptions): Promise<SplatImage> {
     const f = this.fwd;
     if (!f) throw new Error('SplatRenderer: setModel first');
     f.setFrame(cam, this.count, o.background);
@@ -109,7 +124,7 @@ export class SplatRenderer {
     staging.unmap();
     const out: SplatImage = { width: cam.width, height: cam.height, data: new Float32Array(buf, 0, 4 * px) };
     if (o.withN) out.n = new Uint32Array(buf, px * 16, px);
-    if (o.withStats) out.intersections = new Uint32Array(buf, px * 16 + nBytes, 1)[0];
+    out.intersections = new Uint32Array(buf, px * 16 + nBytes, 1)[0];
     if (prof) {
       const t = await prof.read();
       if (t) out.gpuMs = Object.fromEntries(t);
