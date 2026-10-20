@@ -44,11 +44,15 @@ export const MEM = Object.freeze({
   /** Depth-only map (geometric-pass sources need only `depth`). */
   depthOnlyPx: 4,
   rgbaPx: 4,
-  /** PatchMatchGPU (ARCHITECTURE §6 dense notes): 32 B per reference px, 1 B per source px, +4 B per source px geometric. */
+  /**
+   * PatchMatchGPU (ARCHITECTURE §6 dense notes): 32 B per reference px, 1 B per source px, +4 B
+   * per source px geometric; fixed: uniforms, ≤ 8 MB staging and the upload caches' slack layers
+   * (≤ 8 MB each, `PatchMatchGPU.cacheSlackBytes`).
+   */
   pmGpuRefPx: 32,
   pmGpuSrcPx: 1,
   pmGpuGeomSrcPx: 4,
-  pmGpuFixed: 8 * MB,
+  pmGpuFixed: 28 * MB,
   /** Fused point arrays: position + normal 3 × f32, colour 3 B, radius + confidence f32. */
   fusedPoint: 35,
   /**

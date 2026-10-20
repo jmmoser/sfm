@@ -62,10 +62,20 @@ export class PatchMatchHolder {
         this.reason = 'WebGPU unavailable';
         return null;
       }
-      // Precompile only the source buckets densify can use (any quality, with the config's
-      // overrides): a compile failure then still falls back to the CPU here, not mid-densify.
-      const maxSources = Math.max(...(['fast', 'balanced', 'max'] as const).map((q) => Math.min(16, resolveDensePreset(q, this.denseOverrides).numSources)));
-      const pm = await PatchMatchGPU.create(ctx, undefined, maxSources, { timestamps: this.gpuTimestamps });
+      // Precompile only the source buckets and kernel shapes (window, affine warp) densify can
+      // use (any quality, with the config's overrides): a compile failure then still falls back
+      // to the CPU here, not mid-densify. The self-test runs the first preset's kernel shape.
+      const presets = (['fast', 'balanced', 'max'] as const).map((q) => resolveDensePreset(q, this.denseOverrides));
+      const maxSources = Math.max(...presets.map((p) => Math.min(16, p.numSources)));
+      const shapes = new Map<string, Partial<PatchMatchOptions>>();
+      for (const p of presets) {
+        const k = (p.patchMatch ?? {}) as Partial<PatchMatchOptions>;
+        const shape = { patchRadius: k.patchRadius, patchStep: k.patchStep, affineWindow: k.affineWindow };
+        shapes.set(JSON.stringify(shape), shape);
+      }
+      const [first, ...rest] = [...shapes.values()];
+      const pm = await PatchMatchGPU.create(ctx, first, maxSources, { timestamps: this.gpuTimestamps });
+      for (const shape of rest) await pm.precompile(shape, maxSources);
       const st = await pm.selfTest();
       if (!st.ok) {
         pm.destroy();
@@ -470,19 +480,23 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
     await setProgress(pass);
     cur = new EngineDepthStore(backend, `pm${pass}`, 0);
     const have = new Set(persistent && pass === resumePass ? await cur.scan() : []);
-    // last reference (index in `ordered`) that reads each previous-pass map
+    // Full-resolution passes alternate direction (serpentine): the next pass starts with the
+    // views the image LRU (and PatchMatchGPU's upload caches) still hold — 30 % fewer decodes.
+    const fullIndex = passKinds.slice(0, pass + 1).filter((k) => k !== 'half').length - 1;
+    const order = kind !== 'half' && fullIndex % 2 === 1 ? [...ordered].reverse() : ordered;
+    // last reference (index in `order`) that reads each previous-pass map
     const lastUse = new Map<number, number>();
-    ordered.forEach((g, i) => reads(g.id).forEach((id) => lastUse.set(id, i)));
+    order.forEach((g, i) => reads(g.id).forEach((id) => lastUse.set(id, i)));
     const releasePrev = async (i: number): Promise<void> => {
       if (!prev) return;
-      for (const id of reads(ordered[i].id)) {
+      for (const id of reads(order[i].id)) {
         if (lastUse.get(id) !== i) continue;
         srcDepth.delete(id);
         await prev.delete(id);
       }
     };
-    for (let i = 0; i < ordered.length; i++) {
-      const g = ordered[i];
+    for (let i = 0; i < order.length; i++) {
+      const g = order[i];
       check('depth_maps');
       if (have.has(g.id)) {
         skipped++;

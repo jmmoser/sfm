@@ -14,7 +14,13 @@
  *    the page was hidden) the whole computation is retried (max 2×) and then fails;
  *  - all pipelines are compiled in `create()` (compilation blocks the GPU process
  *    on Safari 26), raced against device loss and a timeout.
- * Textures and buffers are reused across compute() calls (grow-only arrays).
+ * Textures and buffers are reused across compute() calls. Source grey images and source depth
+ * maps live in LRU texture-array caches keyed by the uploaded object (`LayerCache`): a view that
+ * is a source of several references is converted and uploaded once while it stays resident (the
+ * caller must not modify an image / depth array in place after passing it). The reference image is
+ * uploaded as is (its grey is derived in the shader). A `finalize` pass converts the hypotheses to
+ * depth / octahedral normal / cost on the GPU, and the result is read back at 12 B/px together
+ * with the dropped-work sentinel in one mapping when it fits the staging buffer.
  */
 import type { GPUContext } from '../gpu/device';
 import { createBuffer } from '../gpu/device';
@@ -30,9 +36,10 @@ import {
   goodCostThreshold,
   isGeometricActive,
   normalPerturbation,
+  octCoords,
+  octDecode,
   packSourceCameras,
   passSeed,
-  planesToDepthMap,
   priorToPlanes,
   resolvePatchMatchOptions,
   rgbaToGray8,
@@ -97,6 +104,8 @@ export interface PatchMatchSelfTestResult {
 interface Pipelines {
   init: GPUComputePipeline;
   propagate: GPUComputePipeline;
+  finalize: GPUComputePipeline;
+  priorPlanes: GPUComputePipeline;
 }
 
 /** Per-reference-size resources (reused while W × H is unchanged). */
@@ -111,12 +120,85 @@ interface Resources {
   staging: GPUBuffer;
 }
 
-/** A 2D-array texture that is only reallocated when it has to grow. */
-interface ArrayTex {
-  tex: GPUTexture;
-  width: number;
-  height: number;
-  layers: number;
+/**
+ * 2D-array texture whose layers cache uploads keyed by the uploaded object (a source image, a
+ * depth array): LRU over the layers, never evicting a layer the current compute() uses. Keys are
+ * held weakly (ids through a WeakMap), so the cache never keeps a caller's data alive. Grows
+ * (reallocated, every entry dropped) when a larger image or more layers are needed.
+ */
+class LayerCache {
+  tex: GPUTexture | null = null;
+  width = 0;
+  height = 0;
+  layers = 0;
+  hits = 0;
+  misses = 0;
+  private readonly ids = new WeakMap<object, number>();
+  private nextId = 1;
+  private slotId: number[] = [];
+  private slotUse: number[] = [];
+  private clock = 0;
+
+  constructor(
+    private readonly device: GPUDevice,
+    private readonly format: GPUTextureFormat,
+    private readonly label: string,
+  ) {}
+
+  /** At least W × H × `layers` (grow-only in every dimension). */
+  ensure(W: number, H: number, layers: number): void {
+    if (this.tex && this.width >= W && this.height >= H && this.layers >= layers) return;
+    const w = Math.max(W, this.width);
+    const h = Math.max(H, this.height);
+    const l = Math.max(layers, this.layers);
+    this.tex?.destroy();
+    this.tex = this.device.createTexture({
+      label: this.label,
+      size: [w, h, l],
+      dimension: '2d',
+      format: this.format,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
+    this.width = w;
+    this.height = h;
+    this.layers = l;
+    this.slotId = new Array<number>(l).fill(0);
+    this.slotUse = new Array<number>(l).fill(0);
+  }
+
+  /** Layer holding `key`'s data; on a miss `upload(layer)` fills the least recently used free layer. */
+  acquire(key: object, taken: Set<number>, upload: (layer: number) => void): number {
+    let id = this.ids.get(key);
+    if (!id) {
+      id = this.nextId++;
+      this.ids.set(key, id);
+    }
+    const t = ++this.clock;
+    const hit = this.slotId.indexOf(id);
+    if (hit >= 0 && !taken.has(hit)) {
+      this.slotUse[hit] = t;
+      this.hits++;
+      taken.add(hit);
+      return hit;
+    }
+    let best = -1;
+    for (let i = 0; i < this.layers; i++) if (!taken.has(i) && (best < 0 || this.slotUse[i] < this.slotUse[best])) best = i;
+    if (best < 0) throw new Error(`PatchMatchGPU: ${this.label} has no free layer`);
+    upload(best);
+    this.slotId[best] = id;
+    this.slotUse[best] = t;
+    this.misses++;
+    taken.add(best);
+    return best;
+  }
+
+  destroy(): void {
+    this.tex?.destroy();
+    this.tex = null;
+    this.width = this.height = this.layers = 0;
+    this.slotId = [];
+    this.slotUse = [];
+  }
 }
 
 /** Number of Params blocks in the uniform ring (one per submission, reused cyclically). */
@@ -127,8 +209,13 @@ const SOURCE_BUCKETS = [4, 8, 12, 16];
 class DroppedWorkError extends Error {}
 
 export class PatchMatchGPU {
-  /** Readback staging-buffer cap in bytes (outputs larger than this are read in chunks). */
-  static stagingBytes = 4 << 20;
+  /** Readback staging-buffer cap in bytes (outputs larger than this, 12 B/px, are read in row chunks). */
+  static stagingBytes = 8 << 20;
+  /**
+   * Upload caches: GPU bytes each may hold beyond the layers of the current call (up to 4 slack
+   * layers: the next references' sources are mostly the same views).
+   */
+  static cacheSlackBytes = 8 << 20;
   /** Pipeline compilation timeout before falling back to synchronous creation. */
   static pipelineTimeoutMs = 30_000;
   /** Use the adaptive band controller also on software adapters (tests). */
@@ -143,8 +230,9 @@ export class PatchMatchGPU {
   private readonly paramsBuf: GPUBuffer;
   private readonly statusBuf: GPUBuffer;
   private res: Resources | null = null;
-  private srcArr: ArrayTex | null = null;
-  private depthArr: ArrayTex | null = null;
+  private readonly srcCache: LayerCache;
+  private readonly depthCache: LayerCache;
+  private grayBuf: Uint8Array | undefined;
   private ts: Timestamps | null = null;
   private lost = false;
   private destroyed = false;
@@ -190,6 +278,13 @@ export class PatchMatchGPU {
     this.camsBuf = createBuffer(device, MAX_PATCHMATCH_SOURCES * GPU_SOURCE_CAMERA_FLOATS * 4, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, 'patchmatch-cams');
     this.paramsBuf = createBuffer(device, PARAMS_RING * PARAMS_STRIDE, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, 'patchmatch-params');
     this.statusBuf = createBuffer(device, 16, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST, 'patchmatch-status');
+    this.srcCache = new LayerCache(device, 'r8unorm', 'pm-src');
+    this.depthCache = new LayerCache(device, 'r32float', 'pm-src-depth');
+  }
+
+  /** Upload-cache statistics (source images, source depth maps). */
+  get cacheStats(): { imageHits: number; imageMisses: number; depthHits: number; depthMisses: number } {
+    return { imageHits: this.srcCache.hits, imageMisses: this.srcCache.misses, depthHits: this.depthCache.hits, depthMisses: this.depthCache.misses };
   }
 
   /**
@@ -218,6 +313,13 @@ export class PatchMatchGPU {
       throw e;
     }
     return pm;
+  }
+
+  /** Compile the pipelines of another kernel shape (patchRadius, patchStep, affineWindow) up front. */
+  async precompile(opts: Partial<PatchMatchOptions>, maxSources = MAX_PATCHMATCH_SOURCES): Promise<void> {
+    const o = resolvePatchMatchOptions({ ...this.defaults, ...opts });
+    const top = SOURCE_BUCKETS.find((b) => b >= maxSources) ?? MAX_PATCHMATCH_SOURCES;
+    for (const b of SOURCE_BUCKETS) if (b <= top) await this.getPipelines(b, o.patchRadius, o.patchStep, o.affineWindow);
   }
 
   /**
@@ -342,7 +444,9 @@ export class PatchMatchGPU {
       p = (async () => {
         const init = await this.createPipeline({ label: `pm-init-${key}`, layout: this.pipelineLayout, compute: { module, entryPoint: 'init' } });
         const propagate = await this.createPipeline({ label: `pm-prop-${key}`, layout: this.pipelineLayout, compute: { module, entryPoint: 'propagate' } });
-        return { init, propagate };
+        const finalize = await this.createPipeline({ label: `pm-final-${key}`, layout: this.pipelineLayout, compute: { module, entryPoint: 'finalize' } });
+        const priorPlanes = await this.createPipeline({ label: `pm-prior-${key}`, layout: this.pipelineLayout, compute: { module, entryPoint: 'priorPlanes' } });
+        return { init, propagate, finalize, priorPlanes };
       })();
       p.catch(() => this.pipelines.delete(key));
       this.pipelines.set(key, p);
@@ -361,10 +465,8 @@ export class PatchMatchGPU {
       r.staging.destroy();
       this.res = null;
     }
-    this.srcArr?.tex.destroy();
-    this.srcArr = null;
-    this.depthArr?.tex.destroy();
-    this.depthArr = null;
+    this.srcCache.destroy();
+    this.depthCache.destroy();
   }
 
   private ensureResources(W: number, H: number): Resources {
@@ -392,35 +494,11 @@ export class PatchMatchGPU {
       views: createBuffer(d, 4 * n, storage, 'pm-views'),
       staging: d.createBuffer({
         label: 'pm-staging',
-        size: Math.max(16, Math.min(20 * n, Math.floor(PatchMatchGPU.stagingBytes / 16) * 16)),
+        size: Math.max(32, Math.min(12 * n + 16, Math.floor(PatchMatchGPU.stagingBytes / 16) * 16)),
         usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
       }),
     };
     return this.res;
-  }
-
-  /**
-   * Grow-only 2D-array texture: reused when it is at least W × H × layers (the
-   * shaders bound every access by the per-source image / depth-map size).
-   */
-  private ensureArray(cur: ArrayTex | null, W: number, H: number, layers: number, format: GPUTextureFormat, label: string): ArrayTex {
-    if (cur && cur.width >= W && cur.height >= H && cur.layers >= layers) return cur;
-    // grow-only in every dimension (avoids reallocating back and forth when views of
-    // different aspect ratios alternate)
-    const keep = cur ? Math.max(cur.layers, layers) : layers;
-    if (cur) {
-      W = Math.max(W, cur.width);
-      H = Math.max(H, cur.height);
-    }
-    cur?.tex.destroy();
-    const tex = this.device.createTexture({
-      label,
-      size: [W, H, keep],
-      dimension: '2d',
-      format,
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-    });
-    return { tex, width: W, height: H, layers: keep };
   }
 
   /** Sum of the GPU durations (ms) of the first `passes` timed compute passes. */
@@ -435,6 +513,69 @@ export class PatchMatchGPU {
     let ns = 0;
     for (let k = 0; k < passes; k++) if (t[2 * k + 1] > t[2 * k]) ns += Number(t[2 * k + 1] - t[2 * k]);
     return ns / 1e6;
+  }
+
+  /**
+   * Finalised outputs (`costs` = depth, `views` = octahedral normal, `photo` = cost) → DepthMap,
+   * in row chunks through the staging buffer; the first chunk also carries the dropped-work
+   * sentinel, which is checked before the rest is read.
+   */
+  private async readOutputs(res: Resources, W: number, H: number, submits: number, range: DepthRange): Promise<DepthMap> {
+    const n = W * H;
+    const depth = new Float32Array(n);
+    const cost = new Float32Array(n);
+    const packed = new Uint32Array(n);
+    const staging = res.staging;
+    const rowsPerChunk = Math.floor((staging.size - 16) / (12 * W));
+    if (rowsPerChunk < 1) {
+      // staging smaller than one row (tests): buffer by buffer
+      const status = new Uint32Array(4);
+      await this.readInto(this.statusBuf, status, staging);
+      if (status[0] !== submits) throw new DroppedWorkError(`PatchMatchGPU: ${submits - status[0]} of ${submits} command buffers were not executed (page hidden?)`);
+      await this.readInto(res.costs, depth, staging);
+      await this.readInto(res.views, packed, staging);
+      await this.readInto(res.photo, cost, staging);
+    } else {
+      for (let y0 = 0; y0 < H; y0 += rowsPerChunk) {
+        const rows = Math.min(rowsPerChunk, H - y0);
+        const off = 4 * y0 * W;
+        const len = 4 * rows * W;
+        const enc = this.device.createCommandEncoder({ label: 'pm-readback' });
+        if (y0 === 0) enc.copyBufferToBuffer(this.statusBuf, 0, staging, 0, 16);
+        enc.copyBufferToBuffer(res.costs, off, staging, 16, len);
+        enc.copyBufferToBuffer(res.views, off, staging, 16 + len, len);
+        enc.copyBufferToBuffer(res.photo, off, staging, 16 + 2 * len, len);
+        this.device.queue.submit([enc.finish()]);
+        try {
+          await staging.mapAsync(GPUMapMode.READ, 0, 16 + 3 * len);
+        } catch (e) {
+          this.checkAlive();
+          throw new Error(`PatchMatchGPU: readback failed (device lost?): ${(e as Error)?.message ?? e}`);
+        }
+        const m = staging.getMappedRange(0, 16 + 3 * len);
+        if (y0 === 0) {
+          const executed = new Uint32Array(m, 0, 1)[0];
+          if (executed !== submits) {
+            staging.unmap();
+            throw new DroppedWorkError(`PatchMatchGPU: ${submits - executed} of ${submits} command buffers were not executed (page hidden?)`);
+          }
+        }
+        const i0 = y0 * W;
+        depth.set(new Float32Array(m, 16, rows * W), i0);
+        packed.set(new Uint32Array(m, 16 + len, rows * W), i0);
+        cost.set(new Float32Array(m, 16 + 2 * len, rows * W), i0);
+        staging.unmap();
+      }
+    }
+    const normal = new Float32Array(3 * n);
+    for (let i = 0; i < n; i++) {
+      const z = depth[i];
+      if (!(z > 0)) continue;
+      // the range test again in double precision (the shader's bounds are f32-rounded)
+      if (!(z >= range.min && z <= range.max)) depth[i] = 0;
+      else octDecode(packed[i], normal, 3 * i);
+    }
+    return { width: W, height: H, depth, normal, cost };
   }
 
   /** Chunked GPU → CPU copy through the (bounded) staging buffer; one getMappedRange per map. */
@@ -562,37 +703,68 @@ export class PatchMatchGPU {
     const iterations = geo ? o.geometricIterations : o.iterations;
 
     // ---- resources & uploads (inside error scopes) ------------------------------
+    let priorSize: { width: number; height: number } | null = null;
     // On failure (e.g. out of memory) the cached resources may be invalid objects:
     // release them so the next call reallocates instead of failing forever.
     const { res, bindGroup } = await this.scoped('set-up', true, () => {
       const res = this.ensureResources(W, H);
-      this.srcArr = this.ensureArray(this.srcArr, texW, texH, N, 'r8unorm', 'pm-src');
-      // photometric passes never read the depth array: keep whatever exists (or a 1×1 dummy)
-      this.depthArr = geo
-        ? this.ensureArray(this.depthArr, depthW, depthH, N, 'r32float', 'pm-src-depth')
-        : (this.depthArr ?? this.ensureArray(null, 1, 1, 1, 'r32float', 'pm-src-depth'));
-      const srcTex = this.srcArr.tex;
-      const depthTex = this.depthArr.tex;
-      // reference: RGB + grey in alpha
-      const gray = rgbaToGray8(ref.image);
-      const refData = new Uint8Array(W * H * 4);
-      refData.set(ref.image.data);
-      for (let i = 0; i < W * H; i++) refData[4 * i + 3] = gray[i];
-      q.writeTexture({ texture: res.refTex }, refData, { bytesPerRow: 4 * W, rowsPerImage: H }, [W, H, 1]);
+      // upload caches: every source of this call resident at once, plus slack layers for the
+      // next references' sources (trajectory-local); photometric passes keep the depth cache
+      const slack = (bytesPerLayer: number): number => Math.min(4, Math.floor(PatchMatchGPU.cacheSlackBytes / bytesPerLayer));
+      const maxLayers = this.ctx.limits.maxTextureArrayLayers;
+      this.srcCache.ensure(texW, texH, Math.min(maxLayers, N + slack(Math.max(texW, this.srcCache.width) * Math.max(texH, this.srcCache.height))));
+      if (geo) this.depthCache.ensure(depthW, depthH, Math.min(maxLayers, N + slack(4 * Math.max(depthW, this.depthCache.width) * Math.max(depthH, this.depthCache.height))));
+      else this.depthCache.ensure(1, 1, 1);
+      const srcTex = this.srcCache.tex!;
+      const depthTex = this.depthCache.tex!;
+      // reference: RGBA as is (the shader derives the grey)
+      q.writeTexture({ texture: res.refTex }, ref.image.data, { bytesPerRow: 4 * W, rowsPerImage: H }, [W, H, 1]);
       const cams = [];
-      let grayBuf: Uint8Array | undefined;
+      const imageLayers: number[] = [];
+      const depthLayers: number[] = [];
+      const takenImg = new Set<number>();
+      const takenDepth = new Set<number>();
       for (let s = 0; s < N; s++) {
         const v = sources[s];
-        grayBuf = rgbaToGray8(v.image, grayBuf);
-        q.writeTexture({ texture: srcTex, origin: [0, 0, s] }, grayBuf, { bytesPerRow: v.cam.width, rowsPerImage: v.cam.height }, [v.cam.width, v.cam.height, 1]);
+        imageLayers.push(
+          this.srcCache.acquire(v.image, takenImg, (layer) => {
+            this.grayBuf = rgbaToGray8(v.image, this.grayBuf);
+            q.writeTexture({ texture: srcTex, origin: [0, 0, layer] }, this.grayBuf, { bytesPerRow: v.cam.width, rowsPerImage: v.cam.height }, [v.cam.width, v.cam.height, 1]);
+          }),
+        );
         const dm = geo ? geometric!.sourceDepths[s] : undefined;
         if (dm && dm.width > 0 && dm.height > 0) {
-          q.writeTexture({ texture: depthTex, origin: [0, 0, s] }, dm.depth, { bytesPerRow: 4 * dm.width, rowsPerImage: dm.height }, [dm.width, dm.height, 1]);
-        }
+          depthLayers.push(
+            this.depthCache.acquire(dm.depth, takenDepth, (layer) => {
+              q.writeTexture({ texture: depthTex, origin: [0, 0, layer] }, dm.depth, { bytesPerRow: 4 * dm.width, rowsPerImage: dm.height }, [dm.width, dm.height, 1]);
+            }),
+          );
+        } else depthLayers.push(0); // 0 × 0 map: never read (dsize = 0)
         cams.push(buildSourceCamera(ref, v, dm ? { width: dm.width, height: dm.height } : undefined));
       }
-      q.writeBuffer(this.camsBuf, 0, packSourceCameras(cams, this.srcArr.width, this.srcArr.height));
-      if (usePrior) q.writeBuffer(res.planes, 0, priorToPlanes(geometric!.prior, W, H, undefined, ref.cam));
+      q.writeBuffer(this.camsBuf, 0, packSourceCameras(cams, this.srcCache.width, this.srcCache.height, undefined, { image: imageLayers, depth: depthLayers }));
+      if (usePrior) {
+        const pr = geometric!.prior;
+        const pn = pr.width * pr.height;
+        if (pn > 0 && pn <= W * H && pr.depth.length >= pn && pr.normal.length >= 3 * pn) {
+          // compact prior (depth + the normal's octahedral coordinates, 12 B/px at its own size)
+          // into the not yet used costs / photo / views buffers; the priorPlanes pass resamples it
+          const nrm = pr.normal;
+          const ox = new Float32Array(pn);
+          const oy = new Float32Array(pn);
+          const o2 = new Float32Array(2);
+          for (let i = 0; i < pn; i++) {
+            if (!(pr.depth[i] > 0)) continue;
+            octCoords(nrm[3 * i], nrm[3 * i + 1], nrm[3 * i + 2], o2, 0);
+            ox[i] = o2[0];
+            oy[i] = o2[1];
+          }
+          q.writeBuffer(res.costs, 0, pr.depth, 0, pn);
+          q.writeBuffer(res.photo, 0, ox);
+          q.writeBuffer(res.views, 0, oy);
+          priorSize = { width: pr.width, height: pr.height };
+        } else q.writeBuffer(res.planes, 0, priorToPlanes(pr, W, H, undefined, ref.cam));
+      }
       q.writeBuffer(this.statusBuf, 0, new Uint32Array(4));
       const bindGroup = device.createBindGroup({
         label: 'pm-bg',
@@ -650,7 +822,7 @@ export class PatchMatchGPU {
       let row = 0;
       while (row < H) {
         const rows = Math.min(H - row, ctl.next());
-        fillParams(pu, pf, o, ref, range, N, colour, row, row + rows, it, seed, geo, usePrior, isInit);
+        fillParams(pu, pf, o, ref, range, N, colour, row, row + rows, it, seed, geo, usePrior, isInit, priorSize);
         const slot = submits % PARAMS_RING;
         // error scope opened and closed synchronously around encode + submit
         device.pushErrorScope('validation');
@@ -678,6 +850,7 @@ export class PatchMatchGPU {
         row += rows;
       }
     };
+    if (priorSize) await runPass(pipes.priorPlanes, new BandController(Infinity, H, H, 1), 0, 0, 0, true);
     await runPass(pipes.init, ctlInitRows, 0, 0, passSeed(o.seed, geo ? 0x1ffff : 0xffff), true);
     tInit = performance.now();
     tPrev = tInit;
@@ -690,21 +863,12 @@ export class PatchMatchGPU {
       tPrev = t;
     }
 
-    // ---- readback + dropped-work check -------------------------------------------
-    const n = W * H;
-    const status = new Uint32Array(4);
-    await this.readInto(this.statusBuf, status, res.staging);
-    if (status[0] !== submits) {
-      throw new DroppedWorkError(`PatchMatchGPU: ${submits - status[0]} of ${submits} command buffers were not executed (page hidden?)`);
-    }
+    // ---- finalisation (depth / normal / cost on the GPU), readback + dropped-work check
+    await runPass(pipes.finalize, new BandController(Infinity, H, H, 1), 0, 0, 0, true);
     let gpuMs: number | undefined;
     if (ts && timed > 0) gpuMs = await this.readTimestamps(ts, timed);
-    const planes = new Float32Array(4 * n);
-    const photo = new Float32Array(n);
-    await this.readInto(res.planes, planes, res.staging);
-    await this.readInto(res.photo, photo, res.staging);
+    const out = await this.readOutputs(res, W, H, submits, range);
     this.checkAlive();
-    const out = planesToDepthMap(planes, photo, W, H, range, o.maxCost);
     const tEnd = performance.now();
     this.lastTimings = {
       uploadMs: tUpload - tStart,
@@ -741,6 +905,7 @@ function fillParams(
   geo: boolean,
   usePrior: boolean,
   init: boolean,
+  prior: { width: number; height: number } | null,
 ): void {
   u[0] = ref.cam.width;
   u[1] = ref.cam.height;
@@ -771,7 +936,7 @@ function fillParams(
   u[26] = usePrior && init ? 1 : 0;
   u[27] = geo ? 1 : 0;
   f[28] = 1 / (2 * o.sigmaSpatial * o.sigmaSpatial);
-  f[29] = 0;
-  f[30] = 0;
-  f[31] = 0;
+  f[29] = o.maxCost;
+  u[30] = prior ? prior.width : 0;
+  u[31] = prior ? prior.height : 0;
 }
