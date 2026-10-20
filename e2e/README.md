@@ -544,7 +544,8 @@ balanced: 80 views at 960 px = the datasets' size, fusion step 2). "before" = th
 GPU-resident PatchMatch data flow (upload caches, GPU finalisation / prior, 12 B/px readback), native float16,
 serpentine passes, image LRU up to every view (ARCHITECTURE §6 "Dense on a real GPU"). Each before / after pair ran
 back to back (host load 4–8, other agents' GPU jobs running: GPU-pass wall time is 1.2–1.6× the timestamped GPU
-time). densify = depth maps + fusion; GPU = PatchMatch execution time from timestamp queries.
+time; exception: the object-real fast "before" ran at load 18–23 while a unit-test run overlapped, so that pair's
+times favour "after"). densify = depth maps + fusion; GPU = PatchMatch execution time from timestamp queries.
 
 | run | densify s | depth maps s (view loads / PatchMatch / halo / store) | GPU s | fusion s (fuse / cap) | points | dense P / C / F | acc p50 / p90 | checks |
 |---|---|---|---|---|---|---|---|---|
