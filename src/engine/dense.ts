@@ -382,8 +382,12 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   const colourBytesPerView = plan.colourBytes / Math.max(1, geom.length);
   const colour = new Map<number, RGBAImage>();
   const geomById = new Map(geom.map((g) => [g.id, g]));
+  // wall-time breakdown of the depth-map stage (ms; logged at its end)
+  const perf = { decodes: 0, load: 0, inputs: 0, compute: 0, upload: 0, gpu: 0, readback: 0, halo: 0, store: 0 };
   const loadView = (id: number): Promise<DenseView> =>
     cache.getOrLoad(id, async () => {
+      const tl = now();
+      perf.decodes++;
       const g = geomById.get(id)!;
       const stored = await deps.store.getFrameImage(id);
       if (!stored) throw new Error(`keyframe image ${id} missing`);
@@ -399,6 +403,7 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
         const fs = fitSize(w, h, Math.max(64, Math.floor(s * Math.max(w, h))));
         colour.set(id, resizeRGBA(und.image, fs.width, fs.height));
       }
+      perf.load += now() - tl;
       return view;
     });
 
@@ -464,6 +469,7 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
       for (const sid of s.sources) srcs.push(await loadView(sid));
       const range = { min: s.depthMin, max: s.depthMax };
       let geometric: { prior: DepthMap; sourceDepths: DepthMap[] } | undefined;
+      const ti = now();
       if (pass > 0 && prev) {
         const prior = await prev.get(g.id);
         if (!prior) {
@@ -478,6 +484,7 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
         }
         geometric = { prior, sourceDepths };
       }
+      perf.inputs += now() - ti;
       const pmOpts =
         pass === 0
           ? { ...(preset.patchMatch ?? {}), iterations: preset.iterations }
@@ -506,7 +513,15 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
       } else {
         dm = patchMatchCPU(ref, srcs, range, pmOpts, geometric);
       }
+      perf.compute += now() - tv;
+      const lt = pm?.lastTimings;
+      if (lt) {
+        perf.upload += lt.uploadMs;
+        perf.gpu += lt.initMs + lt.iterationsMs.reduce((a, b) => a + b, 0);
+        perf.readback += lt.readbackMs;
+      }
       geometric = undefined;
+      const th = now();
       if (halo && pass === passes - 1) {
         try {
           const skyUp = skyUpOf(g.id, g.pose);
@@ -515,8 +530,11 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
           deps.log('warn', `depth halo filter failed: ${(e as Error)?.message ?? e}`);
         }
       }
+      const tp = now();
+      perf.halo += tp - th;
       await cur.put(g.id, dm);
       await releasePrev(i);
+      perf.store += now() - tp;
       done++;
       report('depth_maps', done / total, `${pass === 0 ? 'photometric' : `geometric ${pass}`} ${done}/${total} (${Math.round(now() - tv)} ms)`);
       await tick();
@@ -526,7 +544,16 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
     prev = cur;
   }
   if (skipped) stats.denseResumedMaps = skipped;
-  stats.depthMapsMs = Math.round(now() - tDepth);
+  const depthMapsMs = now() - tDepth;
+  stats.depthMapsMs = Math.round(depthMapsMs);
+  {
+    const s = (ms: number): string => (ms / 1000).toFixed(1);
+    deps.log(
+      'info',
+      `dense depth maps ${s(depthMapsMs)} s: view loads ${s(perf.load)} s (${perf.decodes} decodes), pass inputs ${s(perf.inputs)} s, ` +
+        `PatchMatch ${s(perf.compute)} s (upload ${s(perf.upload)}, GPU passes ${s(perf.gpu)}, readback ${s(perf.readback)}), halo filter ${s(perf.halo)} s, store ${s(perf.store)} s`,
+    );
+  }
   const finalStore = cur!;
   cache.clear();
   // PatchMatchGPU's buffers (≈ 32 B per reference px + 5 B per source px: ~140 MB at 1600 px) are
@@ -553,6 +580,7 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   cache.clear();
   const neighbours = neighboursFromSelection(sel);
   const minViews = deps.mode === 'scene' ? preset.fusionMinViewsScene : preset.fusionMinViewsObject;
+  const tFuseMaps = now();
   let cloud = await fuseDepthMaps(
     views,
     finalStore,
@@ -572,6 +600,7 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   );
   if (cloud.count >= plan.fusionMaxPoints) deps.log('warn', `fusion stopped at the memory cap of ${plan.fusionMaxPoints} points (later views not fused)`);
   stats.fusedPoints = cloud.count;
+  const fuseMs = now() - tFuseMaps;
   // fused: a later densify starts over (progress first, so a kill in between never resumes into
   // deleted maps)
   await setProgress(null);
@@ -579,6 +608,7 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   check('fusion');
   report('fusion', 0.92, `filtering ${cloud.count} points`);
   await tick();
+  const tCap = now();
   if (cloud.count > preset.maxPoints) {
     // voxel size from the median radius so that about maxPoints remain
     const r = cloud.radii ? median(Array.from(cloud.radii.subarray(0, Math.min(cloud.count, 100_000)))) : 0;
@@ -587,6 +617,10 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   if (preset.sorK > 0 && cloud.count > preset.sorK + 1) cloud = filterPointCloud(cloud, { statistical: { k: preset.sorK, std: preset.sorStd } });
   stats.densePoints = cloud.count;
   stats.fusionMs = Math.round(now() - tFuse);
+  deps.log(
+    'info',
+    `dense fusion ${(stats.fusionMs / 1000).toFixed(1)} s: fuseDepthMaps ${(fuseMs / 1000).toFixed(1)} s → ${stats.fusedPoints} points, point cap / filter ${((now() - tCap) / 1000).toFixed(1)} s → ${cloud.count} points`,
+  );
   stats.denseMs = Math.round(now() - t0);
   report('fusion', 1, `${cloud.count} points`);
   const meta: DenseMetaRecord = {
