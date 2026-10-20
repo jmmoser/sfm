@@ -895,6 +895,10 @@ export class IncrementalTriangulator {
         }
         trialsB.add(pointId);
         const q = this.rec.points.get(qid)!;
+        // one observation per image (as create / continue / complete): points sharing an image stay apart
+        let shared = false;
+        for (let a = 0; a < q.track.length && !shared; a++) shared = IncrementalTriangulator.observes(p.track, q.track[a].image);
+        if (shared) continue;
         const wa = p.track.length,
           wb = q.track.length;
         const iw = 1 / (wa + wb);

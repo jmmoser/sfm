@@ -139,8 +139,9 @@ export class LiveMapper {
     return this.mapper;
   }
 
-  /** Keyframes not (yet) registered. */
+  /** Keyframes not (yet) registered (incl. those a refinement through `incrementalMapper` dropped). */
   pendingIds(): number[] {
+    if (this.isInit) this.syncPending();
     return [...this.pending.keys()];
   }
 
@@ -190,6 +191,7 @@ export class LiveMapper {
 
   /** Retries pending keyframes whose visible-point count increased (most recent first). */
   private retryPending(justRegistered: number): void {
+    this.syncPending();
     if (this.pending.size === 0) return;
     // nearest keyframes in capture order first
     const pos = this.keyframes.indexOf(justRegistered);
@@ -276,16 +278,20 @@ export class LiveMapper {
     }
     this.timings.init += now() - t0;
     if (this.isInit) {
-      // register the other pending keyframes, nearest to the initial pair first
-      const ids = [...this.pending.keys()];
-      const pa = this.keyframes.indexOf(newId);
-      ids.sort((x, y) => Math.abs(this.keyframes.indexOf(x) - pa) - Math.abs(this.keyframes.indexOf(y) - pa));
-      for (let pass = 0; pass < 2; pass++) {
+      // register the other pending keyframes, nearest to the initial pair (the only registered images)
+      // first; further passes while any registers retry those whose visible-point count increased
+      const pair = this.rec.registeredImageIds().map((id) => this.keyframes.indexOf(id));
+      const dist = (id: number): number => Math.min(...pair.map((k) => Math.abs(this.keyframes.indexOf(id) - k)));
+      const ids = [...this.pending.keys()].sort((x, y) => dist(x) - dist(y));
+      for (let pass = 0; pass < ids.length; pass++) {
         let any = false;
         for (const id of ids) {
-          if (this.rec.images.get(id)!.registered) continue;
+          const img = this.rec.images.get(id)!;
+          if (img.registered) continue;
+          this.rec.syncVisibility(id);
+          if (img.numVisiblePoints3D <= (this.pending.get(id) ?? -1)) continue;
           if (this.tryRegister(id)) any = true;
-          else this.pending.set(id, this.rec.images.get(id)!.numVisiblePoints3D);
+          else this.pending.set(id, img.numVisiblePoints3D);
         }
         if (!any) break;
       }
