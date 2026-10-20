@@ -161,6 +161,7 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u
  */
 export function rasterForwardWGSL(cfg: SplatShaderConfig): string {
   const geo = !!cfg.geometry;
+  const nrm = cfg.geometry === true;
   return /* wgsl */ `
 ${constantsWGSL(cfg)}
 ${FRAME_WGSL}
@@ -170,8 +171,8 @@ ${FRAME_WGSL}
 @group(0) @binding(3) var<storage, read> proj: array<vec4f>;
 @group(0) @binding(4) var<storage, read_write> outColor: array<vec4f>;
 @group(0) @binding(5) var<storage, read_write> outN: array<u32>;
-${geo ? `@group(0) @binding(6) var<storage, read_write> geo: array<vec4f>;
-var<workgroup> sD: array<vec2f, 256>;` : ''}
+${geo ? '@group(0) @binding(6) var<storage, read_write> geo: array<vec4f>;' : ''}
+${nrm ? 'var<workgroup> sD: array<vec2f, 256>;' : ''}
 var<workgroup> sA: array<vec4f, 256>;
 var<workgroup> sB: array<vec4f, 256>;
 var<workgroup> sC: array<vec4f, 256>;
@@ -209,7 +210,7 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec
       let g = isectVals[idx];
       sA[li] = proj[PS * g];
       sB[li] = proj[PS * g + 1u];
-      ${geo ? `let nrm = proj[4u * g + 3u].xyz;
+      ${nrm ? `let nrm = proj[4u * g + 3u].xyz;
       sC[li] = vec4f(proj[4u * g + 2u].xyz, nrm.x);
       sD[li] = nrm.yz;` : 'sC[li] = proj[PS * g + 2u];'}
     }
@@ -230,7 +231,7 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec
           break;
         }
         C += sC[k].xyz * (alpha * T);
-        ${geo ? 'Gd += (alpha * T) * vec4f(1.0 / s.z, sC[k].w, sD[k]);' : ''}
+        ${nrm ? 'Gd += (alpha * T) * vec4f(1.0 / s.z, sC[k].w, sD[k]);' : geo ? 'Gd.x += alpha * T / s.z;' : ''}
         T = Tn;
         last = b + k + 1u;
       }
@@ -273,6 +274,7 @@ export function rasterBackwardWGSL(cfg: SplatShaderConfig, groups = 2, perStep =
   const Q = perStep;
   const RING = 64 * Q;
   const geo = !!cfg.geometry;
+  const nrm = cfg.geometry === true;
   const NA = grad2dStride(cfg);
   const qs = Array.from({ length: Q }, (_, q) => q);
   const accDecl = qs.map((q) => `  var acc${q}: array<f32, ${NA}>;\n  for (var c = 0u; c < ${NA}u; c++) { acc${q}[c] = 0.0; }`).join('\n');
@@ -292,14 +294,17 @@ export function rasterBackwardWGSL(cfg: SplatShaderConfig, groups = 2, perStep =
                 let alpha = min(ALPHA_MAX, a0);
                 let w = alpha * T;
                 ${
-                  geo
+                  nrm
                     ? `let rc = ringC[slot];
                 let gc = dot(gp.xyz, rc.xyz) + gp.w + gG.x / sa.z + dot(gG.yzw, vec3f(rc.w, ringD[slot]));
                 acc${q}[9] += w * gG.x;
                 acc${q}[10] += w * gG.y;
                 acc${q}[11] += w * gG.z;
                 acc${q}[12] += w * gG.w;`
-                    : 'let gc = dot(gp, ringC[slot].xyz);'
+                    : geo
+                      ? `let gc = dot(gp.xyz, ringC[slot].xyz) + gp.w + gG.x / sa.z;
+                acc${q}[9] += w * gG.x;`
+                      : 'let gc = dot(gp, ringC[slot].xyz);'
                 }
                 r = r - w * gc;
                 let dLda = T * gc - r / (1.0 - alpha);
@@ -337,8 +342,8 @@ const NT: u32 = ${NT}u;
 @group(0) @binding(6) var<storage, read> dLdC: array<vec4f>;
 @group(0) @binding(7) var<storage, read_write> grad2d: array<atomic<u32>>;
 ${geo ? `@group(0) @binding(8) var<storage, read> geo: array<vec4f>;
-var<workgroup> pixGG: array<vec4f, ${NT}>;
-var<workgroup> ringD: array<vec2f, ${RING}>;` : ''}
+var<workgroup> pixGG: array<vec4f, ${NT}>;` : ''}
+${nrm ? `var<workgroup> ringD: array<vec2f, ${RING}>;` : ''}
 var<workgroup> pixT: array<f32, ${NT}>;
 var<workgroup> pixR: array<f32, ${NT}>;
 var<workgroup> pixN: array<u32, ${NT}>;
@@ -401,7 +406,7 @@ ${accDecl}
         let gid = isectVals[start + i];
         ringA[slot] = proj[PS * gid];
         ringB[slot] = proj[PS * gid + 1u];
-        ${geo ? `let nrm = proj[4u * gid + 3u].xyz;
+        ${nrm ? `let nrm = proj[4u * gid + 3u].xyz;
         ringC[slot] = vec4f(proj[4u * gid + 2u].xyz, nrm.x);
         ringD[slot] = nrm.yz;` : 'ringC[slot] = proj[PS * gid + 2u];'}
         ringId[slot] = gid;

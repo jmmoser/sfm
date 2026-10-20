@@ -137,6 +137,33 @@ describe('SplatTrainer geometry channels (GPU) vs CPU reference', () => {
     });
   }
 
+  it('depth-only kernels (normal weights 0): inverse depth and gradients match, 10 accumulators', async () => {
+    const m = randomScene({ count: 300, seed: 135 });
+    const cam = testCamera(120, 100);
+    const t = await trainer(m, [viewOf(cam)], { geometry: { normal: [0, 0] } });
+    const rng = new Rng(29);
+    const px = cam.width * cam.height;
+    const w = new Float32Array(3 * px).map(() => rng.uniform(-1, 1));
+    const wG = new Float32Array(4 * px).map((_, i) => (i % 4 === 0 ? 3 * rng.uniform(-1, 1) : 0));
+    const wA = new Float32Array(px).map(() => rng.uniform(-1, 1));
+    const g = await t.debugGradients(cam, w, wG, wA);
+    const c = backwardCPU(m, cam, w, { geometry: true }, undefined, wG, wA);
+    expect(g.grad2d.length).toBe(10 * m.count);
+    const cpu2d = new Float64Array(10 * m.count);
+    for (let i = 0; i < m.count; i++) cpu2d.set(c.grad2d.g.subarray(13 * i, 13 * i + 10), 10 * i);
+    const invD = (a: ArrayLike<number>): Float64Array => Float64Array.from({ length: px }, (_, i) => a[4 * i]);
+    const e = {
+      invDepth: relErr(invD(g.geo!), invD(c.fwd.geo!)),
+      grad2d: relErr(g.grad2d, cpu2d),
+      means: relErr(g.grads.means, c.grads.means),
+      quats: relErr(g.grads.quats, c.grads.quats),
+      opacities: relErr(g.grads.opacities, c.grads.opacities),
+    };
+    console.log('[splat] depth-only parity', JSON.stringify(e));
+    for (const v of Object.values(e)) expect(v).toBeLessThan(2e-3);
+    for (let i = 0; i < px; i++) expect(g.geo![4 * i + 1]).toBe(0);
+  });
+
   it('geometry loss kernel matches the CPU reference (levels 1, 2, 4)', async () => {
     const m = randomScene({ count: 250, seed: 141, opacity: [0.6, 0.95] });
     const cam = testCamera(96, 80);
@@ -242,7 +269,7 @@ describe('SplatTrainer geometry channels (GPU) vs CPU reference', () => {
     expect(on.loss).toBeLessThan(0.1);
   });
 
-  it('geometry losses that end early (`until`) switch to the plain kernels of the same layout', async () => {
+  for (const normal of [[0.1, 0.01], [0, 0]] as [number, number][]) it(`geometry losses that end early (\`until\`) switch to the plain kernels of the same layout${normal[0] ? '' : ' (depth only)'}`, async () => {
     const gt = randomScene({ count: 150, seed: 171, opacity: [0.5, 0.9] });
     const W = 48;
     const H = 40;
@@ -263,7 +290,7 @@ describe('SplatTrainer geometry channels (GPU) vs CPU reference', () => {
       }
       views.push({ ...viewOf(cam, img, k), map } as SplatTrainingView & { map: DepthMapLike });
     }
-    const t = await trainer(gt, views, { iterations: 100, resolution: [], mcmc: { start: 20, stop: 60, refineEvery: 20 }, geometry: { until: 0.5 } });
+    const t = await trainer(gt, views, { iterations: 100, resolution: [], mcmc: { start: 20, stop: 60, refineEvery: 20 }, geometry: { until: 0.5, normal } });
     views.forEach((v, k) => t.setViewDepth(k, packDepthTarget((v as unknown as { map: DepthMapLike }).map, { f: 50, cx: 23.5, cy: 19.5 }, { width: W, height: H, f: 50, cx: 23.5, cy: 19.5 })));
     await t.step(40);
     expect(t.geometryActive).toBe(true);

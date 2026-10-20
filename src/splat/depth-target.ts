@@ -44,6 +44,11 @@ export interface DepthTargetOptions {
   weight?: (cost: number) => number;
   /** Cost at which the default weight reaches 0 (default 1). */
   costMax?: number;
+  /**
+   * Viewing-angle weighting: the weight is multiplied by |cos θ|^grazing, θ = angle between the
+   * target normal and the pixel's ray (surfaces seen at grazing angles count less). Default 0 (off).
+   */
+  grazing?: number;
 }
 
 /** Octahedral encoding of a unit vector → [−1, 1]². */
@@ -81,6 +86,7 @@ export function packDepthTarget(map: DepthMapLike, mapCam: Pick<CameraIntrinsics
   const factor = Math.max(1, Math.round(o.factor ?? 2));
   const costMax = o.costMax ?? 1;
   const weightOf = o.weight ?? ((c: number) => Math.max(0, Math.min(1, (costMax - c) / costMax)));
+  const grazing = Math.max(0, o.grazing ?? 0);
   const W = Math.max(1, Math.floor(viewCam.width / factor));
   const H = Math.max(1, Math.floor(viewCam.height / factor));
   // target pixel (i, j) = full-resolution block [factor·i, factor·i + factor): its centre
@@ -99,12 +105,19 @@ export function packDepthTarget(map: DepthMapLike, mapCam: Pick<CameraIntrinsics
       const p = v * map.width + u;
       const z = map.depth[p];
       if (!(z > 0) || !Number.isFinite(z)) continue;
-      const w = weightOf(map.cost[p]);
+      let w = weightOf(map.cost[p]);
       if (!(w > 0)) continue;
       const nx = map.normal[3 * p];
       const ny = map.normal[3 * p + 1];
       const nz = map.normal[3 * p + 2];
       if (!(nx * nx + ny * ny + nz * nz > 0.25)) continue;
+      if (grazing > 0) {
+        const rx = (i - cx) / f;
+        const ry = (j - cy) / f;
+        const cos = Math.abs(nx * rx + ny * ry + nz) / (Math.hypot(rx, ry, 1) * Math.hypot(nx, ny, nz));
+        w *= Math.pow(cos, grazing);
+        if (!(w >= 1e-3)) continue;
+      }
       const [ou, ov] = octEncode(nx, ny, nz);
       const t = j * W + i;
       data[2 * t] = (float32ToFloat16Bits(1 / z) | (float32ToFloat16Bits(Math.min(1, w)) << 16)) >>> 0;

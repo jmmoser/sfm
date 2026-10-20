@@ -11,7 +11,9 @@
  *   # then any number of variants (trainer overrides = SplatTrainerOptions fields)
  *   E2E_GPU=host node e2e/splat-replay.mjs e2e/out/e2e/object-real-gr-base \
  *     --variant base='{}' --variant geo='{"geometry":{"depth":[0.5,0.05]}}' \
- *     [--tests held,sim3,object-real-up12,…] [--out DIR] [--skip-nvs] [--repeat N]
+ *     [--tests held,sim3,object-real-up12,…] [--out DIR] [--skip-nvs] [--nvs-only] [--repeat N]
+ *   (--nvs-only: no training; scores the variants' existing splats.ply on the tests missing from
+ *   summary.json — resumes an interrupted run)
  *
  * Writes <out>/<variant>/{result.json (copied from the run), splats.ply, replay.json,
  * nvs-<test>/nvs.json} and <out>/summary.json; prints a table of full-frame PSNR per test set and
@@ -45,6 +47,7 @@ function parse(argv) {
     } else if (a === '--tests') o.tests = next().split(',').filter(Boolean);
     else if (a === '--out') o.out = next();
     else if (a === '--skip-nvs') o.skipNvs = true;
+    else if (a === '--nvs-only') o.nvsOnly = true;
     else if (a === '--no-ssim') o.ssim = false;
     else if (a === '--repeat') o.repeat = Math.max(1, Number(next()) | 0);
     else if (a === '--verbose') o.verbose = true;
@@ -76,11 +79,11 @@ await mkdir(outRoot, { recursive: true });
 console.log(`[replay] ${dataset} (${mode}, ${quality}) from ${runDir}; variants ${o.variants.map((v) => v.name).join(', ')}; tests ${tests.join(', ')} → ${outRoot}`);
 
 const summary = (await exists(join(outRoot, 'summary.json'))) ? JSON.parse(await readFile(join(outRoot, 'summary.json'), 'utf8')) : {};
-const browser = await startHarnessBrowser({ root: ROOT, verbose: o.verbose });
+const browser = o.nvsOnly ? null : await startHarnessBrowser({ root: ROOT, verbose: o.verbose });
 let page = null;
 let closePage = null;
 try {
-  for (const v of o.variants) {
+  for (const v of browser ? o.variants : []) {
     for (let rep = 0; rep < o.repeat; rep++) {
       const name = o.repeat > 1 ? `${v.name}-r${rep + 1}` : v.name;
       const vdir = join(outRoot, name);
@@ -100,13 +103,23 @@ try {
       }
       console.log(`[replay] === ${name}: trainer ${JSON.stringify(v.trainer)}`);
       const t0 = Date.now();
-      const r = await page.evaluate((c) => window.replaySplat(c), {
-        dump: `/${relRun}/session/`,
-        quality,
-        mode,
-        splatConfig: { trainer: v.trainer },
-        outPrefix: `${name}/`,
-      });
+      // a browser killed mid-run leaves page.evaluate pending: time out, reopen and retry once
+      let r = null;
+      for (let attempt = 0; attempt < 2 && !r; attempt++) {
+        let timer;
+        r = await Promise.race([
+          page.evaluate((c) => window.replaySplat(c), { dump: `/${relRun}/session/`, quality, mode, splatConfig: { trainer: v.trainer }, outPrefix: `${name}/` }),
+          new Promise((res) => (timer = setTimeout(() => res(null), 900_000))),
+        ]).finally(() => clearTimeout(timer));
+        if (!r) {
+          console.log(`[replay] ${name}: splat stage timed out${attempt ? '' : ', retrying in a new page'}`);
+          await closePage?.().catch(() => {});
+          const p = await browser.openPage({ outDir: outRoot, onLog: (m) => (o.verbose ? console.log(`[replay:page] ${m}`) : undefined) });
+          page = p.page;
+          closePage = p.close;
+        }
+      }
+      if (!r) throw new Error(`${name}: splat stage failed twice`);
       const st = r.stats;
       console.log(
         `[replay] ${name}: ${r.count} Gaussians, ${r.iterations} it, stage ${(r.ms / 1000).toFixed(1)} s (prepare ${(st.splatPrepareMs / 1000).toFixed(1)} s, train ${(st.splatTrainMs / 1000).toFixed(1)} s at ${st.splatItPerSec} it/s), loss ${st.splatLoss}` +
@@ -122,7 +135,7 @@ try {
   }
 } finally {
   if (closePage) await closePage();
-  await browser.close();
+  await browser?.close();
 }
 
 if (!o.skipNvs) {
@@ -130,12 +143,24 @@ if (!o.skipNvs) {
     for (let rep = 0; rep < o.repeat; rep++) {
       const name = o.repeat > 1 ? `${v.name}-r${rep + 1}` : v.name;
       const vdir = join(outRoot, name);
+      if (!summary[name]) continue;
       for (const t of tests) {
+        if (o.nvsOnly && summary[name].nvs?.[t]) continue;
         const args = [join(ROOT, 'e2e', 'data', dataset), vdir, '--renderers', 'splat'];
         if (!o.ssim) args.push('--no-ssim');
         if (t === 'sim3') args.push('--pose', 'sim3', '--out', join(vdir, 'nvs-sim3'));
         else if (t !== 'held') args.push('--test-dataset', t);
-        const res = await runNvs(parseNvsArgs(args), { log: (m) => (o.verbose ? console.log(`[nvs] ${m}`) : undefined) });
+        // a browser that dies mid-run leaves page.evaluate pending forever: time out and retry once
+        let res = null;
+        for (let attempt = 0; attempt < 3 && !res; attempt++) {
+          let timer;
+          res = await Promise.race([
+            runNvs(parseNvsArgs(args), { log: (m) => (o.verbose ? console.log(`[nvs] ${m}`) : undefined) }),
+            new Promise((r) => (timer = setTimeout(() => r(null), 150_000))),
+          ]).finally(() => clearTimeout(timer));
+          if (!res) console.log(`[replay] ${name} ${t}: nvs timed out${attempt ? '' : ', retrying'}`);
+        }
+        if (!res) continue;
         const s = res.summary.splat;
         summary[name].nvs[t] = { psnr: s.full.psnr.mean, ssim: s.full.ssim?.mean ?? null, ccPsnr: s.cc.full.psnr.mean, coverage: s.coverage.mean, distM: res.distance.distM?.mean ?? null };
         console.log(`[replay] ${name} ${t}: full PSNR ${f2(s.full.psnr.mean)} SSIM ${f2(s.full.ssim?.mean, 3)} cc ${f2(s.cc.full.psnr.mean)} (${res.timing.totalS} s)`);

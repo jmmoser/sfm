@@ -32,7 +32,7 @@ struct Opt {
 }
 `;
 
-const gradMath = (geo: boolean): string => /* wgsl */ `
+const gradMath = (geo: boolean, nrm: boolean): string => /* wgsl */ `
 struct PGrad {
   mean: vec3f,
   scale: vec3f,
@@ -144,7 +144,7 @@ fn projBackward(i: u32, g2: array<f32, G2D>) -> PGrad {
   o.scale = ds * s;
   var G = mat3x3f(dM[0] * s.x, dM[1] * s.y, dM[2] * s.z); // ∂L/∂Rq, G[c][r]
   ${
-    geo
+    nrm
       ? `{
     // n = ±Wr · Rq[k] (smallest-scale axis, facing the camera): ∂L/∂Rq[k] += ±Wrᵀ ∂L/∂n
     let k = minAxis(loadScale(i));
@@ -205,7 +205,7 @@ ${
 }
 ${PARAMS_WGSL}
 ${ROT_WGSL}
-${gradMath(!!cfg.geometry)}
+${gradMath(!!cfg.geometry, cfg.geometry === true)}
 ${adam ? ADAM_FNS : ''}
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3u) {

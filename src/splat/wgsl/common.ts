@@ -23,9 +23,10 @@ export interface SplatShaderConfig {
    * Geometry channels (the trainer's depth / normal supervision, ../cpu-reference.ts): the
    * projection also stores the camera-frame normal (proj stride 4 instead of 3), the rasteriser
    * renders Σ w·(1/z, n) next to the colour, and the backward carries 13 gradients per Gaussian
-   * instead of 9. Default false.
+   * instead of 9. 'depth': the inverse-depth channel only (no normals: proj stride 3, 10
+   * gradients per Gaussian; the normal channels of the geometry buffer stay 0). Default false.
    */
-  geometry?: boolean;
+  geometry?: boolean | 'depth';
   /**
    * Proj stride 4 without the geometry channels: the trainer's kernels after its geometry losses
    * end (`SplatGeometryOptions.until`) keep the geometry run's buffer layout. Default false.
@@ -35,17 +36,17 @@ export interface SplatShaderConfig {
 
 /** vec4 rows of `proj` per Gaussian. */
 export function projStride(cfg: Pick<SplatShaderConfig, 'geometry' | 'wideProj'>): 3 | 4 {
-  return cfg.geometry || cfg.wideProj ? 4 : 3;
+  return cfg.geometry === true || cfg.wideProj ? 4 : 3;
 }
 
 /** 2-D gradient accumulators per Gaussian (wgsl/raster.ts backward → wgsl/backward.ts). */
-export function grad2dStride(cfg: Pick<SplatShaderConfig, 'geometry'>): 9 | 13 {
-  return cfg.geometry ? 13 : 9;
+export function grad2dStride(cfg: Pick<SplatShaderConfig, 'geometry'>): 9 | 10 | 13 {
+  return cfg.geometry === true ? 13 : cfg.geometry === 'depth' ? 10 : 9;
 }
 
 /** Pipeline-cache key of a shader configuration. */
 export function shaderKey(cfg: SplatShaderConfig): string {
-  return `${cfg.shDegree}-${cfg.antialiased}${cfg.geometry ? '-geo' : cfg.wideProj ? '-wide' : ''}`;
+  return `${cfg.shDegree}-${cfg.antialiased}${cfg.geometry === true ? '-geo' : cfg.geometry === 'depth' ? '-geodepth' : cfg.wideProj ? '-wide' : ''}`;
 }
 
 /** Byte size of the Frame uniform (must match the struct below). */
@@ -69,7 +70,7 @@ const BLUR_EPS: f32 = ${f(BLUR_EPS)};
 const SH_K: u32 = ${K}u;
 const SH_N: u32 = ${3 * K}u;
 const ANTIALIASED: bool = ${cfg.antialiased};
-const GEOMETRY: bool = ${!!cfg.geometry};
+const GEOMETRY: bool = ${cfg.geometry === true};
 const PS: u32 = ${projStride(cfg)}u;
 const G2D: u32 = ${grad2dStride(cfg)}u;
 `;

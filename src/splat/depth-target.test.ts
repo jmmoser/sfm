@@ -66,6 +66,30 @@ describe('splat depth targets', () => {
     expect(t.valid).toBe(checked);
   });
 
+  it('grazing weighting: weight × |cos θ|^p between the target normal and the ray', () => {
+    const W = 20;
+    const H = 10;
+    const map = randomMap(W, H, 7);
+    const cam = { width: W, height: H, f: 15, cx: 9.5, cy: 4.5 };
+    const a = packDepthTarget(map, cam, cam, { factor: 1 });
+    const b = packDepthTarget(map, cam, cam, { factor: 1, grazing: 2 });
+    let n = 0;
+    for (let j = 0; j < H; j++)
+      for (let i = 0; i < W; i++) {
+        const t = j * W + i;
+        const pa = unpackTargetPixel(a.data, t);
+        const pb = unpackTargetPixel(b.data, t);
+        if (!(pa.w > 0)) continue;
+        const r = [(i - 9.5) / 15, (j - 4.5) / 15, 1];
+        const cos = Math.abs(pa.n[0] * r[0] + pa.n[1] * r[1] + pa.n[2] * r[2]) / Math.hypot(r[0], r[1], r[2]);
+        const want = pa.w * cos * cos;
+        if (want < 2e-3) continue;
+        expect(Math.abs(pb.w - want)).toBeLessThan(2e-3 * Math.max(1, want) + 1e-3);
+        n++;
+      }
+    expect(n).toBeGreaterThan(50);
+  });
+
   it('resamples between cameras of different sizes along the rays', () => {
     // depth map of a 2× larger camera of the same pinhole (dense size 80×60 vs view 40×30)
     const big = { width: 80, height: 60, f: 100, cx: 39.5, cy: 29.5 };

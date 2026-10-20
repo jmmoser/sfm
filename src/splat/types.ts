@@ -142,7 +142,7 @@ export interface SplatMemoryInput {
    * downscale (8 B per target pixel); also the 4th projection row, 4 more 2-D gradients per
    * Gaussian and 32 B per pixel of geometry channels.
    */
-  geometry?: { views: number; factor: number };
+  geometry?: { views: number; factor: number; normals?: boolean };
 }
 
 export interface SplatMemoryEstimate {
@@ -174,8 +174,8 @@ export function estimateSplatMemory(m: SplatMemoryInput): SplatMemoryEstimate {
   const breakdown: Record<string, number> = {
     params: N * P,
     adam: 2 * N * P,
-    grad2d: N * (g ? 52 : 36),
-    projection: N * ((g ? 64 : 48) + 8 + 4 + 4 * 4 + 4),
+    grad2d: N * (g ? (g.normals === false ? 40 : 52) : 36),
+    projection: N * ((g && g.normals !== false ? 64 : 48) + 8 + 4 + 4 * 4 + 4),
     intersections: isect * 16,
     sortScratch: Math.ceil(isect / 1024) * 16 * 4 + 4096 * 4,
     pixels: px * (16 + 4 + 16 + 48 + 4 + (g ? 32 : 0)) + tiles * (g ? 24 : 8),

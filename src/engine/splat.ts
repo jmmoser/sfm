@@ -371,7 +371,7 @@ export async function runSplat(deps: SplatDeps, opts: SplatOptions = {}, progres
         deps.log('warn', `splat: depth map ${id} is ${map.width}×${map.height}, its dense camera ${mapCam.width}×${mapCam.height}: skipped`);
         continue;
       }
-      t.setViewDepth(i, packDepthTarget(map, mapCam, undistortedCamera(camOf(id), size), { factor: geoOpt!.factor }));
+      t.setViewDepth(i, packDepthTarget(map, mapCam, undistortedCamera(camOf(id), size), { factor: geoOpt!.factor, grazing: geoOpt!.grazing }));
       n++;
       if (n % 4 === 0) await tick();
     }

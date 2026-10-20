@@ -154,9 +154,25 @@ export interface SplatGeometryOptions {
   until: number;
   /** Targets at 1/factor of the training-view size (default 2; memory 8 B per target pixel). */
   factor: number;
+  /**
+   * Target weight × |cos θ|^grazing (θ: target normal vs the pixel's ray; depth-target.ts), so
+   * surfaces the view sees at grazing angles are supervised less. Default 0 (off). Applied when
+   * the engine builds the targets.
+   */
+  grazing: number;
 }
 
-export const DEFAULT_SPLAT_GEOMETRY: SplatGeometryOptions = { depth: [0.5, 0.05], normal: [0.1, 0.01], until: 1, factor: 2 };
+export const DEFAULT_SPLAT_GEOMETRY: SplatGeometryOptions = { depth: [0.5, 0.05], normal: [0.1, 0.01], until: 1, factor: 2, grazing: 0 };
+
+/**
+ * Shader configuration of a geometry option: full channels (inverse depth + normal), 'depth' when
+ * both normal weights are 0 (cheaper kernels), false without geometry.
+ */
+export function geometryMode(g: Partial<SplatGeometryOptions> | false | undefined | null): boolean | 'depth' {
+  if (!g) return false;
+  const n = g.normal ?? DEFAULT_SPLAT_GEOMETRY.normal;
+  return n[0] > 0 || n[1] > 0 ? true : 'depth';
+}
 
 export interface SplatTrainerOptions {
   /** Hard cap on the number of Gaussians (memory plan). */
@@ -401,7 +417,7 @@ export class SplatTrainer {
    */
   static async create(ctx: Pick<GPUContext, 'device'>, opts: SplatTrainerOptions): Promise<SplatTrainer> {
     const device = ctx.device;
-    const cfg: SplatShaderConfig = { shDegree: opts.shDegree ?? 0, antialiased: opts.antialiased ?? true, geometry: !!opts.geometry };
+    const cfg: SplatShaderConfig = { shDegree: opts.shDegree ?? 0, antialiased: opts.antialiased ?? true, geometry: geometryMode(opts.geometry) };
     let perDevice = pipelineCache.get(device);
     if (!perDevice) pipelineCache.set(device, (perDevice = new Map()));
     const key = shaderKey(cfg);
@@ -418,7 +434,7 @@ export class SplatTrainer {
       let post = perDevice.get(wideKey);
       if (!post) {
         const geoPipes = await pipes;
-        post = compilePostGeometryPipelines(device, { ...cfg, geometry: false, wideProj: true }, geoPipes);
+        post = compilePostGeometryPipelines(device, { ...cfg, geometry: false, wideProj: cfg.geometry === true }, geoPipes);
         perDevice.set(wideKey, post);
         post.catch(() => perDevice!.delete(wideKey));
       }
@@ -436,7 +452,8 @@ export class SplatTrainer {
     views: number,
     depthViews = views,
   ): SplatMemoryEstimate {
-    const geometry = opts.geometry ? { views: depthViews, factor: opts.geometry.factor ?? DEFAULT_SPLAT_GEOMETRY.factor } : undefined;
+    const mode = geometryMode(opts.geometry);
+    const geometry = mode ? { views: depthViews, factor: (opts.geometry && opts.geometry.factor) || DEFAULT_SPLAT_GEOMETRY.factor, normals: mode === true } : undefined;
     return estimateSplatMemory({ maxGaussians: opts.maxGaussians, shDegree: opts.shDegree ?? 0, width, height, views, intersectionsPerGaussian: opts.intersectionsPerGaussian, geometry });
   }
 
@@ -450,7 +467,7 @@ export class SplatTrainer {
       height: h,
       views: this.views.length,
       intersectionsPerGaussian: this.fwd ? this.fwd.isectCapacity / this.capacity : this.opts.intersectionsPerGaussian,
-      geometry: this.geo ? { views: this.depthTargets.filter((t) => t).length, factor: this.geo.factor } : undefined,
+      geometry: this.geo ? { views: this.depthTargets.filter((t) => t).length, factor: this.geo.factor, normals: geometryMode(this.geo) === true } : undefined,
     });
   }
 
@@ -484,7 +501,7 @@ export class SplatTrainer {
     this.params = makeBuffer(d, layout.total * 4, 'splat-params');
     this.adamM = makeBuffer(d, layout.total * 4, 'splat-adam-m');
     this.adamV = makeBuffer(d, layout.total * 4, 'splat-adam-v');
-    this.grad2d = makeBuffer(d, cap * grad2dStride({ geometry: !!this.geo }) * 4, 'splat-grad2d');
+    this.grad2d = makeBuffer(d, cap * grad2dStride(P.fwd.cfg) * 4, 'splat-grad2d');
     d.queue.writeBuffer(this.params, 0, packParams({ ...model, count: n }, cap));
     this.views = views.map((v) => ({ cam: splatCamera(v.cam, v.pose), width: v.cam.width, height: v.cam.height }));
     const maxW = Math.max(...views.map((v) => v.cam.width));
