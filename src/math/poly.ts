@@ -664,9 +664,9 @@ export function polyRealRootsSturm(c: ArrayLike<number>, lo = -Infinity, hi = In
   if (!pr) return roots;
   const { deg, ya, yb } = pr;
   if (deg <= 2) return polyRealRoots(c, lo, hi);
-  // A root exactly at an end is not counted by (ya, yb], and at a multiple root every chain member
-  // vanishes, so the count there would be 0 (dropping or duplicating the other roots): record it and
-  // divide it out of q with all its multiplicity.
+  // A root exactly at ya is not counted by (ya, yb], and at a multiple root at either end every chain
+  // member vanishes, so the count there would be 0 (dropping or duplicating the other roots): record an
+  // end root and divide it out of q with all its multiplicity.
   let q = pr.q;
   const yRoots: number[] = [];
   for (const e of ya === yb ? [ya] : [ya, yb]) {
