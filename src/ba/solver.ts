@@ -1378,66 +1378,103 @@ const now = (): number => (typeof performance !== 'undefined' ? performance.now(
  * thrown by `onIteration`.
  */
 export function bundleAdjust(problem: BAProblem, options?: BAOptions): BAResult {
-  const t0 = now();
-  validateBAProblem(problem);
-  const opts = resolveBAOptions(options);
-  const eng = new BAEngine(problem, opts);
-  const init = eng.evaluate(false);
-  const nValid = eng.numValidObs;
-  const result: BAResult = {
-    success: false,
-    termination: 'invalid_initial_cost',
-    iterations: 0,
-    initialCost: init.cost,
-    finalCost: init.cost,
-    initialRmsPx: rmsOf(init.sqErr, nValid),
-    finalRmsPx: rmsOf(init.sqErr, nValid),
-    timeMs: 0,
-    successfulIterations: 0,
-    linearSolver: 'none',
-    numReducedParams: 0,
-    numFreePoints: 0,
-    pcgIterations: 0,
-    finalLambda: opts.initialLambda,
-  };
-  if (!(init.cost < Infinity)) {
-    result.timeMs = now() - t0;
-    return result;
-  }
-  if (opts.cancel?.cancelled) {
-    // (before the O(#obs) structure build: cancellation should be cheap)
-    result.success = true;
-    result.termination = 'cancelled';
-    result.timeMs = now() - t0;
-    return result;
-  }
-  eng.buildStructure();
-  result.numReducedParams = eng.nFree;
-  result.numFreePoints = eng.numFreePoints;
-  if (eng.numParams === 0) {
-    result.success = true;
-    result.termination = 'no_free_parameters';
-    result.timeMs = now() - t0;
-    return result;
-  }
-  result.linearSolver = eng.useDense ? 'dense_schur' : 'pcg_schur';
+  const ba = new BundleAdjuster(problem, options);
+  ba.run();
+  return ba.result;
+}
 
-  let cost = init.cost;
-  let sqErr = init.sqErr;
-  let lambda = Math.min(Math.max(opts.initialLambda, MIN_LAMBDA), MAX_LAMBDA);
-  let nu = 2;
-  let iter = 0;
-  let successful = 0;
-  let termination: BATermination = 'max_iterations';
-  let lastFailureLinear = false;
-  try {
-    eng.linearize();
-    if (eng.gradMaxAbs() <= opts.gradientTolerance) {
-      termination = 'gradient_tolerance';
-    } else {
-      let xNorm = eng.paramNorm();
-      for (;;) {
-        if (iter >= opts.maxIterations) {
+/**
+ * `bundleAdjust` in resumable form: `run(pause)` iterates until the solve ends or `pause()`
+ * (asked after every LM iteration) returns true, and the next `run` continues with the same
+ * solver state (structure of S, linearisation, damping λ and ν, iteration count, time limit
+ * counted from the construction). A caller can thus yield to the event loop between iterations
+ * without rebuilding the problem: the result is the one of a single uninterrupted `bundleAdjust`
+ * wherever the pauses fall. The problem is written back once, when the solve ends (also on an
+ * exception thrown by `onIteration`); while paused it still holds the input. `result` is final
+ * once `run` returned true.
+ */
+export class BundleAdjuster {
+  readonly result: BAResult;
+  private readonly opts: ResolvedBAOptions;
+  private readonly eng: BAEngine;
+  private readonly t0: number;
+  private phase: 'start' | 'iterating' | 'done' = 'start';
+  private cost: number;
+  private sqErr: number;
+  private lambda: number;
+  private nu = 2;
+  private iter = 0;
+  private successful = 0;
+  private lastFailureLinear = false;
+  private xNorm = 0;
+
+  constructor(problem: BAProblem, options?: BAOptions) {
+    this.t0 = now();
+    validateBAProblem(problem);
+    const opts = (this.opts = resolveBAOptions(options));
+    const eng = (this.eng = new BAEngine(problem, opts));
+    const init = eng.evaluate(false);
+    const nValid = eng.numValidObs;
+    this.cost = init.cost;
+    this.sqErr = init.sqErr;
+    this.lambda = Math.min(Math.max(opts.initialLambda, MIN_LAMBDA), MAX_LAMBDA);
+    this.result = {
+      success: false,
+      termination: 'invalid_initial_cost',
+      iterations: 0,
+      initialCost: init.cost,
+      finalCost: init.cost,
+      initialRmsPx: rmsOf(init.sqErr, nValid),
+      finalRmsPx: rmsOf(init.sqErr, nValid),
+      timeMs: 0,
+      successfulIterations: 0,
+      linearSolver: 'none',
+      numReducedParams: 0,
+      numFreePoints: 0,
+      pcgIterations: 0,
+      finalLambda: opts.initialLambda,
+    };
+    if (!(init.cost < Infinity)) this.end(null);
+  }
+
+  /** True once the solve has ended (`result` is final). */
+  get finished(): boolean {
+    return this.phase === 'done';
+  }
+
+  /** Iterate until the solve ends (→ true) or `pause()` returns true after an iteration (→ false). */
+  run(pause?: () => boolean): boolean {
+    if (this.phase === 'done') return true;
+    const eng = this.eng,
+      opts = this.opts,
+      result = this.result;
+    if (this.phase === 'start') {
+      if (opts.cancel?.cancelled) {
+        // (before the O(#obs) structure build: cancellation should be cheap)
+        result.success = true;
+        this.end('cancelled', false);
+        return true;
+      }
+      eng.buildStructure();
+      result.numReducedParams = eng.nFree;
+      result.numFreePoints = eng.numFreePoints;
+      if (eng.numParams === 0) {
+        result.success = true;
+        this.end('no_free_parameters', false);
+        return true;
+      }
+      result.linearSolver = eng.useDense ? 'dense_schur' : 'pcg_schur';
+    }
+    let termination: BATermination | null = null;
+    try {
+      if (this.phase === 'start') {
+        this.phase = 'iterating';
+        eng.linearize();
+        if (eng.gradMaxAbs() <= opts.gradientTolerance) termination = 'gradient_tolerance';
+        else this.xNorm = eng.paramNorm();
+      }
+      while (termination === null) {
+        if (this.iter >= opts.maxIterations) {
           termination = 'max_iterations';
           break;
         }
@@ -1445,76 +1482,95 @@ export function bundleAdjust(problem: BAProblem, options?: BAOptions): BAResult 
           termination = 'cancelled';
           break;
         }
-        if (now() - t0 > opts.timeLimitMs) {
+        if (now() - this.t0 > opts.timeLimitMs) {
           termination = 'time_limit';
           break;
         }
-        iter++;
+        this.iter++;
         let accepted = false;
         let stop: BATermination | null = null;
-        if (eng.solve(lambda)) {
-          lastFailureLinear = false;
+        if (eng.solve(this.lambda)) {
+          this.lastFailureLinear = false;
           // A step below the parameter tolerance ends the run, but it is still taken when it
           // decreases the cost (one extra evaluation; Ceres would discard it).
-          const smallStep = eng.stepNorm() <= opts.parameterTolerance * (xNorm + opts.parameterTolerance);
+          const smallStep = eng.stepNorm() <= opts.parameterTolerance * (this.xNorm + opts.parameterTolerance);
           const dm = eng.modelDecrease();
           if (dm > 0 && dm < Infinity) {
             eng.applyStep();
             const cand = eng.evaluate(true);
-            const actual = cost - cand.cost;
+            const actual = this.cost - cand.cost;
             const rho = actual / dm;
             if (cand.cost < Infinity && rho > MIN_RELATIVE_DECREASE) {
               eng.accept();
-              const prev = cost;
-              cost = cand.cost;
-              sqErr = cand.sqErr;
-              successful++;
+              const prev = this.cost;
+              this.cost = cand.cost;
+              this.sqErr = cand.sqErr;
+              this.successful++;
               accepted = true;
               const tmp = 2 * rho - 1;
-              lambda *= Math.max(1 / 3, 1 - tmp * tmp * tmp);
-              if (lambda < MIN_LAMBDA) lambda = MIN_LAMBDA;
-              nu = 2;
+              this.lambda *= Math.max(1 / 3, 1 - tmp * tmp * tmp);
+              if (this.lambda < MIN_LAMBDA) this.lambda = MIN_LAMBDA;
+              this.nu = 2;
               if (smallStep) {
                 stop = 'parameter_tolerance';
               } else if (actual <= opts.functionTolerance * prev) {
                 stop = 'function_tolerance';
-              } else if (iter < opts.maxIterations) {
+              } else if (this.iter < opts.maxIterations) {
                 // (skipped after the last allowed iteration: nothing would use it)
                 eng.linearize();
-                xNorm = eng.paramNorm();
+                this.xNorm = eng.paramNorm();
                 if (eng.gradMaxAbs() <= opts.gradientTolerance) stop = 'gradient_tolerance';
               }
             }
           }
           if (smallStep) stop = 'parameter_tolerance';
         } else {
-          lastFailureLinear = true;
+          this.lastFailureLinear = true;
         }
         if (!accepted && stop === null) {
-          lambda *= nu;
-          nu *= 2;
-          if (lambda > MAX_LAMBDA) stop = lastFailureLinear ? 'linear_solver_failure' : 'min_trust_region_radius';
+          this.lambda *= this.nu;
+          this.nu *= 2;
+          if (this.lambda > MAX_LAMBDA) stop = this.lastFailureLinear ? 'linear_solver_failure' : 'min_trust_region_radius';
         }
-        opts.onIteration?.(iter, cost);
+        opts.onIteration?.(this.iter, this.cost);
         if (stop !== null) {
           termination = stop;
           break;
         }
+        if (pause?.()) return false;
+      }
+    } catch (e) {
+      this.end(termination ?? 'max_iterations');
+      throw e;
+    }
+    this.end(termination);
+    return true;
+  }
+
+  /**
+   * End the solve. `iterated`: the LM loop ran, so the best state is written back and the
+   * iteration counters are reported; otherwise (invalid input, cancelled before the structure was
+   * built, nothing free) the problem is left untouched.
+   */
+  private end(termination: BATermination | null, iterated = true): void {
+    if (this.phase === 'done') return;
+    const result = this.result;
+    if (termination !== null) {
+      result.termination = termination;
+      if (iterated) {
+        this.eng.writeBack();
+        result.success = termination !== 'linear_solver_failure' && this.cost < Infinity;
+        result.iterations = this.iter;
+        result.successfulIterations = this.successful;
+        result.finalCost = this.cost;
+        result.finalRmsPx = rmsOf(this.sqErr, this.eng.numValidObs);
+        result.pcgIterations = this.eng.pcgIterations;
+        result.finalLambda = this.lambda;
       }
     }
-  } finally {
-    eng.writeBack();
+    result.timeMs = now() - this.t0;
+    this.phase = 'done';
   }
-  result.success = termination !== 'linear_solver_failure' && cost < Infinity;
-  result.termination = termination;
-  result.iterations = iter;
-  result.successfulIterations = successful;
-  result.finalCost = cost;
-  result.finalRmsPx = rmsOf(sqErr, nValid);
-  result.pcgIterations = eng.pcgIterations;
-  result.finalLambda = lambda;
-  result.timeMs = now() - t0;
-  return result;
 }
 
 /**

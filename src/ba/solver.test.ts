@@ -3,7 +3,7 @@ import { mat3Mul, mat3MulTranspose } from '../math/mat3';
 import { Rng } from '../math/random';
 import { rotationAngleBetween, rotvecToMat3 } from '../math/rotation';
 import type { BALossType, BAProblem } from './problem';
-import { bundleAdjust, computeBAGradient, evaluateBACost, reprojectionErrors } from './solver';
+import { bundleAdjust, BundleAdjuster, computeBAGradient, evaluateBACost, reprojectionErrors } from './solver';
 import {
   cloneBAProblem,
   fixGaugeTwoPoses,
@@ -681,6 +681,52 @@ describe('bundleAdjust: termination and edge cases', () => {
     bad2.relRotationPriors = [{ i: 1, j: 1, R_ji: rotvecToMat3([0, 0, 0]), sigma: 1 }];
     expect(() => bundleAdjust(bad2)).toThrow(RangeError);
     expect(() => bundleAdjust(s.problem, { loss: 'tukey' as BALossType })).toThrow(RangeError);
+  });
+
+  it('BundleAdjuster: pausing after every iteration gives the uninterrupted solve bit for bit', () => {
+    for (const linearSolver of ['dense_schur', 'pcg_schur'] as const) {
+      const s = richProblem(11);
+      const a = cloneBAProblem(s.problem),
+        b = cloneBAProblem(s.problem);
+      const opts = { loss: 'cauchy' as BALossType, maxIterations: 30, linearSolver };
+      const ra = bundleAdjust(a, opts);
+      const ba = new BundleAdjuster(b, opts);
+      const input = Array.from(b.points);
+      let runs = 0;
+      while (!ba.run(() => true)) {
+        runs++;
+        // paused: the problem still holds the input
+        expect(Array.from(b.points)).toEqual(input);
+        expect(ba.finished).toBe(false);
+      }
+      expect(ba.finished).toBe(true);
+      // (a stop inside the last iteration ends that run; the iteration cap is noticed by the next one)
+      expect(runs).toBe(ra.termination === 'max_iterations' ? ra.iterations : ra.iterations - 1);
+      expect(ba.run()).toBe(true);
+      const rb = ba.result;
+      expect(rb.iterations).toBe(ra.iterations);
+      expect(rb.termination).toBe(ra.termination);
+      expect(rb.finalCost).toBe(ra.finalCost);
+      expect(rb.finalLambda).toBe(ra.finalLambda);
+      expect(Array.from(b.points)).toEqual(Array.from(a.points));
+      for (let i = 0; i < a.poses.length; i++) {
+        expect(Array.from(b.poses[i].R)).toEqual(Array.from(a.poses[i].R));
+        expect(Array.from(b.poses[i].t)).toEqual(Array.from(a.poses[i].t));
+      }
+      expect(b.cameras).toEqual(a.cameras);
+    }
+    // cancelled while paused: ends at the next run with the best state written back
+    const s = small();
+    const tok = { cancelled: false };
+    const ba = new BundleAdjuster(s.problem, { cancel: tok });
+    expect(ba.run(() => true)).toBe(false);
+    expect(ba.run(() => true)).toBe(false);
+    tok.cancelled = true;
+    expect(ba.run(() => true)).toBe(true);
+    expect(ba.result.termination).toBe('cancelled');
+    expect(ba.result.iterations).toBe(2);
+    expect(evaluateBACost(s.problem).cost).toBeCloseTo(ba.result.finalCost, 6);
+    expect(ba.result.finalCost).toBeLessThan(ba.result.initialCost);
   });
 
   it('reprojectionErrors matches the RMS reported by bundleAdjust', () => {
