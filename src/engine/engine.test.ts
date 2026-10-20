@@ -459,6 +459,10 @@ describe('engine: synthetic orbit, CPU path', () => {
     expect(plyMesh.mesh!.triangleCount).toBe(engine.meshResult!.triangleCount);
     const glb = parseGLB(new Uint8Array(await (await engine.exportModel('glb')).arrayBuffer()));
     expect(glb.json).toBeTruthy();
+    // the mesh is unlit: its vertex colours are photo colours (no double shading in viewers)
+    const gj = glb.json as { extensionsUsed?: string[]; materials?: { extensions?: Record<string, unknown> }[] };
+    expect(gj.extensionsUsed).toContain('KHR_materials_unlit');
+    expect(gj.materials![0].extensions).toEqual({ KHR_materials_unlit: {} });
     const zip = readZip(new Uint8Array(await (await engine.exportModel('colmap-zip')).arrayBuffer()));
     const names = zip.map((e) => e.name);
     expect(names).toEqual(expect.arrayContaining(['sparse/0/cameras.txt', 'sparse/0/images.txt', 'sparse/0/points3D.txt']));

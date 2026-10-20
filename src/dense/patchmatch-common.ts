@@ -204,10 +204,20 @@ export function planeHomography(ref: CameraIntrinsics, sc: SourceCamera, u: numb
   return H;
 }
 
-/** 40 floats (10 vec4) per source, std140/std430 compatible layout used by the WGSL. */
+/**
+ * 40 floats (10 vec4) per source, std140/std430 compatible layout used by the WGSL. The w of `b`
+ * holds the source's layer in the grey-image texture array, the w of `M0` its layer in the
+ * depth-map array (defaults: the source index).
+ */
 export const GPU_SOURCE_CAMERA_FLOATS = 40;
 
-export function packSourceCameras(cams: SourceCamera[], texWidth: number, texHeight: number, out?: Float32Array): Float32Array {
+export function packSourceCameras(
+  cams: SourceCamera[],
+  texWidth: number,
+  texHeight: number,
+  out?: Float32Array,
+  layers?: { image?: ArrayLike<number>; depth?: ArrayLike<number> },
+): Float32Array {
   const o = out ?? new Float32Array(MAX_PATCHMATCH_SOURCES * GPU_SOURCE_CAMERA_FLOATS);
   o.fill(0);
   cams.forEach((c, i) => {
@@ -220,6 +230,8 @@ export function packSourceCameras(cams: SourceCamera[], texWidth: number, texHei
     o[base + 12] = c.b[0];
     o[base + 13] = c.b[1];
     o[base + 14] = c.b[2];
+    o[base + 15] = layers?.image?.[i] ?? i;
+    o[base + 19] = layers?.depth?.[i] ?? i;
     for (let r = 0; r < 3; r++) {
       o[base + 16 + 4 * r] = c.M[3 * r];
       o[base + 16 + 4 * r + 1] = c.M[3 * r + 1];
@@ -382,6 +394,58 @@ export function priorToPlanes(prior: DepthMap, width: number, height: number, ou
   return planes;
 }
 
+/**
+ * Unit normal → octahedral snorm16 × 2 (WGSL `pack2x16snorm` layout: x in the low 16 bits). The
+ * GPU finalisation writes this; `octDecode` inverts it to ≈ 1e-4 rad.
+ */
+export function octEncode(nx: number, ny: number, nz: number): number {
+  const s = Math.abs(nx) + Math.abs(ny) + Math.abs(nz);
+  if (!(s > 0)) return 0;
+  let px = nx / s;
+  let py = ny / s;
+  if (nz < 0) {
+    const qx = (1 - Math.abs(py)) * (px >= 0 ? 1 : -1);
+    const qy = (1 - Math.abs(px)) * (py >= 0 ? 1 : -1);
+    px = qx;
+    py = qy;
+  }
+  const ix = Math.round(Math.max(-1, Math.min(1, px)) * 32767) & 0xffff;
+  const iy = Math.round(Math.max(-1, Math.min(1, py)) * 32767) & 0xffff;
+  return (ix | (iy << 16)) >>> 0;
+}
+
+/** Unit normal → octahedral coordinates in [−1, 1]² (unquantised `octEncode`), written to `out[o..o+1]`. */
+export function octCoords(nx: number, ny: number, nz: number, out: Float32Array, o: number): void {
+  const s = Math.abs(nx) + Math.abs(ny) + Math.abs(nz);
+  let px = s > 0 ? nx / s : 0;
+  let py = s > 0 ? ny / s : 0;
+  if (nz < 0) {
+    const qx = (1 - Math.abs(py)) * (px >= 0 ? 1 : -1);
+    const qy = (1 - Math.abs(px)) * (py >= 0 ? 1 : -1);
+    px = qx;
+    py = qy;
+  }
+  out[o] = px;
+  out[o + 1] = py;
+}
+
+/** Octahedral snorm16 × 2 → unit normal written to `out[o..o+2]`. */
+export function octDecode(v: number, out: Float32Array, o: number): void {
+  let x = Math.max(-1, ((v << 16) >> 16) / 32767);
+  let y = Math.max(-1, (v >> 16) / 32767);
+  const z = 1 - Math.abs(x) - Math.abs(y);
+  if (z < 0) {
+    const qx = (1 - Math.abs(y)) * (x >= 0 ? 1 : -1);
+    const qy = (1 - Math.abs(x)) * (y >= 0 ? 1 : -1);
+    x = qx;
+    y = qy;
+  }
+  const l = 1 / Math.sqrt(x * x + y * y + z * z);
+  out[o] = x * l;
+  out[o + 1] = y * l;
+  out[o + 2] = z * l;
+}
+
 /** Final DepthMap from the hypothesis buffer + photometric costs (invalidation rules applied). */
 export function planesToDepthMap(planes: Float32Array, photoCost: Float32Array, width: number, height: number, range: DepthRange, maxCost: number): DepthMap {
   const n = width * height;
@@ -396,7 +460,7 @@ export function planesToDepthMap(planes: Float32Array, photoCost: Float32Array, 
     let nx = planes[4 * i];
     let ny = planes[4 * i + 1];
     let nz = planes[4 * i + 2];
-    const len = Math.hypot(nx, ny, nz);
+    const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
     if (!(len > 0)) continue;
     nx /= len;
     ny /= len;

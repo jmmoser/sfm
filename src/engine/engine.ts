@@ -11,6 +11,7 @@
  *   const sparse = await engine.refine(onProgress);          // SparseResult (+ t / frameIndex per camera)
  *   const cloud = await engine.densify();                     // PointCloud (world frame)
  *   const mesh = await engine.mesh();
+ *   const info = await engine.splat();                        // Gaussian splats (SplatResult; model: splatModel())
  *   const blob = await engine.exportModel('ply-points');
  *
  * Model updates produced by background keyframe mapping arrive through `on('live', …)`.
@@ -36,6 +37,9 @@ import {
   type MeshOptions,
   type QualityPreset,
   type SessionSummary,
+  type SplatModelPayload,
+  type SplatOptions,
+  type SplatResult,
 } from '../workers/protocol';
 import { EngineDepthStore } from './depth-store';
 import { PatchMatchHolder, rebuildColourViews, runDensify, runMesh, type DenseOutput } from './dense';
@@ -47,15 +51,21 @@ import {
   MemoryEngineStore,
   SessionEngineStore,
   packSparseModel,
+  packSplatModel,
   unpackSparseModel,
+  unpackSplatModel,
   type DenseMetaRecord,
   type EngineStateRecord,
   type EngineStore,
   type SparseMetaRecord,
+  type SplatMetaRecord,
+  type SplatProgressRecord,
 } from './persistence';
 import { MB, deviceMemoryBudgetMB, formatBreakdown, sumBreakdown, type GpuMemoryHints, type MemoryBreakdown } from './memory';
 import { ENGINE_DEFAULTS, QUALITY_PRESETS, type QualityPresetConfig, type ResolvedMode } from './presets';
 import { modelPointCloud, runRefine } from './refine';
+import { SPLAT_PROGRESS_KEY, clearSplatCheckpoints, runSplat } from './splat';
+import { CpuPool, defaultCpuWorkers } from './cpu-pool';
 import type { EngineConfig, EngineEvents, KeyframeRecord, SparseModel, SparseResultEx } from './types';
 import { cameraFromDevice } from '../sensors/frame-orientation';
 
@@ -150,6 +160,9 @@ export class PhotogrammetryEngine {
   /** The in-memory dense cloud / mesh is in the store too (releaseResultMemory may drop it). */
   private densePersisted = false;
   private meshPersisted = false;
+  /** A trained splat model is stored (`splat/model`; never kept in memory) and its info. */
+  private hasSplat = false;
+  private splatInfo: SplatResult | null = null;
   private readonly holder: PatchMatchHolder;
   private hiddenFlag = false;
   private visibleWaiters: (() => void)[] = [];
@@ -181,7 +194,7 @@ export class PhotogrammetryEngine {
     this.options = { persist: false, preferGPU: true, ...options };
     this.config = config;
     this.pipelineCfgKey = pipelineKey(this.options.quality, this.options.preferGPU !== false, config);
-    this.holder = new PatchMatchHolder(this.options.preferGPU !== false, config.dense ?? {});
+    this.holder = new PatchMatchHolder(this.options.preferGPU !== false, config.dense ?? {}, !!config.denseGpuTimestamps);
   }
 
   // ------------------------------------------------------------------------------------------
@@ -410,7 +423,7 @@ export class PhotogrammetryEngine {
   }
 
   private stateRecord(): EngineStateRecord {
-    const extra: Partial<EngineStateRecord> = { hasSparse: !!this.model, hasDense: this.hasDense, hasMesh: this.hasMesh };
+    const extra: Partial<EngineStateRecord> = { hasSparse: !!this.model, hasDense: this.hasDense, hasMesh: this.hasMesh, hasSplat: this.hasSplat };
     if (this.live) return this.live.stateRecord(extra);
     // no live session (loadSession, or released for the dense stage): keep the stored capture
     // state (θ, verified camera←device mapping, time offset, counters) — a generic record here
@@ -435,6 +448,7 @@ export class PhotogrammetryEngine {
       hasSparse: !!this.model,
       hasDense: this.hasDense,
       hasMesh: this.hasMesh,
+      hasSplat: this.hasSplat,
     };
   }
 
@@ -722,7 +736,14 @@ export class PhotogrammetryEngine {
       live.state.captureFinished = true;
       await live.flush();
       const t0 = now();
-      const out = await runRefine({ live, config: this.config, store: this.store!, log: (l, m, d) => this.log(l, m, d) }, progress, cancel);
+      // CPU helper workers for the pair verification and vocabulary indexing (refine only)
+      const pool = CpuPool.create(this.config.cpuWorkers ?? defaultCpuWorkers());
+      let out: Awaited<ReturnType<typeof runRefine>>;
+      try {
+        out = await runRefine({ live, config: this.config, store: this.store!, log: (l, m, d) => this.log(l, m, d), pool }, progress, cancel);
+      } finally {
+        pool?.dispose();
+      }
       releaseSiftCPUMemory();
       this.model = out.model;
       this.sparse = out.result;
@@ -735,6 +756,8 @@ export class PhotogrammetryEngine {
       this.meshModel = null;
       this.hasDense = false;
       this.hasMesh = false;
+      this.hasSplat = false;
+      this.splatInfo = null;
       await this.persistSparse();
       out.result.stats.memoryMB = this.logMemory('refine');
       return out.result;
@@ -761,6 +784,11 @@ export class PhotogrammetryEngine {
       // the new model with the old meta, dense cloud or mesh)
       await this.store.deleteBinary('dense/points').catch(() => undefined);
       await this.store.deleteBinary('mesh').catch(() => undefined);
+      // splats and their checkpoints were trained on the old poses
+      await this.store.deleteBinary('splat/model').catch(() => undefined);
+      await this.store.putValue('splat/meta', null);
+      await clearSplatCheckpoints(this.store);
+      if (this.scratch) await clearSplatCheckpoints(this.scratch);
       // depth maps of an earlier model (poses changed): no meshing / resuming from them, and
       // free their storage (up to ≈ 2 GB of float16 maps at `max`)
       await this.store.putValue('dense/meta', null);
@@ -989,6 +1017,130 @@ export class PhotogrammetryEngine {
     });
   }
 
+  /**
+   * Gaussian splats (src/engine/splat.ts): trained on the registered keyframes, seeded from the
+   * dense cloud when it exists (else the sparse points) + a sky shell for scene captures; resumes
+   * a checkpoint of the same run (a cancel / kill / reload). The model is persisted (`splat/model`)
+   * and not kept in memory: `splatModel()` / `exportModel('ply-splat')` read it back.
+   */
+  splat(opts?: SplatOptions, progress?: ProgressCallback, cancel?: CancelToken): Promise<SplatResult> {
+    return this.longRun('splat', async () => {
+      const t0 = now();
+      const model = await this.ensureModel();
+      if (!this.store) throw namedError(ENGINE_ERRORS.notInitialized, 'No session');
+      await this.ensureDeviceBudget();
+      // the memory and the GPU go to the trainer: capture state, feature caches, PatchMatchGPU
+      // (≈ 140 MB at 1600 px, recreated by the next densify) and, when the session persists, the
+      // dense colour views (mesh() rebuilds them from IndexedDB)
+      this.releaseCaptureMemory();
+      this.holder.reset();
+      if (this.store.persistent) this.denseOut = null;
+      // the dense cloud seeds the Gaussians: resident, or read for this stage only
+      let cloud: PointCloud | null = this.denseCloud;
+      const denseResident = !!cloud;
+      if (!cloud && this.hasDense) {
+        const b = await this.store.getBinary('dense/points').catch(() => null);
+        if (b) cloud = deserializePointCloud(b);
+      }
+      const densePoints = cloud?.count ?? 0;
+      const resident = sumBreakdown(this.memoryReport().parts);
+      const store = this.store;
+      const out = await runSplat(
+        {
+          store,
+          checkpoints: await this.depthBackend(),
+          model,
+          denseCloud: async () => {
+            const c = cloud;
+            cloud = null;
+            return c;
+          },
+          densePoints,
+          denseResident,
+          // the fusion-filtered depth maps (trainer geometry supervision): in memory (dense run
+          // of this engine, no storage) or in the depth backend (session / scratch store)
+          depthMaps: this.hasDense
+            ? async () => {
+                const f = this.denseOut?.filtered ?? new EngineDepthStore(await this.depthBackend(), 'depth', 0);
+                await f.scan();
+                return f;
+              }
+            : null,
+          quality: this.quality,
+          mode: this.resolvedMode(),
+          config: this.config,
+          waitVisible: () => this.waitVisible(),
+          gpuLock: (fn) => this.gpu(fn),
+          log: (l, m, d) => this.log(l, m, d),
+          memoryBudgetMB: this.memoryBudgetMB,
+          residentBytes: resident,
+          gpu: () => (this.options.preferGPU === false || !hasWebGPU() ? Promise.resolve(null) : getGPU()),
+        },
+        opts ?? {},
+        progress,
+        cancel,
+      );
+      cloud = null;
+      progress?.({ stage: 'splat_finishing', progress: 0.7, message: 'saving' });
+      const packed = packSplatModel(out.model);
+      const m = out.model;
+      const result: SplatResult = {
+        count: m.count,
+        iterations: out.iterations,
+        ms: Math.round(now() - t0),
+        shDegree: m.shDegree,
+        bytes: m.means.byteLength + m.logScales.byteLength + m.quats.byteLength + m.opacities.byteLength + m.sh.byteLength,
+        antialiased: out.antialiased,
+        stats: { ...out.stats, splatStoredBytes: packed.byteLength },
+      };
+      const meta: SplatMetaRecord = {
+        version: 1,
+        count: m.count,
+        shDegree: m.shDegree,
+        antialiased: out.antialiased,
+        background: out.background,
+        iterations: out.iterations,
+        bytes: packed.byteLength,
+        stats: result.stats,
+        createdAt: Date.now(),
+      };
+      try {
+        await store.putBinary('splat/model', packed);
+        await store.putValue('splat/meta', meta);
+        this.hasSplat = true;
+        await store.putValue('engine/state', this.stateRecord());
+      } catch (e) {
+        this.onStorageError(e);
+        throw e;
+      }
+      // trained: a later splat() starts over
+      const ck = await this.depthBackend();
+      if (ck) await clearSplatCheckpoints(ck);
+      this.splatInfo = result;
+      Object.assign(this.stats, result.stats);
+      if (this.sparse) Object.assign(this.sparse.stats, result.stats);
+      result.stats.memoryMB = this.logMemory('splat');
+      progress?.({ stage: 'splat_finishing', progress: 1, message: `${m.count} Gaussians` });
+      return result;
+    });
+  }
+
+  /** The stored splat model for a viewer (fresh arrays: transferable), null when none was trained. */
+  async splatModel(): Promise<SplatModelPayload | null> {
+    if (this.disposed) throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');
+    if (!this.store || !this.hasSplat) return null;
+    const buf = await this.store.getBinary('splat/model');
+    if (!buf) return null;
+    const meta = await this.store.getValue<SplatMetaRecord>('splat/meta').catch(() => null);
+    const { model } = unpackSplatModel(buf);
+    return { model, antialiased: meta?.antialiased ?? true, background: meta?.background ?? [0, 0, 0], iterations: meta?.iterations ?? 0 };
+  }
+
+  /** Info of the stored splat model (null: none). */
+  get splatResult(): SplatResult | null {
+    return this.splatInfo;
+  }
+
   // ------------------------------------------------------------------------------------------
   // export
 
@@ -1060,6 +1212,7 @@ export class PhotogrammetryEngine {
         mesh: needMesh ? this.meshModel : null,
         store: this.store,
         features: (id) => this.featuresOf(id),
+        splat: () => this.splatModel(),
       });
     } finally {
       if (this.store?.persistent) {
@@ -1128,6 +1281,21 @@ export class PhotogrammetryEngine {
       this.hasMesh = true;
       this.meshPersisted = true;
     }
+    // splats: only the info (the model is read on demand: splatModel / export)
+    const sm = this.model ? await store.getValue<SplatMetaRecord>('splat/meta').catch(() => null) : null;
+    const smKeys = sm ? await store.listBinaryKeys('splat/model').catch(() => [] as string[]) : [];
+    if (sm && typeof sm.count === 'number' && smKeys.includes('splat/model')) {
+      this.hasSplat = true;
+      this.splatInfo = {
+        count: sm.count,
+        iterations: sm.iterations,
+        ms: 0,
+        shDegree: sm.shDegree === 1 ? 1 : 0,
+        bytes: 4 * sm.count * (11 + 3 * (sm.shDegree === 1 ? 4 : 1)),
+        antialiased: sm.antialiased !== false,
+        stats: { ...(sm.stats ?? {}) },
+      };
+    }
     void st;
   }
 
@@ -1151,6 +1319,8 @@ export class PhotogrammetryEngine {
       this.meshModel = null;
       this.hasDense = false;
       this.hasMesh = false;
+      this.hasSplat = false;
+      this.splatInfo = null;
       // nothing of the previous session may leak into this one (stats in the summary, the
       // resolved capture mode of the dense / mesh stages, the FOV prior of a later refine)
       this.stats = {};
@@ -1194,6 +1364,12 @@ export class PhotogrammetryEngine {
       // the interrupted run's preset: resuming needs the same one (another one starts over)
       if (prog.quality === 'fast' || prog.quality === 'balanced' || prog.quality === 'max') extra.denseResumableQuality = prog.quality;
     }
+    // an interrupted splat() resumes from its checkpoint (same quality and options)
+    const sprog = this.store!.persistent ? await this.store!.getValue<SplatProgressRecord>(SPLAT_PROGRESS_KEY).catch(() => null) : null;
+    if (sprog && typeof sprog.iteration === 'number' && sprog.iteration > 0) {
+      extra.splatResumableIteration = sprog.iteration;
+      if (sprog.quality === 'fast' || sprog.quality === 'balanced' || sprog.quality === 'max') extra.splatResumableQuality = sprog.quality;
+    }
     return {
       id,
       name: meta.name,
@@ -1206,6 +1382,7 @@ export class PhotogrammetryEngine {
       sparse: this.sparse,
       dense: this.denseCloud,
       mesh: this.meshModel,
+      splat: this.splatInfo,
       stats: { ...(meta.stats ?? {}), ...this.stats, ...extra },
     };
   }

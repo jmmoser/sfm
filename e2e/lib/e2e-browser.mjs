@@ -2,6 +2,7 @@
 // (harness.html, src/harness/engine/main.ts). Used by e2e/run-e2e.mjs.
 import { createServer } from 'vite';
 import { chromium } from 'playwright';
+import { launchOptions } from './launch.mjs';
 import { appendFile, mkdir, writeFile } from 'node:fs/promises';
 import { createServer as createNetServer } from 'node:net';
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path';
@@ -57,7 +58,7 @@ export async function startHarnessBrowser({ root, verbose = false, headed = fals
   });
   await server.listen();
   const base = `http://127.0.0.1:${port}`;
-  const browser = await chromium.launch({ headless: !headed, args: CHROMIUM_ARGS });
+  const browser = await chromium.launch(launchOptions(CHROMIUM_ARGS, { headless: !headed }));
 
   /**
    * New page on harness.html with `__e2eLog` / `__e2eWrite` installed.

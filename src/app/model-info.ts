@@ -1,8 +1,8 @@
 /**
  * Pure helpers for the Viewer / Processing screens (unit-tested in model-info.test.ts):
- * dense-resume detection, north reference of the model, engine memory statistics.
+ * dense / splat resume detection, north reference of the model, engine memory statistics.
  */
-import type { QualityPreset } from '../workers/protocol';
+import { SPLAT_STAGES, type QualityPreset } from '../workers/protocol';
 import type { Results } from './app';
 
 type Stats = Record<string, number | string>;
@@ -33,12 +33,73 @@ export function denseResumeQuality(r: Pick<Results, 'stats'>): QualityPreset | n
 }
 
 /**
- * Quality preset the dense cloud / mesh was built with (`denseQuality` / `meshQuality`, set by
- * the Processing screen). Older records lack them: the scan's preset is the best guess.
+ * Quality preset the dense cloud / mesh / splats were built with (`denseQuality` / `meshQuality`
+ * set by the Processing screen, `splatQuality` by the viewer's photoreal build). Older records
+ * lack them: the scan's preset is the best guess.
  */
-export function builtQuality(r: Pick<Results, 'stats' | 'quality'>, what: 'dense' | 'mesh'): QualityPreset {
-  const v = r.stats[what === 'dense' ? 'denseQuality' : 'meshQuality'];
+export function builtQuality(r: Pick<Results, 'stats' | 'quality'>, what: 'dense' | 'mesh' | 'splat'): QualityPreset {
+  const v = r.stats[what === 'dense' ? 'denseQuality' : what === 'mesh' ? 'meshQuality' : 'splatQuality'];
   return v === 'fast' || v === 'balanced' || v === 'max' ? v : r.quality;
+}
+
+/**
+ * An interrupted splat training can continue from its checkpoint: the engine reports
+ * `stats.splatResumableIteration` (loadSession) and the app marks `splatInterrupted` when a build
+ * it ran was cancelled / failed. Needs a sparse model; an existing splat model does not prevent
+ * it (an interrupted rebuild at another quality).
+ */
+export function splatResumable(r: Pick<Results, 'sparse' | 'stats'>): boolean {
+  if (!r.sparse) return false;
+  return typeof r.stats.splatResumableIteration === 'number' || !!r.stats.splatInterrupted;
+}
+
+/** Quality of the interrupted splat run (app marker first, else the engine's), null when unknown. */
+export function splatResumeQuality(r: Pick<Results, 'stats'>): QualityPreset | null {
+  for (const k of ['splatInterruptedQuality', 'splatResumableQuality']) {
+    const v = r.stats[k];
+    if (v === 'fast' || v === 'balanced' || v === 'max') return v;
+  }
+  return null;
+}
+
+/** Drop the splat-resume markers (a training finished, or refine invalidated the checkpoints). */
+export function clearSplatResume(stats: Stats): void {
+  delete stats.splatResumableIteration;
+  delete stats.splatResumableQuality;
+  delete stats.splatInterrupted;
+  delete stats.splatInterruptedQuality;
+}
+
+export interface SplatProgressView {
+  /** Overall 0..1 over the three stages (prepare ≈ 8 %, training ≈ 89 %, finishing ≈ 3 %), −1 = indeterminate. */
+  progress: number;
+  /** One line for the progress card. */
+  text: string;
+}
+
+/**
+ * The viewer's photoreal-build card from an engine progress event of `splat` (stages
+ * SPLAT_STAGES; training events carry a SplatTrainingDetail): overall progress and a line short
+ * enough for a phone, such as "1,250 / 3,000 iterations · ~2 min left" (from the it/s).
+ */
+export function splatProgressView(e: { stage: string; progress: number; message?: string; detail?: Record<string, number> }): SplatProgressView {
+  const p = Number.isFinite(e.progress) && e.progress >= 0 ? Math.min(1, e.progress) : -1;
+  if (e.stage === SPLAT_STAGES.training) {
+    const d = e.detail;
+    if (d && typeof d.iteration === 'number' && typeof d.iterations === 'number' && d.iterations > 0) {
+      const it = Math.min(d.iteration, d.iterations);
+      const parts = [`${it.toLocaleString('en-US')} / ${d.iterations.toLocaleString('en-US')} iterations`];
+      const rate = typeof d.itPerSec === 'number' && d.itPerSec > 0 ? d.itPerSec : 0;
+      if (rate && it > 0) {
+        const s = (d.iterations - it) / rate;
+        parts.push(s < 45 ? '< 1 min left' : `~${Math.round(s / 60)} min left`);
+      }
+      return { progress: 0.08 + 0.89 * (it / d.iterations), text: parts.join(' · ') };
+    }
+    return { progress: p < 0 ? -1 : 0.08 + 0.89 * p, text: 'Training' };
+  }
+  if (e.stage === SPLAT_STAGES.finishing) return { progress: 0.97 + 0.03 * Math.max(0, p), text: 'Saving the model' };
+  return { progress: p < 0 ? -1 : 0.08 * p, text: 'Preparing the photos' };
 }
 
 /** Drop the dense-resume markers (a densify finished, or refine invalidated the stored depth maps). */

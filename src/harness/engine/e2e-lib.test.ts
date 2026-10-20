@@ -40,6 +40,16 @@ describe('parseArgs', () => {
     expect(d.config.mesh).toEqual({ targetTriangles: 50000 });
     expect(d.config.exports).toEqual(['glb', 'ply-points']);
     expect(d.config.logFrames).toBe(false);
+    expect(d.nvs).toBe(false);
+    const sp = parseArgs(['object-real', '--splat', '--splat-iterations', '500']);
+    expect(sp.config.splat).toEqual({ iterations: 500 });
+    expect(parseArgs(['yard', '--no-dense', '--splat']).config).toMatchObject({ densify: false, splat: true });
+    expect(parseArgs(['yard', '--splat-max', '100000']).config.splat).toEqual({ maxGaussians: 100000 });
+    expect(parseArgs(['yard']).config.splat).toBe(false);
+    expect(parseArgs(['yard', '--export', 'ply-splat']).config.exports).toEqual(['ply-splat']);
+    const nv = parseArgs(['object-real', '--nvs', '--nvs-views', '8']);
+    expect(nv.nvs).toBe(true);
+    expect(nv.nvsViews).toBe(8);
   });
 
   it('rejects bad input', () => {

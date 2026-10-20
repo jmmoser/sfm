@@ -78,6 +78,26 @@ describe('PatchMatchGPU', () => {
     }
   });
 
+  it('affine 13 px window (preset kernel) on the GPU is statistically equal to the CPU reference', async () => {
+    const W = 256;
+    const H = 192;
+    const ds = makeSyntheticDataset('near', { width: W, height: H });
+    const opts = { patchRadius: 6, patchStep: 3, affineWindow: true, numSamplesPerIter: 3 };
+    const dm = await pm.compute(ds.views[0], ds.views.slice(1), ds.range, opts);
+    log(`near ${W}x${H} GPU affine r6/s3/3 proposals: ${fmtTimings()}`);
+    const dc = patchMatchCPU(ds.views[0], ds.views.slice(1), ds.range, opts);
+    const mask = surfaceMask(ds.views[0].cam, ds.gtDepth[0], ds.gtNormal[0]);
+    const g = evaluateDepthMap(dm, ds.gtDepth[0], ds.gtNormal[0], { mask });
+    const c = evaluateDepthMap(dc, ds.gtDepth[0], ds.gtNormal[0], { mask });
+    log(`  GPU mask: ${formatDepthStats(g)}`);
+    log(`  CPU mask: ${formatDepthStats(c)}`);
+    expect(g.validFraction).toBeGreaterThanOrEqual(0.7);
+    expect(g.accurateFraction).toBeGreaterThanOrEqual(0.8);
+    expect(Math.abs(g.validFraction - c.validFraction)).toBeLessThan(0.03);
+    expect(Math.abs(g.accurateFraction - c.accurateFraction)).toBeLessThan(0.03);
+    expect(Math.abs(g.medianNormalErrorDeg - c.medianNormalErrorDeg)).toBeLessThan(1.5);
+  });
+
   it('far scene (5–60 m) 256×192 works with inverse-depth sampling', async () => {
     const ds = makeSyntheticDataset('far', { width: 256, height: 192 });
     const dm = await pm.compute(ds.views[0], ds.views.slice(1), ds.range);
@@ -162,6 +182,166 @@ describe('PatchMatchGPU', () => {
     } finally {
       pm2.destroy();
       pm3.destroy();
+    }
+  });
+
+  it('upload caches: a repeated source image / depth map is not uploaded again, results are unchanged', async () => {
+    const ds = makeSyntheticDataset('near', { width: 96, height: 72, numSources: 4, supersample: 1 });
+    const fresh = await PatchMatchGPU.create(ctx!);
+    try {
+      const a = await fresh.compute(ds.views[0], ds.views.slice(1), ds.range, { iterations: 2 });
+      const s0 = fresh.cacheStats;
+      expect(s0.imageMisses).toBe(4);
+      // the same sources again (another order) + the reference as a source: 4 hits, 1 upload
+      const b = await fresh.compute(ds.views[1], [ds.views[0], ds.views[4], ds.views[3], ds.views[2]], ds.range, { iterations: 2 });
+      const s1 = fresh.cacheStats;
+      expect(s1.imageHits - s0.imageHits).toBe(3);
+      expect(s1.imageMisses - s0.imageMisses).toBe(1);
+      expect(b.depth.some((z) => z > 0)).toBe(true);
+      // a geometric pass twice with the same depth maps: the second one uploads none of them
+      const geo = { prior: a, sourceDepths: [a, a, a, a].map((m) => ({ ...m, depth: m.depth.slice() })) };
+      const g1 = await fresh.compute(ds.views[0], ds.views.slice(1), ds.range, { geometricIterations: 1 }, geo);
+      const s2 = fresh.cacheStats;
+      const g2 = await fresh.compute(ds.views[0], ds.views.slice(1), ds.range, { geometricIterations: 1 }, geo);
+      const s3 = fresh.cacheStats;
+      expect(s3.depthMisses).toBe(s2.depthMisses);
+      expect(s3.depthHits - s2.depthHits).toBe(4);
+      expect(Array.from(g2.depth)).toEqual(Array.from(g1.depth));
+      // the first result again from cached sources equals a fresh instance's
+      const again = await fresh.compute(ds.views[0], ds.views.slice(1), ds.range, { iterations: 2 });
+      expect(Array.from(again.depth)).toEqual(Array.from(a.depth));
+    } finally {
+      fresh.destroy();
+    }
+  });
+
+  /**
+   * Simulated dropped work (iOS discards queue work while the page is hidden): `hidden(true)`
+   * drops source uploads (writeTexture into the 'pm-src' cache) and every command buffer until
+   * the first one was dropped; `dropReadbacks` drops that many 'pm-readback' command buffers.
+   */
+  const withDroppedWork = async <T>(fn: (sim: { hidden: boolean; dropReadbacks: number; dropped: number }) => Promise<T>): Promise<T> => {
+    const device = ctx!.device;
+    const q = device.queue;
+    const sim = { hidden: false, dropReadbacks: 0, dropped: 0 };
+    const drop = new WeakSet<GPUCommandBuffer>();
+    const origSubmit = q.submit;
+    const origWriteTexture = q.writeTexture;
+    const origEncoder = device.createCommandEncoder;
+    q.submit = (bufs: Iterable<GPUCommandBuffer>): undefined => {
+      const keep = [...bufs].filter((b) => !drop.has(b));
+      if (sim.hidden) {
+        sim.hidden = false; // visible again after this submission
+        sim.dropped++;
+        return undefined;
+      }
+      sim.dropped += [...bufs].length - keep.length;
+      return origSubmit.call(q, keep);
+    };
+    q.writeTexture = ((dst: GPUTexelCopyTextureInfo, ...rest: unknown[]) => {
+      if (sim.hidden && dst.texture.label === 'pm-src') return undefined;
+      return (origWriteTexture as (...a: unknown[]) => undefined).call(q, dst, ...rest);
+    }) as typeof q.writeTexture;
+    device.createCommandEncoder = (d?: GPUCommandEncoderDescriptor): GPUCommandEncoder => {
+      const enc = origEncoder.call(device, d);
+      if (d?.label === 'pm-readback' && sim.dropReadbacks > 0) {
+        sim.dropReadbacks--;
+        const finish = enc.finish.bind(enc);
+        enc.finish = (fd?: GPUCommandBufferDescriptor): GPUCommandBuffer => {
+          const cb = finish(fd);
+          drop.add(cb);
+          return cb;
+        };
+      }
+      return enc;
+    };
+    try {
+      return await fn(sim);
+    } finally {
+      delete (q as unknown as Record<string, unknown>).submit;
+      delete (q as unknown as Record<string, unknown>).writeTexture;
+      delete (device as unknown as Record<string, unknown>).createCommandEncoder;
+    }
+  };
+
+  it('a dropped source upload is redone by the retry (upload caches are invalidated)', async () => {
+    const ds = makeSyntheticDataset('near', { width: 96, height: 72, numSources: 4, supersample: 1 });
+    const opts = { iterations: 2, targetSubmitMs: 0 };
+    const ref = await PatchMatchGPU.create(ctx!);
+    const sim = await PatchMatchGPU.create(ctx!);
+    const warn = console.warn;
+    console.warn = () => undefined;
+    try {
+      const want = await ref.compute(ds.views[0], ds.views.slice(1), ds.range, opts);
+      const got = await withDroppedWork(async (s) => {
+        s.hidden = true;
+        const out = await sim.compute(ds.views[0], ds.views.slice(1), ds.range, opts);
+        expect(s.dropped).toBe(1);
+        return out;
+      });
+      expect(Array.from(got.depth)).toEqual(Array.from(want.depth));
+      expect(Array.from(got.cost)).toEqual(Array.from(want.cost));
+      expect(sim.lastTimings!.retries).toBe(1);
+      expect(sim.cacheStats.imageMisses).toBe(8);
+    } finally {
+      console.warn = warn;
+      ref.destroy();
+      sim.destroy();
+    }
+  });
+
+  it('a dropped readback never returns stale staging contents (previous call or chunk)', async () => {
+    const ds = makeSyntheticDataset('near', { width: 96, height: 72, numSources: 4, supersample: 1 });
+    // fixed bands: both references take the same number of submissions (equal sentinels)
+    const opts = { iterations: 2, targetSubmitMs: 0 };
+    const srcB = [ds.views[0], ds.views[2], ds.views[3], ds.views[4]];
+    const saved = PatchMatchGPU.stagingBytes;
+    const warn = console.warn;
+    console.warn = () => undefined;
+    try {
+      for (const stagingBytes of [saved, 4096]) {
+        PatchMatchGPU.stagingBytes = stagingBytes; // 4096: several row chunks per readback
+        const ref = await PatchMatchGPU.create(ctx!);
+        const sim = await PatchMatchGPU.create(ctx!);
+        try {
+          await ref.compute(ds.views[0], ds.views.slice(1), ds.range, opts);
+          const want = await ref.compute(ds.views[1], srcB, ds.range, opts);
+          const a = await sim.compute(ds.views[0], ds.views.slice(1), ds.range, opts);
+          expect(Array.from(want.depth)).not.toEqual(Array.from(a.depth));
+          // the first readback chunk of B dropped: the staging buffer still holds A's last chunk
+          const got = await withDroppedWork(async (s) => {
+            s.dropReadbacks = 1;
+            const out = await sim.compute(ds.views[1], srcB, ds.range, opts);
+            expect(s.dropped).toBe(1);
+            return out;
+          });
+          expect(Array.from(got.depth)).toEqual(Array.from(want.depth));
+          expect(Array.from(got.cost)).toEqual(Array.from(want.cost));
+          expect(sim.lastTimings!.retries).toBe(1);
+          if (stagingBytes !== saved) {
+            // a later chunk dropped: the staging buffer holds the previous chunk of this call
+            const got2 = await withDroppedWork(async (s) => {
+              const enc = ctx!.device.createCommandEncoder;
+              let seen = 0;
+              ctx!.device.createCommandEncoder = (d?: GPUCommandEncoderDescriptor): GPUCommandEncoder => {
+                if (d?.label === 'pm-readback' && ++seen === 2) s.dropReadbacks = 1;
+                return enc.call(ctx!.device, d);
+              };
+              const out = await sim.compute(ds.views[1], srcB, ds.range, opts);
+              expect(s.dropped).toBe(1);
+              return out;
+            });
+            expect(Array.from(got2.depth)).toEqual(Array.from(want.depth));
+            expect(sim.lastTimings!.retries).toBe(1);
+          }
+        } finally {
+          ref.destroy();
+          sim.destroy();
+        }
+      }
+    } finally {
+      PatchMatchGPU.stagingBytes = saved;
+      console.warn = warn;
     }
   });
 

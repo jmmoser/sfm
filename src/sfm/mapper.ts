@@ -28,7 +28,7 @@ import type {
   Vec3,
 } from '../core/types';
 import type { BACameraRefine, BALinearSolverType, BALossType, BAProblem, BAResult } from '../ba/problem';
-import { bundleAdjust } from '../ba/solver';
+import { bundleAdjust, BundleAdjuster } from '../ba/solver';
 import { scaleIntrinsics } from '../geometry/camera';
 import { projectToEssential, recoverPose } from '../geometry/essential';
 import { solvePnPRansac } from '../geometry/pnp';
@@ -1001,6 +1001,31 @@ export class IncrementalMapper {
     linearSolver: BALinearSolverType = 'auto',
     control?: BAControl,
   ): { result: BAResult | null; numObs: number } {
+    const b = this.buildBundle(cfg, false);
+    if (!b) return { result: null, numObs: 0 };
+    const result = bundleAdjust(b.problem, {
+      loss,
+      lossScalePx,
+      maxIterations,
+      timeLimitMs,
+      functionTolerance,
+      parameterTolerance: 0,
+      initialLambda,
+      linearSolver,
+      cancel: control?.cancel,
+      onIteration: control?.onIteration,
+    });
+    this.writeBundlePoints(b);
+    return { result, numObs: b.problem.obsPose.length };
+  }
+
+  /**
+   * BA problem of a configuration: poses and cameras are the reconstruction's own objects (written
+   * by the solver), points a copy (`writeBundlePoints`). The observation arrays are views of this
+   * mapper's scratch buffers unless `own` (a problem that outlives the next `buildBundle` call:
+   * the resumable global BA, which yields to the event loop).
+   */
+  private buildBundle(cfg: BundleConfig, own: boolean): { problem: BAProblem; pointIds: Int32Array } | null {
     const rec = this.rec;
     const imageSet = new Set(cfg.images);
     // pose set: config images + outside images observing variable points
@@ -1141,9 +1166,9 @@ export class IncrementalMapper {
       }
     }
     for (const pid of touched) cls[pid] = 0;
-    const ids = this.pointIdBuf;
+    const ids = own ? this.pointIdBuf.slice(0, nX) : this.pointIdBuf;
     for (let k = 0; k < nX; k++) slot[ids[k]] = 0;
-    if (nO === 0 || nX === 0) return { result: null, numObs: 0 };
+    if (nO === 0 || nX === 0) return null;
     const points = new Float64Array(3 * nX);
     const pointFixed = new Uint8Array(nX);
     for (let k = 0; k < nX; k++) {
@@ -1162,9 +1187,9 @@ export class IncrementalMapper {
       translationFixedMask: anyMask ? tmask : undefined,
       points,
       pointFixed,
-      obsPose: this.obsPoseBuf.subarray(0, nO),
-      obsPoint: this.obsPointBuf.subarray(0, nO),
-      obsUV: this.obsUVBuf.subarray(0, 2 * nO),
+      obsPose: own ? this.obsPoseBuf.slice(0, nO) : this.obsPoseBuf.subarray(0, nO),
+      obsPoint: own ? this.obsPointBuf.slice(0, nO) : this.obsPointBuf.subarray(0, nO),
+      obsUV: own ? this.obsUVBuf.slice(0, 2 * nO) : this.obsUVBuf.subarray(0, 2 * nO),
     };
     if (cfg.focalPriors && cfg.focalPriors.size) {
       problem.focalPriors = [];
@@ -1180,26 +1205,21 @@ export class IncrementalMapper {
         if (ci !== undefined && cameraRefine[ci].principalPoint) (problem.principalPointPriors ??= []).push({ camera: ci, cx: pp.cx, cy: pp.cy, sigma: pp.sigma });
       }
     }
-    const result = bundleAdjust(problem, {
-      loss,
-      lossScalePx,
-      maxIterations,
-      timeLimitMs,
-      functionTolerance,
-      parameterTolerance: 0,
-      initialLambda,
-      linearSolver,
-      cancel: control?.cancel,
-      onIteration: control?.onIteration,
-    });
+    return { problem, pointIds: ids };
+  }
+
+  /** Copy the free points of a solved `buildBundle` problem back into the reconstruction. */
+  private writeBundlePoints(b: { problem: BAProblem; pointIds: Int32Array }): void {
+    const { points, pointFixed } = b.problem;
+    const nX = points.length / 3;
     for (let k = 0; k < nX; k++) {
-      if (pointFixed[k]) continue;
-      const p = rec.points.get(ids[k])!;
+      if (pointFixed && pointFixed[k]) continue;
+      const p = this.rec.points.get(b.pointIds[k]);
+      if (!p) continue;
       p.xyz[0] = points[3 * k];
       p.xyz[1] = points[3 * k + 1];
       p.xyz[2] = points[3 * k + 2];
     }
-    return { result, numObs: nO };
   }
 
   // scratch for solveBundle (grow-only)
@@ -1430,11 +1450,32 @@ export class IncrementalMapper {
     const reg = this.rec.registeredImageIds();
     if (reg.length < 2) return null;
     if (filterNegativeDepth) this.rec.filterObservationsWithNegativeDepth();
+    const { cfg, linearSolver } = this.globalBundleConfig(reg, trackCap);
+    const { result } = this.solveBundle(
+      cfg,
+      o.globalBALoss,
+      o.globalBALossScalePx,
+      maxIterations ?? o.globalBAMaxIterations,
+      timeLimitMs ?? o.globalBATimeLimitMs,
+      1e-6,
+      initialLambda,
+      linearSolver,
+      control,
+    );
+    this.timings.globalBA += now() - t0;
+    this.timings.numGlobalBA++;
+    if (result) this.timings.globalBAIterations += result.iterations;
+    return result;
+  }
+
+  /** Configuration of a global BA over `reg` (≥ 2 registered images) and its linear solver. */
+  private globalBundleConfig(reg: number[], trackCap: number): { cfg: BundleConfig; linearSolver: BALinearSolverType } {
+    const o = this.opts;
     const constantPoses = new Set<number>([reg[0]]);
     const ax = largestRelTranslationAxis(this.rec.images.get(reg[0])!.pose, this.rec.images.get(reg[1])!.pose);
     const translationMask = new Map<number, number>([[reg[1], 1 << ax]]);
-    const { result } = this.solveBundle(
-      {
+    return {
+      cfg: {
         images: reg,
         constantPoses,
         translationMask,
@@ -1443,19 +1484,8 @@ export class IncrementalMapper {
         maxConstObsPerImage: Infinity,
         trackCap,
       },
-      o.globalBALoss,
-      o.globalBALossScalePx,
-      maxIterations ?? o.globalBAMaxIterations,
-      timeLimitMs ?? o.globalBATimeLimitMs,
-      1e-6,
-      initialLambda,
-      o.globalBALinearSolver === 'auto' && reg.length > 150 && this.rec.meanTrackLength() > 8 ? 'pcg_schur' : o.globalBALinearSolver,
-      control,
-    );
-    this.timings.globalBA += now() - t0;
-    this.timings.numGlobalBA++;
-    if (result) this.timings.globalBAIterations += result.iterations;
-    return result;
+      linearSolver: o.globalBALinearSolver === 'auto' && reg.length > 150 && this.rec.meanTrackLength() > 8 ? 'pcg_schur' : o.globalBALinearSolver,
+    };
   }
 
   /**
@@ -1564,67 +1594,48 @@ export class IncrementalMapper {
   }
 
   /**
-   * Global BA in slices of ≈ `globalBASliceMs` with event-loop yields in between, up to
-   * globalBAMaxIterations in total and within `globalBATimeLimitMs` (and `tEnd`).
-   *
-   * Slices end only right after an ACCEPTED LM step: the solver's state is then fully
-   * described by its parameters and damping λ (the damping growth factor is reset by
-   * an accepted step), so the next slice — started from the written-back parameters
-   * with the carried λ — continues exactly as one uninterrupted solve would. Where the
-   * slices fall (which depends on CPU speed / load) therefore does not change the
-   * result (deterministic runs). A slice is cut regardless after 3 × globalBASliceMs.
+   * Global BA (as `adjustGlobalBundle`; `full = false` caps long tracks) that yields to the event
+   * loop every ≈ `globalBASliceMs`, up to globalBAMaxIterations and within `globalBATimeLimitMs`
+   * (and `tEnd`). The solver is resumable (`BundleAdjuster`): its structure, linearisation and LM
+   * state live across the yields, so the result is exactly that of one uninterrupted solve
+   * wherever the yields fall (deterministic runs), and no slice rebuilds the problem (a rebuild per
+   * slice cost +65–77 % on large BAs: one build + linearisation per LM iteration once an iteration
+   * outlasts the slice). The reconstruction is updated when the solve ends.
    */
   async adjustGlobalBundleSliced(tEnd = Infinity, cancel?: CancelToken, full = true): Promise<void> {
+    const t0 = now();
     const o = this.opts;
-    const deadline = Math.min(tEnd, now() + o.globalBATimeLimitMs);
-    let used = 0;
-    let lambda: number | undefined;
-    let lastCost = NaN;
-    let first = true;
-    while (used < o.globalBAMaxIterations) {
-      const t0 = now();
-      const remaining = deadline - t0;
-      if (remaining <= 0) break;
-      const sliceEnd = t0 + o.globalBASliceMs,
-        hardEnd = t0 + 3 * o.globalBASliceMs;
-      const stop = { cancelled: false };
-      let prev = lastCost,
-        sliced = false;
-      const res = this.adjustGlobalBundle(
-        remaining,
-        o.globalBAMaxIterations - used,
-        lambda,
-        full ? Infinity : o.globalBAMaxTrackLength,
-        {
-          cancel: stop,
-          onIteration: (_it, cost) => {
-            // an accepted step strictly lowers the cost; a rejected one leaves it unchanged
-            const accepted = cost < prev;
-            prev = cost;
-            if (cancel?.cancelled) {
-              stop.cancelled = true;
-              return;
-            }
-            const t = now();
-            if ((accepted && t >= sliceEnd) || t >= hardEnd) {
-              stop.cancelled = true;
-              sliced = true;
-            }
-          },
-        },
-        first,
-      );
-      first = false;
-      if (!res) break;
-      used += Math.max(1, res.iterations);
-      lastCost = res.finalCost;
-      // continue the next slice with the adapted damping (LM state carried over)
-      lambda = res.finalLambda > 0 && Number.isFinite(res.finalLambda) ? res.finalLambda : undefined;
-      if (cancel?.cancelled) throw new SfMCancelledError();
-      if (res.termination !== 'cancelled' || !sliced) break;
-      await yieldToEventLoop();
-      if (cancel?.cancelled) throw new SfMCancelledError();
+    const deadline = Math.min(tEnd, t0 + o.globalBATimeLimitMs);
+    const reg = this.rec.registeredImageIds();
+    if (reg.length < 2 || deadline - t0 <= 0) return;
+    this.rec.filterObservationsWithNegativeDepth();
+    const { cfg, linearSolver } = this.globalBundleConfig(reg, full ? Infinity : o.globalBAMaxTrackLength);
+    const b = this.buildBundle(cfg, true);
+    if (b) {
+      const ba = new BundleAdjuster(b.problem, {
+        loss: o.globalBALoss,
+        lossScalePx: o.globalBALossScalePx,
+        maxIterations: o.globalBAMaxIterations,
+        timeLimitMs: deadline - t0,
+        functionTolerance: 1e-6,
+        parameterTolerance: 0,
+        linearSolver,
+        cancel,
+      });
+      let sliceEnd = now() + o.globalBASliceMs;
+      try {
+        while (!ba.run(() => now() >= sliceEnd)) {
+          await yieldToEventLoop();
+          sliceEnd = now() + o.globalBASliceMs;
+        }
+      } finally {
+        if (ba.finished) this.writeBundlePoints(b);
+      }
+      this.timings.globalBAIterations += ba.result.iterations;
     }
+    this.timings.globalBA += now() - t0;
+    this.timings.numGlobalBA++;
+    if (cancel?.cancelled) throw new SfMCancelledError();
   }
 
   /** Synchronous variant (for time-bounded live use); `full = false` caps long tracks. */

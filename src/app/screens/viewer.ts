@@ -1,7 +1,10 @@
 /**
- * Viewer: full-screen 3D model (points / mesh / cameras / EDL), measure tool (metres only for
- * metric models), Build sheet (dense cloud / mesh with a quality picker), Export sheet
- * (PLY points, PLY mesh, GLB, COLMAP + images ZIP: the first tap builds the file through the
+ * Viewer: full-screen 3D model (photoreal Gaussian splats / points / mesh — one layer at a time,
+ * switched by the layer pill above the toolbar —, cameras, EDL), measure tool (metres only for
+ * metric models; on the points / mesh also while the splats are shown), Build sheet (dense cloud
+ * / mesh with a quality picker, and the photoreal model: `engine.splat()` runs HERE with a
+ * progress card and Cancel, the model is shown when it finishes), Export sheet (PLY points, PLY
+ * mesh, GLB, Gaussian splats PLY, COLMAP + images ZIP: the first tap builds the file through the
  * engine and shows its size, a second tap "Share / Save" calls saveFile directly in the tap
  * handler — iOS allows navigator.share only within ~5 s of a user activation), Info sheet
  * (scale source and uncertainty, gravity / north alignment with the yaw source — the compass
@@ -10,27 +13,46 @@
  * "Resume dense reconstruction" (HUD + Build sheet): the engine continues from its stored maps.
  */
 import { saveFile } from '../../io/download';
-import type { Viewer } from '../../viewer';
+import type { SplatDisplayState, Viewer } from '../../viewer';
 import { loadViewerModule } from '../viewer-loader';
 import { formatDistance } from '../../viewer/helpers';
-import type { ExportFormat, QualityPreset } from '../../workers/protocol';
+import type { ProgressEvent } from '../../core/types';
+import { isCancelledError, type ExportFormat, type QualityPreset } from '../../workers/protocol';
 import type { App, Results, Screen } from '../app';
-import { button, chip, group, iconButton, kvRow, section, segmented, setButtonLabel, spinner, switchRow } from '../components/controls';
+import { button, chip, group, iconButton, kvRow, progressBar, section, segmented, setButtonLabel, spinner, switchRow } from '../components/controls';
+import { confirmDialog } from '../components/dialog';
 import { openSheet, type SheetHandle } from '../components/sheet';
 import { toast } from '../components/toast';
 import { Disposer, h, replaceChildren } from '../dom';
 import { exportFilename, formatBytes, formatCount, formatDuration, modeLabel, qualityLabel } from '../format';
 import { icon, type IconName } from '../icons';
 import type { ProcessingStep, Route } from '../router';
-import { builtQuality, clearDenseResume, denseResumable, denseResumeQuality, memoryStatRows, northInfo } from '../model-info';
+import {
+  builtQuality,
+  clearDenseResume,
+  clearSplatResume,
+  denseResumable,
+  denseResumeQuality,
+  memoryStatRows,
+  northInfo,
+  splatProgressView,
+  splatResumable,
+  splatResumeQuality,
+} from '../model-info';
+
+/** What the 3D view shows: one model layer at a time. */
+type LayerId = 'splats' | 'points' | 'mesh';
 
 interface DisplayState {
-  points: boolean;
-  mesh: boolean;
+  layer: LayerId;
   cameras: boolean;
   edl: boolean;
   grid: boolean;
+  /** Light the mesh (default off: its colours are photo colours, which already contain the shading). */
+  meshLighting: boolean;
 }
+
+const LAYER_LABELS: Record<LayerId, string> = { splats: 'Splats', points: 'Points', mesh: 'Mesh' };
 
 interface ExportState {
   status: 'idle' | 'building' | 'ready' | 'error';
@@ -42,6 +64,7 @@ const EXPORTS: { format: ExportFormat; title: string; icon: IconName; ext: strin
   { format: 'ply-points', title: 'Point cloud (PLY)', icon: 'points', ext: 'ply', suffix: 'points' },
   { format: 'ply-mesh', title: 'Mesh (PLY)', icon: 'mesh', ext: 'ply', suffix: 'mesh' },
   { format: 'glb', title: '3D model (GLB)', icon: 'cube', ext: 'glb', suffix: '' },
+  { format: 'ply-splat', title: 'Gaussian splats (.ply)', icon: 'splats', ext: 'ply', suffix: 'splats' },
   { format: 'colmap-zip', title: 'COLMAP project (ZIP)', icon: 'zip', ext: 'zip', suffix: 'colmap' },
 ];
 
@@ -52,8 +75,23 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   /** load() applied this scan: until then app.results may still describe the previous one. */
   let ready = false;
   let measuring = false;
-  const display: DisplayState = { points: true, mesh: false, cameras: true, edl: true, grid: true };
+  const display: DisplayState = { layer: 'points', cameras: true, edl: true, grid: true, meshLighting: false };
   const exports = new Map<ExportFormat, ExportState>();
+  /** Bumped when a photoreal build replaces the model: a splat PLY prepared before is stale. */
+  let splatVersion = 0;
+  /** The viewer's splat layer ('none' until a model is set; 'unavailable': no WebGPU / failed). */
+  let splatState: SplatDisplayState = 'none';
+  /** engine.splatModel() is being fetched. */
+  let splatFetching = false;
+  /** Bumped by every splat model load (a slower earlier one must not install its model). */
+  let splatLoadToken = 0;
+  /** The user picked a layer: a model finishing to load does not switch the view on its own. */
+  let userPickedLayer = false;
+  /** A photoreal build (engine.splat) runs from this screen. */
+  let building = false;
+  let cancelling = false;
+  /** Splats cannot be built here (no WebGPU in this browser; the engine would reject). */
+  const webgpuMissing = (): boolean => app.env.webgpu === 'unsupported' || app.env.webgpu === 'no-adapter';
 
   const canvasHost = h('div', { class: 'viewer-canvas', 'data-testid': 'viewer-canvas' });
   const loading = h('div', { class: 'viewer-loading' }, spinner('lg'), h('span', { text: 'Loading model…' }));
@@ -63,7 +101,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   const top = h(
     'header',
     { class: 'viewer-top' },
-    iconButton('back', 'Back to scans', () => app.navigate({ type: 'BACK' }), { variant: 'glass', testId: 'viewer-back' }),
+    iconButton('back', 'Back to scans', () => void goBack(), { variant: 'glass', testId: 'viewer-back' }),
     h('div', { class: 'viewer-heading' }, titleEl, subEl),
     iconButton('info', 'Model info', () => openInfo(), { variant: 'glass', testId: 'viewer-info' }),
   );
@@ -98,7 +136,32 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     button({ label: 'Resume', variant: 'primary', size: 'sm', testId: 'dense-resume-button', onClick: () => resumeDense() }),
   );
 
-  const el = h('div', { class: 'viewer-screen' }, canvasHost, loading, top, resumeHud, measureHud, toolbar);
+  // Interrupted photoreal build: the same card for the splats (dense takes precedence).
+  const splatResumeSub = h('span', { class: 'viewer-resume-sub' });
+  const splatResumeHud = h(
+    'div',
+    { class: 'viewer-resume', hidden: true, role: 'status', 'data-testid': 'splat-resume' },
+    h('span', { class: 'viewer-resume-icon' }, icon('splats', { size: 20 })),
+    h('div', { class: 'viewer-resume-text' }, h('span', { class: 'viewer-resume-title', text: 'Photoreal model interrupted' }), splatResumeSub),
+    button({ label: 'Resume', variant: 'primary', size: 'sm', testId: 'splat-resume-button', onClick: () => void buildSplats(splatResumeQuality(app.results) ?? builtQuality(app.results, 'splat')) }),
+  );
+
+  // Photoreal build progress (engine.splat runs while the model stays explorable).
+  const jobBar = progressBar('Photoreal model');
+  const jobSub = h('span', { class: 'viewer-job-sub', 'data-testid': 'splat-progress-text' });
+  const jobCancel = button({ label: 'Cancel', variant: 'glass', size: 'sm', testId: 'splat-cancel', onClick: () => void cancelBuild() });
+  const jobHud = h(
+    'div',
+    { class: 'viewer-job', hidden: true, role: 'status', 'aria-live': 'polite', 'data-testid': 'splat-progress' },
+    h('span', { class: 'viewer-job-icon' }, spinner('sm', 'Building')),
+    h('div', { class: 'viewer-job-text' }, h('span', { class: 'viewer-job-title', text: 'Building photoreal model' }), jobSub, jobBar.el),
+    jobCancel,
+  );
+
+  // Layer pill above the toolbar (Splats / Points / Mesh), shown when there is a choice.
+  const layerHost = h('div', { class: 'layer-switch', hidden: true, 'data-testid': 'layer-switch' });
+
+  const el = h('div', { class: 'viewer-screen' }, canvasHost, loading, top, resumeHud, splatResumeHud, jobHud, measureHud, layerHost, toolbar);
 
   /**
    * Resume (re-run) the interrupted densify with the quality of the INTERRUPTED run (the engine skips
@@ -111,22 +174,40 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   }
 
   // ---- content -----------------------------------------------------------------------------------
+  /**
+   * Splats can be shown: a trained model exists, the viewer did not give up on its layer and no
+   * photoreal build runs (it frees the layer: `releaseSplats`).
+   */
+  function splatsAvailable(): boolean {
+    return !building && !!app.results.splat && splatState !== 'unavailable' && !!viewer;
+  }
+
+  function availableLayers(): LayerId[] {
+    const r = app.results;
+    const out: LayerId[] = [];
+    if (splatsAvailable()) out.push('splats');
+    if (r.dense || r.sparse) out.push('points');
+    if (r.mesh) out.push('mesh');
+    return out;
+  }
+
+  /** The layer to show when the current one is gone (splats → mesh → points). */
+  function fallbackLayer(): LayerId {
+    const av = availableLayers();
+    if (av.includes(display.layer)) return display.layer;
+    return av.includes('mesh') ? 'mesh' : 'points';
+  }
+
   function applyContent(first: boolean): void {
     const r = app.results;
     // (an empty dense cloud, from a fusion that kept nothing, shows the sparse one, as exports do)
     const dense = r.dense && r.dense.count > 0 ? r.dense : null;
     titleEl.textContent = r.name;
-    const parts: string[] = [];
-    if (r.mesh) parts.push(`${formatCount(r.mesh.triangleCount)} triangles`);
-    if (dense) parts.push(`${formatCount(dense.count)} points`);
-    else if (r.sparse) parts.push(`${formatCount(r.sparse.points.count)} points`);
-    if (r.sparse) parts.push(`${r.sparse.cameras.length} photos`);
-    subEl.textContent = parts.join(' · ');
-    buildTool.classList.toggle('has-badge', !r.dense || !r.mesh);
-    resumeHud.hidden = !denseResumable(r);
-    const rq = denseResumeQuality(r);
-    resumeSub.textContent = rq ? `Resume from the saved depth maps (${qualityLabel(rq)} quality).` : 'Resume from the saved depth maps.';
-    if (!viewer) return;
+    renderBadges();
+    if (!viewer) {
+      renderSub();
+      return;
+    }
     const metric = r.sparse?.metric;
     viewer.setWorldUp(metric?.gravityAligned ? 'z' : 'auto');
     viewer.setUnits(!!metric?.metric);
@@ -136,19 +217,179 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     viewer.setMesh(r.mesh);
     viewer.setCameras(r.sparse ? r.sparse.cameras.map((c) => ({ pose: c.pose, intrinsics: c.intrinsics, upCam: c.upCam })) : [], false);
     if (first) {
-      display.mesh = !!r.mesh;
-      display.points = !r.mesh;
+      // the photoreal model when there is one (points meanwhile, while it loads), else the mesh
+      display.layer = r.splat ? 'splats' : r.mesh ? 'mesh' : 'points';
       display.grid = !!metric?.gravityAligned;
+      // splats have no depth for the frustums to hide behind: they would cover the view
+      display.cameras = !r.splat;
     }
-    if (!r.mesh) display.mesh = false;
-    if (!display.points && !display.mesh) display.points = true;
-    viewer.setDisplay(display);
-    if (first) viewer.fitToContent();
+    if (display.layer !== 'splats' || !r.splat) display.layer = fallbackLayer();
+    applyDisplay();
+    if (first) frameView(false);
+    if (r.splat && splatState === 'none' && !splatFetching && !building) void loadSplats(false);
+  }
+
+  /** Header sub line: the shown layer's size and the photo count. */
+  function renderSub(): void {
+    const r = app.results;
+    const parts: string[] = [];
+    const layer = display.layer === 'splats' && splatState !== 'ready' ? 'points' : display.layer;
+    if (layer === 'splats' && r.splat) parts.push(`${formatCount(r.splat.count)} Gaussians`);
+    else if (layer === 'mesh' && r.mesh) parts.push(`${formatCount(r.mesh.triangleCount)} triangles`);
+    // (an empty dense cloud shows the sparse one: applyContent)
+    else if (r.dense && r.dense.count > 0) parts.push(`${formatCount(r.dense.count)} points`);
+    else if (r.sparse) parts.push(`${formatCount(r.sparse.points.count)} points`);
+    if (r.sparse) parts.push(`${r.sparse.cameras.length} photos`);
+    subEl.textContent = parts.join(' · ');
+  }
+
+  /** Build tool badge (something left to build) and the resume cards. */
+  function renderBadges(): void {
+    const r = app.results;
+    buildTool.classList.toggle('has-badge', !r.dense || !r.mesh || (!r.splat && !!r.sparse && !webgpuMissing()));
+    const dense = denseResumable(r);
+    resumeHud.hidden = !dense || building;
+    const rq = denseResumeQuality(r);
+    resumeSub.textContent = rq ? `Resume from the saved depth maps (${qualityLabel(rq)} quality).` : 'Resume from the saved depth maps.';
+    splatResumeHud.hidden = dense || building || !splatResumable(r) || webgpuMissing();
+    const sq = splatResumeQuality(r);
+    const it = r.stats.splatResumableIteration;
+    splatResumeSub.textContent = `Continues from the saved training${typeof it === 'number' && it > 0 ? ` (iteration ${it.toLocaleString('en-US')})` : ''}${sq ? ` · ${qualityLabel(sq)}` : ''}.`;
+    jobHud.hidden = !building;
+    el.classList.toggle('building', building);
+  }
+
+  function applyDisplay(): void {
+    const l = display.layer;
+    viewer?.setDisplay({
+      // splats replace the points / mesh once ready; the points show while they load
+      splats: l === 'splats',
+      points: l !== 'mesh',
+      mesh: l === 'mesh',
+      cameras: display.cameras,
+      edl: display.edl,
+      grid: display.grid,
+      unlit: !display.meshLighting,
+    });
+    renderLayerSwitch();
+    renderSub();
+  }
+
+  /**
+   * Default view: with splats, from the middle photo (they are photoreal near the capture and show
+   * floaters far outside it); otherwise the whole content.
+   */
+  function frameView(animate: boolean): void {
+    if (!viewer) return;
+    if (display.layer === 'splats' && viewer.viewFromCamera(undefined, { animate })) return;
+    viewer.fitToContent(animate);
   }
 
   function setDisplay(patch: Partial<DisplayState>): void {
     Object.assign(display, patch);
-    viewer?.setDisplay(display);
+    applyDisplay();
+  }
+
+  function setLayer(l: LayerId): void {
+    userPickedLayer = true;
+    setDisplay({ layer: l });
+  }
+
+  let layerSegments: { el: HTMLElement; set: (v: LayerId) => void } | null = null;
+  let layerKey = '';
+  function renderLayerSwitch(): void {
+    const av = availableLayers();
+    const loadingSplats = display.layer === 'splats' && (splatFetching || splatState === 'loading' || splatState === 'lost');
+    layerHost.hidden = av.length < 2;
+    layerHost.classList.toggle('loading', loadingSplats);
+    layerHost.dataset.layer = display.layer;
+    layerHost.dataset.splats = splatFetching ? 'fetching' : splatState;
+    const key = av.join(',');
+    if (key !== layerKey || !layerSegments) {
+      layerKey = key;
+      layerSegments = segmented<LayerId>(
+        'Model layer',
+        av.map((v) => ({ value: v, label: LAYER_LABELS[v] })),
+        av.includes(display.layer) ? display.layer : av[0],
+        (v) => setLayer(v),
+      );
+      replaceChildren(layerHost, layerSegments.el, h('span', { class: 'layer-status', 'aria-hidden': 'true' }, spinner('sm', 'Loading photoreal model')));
+    } else layerSegments.set(display.layer);
+  }
+
+  /**
+   * Fetches the stored splat model (transferred from the engine) into the viewer's WebGPU layer.
+   * `show`: switch to it when ready (after a build); otherwise only when the user did not pick
+   * another layer meanwhile.
+   */
+  async function loadSplats(show: boolean): Promise<void> {
+    if (!viewer || !app.results.splat) return;
+    const token = ++splatLoadToken;
+    splatFetching = true;
+    renderLayerSwitch();
+    try {
+      const payload = await app.engine.splatModel();
+      if (closed || token !== splatLoadToken || !viewer) return;
+      splatFetching = false;
+      if (!payload) {
+        // the engine has none (e.g. refine removed it)
+        app.results.splat = null;
+        display.layer = fallbackLayer();
+        applyDisplay();
+        return;
+      }
+      const ok = await viewer.setSplats(payload);
+      if (closed || token !== splatLoadToken) return;
+      if (ok && (show || !userPickedLayer)) display.layer = 'splats';
+      if (ok && show) {
+        // a model just built: show it from the photos, without the frustums in front of it
+        display.cameras = false;
+        frameView(true);
+      }
+      if (!ok && display.layer === 'splats') display.layer = fallbackLayer();
+      applyDisplay();
+    } catch (e) {
+      if (closed || token !== splatLoadToken) return;
+      splatFetching = false;
+      console.warn('[viewer] splat model unavailable', e);
+      toast(`Couldn’t load the photoreal model: ${(e as Error)?.message ?? e}`, { tone: 'warn' });
+      if (display.layer === 'splats') display.layer = fallbackLayer();
+      applyDisplay();
+    }
+  }
+
+  /**
+   * Frees the viewer's splat layer and drops a model load in flight. The layer (≈ 150–220 MB of GPU
+   * memory plus the host copy of the model at 300–500 k Gaussians) is not part of the page reserve
+   * the engine plans the training with, so a rebuild must not run next to it.
+   */
+  function releaseSplats(): void {
+    if (!viewer) return;
+    splatLoadToken++;
+    splatFetching = false;
+    if (splatState !== 'none' && splatState !== 'unavailable') void viewer.setSplats(null);
+    if (display.layer === 'splats') display.layer = fallbackLayer();
+    applyDisplay();
+  }
+
+  let splatUnavailableToast = false;
+  function onSplatState(st: SplatDisplayState, detail?: string): void {
+    splatState = st;
+    if (closed) return;
+    el.dataset.splats = st;
+    if (st === 'unavailable') {
+      if (!splatUnavailableToast) {
+        splatUnavailableToast = true;
+        toast(
+          webgpuMissing() || /software|WebGPU is not available/i.test(detail ?? '')
+            ? 'The photoreal model needs WebGPU to be shown — showing the points instead.'
+            : `The photoreal model can’t be shown right now (${detail ?? 'GPU error'}).`,
+          { tone: 'warn', durationMs: 6000 },
+        );
+      }
+      if (display.layer === 'splats') display.layer = fallbackLayer();
+    }
+    applyDisplay();
   }
 
   // ---- measure -----------------------------------------------------------------------------------
@@ -178,23 +419,39 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   function openDisplay(): void {
     if (!ready) return;
     const r = app.results;
+    const av = availableLayers();
+    const layers = segmented<LayerId>(
+      'Show',
+      av.map((v) => ({ value: v, label: LAYER_LABELS[v] })),
+      av.includes(display.layer) ? display.layer : av[0],
+      (v) => setLayer(v),
+    );
+    layers.el.dataset.testid = 'display-layer';
+    const note = !r.splat
+      ? 'Splats: build the photoreal model (Build).'
+      : splatState === 'unavailable'
+        ? 'Splats need WebGPU, which is not available here.'
+        : 'Splats are the photoreal model; measuring uses the points and mesh.';
     const rows = [
-      switchRow({ label: 'Points', icon: 'points', checked: display.points, testId: 'display-points', onChange: (v) => setDisplay({ points: v }) }),
-      switchRow({
-        label: 'Mesh',
-        icon: 'mesh',
-        description: r.mesh ? undefined : 'Not built yet',
-        checked: display.mesh,
-        disabled: !r.mesh,
-        testId: 'display-mesh',
-        onChange: (v) => setDisplay({ mesh: v }),
-      }),
       switchRow({ label: 'Cameras', icon: 'frustum', checked: display.cameras, testId: 'display-cameras', onChange: (v) => setDisplay({ cameras: v }) }),
       switchRow({ label: 'Eye-dome lighting', icon: 'sun', description: 'Shades point clouds for depth', checked: display.edl, testId: 'display-edl', onChange: (v) => setDisplay({ edl: v }) }),
-      switchRow({ label: 'Ground grid', icon: 'target', checked: display.grid, disabled: !r.sparse?.metric.gravityAligned, onChange: (v) => setDisplay({ grid: v }) }),
+      switchRow({
+        label: 'Mesh lighting',
+        icon: 'mesh',
+        description: 'Off: the photo colours as captured (they already contain the light)',
+        checked: display.meshLighting,
+        disabled: !r.mesh,
+        testId: 'display-mesh-lighting',
+        onChange: (v) => setDisplay({ meshLighting: v }),
+      }),
+      switchRow({ label: 'Ground grid', icon: 'target', description: 'Not with splats', checked: display.grid, disabled: !r.sparse?.metric.gravityAligned, onChange: (v) => setDisplay({ grid: v }) }),
     ];
-    const reset = button({ label: 'Reset view', icon: 'target', variant: 'secondary', size: 'md', block: true, onClick: () => viewer?.fitToContent(true) });
-    openSheet({ title: 'Display', content: [group(...rows.map((r) => r.el)), h('div', { class: 'sheet-footer' }, reset)], testId: 'sheet-display' });
+    const reset = button({ label: 'Reset view', icon: 'target', variant: 'secondary', size: 'md', block: true, onClick: () => frameView(true) });
+    openSheet({
+      title: 'Display',
+      content: [section('Show', layers.el, h('p', { class: 'section-note', text: note })), group(...rows.map((r) => r.el)), h('div', { class: 'sheet-footer' }, reset)],
+      testId: 'sheet-display',
+    });
   }
 
   function openBuild(): void {
@@ -234,6 +491,10 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       /** Sub line when rebuilding at quality `q`. */
       rebuildDesc: (q: QualityPreset) => string;
       steps: ProcessingStep[];
+      /** Runs here instead of the Processing screen (the photoreal build). */
+      run?: (q: QualityPreset) => void;
+      /** Resumable at this quality: "Resume" + this sub line. */
+      resume?: (q: QualityPreset) => string | null;
       testId: string;
       disabled?: boolean;
     }): HTMLElement => {
@@ -241,12 +502,18 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       const action = h('div', { class: 'build-action' });
       const sync = (): void => {
         const built = o.done && o.done.quality === q;
-        sub.textContent = !o.done ? o.desc : built ? `${o.done.sub} · ${qualityLabel(o.done.quality)}` : o.rebuildDesc(q);
+        const resume = o.resume?.(q) ?? null;
+        sub.textContent = resume ?? (!o.done ? o.desc : built ? `${o.done.sub} · ${qualityLabel(o.done.quality)}` : o.rebuildDesc(q));
+        const onClick = (): void => {
+          if (!o.run) return build(o.steps);
+          sheet.close();
+          o.run(q);
+        };
         replaceChildren(
           action,
-          built
+          built && !resume
             ? chip('Built', 'good', 'check')
-            : button({ label: o.done ? 'Rebuild' : 'Build', variant: 'primary', size: 'sm', testId: o.testId, disabled: o.disabled, onClick: () => build(o.steps) }),
+            : button({ label: resume ? 'Resume' : o.done ? 'Rebuild' : 'Build', variant: 'primary', size: 'sm', testId: o.testId, disabled: o.disabled, onClick }),
         );
       };
       syncs.push(sync);
@@ -270,7 +537,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
                 rebuildDesc: (q) => `Rebuilds at ${qualityLabel(q)} quality${r.mesh ? ' and removes the mesh' : ''}.`,
                 steps: ['densify'],
                 testId: 'build-dense',
-                disabled: !r.sparse,
+                disabled: !r.sparse || building,
               }),
           item({
             icon: 'mesh',
@@ -280,7 +547,26 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
             rebuildDesc: (q) => `Rebuilds the dense cloud and mesh at ${qualityLabel(q)} quality.`,
             steps: r.dense ? ['mesh'] : ['densify', 'mesh'],
             testId: 'build-mesh',
-            disabled: !r.sparse,
+            disabled: !r.sparse || building,
+          }),
+          item({
+            icon: 'splats',
+            title: 'Photoreal model',
+            done: r.splat ? { sub: `${formatCount(r.splat.count)} Gaussians`, quality: builtQuality(r, 'splat') } : null,
+            desc: webgpuMissing()
+              ? 'Needs WebGPU, which this browser does not have.'
+              : `Gaussian splats trained on your photos — looks like the real scene.${r.dense ? '' : ' Better after the dense cloud.'} A few minutes.`,
+            rebuildDesc: (q) => `Retrains at ${qualityLabel(q)} quality.`,
+            steps: [],
+            run: (q) => void buildSplats(q),
+            resume: (q) => {
+              if (!splatResumable(r)) return null;
+              const rq = splatResumeQuality(r);
+              if (rq && rq !== q) return null;
+              return 'Interrupted — continues from the saved training.';
+            },
+            testId: 'build-splat',
+            disabled: !r.sparse || building || webgpuMissing(),
           }),
         ),
       ),
@@ -295,6 +581,8 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
         variant: 'primary',
         size: 'sm',
         testId: 'build-dense',
+        // like the other builds: not while the photoreal model trains (leaving would stop it)
+        disabled: building,
         onClick: () => {
           // Another quality starts over (the engine discards the stored maps of the other settings).
           if (q !== quality0) clearDenseResume(app.results.stats);
@@ -403,11 +691,14 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   }
 
   async function prepare(format: ExportFormat): Promise<void> {
+    const version = splatVersion;
     exports.set(format, { status: 'building' });
     renderExports?.();
     try {
       const blob = await app.engine.exportModel(format);
-      exports.set(format, { status: 'ready', blob });
+      // a photoreal build replaced the model meanwhile: the file may hold the previous one
+      if (format === 'ply-splat' && version !== splatVersion) exports.delete(format);
+      else exports.set(format, { status: 'ready', blob });
     } catch (e) {
       exports.set(format, { status: 'error', error: (e as Error)?.message ?? String(e) });
     }
@@ -440,6 +731,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       kvRow('Sparse points', h('span', { text: sp ? formatCount(sp.points.count) : '–' })),
       kvRow('Dense points', h('span', { text: r.dense ? formatCount(r.dense.count) : 'Not built' })),
       kvRow('Mesh', h('span', { text: r.mesh ? `${formatCount(r.mesh.triangleCount)} triangles` : 'Not built' })),
+      kvRow('Photoreal model', h('span', { text: r.splat ? `${formatCount(r.splat.count)} Gaussians · ${r.splat.iterations.toLocaleString('en-US')} iterations` : 'Not built' })),
       kvRow('Mean reprojection error', h('span', { text: num('meanReprojErrorPx') !== null ? `${num('meanReprojErrorPx')!.toFixed(2)} px` : '–' })),
     ];
     if (num('meanTrackLength') !== null) counts.push(kvRow('Mean track length', h('span', { text: num('meanTrackLength')!.toFixed(1) })));
@@ -458,6 +750,111 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     if (timings.length) content.push(section('Timings', group(...timings)));
     content.push(section('Capture', group(...about)));
     openSheet({ title: 'Model info', subtitle: `${modeLabel(r.mode)} scan · ${qualityLabel(r.quality)} quality`, content, testId: 'sheet-info' });
+  }
+
+  // ---- photoreal build ----------------------------------------------------------------------------
+  /**
+   * Trains the Gaussian splats (engine.splat) while the model stays explorable (points / mesh: the
+   * splat layer of a previous model is freed meanwhile and loaded again when the build stops):
+   * progress card with Cancel; the wake lock is held and leaving the page asks first. A cancelled /
+   * failed run is marked resumable (the engine keeps checkpoints; the same quality continues from
+   * the last one).
+   */
+  async function buildSplats(q: QualityPreset): Promise<void> {
+    if (building || closed || !app.results.sparse) return;
+    building = true;
+    cancelling = false;
+    app.busy = true;
+    // iOS suspends a hidden page; the engine pauses its GPU work while hidden anyway
+    void app.wakeLock.acquire();
+    // the previous model's layer is freed while the trainer runs (the points / mesh show meanwhile)
+    const wasSplats = display.layer === 'splats';
+    releaseSplats();
+    let built = false;
+    jobBar.set(-1);
+    jobSub.textContent = 'Starting';
+    jobCancel.disabled = false;
+    renderBadges();
+    const sessionId = route.sessionId;
+    try {
+      const res = await app.engine.splat({ quality: q }, (e: ProgressEvent) => {
+        if (closed || cancelling) return;
+        const v = splatProgressView(e);
+        jobBar.set(v.progress);
+        jobSub.textContent = v.text;
+      });
+      const r = app.results;
+      r.splat = res;
+      built = true;
+      const timings: Record<string, number> = {};
+      for (const k of ['splatPrepareMs', 'splatTrainMs', 'splatFinishMs']) if (typeof res.stats[k] === 'number') timings[k] = res.stats[k] as number;
+      r.stats = { ...r.stats, ...timings, splatQuality: q };
+      clearSplatResume(r.stats);
+      // a splat PLY prepared before holds the previous model
+      splatVersion++;
+      exports.delete('ply-splat');
+      void app.updateSession(sessionId, { stats: { splatGaussians: res.count, splatIterations: res.iterations, splatQuality: q } });
+      if (closed) return;
+      renderExports?.();
+      toast(`Photoreal model ready · ${formatCount(res.count)} Gaussians`, { tone: 'good', icon: 'splats' });
+      // a new model: show it (also replaces an older one in the viewer)
+      void loadSplats(true);
+    } catch (e) {
+      const r = app.results;
+      r.stats = { ...r.stats, splatInterrupted: 1, splatInterruptedQuality: q };
+      if (closed) return;
+      if (isCancelledError(e) || cancelling) toast('Stopped. Resume continues from the saved training.', { tone: 'info', icon: 'splats' });
+      else toast(`Couldn’t build the photoreal model: ${(e as Error)?.message ?? e}`, { tone: 'bad', durationMs: 9000 });
+    } finally {
+      building = false;
+      cancelling = false;
+      // once the screen was left, leave() released them and the next screen may hold them now
+      if (!closed) {
+        app.busy = false;
+        void app.wakeLock.release();
+        renderBadges();
+        // stopped / failed: the previous model (still the stored one) is shown again
+        if (!built && app.results.splat && viewer && splatState === 'none' && !splatFetching) void loadSplats(wasSplats);
+        else applyDisplay();
+      }
+    }
+  }
+
+  async function cancelBuild(): Promise<void> {
+    if (!building || cancelling) return;
+    const ok = await confirmDialog({
+      title: 'Stop building the photoreal model?',
+      message: 'The training so far is kept: Resume continues from it.',
+      confirmLabel: 'Stop',
+      cancelLabel: 'Continue',
+      destructive: true,
+    });
+    if (!ok || !building || closed) return;
+    stopBuild();
+  }
+
+  /** Cancel the running build; restart the engine if it does not stop within 8 s. */
+  function stopBuild(): void {
+    cancelling = true;
+    jobCancel.disabled = true;
+    jobSub.textContent = 'Stopping…';
+    jobBar.set(-1);
+    void app.engine.abortLongOperation({ graceMs: 8000, method: 'splat' });
+  }
+
+  async function goBack(): Promise<void> {
+    if (building && !cancelling) {
+      const ok = await confirmDialog({
+        title: 'Stop building the photoreal model?',
+        message: 'The training so far is kept: open the scan again and tap Resume to continue.',
+        confirmLabel: 'Stop and leave',
+        cancelLabel: 'Stay',
+        destructive: true,
+      });
+      if (!ok || closed) return;
+      if (building) stopBuild();
+    }
+    app.navigate({ type: 'BACK' });
   }
 
   // ---- lifecycle ---------------------------------------------------------------------------------
@@ -482,7 +879,8 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     try {
       const { Viewer: ViewerCtor } = await loadViewerModule();
       if (closed) return;
-      viewer = new ViewerCtor(canvasHost, { background: '#0b0c10' });
+      viewer = new ViewerCtor(canvasHost, { background: '#0b0c10', onSplatState: (st, detail) => onSplatState(st, detail) });
+      app.debug.viewer = viewer;
     } catch (e) {
       replaceChildren(canvasHost, h('div', { class: 'viewer-nogl' }, icon('warning', { size: 28 }), h('p', { text: `The 3D view could not start: ${(e as Error)?.message ?? e}` })));
     }
@@ -496,6 +894,13 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     },
     leave() {
       closed = true;
+      if (building) {
+        // the training must not outlive its screen (it keeps its checkpoints)
+        if (!cancelling) void app.engine.abortLongOperation({ graceMs: 8000, method: 'splat' });
+        app.busy = false;
+        void app.wakeLock.release();
+      }
+      if (app.debug.viewer === viewer) app.debug.viewer = undefined;
       viewer?.dispose();
       viewer = null;
       d.dispose();
@@ -504,7 +909,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
 }
 
 /** Whether an export format has something to export, and what (the Export sheet's sub line). */
-export function exportAvailability(r: Pick<Results, 'sparse' | 'dense' | 'mesh'>, f: ExportFormat): { ok: boolean; sub: string } {
+export function exportAvailability(r: Pick<Results, 'sparse' | 'dense' | 'mesh'> & Partial<Pick<Results, 'splat'>>, f: ExportFormat): { ok: boolean; sub: string } {
   // an empty dense cloud (fusion kept no point) is skipped like the engine's export does
   const dense = r.dense && r.dense.count > 0 ? r.dense : null;
   switch (f) {
@@ -520,6 +925,10 @@ export function exportAvailability(r: Pick<Results, 'sparse' | 'dense' | 'mesh'>
       return { ok: false, sub: 'Nothing to export yet' };
     case 'colmap-zip':
       return r.sparse ? { ok: true, sub: `Cameras, sparse model and ${r.sparse.cameras.length} photos` } : { ok: false, sub: 'No sparse model yet' };
+    case 'ply-splat':
+      return r.splat
+        ? { ok: true, sub: `${formatCount(r.splat.count)} Gaussians · opens in SuperSplat, Spark and most splat viewers` }
+        : { ok: false, sub: 'Build the photoreal model first' };
   }
 }
 
@@ -538,6 +947,9 @@ function timingLabel(k: string): string {
     fusion: 'Fusion',
     meshing: 'Meshing',
     total: 'Total',
+    splatPrepare: 'Photoreal: preparation',
+    splatTrain: 'Photoreal: training',
+    splatFinish: 'Photoreal: saving',
   };
   return map[base] ?? base.replace(/([A-Z])/g, ' $1').replace(/^./, (c) => c.toUpperCase());
 }

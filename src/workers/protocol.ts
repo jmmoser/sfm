@@ -17,7 +17,8 @@
  * no `visibilitychange`; the engine must not submit GPU work while the page is hidden), the
  * `close` request (let go of a session before it is deleted),
  * `EngineOptions.resume` (re-open a persisted session after a worker respawn), optional
- * FramePump metadata on `FrameInput`, `SessionSummary` carries the stored models.
+ * FramePump metadata on `FrameInput`, `SessionSummary` carries the stored models, the Gaussian
+ * splatting stage (`splat`, `splatModel`, export 'ply-splat', `ProgressEvent.detail`).
  */
 import type {
   CameraIntrinsics,
@@ -33,6 +34,7 @@ import type {
   Vec3,
 } from '../core/types';
 import type { SessionStatus } from '../io/storage';
+import type { SplatModel } from '../splat/types';
 
 export const ENGINE_PROTOCOL_VERSION = 1;
 
@@ -252,8 +254,95 @@ export interface MeshOptions {
   targetTriangles?: number;
 }
 
-export type ExportFormat = 'ply-points' | 'ply-mesh' | 'glb' | 'colmap-zip';
-export const EXPORT_FORMATS: readonly ExportFormat[] = ['ply-points', 'ply-mesh', 'glb', 'colmap-zip'];
+/**
+ * 'ply-splat': the trained Gaussian splats as an INRIA 3DGS PLY (x y z, f_dc / f_rest, opacity
+ * logit, log-scales, rot w x y z; appearance-normalised; world frame of the model) — opens in
+ * SuperSplat, Brush, Spark and most splat viewers.
+ */
+export type ExportFormat = 'ply-points' | 'ply-mesh' | 'glb' | 'colmap-zip' | 'ply-splat';
+export const EXPORT_FORMATS: readonly ExportFormat[] = ['ply-points', 'ply-mesh', 'glb', 'colmap-zip', 'ply-splat'];
+
+// ---------------------------------------------------------------------------------------------
+// Gaussian splatting stage (extension; docs/ENGINE.md "Splat")
+// ---------------------------------------------------------------------------------------------
+
+export interface SplatOptions {
+  /** Default: the session preset (iterations, Gaussian cap, image size, views: docs/ENGINE.md). */
+  quality?: QualityPreset;
+  /** Training iterations (overrides the preset). */
+  iterations?: number;
+  /** Hard cap on the number of Gaussians (overrides the preset; the memory plan may lower it). */
+  maxGaussians?: number;
+  /** Long side of the training images (px, ≤ the dense size; the memory plan may lower it). */
+  maxImageSize?: number;
+  /** Most training views (registered keyframes, evenly spread). */
+  maxViews?: number;
+  /** Far background shell (sky, distant structure). Default: on for scene captures. */
+  backgroundShell?: boolean;
+  /** Ignore a resumable checkpoint of the same run and train from the start. */
+  restart?: boolean;
+}
+
+/** Progress stage names of `splat` (ProgressEvent.stage). */
+export const SPLAT_STAGES = {
+  /** Views, memory plan, initial Gaussians (dense + sparse + shell), pipeline compilation, uploads. */
+  prepare: 'splat_prepare',
+  /** Training; `ProgressEvent.detail` is a `SplatTrainingDetail`. */
+  training: 'splat_training',
+  /** Appearance normalisation, read-back, persisting the model. */
+  finishing: 'splat_finishing',
+} as const;
+
+/** `ProgressEvent.detail` of the 'splat_training' stage. */
+export interface SplatTrainingDetail {
+  [key: string]: number;
+  iteration: number;
+  iterations: number;
+  /** Training loss of the last iteration ((1 − λ)·L1 + λ·D-SSIM, λ = 0.2). */
+  loss: number;
+  /** Iterations per second of the last chunk. */
+  itPerSec: number;
+  gaussians: number;
+}
+
+/** What `splat` resolves with (the model itself: `splatModel`). */
+export interface SplatResult {
+  /** Gaussians in the trained model. */
+  count: number;
+  /** Iterations trained (including those of a resumed checkpoint). */
+  iterations: number;
+  /** Wall time of this call (ms). */
+  ms: number;
+  shDegree: 0 | 1;
+  /** Bytes of the packed model (`SplatModelPayload` arrays). */
+  bytes: number;
+  /** Trained with the Mip-Splatting opacity compensation (a renderer must apply it). */
+  antialiased: boolean;
+  /**
+   * Well-known keys: splatViews, splatWidth / splatHeight, splatMaxGaussians, splatInitGaussians,
+   * splatShell, splatItPerSec, splatLoss, splatResumedFrom, splatMemPeakMB, splatGpuMB,
+   * splatDegraded, splatTrainMs, splatPrepareMs, splatStoredBytes.
+   */
+  stats: Record<string, number | string>;
+}
+
+/**
+ * The trained model for a viewer (`splatModel`; the arrays are transferred). World frame of the
+ * sparse model (+Z up, metres when metric, ARCHITECTURE §2). Per Gaussian i (src/splat/types.ts):
+ * mean `means[3i..]`; scale σ = exp(logScales[3i..]) along its local axes; rotation = the
+ * quaternion [w, x, y, z] `quats[4i..]` (unnormalised; local → world, Σ = R S² Rᵀ); opacity =
+ * sigmoid(opacities[i]); sRGB colour = max(0, SH_C0·f0 + 0.5) for SH degree 0 (`sh[3i..]`; degree 1
+ * adds SH_C1·(−y f1 + z f2 − x f3) with (x, y, z) the unit camera → mean direction). `antialiased`:
+ * multiply the opacity by √(det Σ₂ / det(Σ₂ + 0.3 I)) after adding 0.3 px² to the projected 2-D
+ * covariance Σ₂ (Mip-Splatting), as the trainer did. Colours are already appearance-normalised.
+ */
+export interface SplatModelPayload {
+  model: SplatModel;
+  antialiased: boolean;
+  /** Training background (sRGB); viewers usually draw their own. */
+  background: [number, number, number];
+  iterations: number;
+}
 
 export interface SessionSummary {
   id: string;
@@ -269,6 +358,8 @@ export interface SessionSummary {
   sparse: SparseResult | null;
   dense: PointCloud | null;
   mesh: TriangleMesh | null;
+  /** Extension: the stored splat model's info (fetch the model with `splatModel`). */
+  splat?: SplatResult | null;
   stats: Record<string, number | string>;
 }
 
@@ -283,6 +374,10 @@ export interface EngineMethodMap {
   refine: { params: undefined; result: SparseResult };
   densify: { params: DenseOptions | undefined; result: PointCloud };
   mesh: { params: MeshOptions | undefined; result: TriangleMesh };
+  /** Extension: train Gaussian splats (after densify, or after refine without a dense cloud). */
+  splat: { params: SplatOptions | undefined; result: SplatResult };
+  /** Extension: the stored splat model (packed, transferred), null when none was trained. */
+  splatModel: { params: undefined; result: SplatModelPayload | null };
   export: { params: { format: ExportFormat }; result: Blob };
   /** May be called without `init`: the engine is created from the stored session. */
   loadSession: { params: { id: string; options?: Partial<EngineOptions> }; result: SessionSummary };
@@ -310,6 +405,8 @@ export const ENGINE_METHODS: readonly EngineMethod[] = [
   'refine',
   'densify',
   'mesh',
+  'splat',
+  'splatModel',
   'export',
   'loadSession',
   'cancel',
@@ -319,7 +416,7 @@ export const ENGINE_METHODS: readonly EngineMethod[] = [
 ];
 
 /** Long-running methods that report `progress` events and can be cancelled. */
-export const LONG_RUNNING_METHODS: readonly EngineMethod[] = ['refine', 'densify', 'mesh', 'export', 'loadSession', 'finishCapture'];
+export const LONG_RUNNING_METHODS: readonly EngineMethod[] = ['refine', 'densify', 'mesh', 'splat', 'export', 'loadSession', 'finishCapture'];
 
 export interface EngineRequest<M extends EngineMethod = EngineMethod> {
   id: number;

@@ -9,7 +9,7 @@ import { isAppleMobileWebKit } from '../sensors/camera';
 import { parseConfig } from './config';
 import { requestCapturePermissions, type CapturePermissionStatus } from '../sensors/permissions';
 import { WakeLock } from '../sensors/wakelock';
-import type { CaptureMode, LiveCamera, QualityPreset, SparseResult } from '../workers/protocol';
+import type { CaptureMode, LiveCamera, QualityPreset, SparseResult, SplatResult } from '../workers/protocol';
 import { isQuotaError } from './capture-policy';
 import { closeAllModals, initLayers } from './components/layers';
 import { toast } from './components/toast';
@@ -69,6 +69,8 @@ export interface Results {
   sparse: SparseResult | null;
   dense: PointCloud | null;
   mesh: TriangleMesh | null;
+  /** The stored Gaussian-splat model's info (the model itself: engine.splatModel()); null when none. */
+  splat: SplatResult | null;
   /** Last live sparse model / keyframe cameras of the capture (processing preview). */
   liveSparse: { positions: Float32Array; colors: Uint8Array } | null;
   liveCameras: LiveCamera[] | null;
@@ -120,7 +122,18 @@ export class App {
    * Debug / e2e hooks installed by screens (e.g. hold frame delivery while a headless test
    * takes a screenshot: software GPU emulation starves the compositor while frames are grabbed).
    */
-  readonly debug: { holdFrames?: (hold: boolean) => void; /** Last Diagnostics benchmark report (e2e). */ benchReport?: unknown } = {};
+  readonly debug: {
+    holdFrames?: (hold: boolean) => void;
+    /** Last Diagnostics benchmark report (e2e). */
+    benchReport?: unknown;
+    /** The viewer screen's 3D view (e2e screenshots / measurements); undefined elsewhere. */
+    viewer?: unknown;
+  } = {};
+  /**
+   * A long engine job runs outside the Processing screen (the viewer's photoreal build): leaving
+   * the page asks first, like during capture / processing.
+   */
+  busy = false;
   /** Bumped by each ensureSessionLoaded and by what supersedes it (new scan, release, delete): a stale load is not applied. */
   private loadSeq = 0;
   private permissions: Promise<CapturePermissionStatus> | null = null;
@@ -167,7 +180,7 @@ export class App {
     // (iOS Safari shows no beforeunload prompt; the capture itself is persisted as it goes.)
     window.addEventListener('beforeunload', (e: BeforeUnloadEvent) => {
       const screen = this.route.screen;
-      if (screen !== 'capture' && screen !== 'processing') return;
+      if (screen !== 'capture' && screen !== 'processing' && !this.busy) return;
       e.preventDefault();
       e.returnValue = '';
     });
@@ -191,6 +204,7 @@ export class App {
       sparse: null,
       dense: null,
       mesh: null,
+      splat: null,
       liveSparse: null,
       liveCameras: null,
       stats: {},
@@ -451,6 +465,7 @@ export class App {
         sparse: sum.sparse,
         dense: sum.dense,
         mesh: sum.mesh,
+        splat: sum.splat ?? null,
         stats: sum.stats,
       };
       return true;

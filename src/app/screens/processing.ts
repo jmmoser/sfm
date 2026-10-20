@@ -18,7 +18,7 @@ import { icon } from '../icons';
 import type { ProcessingStep, Route } from '../router';
 import { STAGES, estimateRemainingMs, stageIdFor, stageWeights, type StageId, type StageState } from '../stages';
 import { decimate } from './capture';
-import { clearDenseResume as clearResumeMarkers, denseResumable } from '../model-info';
+import { clearDenseResume as clearResumeMarkers, clearSplatResume, denseResumable } from '../model-info';
 
 interface StageRow {
   el: HTMLElement;
@@ -301,9 +301,12 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
           app.results.sparse = sparse;
           app.results.stats = { ...app.results.stats, ...sparse.stats };
           clearDenseResume(); // refine deletes the depth maps of the old poses
+          // … and the splats + their checkpoints (trained for the old poses)
+          app.results.splat = null;
+          clearSplatResume(app.results.stats);
           completeStep('refine');
           showPreview();
-          void app.updateSession(route.sessionId, { status: 'sparse', stats: numericStats(sparse.stats) });
+          void app.updateSession(route.sessionId, { status: 'sparse', stats: { ...numericStats(sparse.stats), splatGaussians: 0 } });
         } else if (s === 'densify') {
           if (!app.results.sparse) throw new Error('No sparse model to densify');
           setActive('depth_maps');

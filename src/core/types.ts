@@ -197,6 +197,11 @@ export interface ProgressEvent {
   /** 0..1 within the stage, or -1 for indeterminate. */
   progress: number;
   message?: string;
+  /**
+   * Structured numbers of the stage for the UI (e.g. the splat stage's `SplatTrainingDetail`:
+   * iteration, loss, it/s). Plain numbers only, so it survives the worker message as is.
+   */
+  detail?: Record<string, number>;
 }
 
 export type ProgressCallback = (e: ProgressEvent) => void;

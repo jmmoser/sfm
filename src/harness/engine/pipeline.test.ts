@@ -41,6 +41,7 @@ function stubEngine(s: Script): HarnessEngine {
     refine: () => Promise.reject(new Error('refine is not scripted')),
     densify: unused,
     mesh: unused,
+    splat: unused,
     exportModel: unused,
     cancel: () => undefined,
     onLive: (cb) => {

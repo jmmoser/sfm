@@ -329,6 +329,12 @@ export interface YardTrajectoryOptions {
   stepHz: number;
   /** Lateral sway amplitude (m) at stepHz/2. Default 0.02. */
   swayAmplitude: number;
+  /**
+   * Constant sideways offset of the walk from the loop (m, along the outward loop normal; + = outward).
+   * The scene's gravel path stays on the loop, so test sets of the same seeded scene can walk beside
+   * it (e2e/README.md "Off-trajectory views"). Default 0.
+   */
+  lateralOffset: number;
   /** Slow panning amplitude around the outward direction (deg). Default 25. */
   panAmplitudeDeg: number;
   /** Mean pitch (deg, negative = looking down). Default −4. */
@@ -348,6 +354,7 @@ export const DEFAULT_YARD_TRAJECTORY: YardTrajectoryOptions = {
   bobAmplitude: 0.03,
   stepHz: 2,
   swayAmplitude: 0.02,
+  lateralOffset: 0,
   panAmplitudeDeg: 25,
   pitchDeg: -4,
   screenAngle: 90,
@@ -389,7 +396,8 @@ export function createYardTrajectory(opts: Partial<YardTrajectoryOptions> = {}):
     const tn = jsqrt(jadd(jmul(tx, tx), jmul(ty, ty)));
     const nx = jdiv(ty, tn),
       ny = jdiv(jneg(tx), tn);
-    const sway = jsinusoid(t, o.swayAmplitude, o.stepHz / 2, 0.3);
+    const sway0 = jsinusoid(t, o.swayAmplitude, o.stepHz / 2, 0.3);
+    const sway = o.lateralOffset ? jaddc(sway0, o.lateralOffset) : sway0;
     const bob = jadd(jsinusoid(t, o.bobAmplitude, o.stepHz, 0), jsinusoid(t, 0.03, 1 / 13, 1.0));
     let p: JetVec3 = [
       jsum(jconst(o.center[0]), cx, jmul(sway, nx)),

@@ -14,9 +14,10 @@ import type { KeyframeSelectorOptions } from '../sfm/keyframes';
 import type { RollingShutterDevice, RollingShutterEstimateOptions } from '../sfm/rolling-shutter';
 import type { LiveMapperOptions } from '../sfm/live';
 import type { MapperOptions } from '../sfm/mapper';
+import type { SplatTrainer, SplatTrainerOptions } from '../splat/trainer';
 import type { LiveUpdate, LogLevel, SparseCamera, SparseResult } from '../workers/protocol';
 import type { EngineStore } from './persistence';
-import type { DensePresetConfig } from './presets';
+import type { DensePresetConfig, SplatPresetConfig } from './presets';
 
 /**
  * `SparseCamera` plus the capture time and the source frame index (FrameInput.index, or the
@@ -80,6 +81,19 @@ export interface EngineConfig {
   vocabulary?: { trainAfter?: number; words?: number; refineWords?: number };
   /** Dense preset overrides. */
   dense?: Partial<DensePresetConfig>;
+  /**
+   * Splat stage overrides: preset fields (iterations, maxGaussians, maxImageSize, maxViews,
+   * denseInitFraction, shellCount, shDegree, checkpointEvery, chunk) and `trainer` options passed
+   * to SplatTrainer (learning rates, MCMC, colour correction, seed, inFlight, …).
+   */
+  splat?: Partial<SplatPresetConfig> & { trainer?: Partial<SplatTrainerOptions> };
+  /** TEST-ONLY (inline engine; functions do not cross the worker boundary): called with every trainer the splat stage creates. */
+  splatDebug?: { onTrainer?(trainer: SplatTrainer): void };
+  /**
+   * Diagnostics: time the PatchMatch compute passes with GPU timestamp queries (when the adapter
+   * has 'timestamp-query'); the dense timing log then reports GPU time. Default false.
+   */
+  denseGpuTimestamps?: boolean;
   /** Approximate memory budget of the tab in MB (default 1200, iPhone). */
   memoryBudgetMB?: number;
   /** Guided-matching search radius as a fraction of the image long side (default 0.08). */
@@ -143,6 +157,19 @@ export interface EngineConfig {
    * otherwise the lower mean reprojection error.
    */
   modelChoiceExplainedGap?: number;
+  /**
+   * The from-scratch offline SfM of refine, the independent check of the live model: 'auto'
+   * (default) runs it only when the live model shows a symptom it has to be checked for (keyframes
+   * not registered, no verified gyro, gyro breaks or outliers, few images, a low explained ratio,
+   * unmerged loop-closure pairs: `liveModelHealth` in refine.ts); 'always' runs it every time.
+   */
+  refineOfflineSfM?: 'auto' | 'always';
+  /**
+   * CPU helper workers (nested in the engine worker) that verify refine's candidate pairs and
+   * quantise its vocabulary in parallel (default: hardware threads − 2, at most 3; 0 = everything
+   * on the engine thread). Same results either way.
+   */
+  cpuWorkers?: number;
   /** Per-image focal lengths tied to the shared focal in the final refinement (default true; kept only if it helps). */
   perImageFocal?: boolean;
   /** Prior σ of the per-image focal (relative, default 0.005) and the required reprojection improvement (default 0.005). */

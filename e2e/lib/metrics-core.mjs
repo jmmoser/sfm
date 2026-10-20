@@ -225,17 +225,25 @@ function denseMetrics(dataset, rawPoints, sim, se3, opts) {
   let T = null;
   if (mode === 'sim3' || mode === 'sim3+icp') T = sim;
   else if (mode === 'se3') T = se3;
-  // ---- transform + ROI-filter + subsample result points ----
+  // ---- transform + ROI-filter result points; accuracy / precision use a ≤ maxPoints subsample,
+  // completeness every point (a strided subsample of a large cloud thins its coverage: a 3.5 M
+  // point yard cloud read every 2nd point scored C 0.434 instead of 0.484) ----
   const nRaw = rawPoints.length / 3;
   const maxPoints = opts.maxPoints ?? 3_000_000;
   const step = Math.max(1, Math.ceil(nRaw / maxPoints));
+  const all = new Float64Array(3 * nRaw);
+  let nAll = 0;
   const pts = [];
-  for (let i = 0; i < nRaw; i += step) {
+  for (let i = 0; i < nRaw; i++) {
     let p = [rawPoints[3 * i], rawPoints[3 * i + 1], rawPoints[3 * i + 2]];
     if (!Number.isFinite(p[0] + p[1] + p[2])) continue;
     if (T) p = applySim3(T, p);
     if (useRoi && !inBox(meta.roi, p[0], p[1], p[2])) continue;
-    pts.push(p[0], p[1], p[2]);
+    all[3 * nAll] = p[0];
+    all[3 * nAll + 1] = p[1];
+    all[3 * nAll + 2] = p[2];
+    nAll++;
+    if (i % step === 0) pts.push(p[0], p[1], p[2]);
   }
   const P = Float64Array.from(pts);
   const nP = P.length / 3;
@@ -292,6 +300,13 @@ function denseMetrics(dataset, rawPoints, sim, se3, opts) {
       if (ang < 1e-6 && Math.hypot(...step.t) < 1e-4 * tau) break;
     }
     icp = { iterations: it, rotationDeg: rotationAngleBetween(total.R, [1, 0, 0, 0, 1, 0, 0, 0, 1]) * DEG, translation: Math.hypot(...total.t) };
+    // completeness reads every point (`all`) when P is a subsample: move them as well
+    if (step > 1) {
+      for (let i = 0; i < nAll; i++) {
+        const q = applySim3(total, [all[3 * i], all[3 * i + 1], all[3 * i + 2]]);
+        all[3 * i] = q[0]; all[3 * i + 1] = q[1]; all[3 * i + 2] = q[2];
+      }
+    }
   }
   // ---- accuracy: result → GT surface (nearest sample, point-to-plane refined) ----
   const acc = new Float64Array(nP);
@@ -332,7 +347,7 @@ function denseMetrics(dataset, rawPoints, sim, se3, opts) {
   // ---- completeness: GT samples (visible, in ROI) with a result point within tau ----
   const compSet = dataset.gtFocus ?? dataset.gt;
   const compRoi = dataset.gtFocus ? false : useRoi;
-  const rGrid = nP > 0 ? new HashGrid(P, tau) : null;
+  const rGrid = nAll > 0 ? new HashGrid(step > 1 ? all.subarray(0, 3 * nAll) : P, tau) : null;
   let nEval = 0,
     covered = 0;
   const nC = compSet.points.length / 3;

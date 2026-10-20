@@ -270,6 +270,33 @@ describe('Viewer interaction', () => {
 });
 
 describe('Viewer framing', () => {
+  it('viewFromCamera looks along a capture camera, the orbit target at the median depth of its view', () => {
+    const v = makeViewer();
+    // ground plane z = 0 seen by a ring of cameras 3 m out, 1 m up, looking at the origin
+    v.setPointCloud(planeCloud(1.5, 0.05, 0, [200, 200, 200]), { pointSizePx: 2, splats: false });
+    const cams = ringCameras(8, 3, 1);
+    v.setCameras(cams, false);
+    expect(v.viewFromCamera(2, { pullBack: 0 })).toBe(true);
+    // eye at the camera centre (C = -Rᵀt), target on its optical axis
+    const { R, t } = cams[2].pose;
+    const C = [-(R[0] * t[0] + R[3] * t[1] + R[6] * t[2]), -(R[1] * t[0] + R[4] * t[1] + R[7] * t[2]), -(R[2] * t[0] + R[5] * t[1] + R[8] * t[2])];
+    const tg = v.getOrbitTarget();
+    const d = [tg[0] - C[0], tg[1] - C[1], tg[2] - C[2]];
+    const len = Math.hypot(d[0], d[1], d[2]);
+    expect((d[0] * R[6] + d[1] * R[7] + d[2] * R[8]) / len).toBeGreaterThan(0.9999);
+    // median depth of the plane points in the photo: between the near edge and the far edge
+    expect(len).toBeGreaterThan(1.8);
+    expect(len).toBeLessThan(4.5);
+    // the target is at the screen centre; the eye sits at C (pulled back by 30 %: further away)
+    const sc = v.worldToScreen(tg)!;
+    expect(Math.abs(sc.x - W / 2)).toBeLessThan(0.5);
+    expect(Math.abs(sc.y - H / 2)).toBeLessThan(0.5);
+    v.viewFromCamera(2, { pullBack: 0.3 });
+    const tg2 = v.getOrbitTarget();
+    expect(Math.hypot(tg2[0] - tg[0], tg2[1] - tg[1], tg2[2] - tg[2])).toBeLessThan(1e-6);
+    expect(makeViewer().viewFromCamera()).toBe(false); // no cameras
+  });
+
   it('fitToContent frames the robust bounds and ignores outliers', () => {
     const v = makeViewer();
     const n = 20000;

@@ -1,12 +1,14 @@
 /**
  * Exports (ENGINE.md §2 `exportModel`): PLY points (dense if available, else sparse), PLY
- * mesh, GLB (mesh if available, else points), COLMAP text model + images in a ZIP.
+ * mesh, GLB (mesh if available, else points), COLMAP text model + images in a ZIP, Gaussian
+ * splats as an INRIA 3DGS PLY (appearance-normalised model of the splat stage).
  */
 import type { FeatureSet, PointCloud, RGBAImage, TriangleMesh } from '../core/types';
 import { createColmapZipBlob, type ColmapArchiveImage, type ColmapModelInput } from '../io/colmap';
 import { encodeGLB } from '../io/glb';
 import { encodeMeshPLY, encodePLY } from '../io/ply';
-import type { ExportFormat } from '../workers/protocol';
+import { encodeSplatPLY } from '../splat/ply';
+import type { ExportFormat, SplatModelPayload } from '../workers/protocol';
 import { isRGBAImage, type EngineStore } from './persistence';
 import type { SparseModel } from './types';
 
@@ -19,6 +21,8 @@ export interface ExportSources {
   store: EngineStore | null;
   /** Features of a keyframe (memory or store). */
   features(id: number): Promise<FeatureSet | null>;
+  /** The stored splat model (read on demand), null when none. */
+  splat?: () => Promise<SplatModelPayload | null>;
   /** Metadata comments for the files. */
   comments?: string[];
 }
@@ -120,7 +124,9 @@ export async function buildExport(format: ExportFormat, src: ExportSources): Pro
     case 'glb': {
       const points = src.mesh ? undefined : (dense ?? src.sparse ?? undefined);
       if (!src.mesh && (!points || points.count === 0)) throw new Error('Nothing to export yet (run refine first)');
-      return new Blob([encodeGLB({ mesh: src.mesh ?? undefined, points, extras: { name: src.name } })], { type: 'model/gltf-binary' });
+      // unlit (KHR_materials_unlit): the vertex colours are photo colours that already contain the
+      // shading; lit, viewers shade them twice (−5 dB held-out PSNR in the app's viewer)
+      return new Blob([encodeGLB({ mesh: src.mesh ?? undefined, points, unlitMesh: true, extras: { name: src.name } })], { type: 'model/gltf-binary' });
     }
     case 'colmap-zip': {
       if (!src.model) throw new Error('No sparse model yet (run refine first)');
@@ -145,6 +151,11 @@ export async function buildExport(format: ExportFormat, src: ExportSources): Pro
         `Camera model RADIAL; images are the keyframes in the session's canonical orientation.\n` +
         `World frame: +Z up (gravity aligned when the IMU allowed it); units are metres when the scan is metric.\n`;
       return createColmapZipBlob(model, images, { readme });
+    }
+    case 'ply-splat': {
+      const sp = src.splat ? await src.splat() : null;
+      if (!sp || sp.model.count === 0) throw new Error('No Gaussian splats yet (run splat first)');
+      return new Blob([encodeSplatPLY(sp.model, { antialiased: sp.antialiased, comments }) as Uint8Array<ArrayBuffer>], { type: 'application/octet-stream' });
     }
     default:
       throw new Error(`Unknown export format ${String(format)}`);

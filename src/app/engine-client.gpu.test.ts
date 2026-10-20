@@ -54,6 +54,11 @@ function waitFor(pred: () => boolean, timeoutMs = 10_000): Promise<void> {
   });
 }
 
+/** `p`, or 'timeout' after `ms` (a regression fails instead of hanging the test). */
+function within<T>(p: Promise<T>, ms = 5000): Promise<T | 'timeout'> {
+  return Promise.race([p, new Promise<'timeout'>((r) => setTimeout(() => r('timeout'), ms))]);
+}
+
 describe('EngineClient', () => {
   it('init + frame round trip transfers the bitmap and emits the LiveUpdate', async () => {
     const { c } = client('ok');
@@ -123,6 +128,36 @@ describe('EngineClient', () => {
     await waitFor(() => n >= 2);
     c.cancel();
     await expect(p).rejects.toMatchObject({ name: 'CancelledError' });
+    expect(c.pendingCount).toBe(0);
+  });
+
+  it('cancel / abortLongOperation still reach a long operation after another one (an export) settled meanwhile (review)', async () => {
+    const { c } = client('ok');
+    await c.init({ mode: 'object', quality: 'fast' });
+    let n = 0;
+    // runs until cancelled (stands in for a splat build in the viewer)
+    const settled = c.densify(undefined, () => n++).catch((e: Error) => e);
+    await waitFor(() => n >= 2);
+    expect(await (await c.exportModel('ply-points')).text()).toBe('ply\n');
+    expect(await c.abortLongOperation({ graceMs: 3000 })).toBe('cancelled');
+    expect(await within(settled)).toMatchObject({ name: 'CancelledError' });
+    expect(c.pendingCount).toBe(0);
+  });
+
+  it('abortLongOperation({ method }) targets that operation, not a newer one', async () => {
+    const { c } = client('slow-finish');
+    await c.init({ mode: 'object', quality: 'fast' });
+    let n = 0;
+    const dense = c.densify(undefined, () => n++).catch((e: Error) => e);
+    await waitFor(() => n >= 1);
+    const finish = c.finishCapture().catch((e: Error) => e); // newer, runs until cancelled too
+    await new Promise((r) => setTimeout(r, 80));
+    expect(await c.abortLongOperation({ graceMs: 3000, method: 'densify' })).toBe('cancelled');
+    expect(await within(dense)).toMatchObject({ name: 'CancelledError' });
+    expect(c.pendingCount).toBe(1); // finishCapture still runs
+    expect(await c.abortLongOperation({ graceMs: 3000, method: 'densify' })).toBe('none');
+    c.cancel();
+    expect(await within(finish)).toMatchObject({ name: 'CancelledError' });
     expect(c.pendingCount).toBe(0);
   });
 

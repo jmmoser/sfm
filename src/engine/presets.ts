@@ -2,11 +2,13 @@
  * Quality presets and capture-mode parameters. `QUALITY_PRESETS` below holds the feature settings
  * and the engine's base dense table; the tuned `DENSE_PRESETS` of src/dense/presets.ts override
  * its dense part (only known numeric / boolean fields are taken, under the engine's or a few
- * alternative names). Effective values: docs/ENGINE.md §2 "Quality presets".
+ * alternative names). `SPLAT_PRESETS`: the Gaussian-splatting stage. Effective values:
+ * docs/ENGINE.md §2 "Quality presets".
  */
 import { DENSE_PRESETS } from '../dense/presets';
 import type { KeyframeSelectorOptions } from '../sfm/keyframes';
 import type { CaptureMode, QualityPreset } from '../workers/protocol';
+import type { SplatTrainerOptions } from '../splat/trainer';
 
 export interface FeaturePresetConfig {
   /** SIFT working resolution (long side, px). */
@@ -27,6 +29,14 @@ export interface DensePresetConfig {
   geometricPasses: number;
   /** Iterations of each geometric pass. */
   geometricIterations: number;
+  /**
+   * Multi-scale photometric initialisation (src/dense `DensePreset.multiScale`): photometric at ½
+   * resolution for all views (`iterations`), then a prior-initialised full-resolution photometric
+   * pass (`fullResIterations`), then the geometric passes. Default false.
+   */
+  multiScale?: boolean;
+  /** Full-resolution prior-initialised photometric iterations when `multiScale`. Default 2. */
+  fullResIterations?: number;
   /** Maximum number of reference views. */
   maxViews: number;
   /** Source views per reference. */
@@ -149,6 +159,7 @@ const DENSE_ALIASES: Record<string, keyof DensePresetConfig> = {
   geometricPasses: 'geometricPasses',
   geomPasses: 'geometricPasses',
   geometricIterations: 'geometricIterations',
+  fullResIterations: 'fullResIterations',
   maxViews: 'maxViews',
   numSources: 'numSources',
   sources: 'numSources',
@@ -196,6 +207,7 @@ export function parseDensePresetEntry(entry: unknown): Partial<DensePresetConfig
     for (const [k, v] of Object.entries(obj)) {
       if (typeof v === 'number' && Number.isFinite(v) && DENSE_ALIASES[k]) (dst as Record<string, number>)[DENSE_ALIASES[k]] = v;
       else if (typeof v === 'boolean' && k === 'haloFilter') dst.haloFilter = v;
+      else if (typeof v === 'boolean' && k === 'multiScale') dst.multiScale = v;
       else if (typeof v === 'boolean' && k === 'geometric' && !v) dst.geometricPasses = 0;
       else if (v && typeof v === 'object' && !Array.isArray(v) && depth < 2) {
         // nested blocks like { patchMatch: { iterations }, fusion: { minViews } }
@@ -224,6 +236,60 @@ function stripUndefined<T extends object>(o: T): Partial<T> {
   const out: Partial<T> = {};
   for (const [k, v] of Object.entries(o)) if (v !== undefined) (out as Record<string, unknown>)[k] = v;
   return out;
+}
+
+/**
+ * Gaussian-splatting stage (`PhotogrammetryEngine.splat`, src/engine/splat.ts). The memory plan
+ * (`fitSplatPlan`) may lower views, image size and Gaussians below these on a small budget.
+ */
+export interface SplatPresetConfig {
+  /** Training iterations. */
+  iterations: number;
+  /** Hard cap on the number of Gaussians (MCMC grows the count up to it). */
+  maxGaussians: number;
+  /** Long side of the training images (px); never above the preset's dense size. */
+  maxImageSize: number;
+  /** Training views: the registered keyframes with a stored photo, evenly spread down to this many. */
+  maxViews: number;
+  /**
+   * Gaussians seeded from the fused dense cloud (footprint LOD) as a fraction of `maxGaussians`;
+   * the sparse SfM points and the background shell come on top. Without a dense cloud: sparse + shell.
+   */
+  denseInitFraction: number;
+  /** Background-shell Gaussians (sky, far structure) of scene captures (0 = none). */
+  shellCount: number;
+  shDegree: 0 | 1;
+  /** Iterations between checkpoints (parameters, Adam moments, colour matrices; resume after a kill). */
+  checkpointEvery: number;
+  /** Iterations per trainer step call: cancel / page-hidden latency (≤ 64: the dropped-work check window). */
+  chunk: number;
+  /**
+   * Trainer defaults of the stage (`SplatTrainerOptions` fields; `EngineConfig.splat.trainer`
+   * overrides them field by field), e.g. the geometry supervision from the dense depth maps and
+   * the per-view colour correction (ARCHITECTURE "Geometry supervision … off-trajectory").
+   */
+  trainer: Partial<SplatTrainerOptions>;
+}
+
+/**
+ * Trainer defaults of every splat preset (see `SplatPresetConfig.trainer`): inverse-depth
+ * supervision from the dense stage's filtered depth maps during the first 30 % of the iterations
+ * (`DEFAULT_SPLAT_GEOMETRY`; only when the session has them). Per-view colour correction stays on.
+ */
+export const SPLAT_TRAINER_DEFAULTS: Readonly<Partial<SplatTrainerOptions>> = Object.freeze({ geometry: {} });
+
+export const SPLAT_PRESETS: Readonly<Record<QualityPreset, SplatPresetConfig>> = Object.freeze({
+  fast: { iterations: 3000, maxGaussians: 200_000, maxImageSize: 800, maxViews: 120, denseInitFraction: 0.5, shellCount: 20_000, shDegree: 0, checkpointEvery: 500, chunk: 25, trainer: SPLAT_TRAINER_DEFAULTS },
+  balanced: { iterations: 5000, maxGaussians: 300_000, maxImageSize: 1024, maxViews: 160, denseInitFraction: 0.5, shellCount: 20_000, shDegree: 0, checkpointEvery: 500, chunk: 25, trainer: SPLAT_TRAINER_DEFAULTS },
+  max: { iterations: 7000, maxGaussians: 500_000, maxImageSize: 1280, maxViews: 200, denseInitFraction: 0.5, shellCount: 30_000, shDegree: 0, checkpointEvery: 500, chunk: 25, trainer: SPLAT_TRAINER_DEFAULTS },
+});
+
+/** The splat preset: table ← EngineConfig.splat overrides; the image size never exceeds the dense size. */
+export function resolveSplatPreset(quality: QualityPreset, overrides: Partial<SplatPresetConfig> = {}, denseOverrides: Partial<DensePresetConfig> = {}): SplatPresetConfig {
+  const p = { ...SPLAT_PRESETS[quality], ...stripUndefined(overrides) };
+  p.maxImageSize = Math.min(p.maxImageSize, resolveDensePreset(quality, denseOverrides).maxImageSize);
+  p.chunk = Math.max(1, Math.min(64, Math.round(p.chunk)));
+  return p;
 }
 
 /** Concrete capture mode (after 'auto' resolved). */

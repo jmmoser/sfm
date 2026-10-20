@@ -14,6 +14,7 @@ import type {
   KeyframeDecision,
   MeshOptions,
   QualityPreset,
+  SplatOptions,
   TrackingState,
 } from '../../workers/protocol';
 
@@ -39,6 +40,8 @@ export interface HarnessOutput {
   dense?: boolean;
   /** Stream `mesh.ply` (default true). */
   mesh?: boolean;
+  /** Stream `splats.ply` (exportModel('ply-splat'), default true). */
+  splat?: boolean;
 }
 
 export interface HarnessConfig {
@@ -90,6 +93,8 @@ export interface HarnessConfig {
   densify?: boolean | DenseOptions;
   /** Run mesh (default false; needs densify). */
   mesh?: boolean | MeshOptions;
+  /** Run the Gaussian-splatting stage after mesh / densify / refine (default false). */
+  splat?: boolean | SplatOptions;
   /** Export formats (sizes only): true = every applicable format (default false). */
   exports?: boolean | ExportFormat[];
   /** EngineOptions.persist (default false). */
@@ -125,6 +130,13 @@ export interface HarnessConfig {
    * pairs + live model after finishCapture and after refine. Default false.
    */
   debugDump?: boolean;
+  /**
+   * Experiments (needs `persist: true`): after mesh, write the engine's session store (keyframe
+   * JPEGs + records, values, binaries incl. the filtered `depth/` maps) to `<output prefix>session/`
+   * through `window.__e2eWrite`, so the splat stage can be re-run on the same inputs
+   * (src/harness/engine/replay.ts, e2e/splat-replay.mjs). Default false.
+   */
+  dumpSession?: boolean;
 }
 
 /** Config with every default filled in. */
@@ -309,7 +321,7 @@ export interface HarnessResult {
     imuSamples: number;
   };
   engine: { kind: HarnessEngineKind; init: InitResult | null; respawns: number; statusChanges: { ms: number; state: string; reason?: string }[] };
-  /** Harness steps (ms): load, init, capture, finishCapture, refine, densify, mesh, export, total. */
+  /** Harness steps (ms): load, init, capture, finishCapture, refine, densify, mesh, splat, export, total. */
   timings: Record<string, number>;
   stageTimings: StageTiming[];
   frames: FrameRecord[];
@@ -323,6 +335,19 @@ export interface HarnessResult {
   /** Dense cloud as base64 (Float32 LE xyz + Uint8 rgb) when not streamed. */
   densePoints?: { count: number; xyz: string; rgb: string };
   mesh: { vertexCount: number; triangleCount: number; file: string | null; bboxMin: number[] | null; bboxMax: number[] | null } | null;
+  /** The splat stage's result (SplatResult) and the streamed `splats.ply`. */
+  splat?: {
+    count: number;
+    iterations: number;
+    ms: number;
+    shDegree: number;
+    bytes: number;
+    antialiased: boolean;
+    stats: Record<string, number | string>;
+    /** `detail` of the last 'splat_training' progress event (SplatTrainingDetail). */
+    lastDetail: Record<string, number> | null;
+    file: string | null;
+  } | null;
   exports: Record<string, { bytes: number; ms: number; type: string } | { error: string }>;
   /** Files streamed through `__e2eWrite` (relative to the runner's output directory). */
   files: string[];

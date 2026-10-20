@@ -90,20 +90,36 @@ function getF16Table(): Float32Array {
   return t;
 }
 
+/**
+ * Native `Float16Array` (Chrome 135+, Safari 18.2+, Node 24+): its conversion is the same
+ * correctly rounded round-to-nearest-even (NaN canonicalised), several times faster than the
+ * scalar fallback on depth maps (1.2 M normals + costs per 1280×960 map).
+ */
+type F16Ctor = new (buffer: ArrayBufferLike, byteOffset: number, length: number) => { set(a: ArrayLike<number>): void; length: number } & ArrayLike<number>;
+const F16 = (globalThis as { Float16Array?: F16Ctor }).Float16Array;
+
 /** Pack float32 values into binary16 bit patterns. */
 export function packFloat16(src: ArrayLike<number>, out?: Uint16Array): Uint16Array {
   const n = src.length;
   const o = out ?? new Uint16Array(n);
   if (o.length < n) throw new RangeError('packFloat16: output too small');
+  if (F16) {
+    new F16(o.buffer, o.byteOffset, n).set(src);
+    return o;
+  }
   for (let i = 0; i < n; i++) o[i] = float32ToFloat16Bits(src[i]);
   return o;
 }
 
-/** Unpack binary16 bit patterns into float32 values (table lookup). */
+/** Unpack binary16 bit patterns into float32 values (native, else table lookup). */
 export function unpackFloat16(src: Uint16Array, out?: Float32Array): Float32Array {
   const n = src.length;
   const o = out ?? new Float32Array(n);
   if (o.length < n) throw new RangeError('unpackFloat16: output too small');
+  if (F16) {
+    o.set(new F16(src.buffer, src.byteOffset, n));
+    return o;
+  }
   const t = getF16Table();
   for (let i = 0; i < n; i++) o[i] = t[src[i]];
   return o;
