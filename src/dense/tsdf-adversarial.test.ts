@@ -1,14 +1,15 @@
 /**
  * Adversarial tests for the TSDF mesher (review pass): block allocation completeness for
  * scenes with a wide depth range, memory cap with a user voxel size, tile-culling
- * conservativeness, face winding, cancellation in the middle of a run.
+ * conservativeness, face winding, cancellation in the middle of a run, vertex colours at
+ * one-sided silhouettes.
  */
 import { describe, expect, it } from 'vitest';
 import type { Pose, TriangleMesh } from '../core/types';
 import { BLOCK_SIZE, meshComponents, meshEdgeStats, removeSmallComponents } from './marching-cubes';
 import { cameraCenter, lookAt, orbitPoses, pinholeIntrinsics, type SynthScene } from './synthetic';
 import { distanceToScene, renderGtViews } from './testutil-scene';
-import { buildTsdfVolume, integrateDepthMap, tsdfMesh, TsdfVolume, type TsdfStats } from './tsdf';
+import { buildTsdfVolume, integrateDepthMap, tsdfMesh, tsdfScratchBytes, TsdfVolume, type TsdfStats } from './tsdf';
 import { MemoryDepthMapStore, type DenseView, type DepthMap } from './types';
 import { Rng } from '../math/random';
 import { perfSlack } from '../core/perf-slack';
@@ -347,6 +348,34 @@ describe('TSDF orientation and cancellation (adversarial)', () => {
     expect(msgs.some((m) => m.startsWith('integrating 4/'))).toBe(false);
   });
 
+  it('the per-pixel scratch is released when integration is cancelled or a depth-map read fails', async () => {
+    const scene: SynthScene = { primitives: [{ kind: 'sphere', center: [0, 0, 0], radius: 0.5, material: { scale: 0.2 } }] };
+    const cam = pinholeIntrinsics(64, 48, 1);
+    const gt = renderGtViews(scene, cam, orbitPoses([0, 0, 0], 2, 0.3, 4));
+    await buildTsdfVolume(gt.views, gt.store);
+    expect(tsdfScratchBytes()).toBe(0);
+    const token = { cancelled: false };
+    const p = buildTsdfVolume(gt.views, gt.store, {}, (e) => {
+      if ((e.message ?? '').startsWith('integrating 2/')) token.cancelled = true;
+    }, token);
+    await expect(p).rejects.toMatchObject({ name: 'CancelledError' });
+    expect(tsdfScratchBytes()).toBe(0);
+    // the store fails once integration has started
+    let integrating = false;
+    const failing = {
+      get: (id: number) => (integrating && id === 2 ? Promise.reject(new Error('read failed')) : gt.store.get(id)),
+      put: (id: number, d: DepthMap) => gt.store.put(id, d),
+    };
+    const msgs: string[] = [];
+    const q = buildTsdfVolume(gt.views, failing, {}, (e) => {
+      msgs.push(e.message ?? '');
+      if ((e.message ?? '').startsWith('integrating')) integrating = true;
+    });
+    await expect(q).rejects.toThrow('read failed');
+    expect(msgs).toContain('integrating 3/4');
+    expect(tsdfScratchBytes()).toBe(0);
+  });
+
   it('Infinity / NaN depths and NaN normals in the input are ignored (no hang, no budget blow-up)', async () => {
     const scene: SynthScene = { primitives: [{ kind: 'sphere', center: [0, 0, 0], radius: 0.5, material: { scale: 0.2 } }] };
     const cam = pinholeIntrinsics(64, 48, (60 * Math.PI) / 180);
@@ -381,6 +410,48 @@ describe('TSDF orientation and cancellation (adversarial)', () => {
     const mesh = await tsdfMesh([], new MemoryDepthMapStore());
     expect(mesh.triangleCount).toBe(0);
     void distanceToScene;
+  });
+});
+
+describe('TSDF colour (adversarial)', () => {
+  it('silhouettes seen from one side only are not darkened by voxels that were never coloured', async () => {
+    // 0.8 m plate at z = 2 in front of a wall at z = 3, three frontal views: the voxels beside
+    // the plate only see free space (+1, no colour), the ones just behind its front face are
+    // negative, so the plate's TSDF skirt has edges between a coloured and an uncoloured voxel
+    const W = 96;
+    const cam = pinholeIntrinsics(W, W, (60 * Math.PI) / 180);
+    const plate = [200, 50, 50];
+    const wall = [50, 200, 50];
+    const views: DenseView[] = [];
+    const store = new MemoryDepthMapStore();
+    for (const [id, cx] of [-0.1, 0, 0.1].entries()) {
+      const depth = new Float32Array(W * W);
+      const normal = new Float32Array(3 * W * W);
+      const data = new Uint8Array(4 * W * W);
+      for (let y = 0; y < W; y++)
+        for (let x = 0; x < W; x++) {
+          const i = y * W + x;
+          const onPlate = Math.abs(cx + (2 * (x - cam.cx)) / cam.f) <= 0.4 && Math.abs((2 * (y - cam.cy)) / cam.f) <= 0.4;
+          depth[i] = onPlate ? 2 : 3;
+          normal[3 * i + 2] = -1;
+          data.set([...(onPlate ? plate : wall), 255], 4 * i);
+        }
+      const pose: Pose = { R: Float64Array.from([1, 0, 0, 0, 1, 0, 0, 0, 1]), t: Float64Array.from([-cx, 0, 0]) };
+      views.push({ id, cam, pose, image: { width: W, height: W, data } });
+      await store.put(id, { width: W, height: W, depth, normal, cost: new Float32Array(W * W) });
+    }
+    const mesh = await tsdfMesh(views, store);
+    // every true colour sums to 300
+    let dark = 0;
+    let minSum = Infinity;
+    for (let i = 0; i < mesh.vertexCount; i++) {
+      const s = mesh.colors[3 * i] + mesh.colors[3 * i + 1] + mesh.colors[3 * i + 2];
+      if (s < 270) dark++;
+      minSum = Math.min(minSum, s);
+    }
+    log(`one-sided silhouettes: V ${mesh.vertexCount}, ${dark} vertices darker than R+G+B = 270, min ${minSum}`);
+    expect(mesh.vertexCount).toBeGreaterThan(1000);
+    expect(dark).toBe(0);
   });
 });
 

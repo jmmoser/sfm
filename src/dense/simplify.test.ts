@@ -233,3 +233,77 @@ describe('simplifyMesh', () => {
     expect(Array.from(s.positions)).toEqual(Array.from(mesh.positions));
   });
 });
+
+/** Pairs of alive triangles over the same three vertices (coincident faces). */
+function coincidentPairs(mesh: TriangleMesh): number {
+  const seen = new Map<string, number>();
+  let pairs = 0;
+  for (let t = 0; t < mesh.triangleCount; t++) {
+    const key = Array.from(mesh.indices.subarray(3 * t, 3 * t + 3))
+      .sort((a, b) => a - b)
+      .join(',');
+    const n = seen.get(key) ?? 0;
+    pairs += n;
+    seen.set(key, n + 1);
+  }
+  return pairs;
+}
+
+function polyMesh(positions: number[], indices: number[]): TriangleMesh {
+  const V = positions.length / 3;
+  return {
+    vertexCount: V,
+    triangleCount: indices.length / 3,
+    positions: Float32Array.from(positions),
+    normals: Float32Array.from(positions),
+    colors: new Uint8Array(3 * V).fill(128),
+    indices: Uint32Array.from(indices),
+  };
+}
+
+describe('simplifyMesh link condition', () => {
+  it('a closed tetrahedron is not collapsed into two coincident faces of opposite winding', () => {
+    const tet = polyMesh([1, 1, 1, 1, -1, -1, -1, 1, -1, -1, -1, 1], [0, 1, 2, 0, 3, 1, 0, 2, 3, 1, 3, 2]);
+    expect(outwardFlips(tet)).toBe(0);
+    const s = simplifyMesh(tet, 0);
+    expect(s.triangleCount).toBe(4);
+    expect(coincidentPairs(s)).toBe(0);
+    expect(meshEdgeStats(s)).toMatchObject({ boundary: 0, nonManifold: 0, misoriented: 0 });
+  });
+
+  it('an octahedron simplified to 0 stops at a closed solid', () => {
+    // vertices ±x, ±y, ±z; faces CCW seen from outside
+    const P = [1, 0, 0, -1, 0, 0, 0, 1, 0, 0, -1, 0, 0, 0, 1, 0, 0, -1];
+    const I: number[] = [];
+    for (const [x, y] of [
+      [0, 2],
+      [2, 1],
+      [1, 3],
+      [3, 0],
+    ]) {
+      I.push(x, y, 4);
+      I.push(y, x, 5);
+    }
+    const oct = polyMesh(P, I);
+    expect(outwardFlips(oct)).toBe(0);
+    const s = simplifyMesh(oct, 0);
+    log(`octahedron → ${s.triangleCount} triangles`);
+    expect(s.triangleCount).toBeGreaterThanOrEqual(4);
+    expect(coincidentPairs(s)).toBe(0);
+    expect(meshEdgeStats(s)).toMatchObject({ boundary: 0, nonManifold: 0, misoriented: 0 });
+  });
+
+  it('marching-cubes spheres simplified very aggressively keep no coincident faces', () => {
+    const sdf = (x: number, y: number, z: number): number => Math.min(Math.hypot(x, y, z) - 0.8, Math.hypot(x - 1.6, y, z) - 0.24);
+    const vol = TsdfVolume.fromFunction(sdf, [-1.1, -1.1, -1.1], [2, 1.1, 1.1], 0.04);
+    const mesh = marchingCubes(vol);
+    for (const target of [0, 300]) {
+      const s = simplifyMesh(mesh, target);
+      const st = meshEdgeStats(s);
+      log(`two spheres ${mesh.triangleCount} → ${s.triangleCount} triangles (target ${target}), ${coincidentPairs(s)} coincident pairs, edges ${JSON.stringify(st)}`);
+      expect(coincidentPairs(s)).toBe(0);
+      expect(st.boundary).toBe(0);
+      expect(st.nonManifold).toBe(0);
+    }
+  });
+});

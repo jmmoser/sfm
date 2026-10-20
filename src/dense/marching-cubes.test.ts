@@ -146,6 +146,22 @@ describe('marchingCubes on analytic SDFs', () => {
     expect(st.misoriented).toBe(0);
   });
 
+  it('vertex colours come from the coloured end of an edge when the other end was never coloured', () => {
+    const vs = 0.05;
+    const vol = TsdfVolume.fromFunction((x) => x - 0.3 * vs, [-0.5, -0.5, -0.5], [0.5, 0.5, 0.5], vs, 4, () => [200, 50, 50]);
+    // free-space side: observed but never coloured (colour 0, colour weight 0)
+    for (let vi = 0; vi < vol.tsdf.length; vi++) {
+      if (vol.tsdf[vi] <= 0) continue;
+      vol.color!.fill(0, 3 * vi, 3 * vi + 3);
+      vol.colorWeight![vi] = 0;
+    }
+    const mesh = marchingCubes(vol);
+    expect(mesh.vertexCount).toBeGreaterThan(100);
+    let bad = 0;
+    for (let i = 0; i < mesh.vertexCount; i++) if (mesh.colors[3 * i] !== 200 || mesh.colors[3 * i + 1] !== 50 || mesh.colors[3 * i + 2] !== 50) bad++;
+    expect(bad).toBe(0);
+  });
+
   it('removeSmallComponents keeps the large component', () => {
     const sdf = (x: number, y: number, z: number): number => Math.min(Math.hypot(x, y, z) - 1, Math.hypot(x - 2, y, z) - 0.15);
     const vol = TsdfVolume.fromFunction(sdf, [-1.3, -1.3, -1.3], [2.3, 1.3, 1.3], 0.05);

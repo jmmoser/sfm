@@ -475,6 +475,27 @@ export function simplifyMesh(mesh: TriangleMesh, targetTriangles: number, opts: 
       }
     }
     if (common !== shared) return false;
+    // edge part: no triangles (u, a, b) and (v, a, b) both — true for every edge of a closed
+    // tetrahedron, which would collapse into two coincident faces of opposite winding
+    for (let r = refStart[v]; r < refStart[v] + refCount[v]; r++) {
+      const t = refs[r];
+      if (!triAlive[t]) continue;
+      const i0 = tri[3 * t];
+      const i1 = tri[3 * t + 1];
+      const i2 = tri[3 * t + 2];
+      if (i0 === u || i1 === u || i2 === u) continue;
+      const a = i0 === v ? i1 : i0;
+      const b = i2 === v ? i1 : i2;
+      if (mark[a] !== su || mark[b] !== su) continue;
+      for (let r2 = refStart[u]; r2 < refStart[u] + refCount[u]; r2++) {
+        const t2 = refs[r2];
+        if (!triAlive[t2]) continue;
+        const j0 = tri[3 * t2];
+        const j1 = tri[3 * t2 + 1];
+        const j2 = tri[3 * t2 + 2];
+        if ((j0 === a || j1 === a || j2 === a) && (j0 === b || j1 === b || j2 === b)) return false;
+      }
+    }
     if (shared >= 2 && boundary[u] && boundary[v]) return false;
     return facesOk(u, v) && facesOk(v, u);
   };
