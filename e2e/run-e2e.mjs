@@ -17,7 +17,8 @@
  *                 numInputImages, pointsFile) — re-score with `node e2e/metrics.mjs e2e/data/<d> result.json`
  *   sparse.ply / dense.ply / mesh.ply   (streamed from the page)
  *   metrics.json  metrics (e2e/lib/metrics-core.mjs) + sparse-cloud accuracy + live-trajectory
- *                 metrics + threshold checks (e2e/thresholds.json)
+ *                 metrics + threshold checks (e2e/thresholds.json) [+ novel-view summary with --nvs]
+ *   nvs/nvs.json  with --nvs: novel-view evaluation of the output (e2e/nvs.mjs; informational)
  * Exit code: 0 when every pipeline finished without errors and every enforced check passed,
  * 1 otherwise, 2 for usage errors. Thresholds are not enforced for --engine mock unless --enforce.
  */
@@ -31,6 +32,8 @@ import { ArgError, USAGE, parseArgs } from './lib/e2e-args.mjs';
 import { startHarnessBrowser } from './lib/e2e-browser.mjs';
 import { plyFromBase64 } from './lib/e2e-ply.mjs';
 import { SUMMARY_HEADER, fmtNum, formatChecks, metricsInput, resolveThresholds, runChecks, summaryRow, table } from './lib/e2e-checks.mjs';
+import { parseNvsArgs } from './lib/nvs-args.mjs';
+import { runNvs } from './nvs.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -196,9 +199,23 @@ async function runDataset(browser, name, opts, outRoot, thresholdsSpec) {
   if (sparseCloud) log(`sparse cloud: ${sparseCloud.evaluated} points in ROI, accuracy p50 ${fmtNum(sparseCloud.accuracyMedian)} p90 ${fmtNum(sparseCloud.accuracyP90)} m, precision ${fmtNum(sparseCloud.precision, 3)} (tau ${fmtNum(sparseCloud.tau)})`);
   if (liveMetrics) log(`live trajectory (${liveMetrics.registered} keyframe poses, ${liveMetrics.mapping}): ATE/extent ${fmtNum(liveMetrics.ateRelative)}, rotation p50 ${fmtNum(liveMetrics.rotErrDegMedian, 3)}°`);
   log(`checks (${enforced ? 'enforced' : 'NOT enforced'}${cfg.engine === 'mock' ? ' — mock engine: metrics are meaningless' : ''}):\n${formatChecks(checks)}`);
+  // ---- novel-view evaluation (informational: never fails the run) ----
+  let nvs = null;
+  if (opts.nvs) {
+    if (!pointsFile && !(await exists(join(dir, 'mesh.ply')))) log('nvs skipped: no dense.ply or mesh.ply');
+    else {
+      try {
+        const res = await runNvs({ ...parseNvsArgs([dsDir, dir]), views: opts.nvsViews }, { log: (m) => log(`[nvs] ${m}`) });
+        nvs = { file: 'nvs/nvs.json', views: res.views.length, summary: res.summary };
+      } catch (e) {
+        log(`nvs failed: ${e.message}`);
+        nvs = { error: e.message };
+      }
+    }
+  }
   await writeFile(
     join(dir, 'metrics.json'),
-    JSON.stringify({ dataset: name, run: runName, engine: cfg.engine, pipelineOk: !!r.ok, errors: r.errors ?? [], metrics, sparseCloud, live: liveMetrics, checks, thresholdsEnforced: enforced }, null, 2),
+    JSON.stringify({ dataset: name, run: runName, engine: cfg.engine, pipelineOk: !!r.ok, errors: r.errors ?? [], metrics, sparseCloud, live: liveMetrics, checks, thresholdsEnforced: enforced, ...(nvs ? { nvs } : {}) }, null, 2),
   );
   log(`wrote ${dir}/{result.json, metrics.json${r.files?.length ? ', ' + r.files.map((f) => f.split('/').pop()).join(', ') : ''}} (${wall.toFixed(1)} s)`);
   const checkFail = enforced && checks.some((c) => c.status === 'fail');
