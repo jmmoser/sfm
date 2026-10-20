@@ -78,64 +78,264 @@ export function voxelDownsample(pc: PointCloud, voxelSize: number): PointCloud {
     if (map.inserted) cells++;
     cellOf[i] = c;
   }
-  const cnt = new Uint32Array(cells);
-  const sp = new Float64Array(3 * cells);
-  const sc = new Float64Array(3 * cells);
-  const sn = pc.normals ? new Float64Array(3 * cells) : null;
-  const first = pc.normals ? new Int32Array(cells).fill(-1) : null;
-  const sr = pc.radii ? new Float64Array(cells) : null;
-  const sconf = pc.confidence ? new Float64Array(cells) : null;
+  return mergeCells(pc, cellOf, cells, () => voxelSize);
+}
+
+/** Levels of `footprintDownsample` (half octaves of the radius; cells of different levels never merge). */
+const LOD_LEVELS = 64;
+const LOD_LEVELS_PER_OCTAVE = 2;
+
+/**
+ * Footprint-adaptive voxel LOD (the dense point cap). Every point is merged with the points of
+ * its cell in a grid whose cell size is `s` × its own splat radius (`radii`, ≈ 0.7 pixel
+ * footprints on the surface), quantised to half-octave levels. Near / fine geometry thus keeps
+ * its own resolution instead of being merged at one cloud-wide voxel size (which, sized from the
+ * median radius, merged a close-range object ~10× and averaged its points across surfaces), and a
+ * merged centroid moves by at most about one cell, i.e. a few footprints. `s` is searched so
+ * that at most `maxPoints` cells remain (≥ 90 % of it when the search converges). Merged
+ * attributes as in `voxelDownsample` (radius ≥ 0.6 × the cell). Points without a finite positive
+ * radius use the median radius; without `radii` the grid is uniform (searched voxel size).
+ * Non-finite positions are dropped.
+ */
+export function footprintDownsample(pc: PointCloud, maxPoints: number): PointCloud {
+  const n = pc.count;
+  const target = Math.max(1, Math.floor(maxPoints));
+  if (n <= target) return pc;
+  const P = pc.positions;
+  const radii = pc.radii;
+  // median / minimum radius (subsample) and coordinate range
+  let rMed = 1;
+  let rMin = 1;
+  if (radii) {
+    const rs: number[] = [];
+    const stride = Math.max(1, Math.floor(n / 50_000));
+    for (let i = 0; i < n; i += stride) if (radii[i] > 0 && radii[i] < Infinity) rs.push(radii[i]);
+    if (rs.length) {
+      rs.sort((a, b) => a - b);
+      rMed = rs[rs.length >> 1];
+      rMin = rs[0];
+    }
+  }
+  let maxAbs = 0;
+  const lo = [Infinity, Infinity, Infinity];
+  const hi = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < 3 * n; i++) {
+    const v = P[i];
+    if (!Number.isFinite(v)) continue;
+    maxAbs = Math.max(maxAbs, Math.abs(v));
+    lo[i % 3] = Math.min(lo[i % 3], v);
+    hi[i % 3] = Math.max(hi[i % 3], v);
+  }
+  if (!radii) {
+    // no footprints: a uniform grid, starting from the spacing of a surface filling the box
+    rMed = rMin = Math.max(1e-12, Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]) / Math.sqrt(n)) || 1;
+  }
+  const r0 = Math.max(rMin * 0.5, rMed * 1e-4, 1e-12);
+  // smallest scale: cell indices × levels stay inside int32
+  const sMin = Math.max(1e-3, (maxAbs * 64) / 2 ** 30 / r0);
+  const level = new Uint8Array(n);
+  const valid = new Uint8Array(n);
+  let nValid = 0;
+  for (let i = 0; i < n; i++) {
+    if (!(Number.isFinite(P[3 * i]) && Number.isFinite(P[3 * i + 1]) && Number.isFinite(P[3 * i + 2]))) continue;
+    valid[i] = 1;
+    nValid++;
+    const r = radii && radii[i] > 0 && radii[i] < Infinity ? radii[i] : rMed;
+    const l = Math.floor(LOD_LEVELS_PER_OCTAVE * Math.log2(Math.max(r, r0) / r0));
+    level[i] = l < 0 ? 0 : l >= LOD_LEVELS ? LOD_LEVELS - 1 : l;
+  }
+  // cell size of level l at scale s: s · r0 · 2^((l + ½) / levelsPerOctave) (the level's geometric centre)
+  const levelSize = new Float64Array(LOD_LEVELS);
+  for (let l = 0; l < LOD_LEVELS; l++) levelSize[l] = r0 * Math.pow(2, (l + 0.5) / LOD_LEVELS_PER_OCTAVE);
+  const inv = new Float64Array(LOD_LEVELS);
+  // a pass stops once it has more cells than `abortAt` (its count is then extrapolated): bounds
+  // the table to ≈ 1.25 × target entries
+  const abortAt = Math.min(nValid, Math.ceil(1.25 * target));
+  const tableRef = (): CellTable => table!;
+  let table: CellTable | null = new CellTable(abortAt + 1);
+  /** Cells at scale `scale` (into `cellOf`); > target ⇒ possibly an extrapolated estimate. */
+  const assign = (scale: number, cellOf: Int32Array): number => {
+    for (let l = 0; l < LOD_LEVELS; l++) inv[l] = 1 / (scale * levelSize[l]);
+    const table = tableRef();
+    table.clear();
+    for (let i = 0; i < n; i++) {
+      if (!valid[i]) {
+        cellOf[i] = -1;
+        continue;
+      }
+      const l = level[i];
+      const k = inv[l];
+      cellOf[i] = table.getOrInsert(Math.floor(P[3 * i] * k), Math.floor(P[3 * i + 1] * k), Math.floor(P[3 * i + 2] * k) * LOD_LEVELS + l);
+      if (table.size > abortAt) return Math.max(table.size, Math.round((table.size * n) / (i + 1)));
+    }
+    return table.size;
+  };
+  // search s (cells fall roughly as 1 / s² on surfaces): secant steps inside a bracket; any count
+  // in [0.9, 1] × target is accepted
+  let cellOf = new Int32Array(n);
+  let spare = new Int32Array(n);
+  let s = Math.max(sMin, 1.8 * Math.sqrt(nValid / target));
+  let okS = Infinity; // smallest s seen with cells ≤ target (its assignment is in `cellOf`)
+  let okCells = 0;
+  let failS = sMin; // largest s seen with cells > target
+  for (let it = 0; it < 8; it++) {
+    const cells = assign(s, spare);
+    if (cells <= target) {
+      if (s < okS) {
+        okS = s;
+        okCells = cells;
+        [cellOf, spare] = [spare, cellOf];
+      }
+      if (cells >= 0.9 * target) break;
+    } else failS = Math.max(failS, s);
+    let next = s * Math.sqrt(cells / (0.9 * target));
+    if (!(next > failS && next < okS)) next = okS < Infinity ? Math.sqrt(failS * okS) : 2 * s;
+    s = next;
+  }
+  for (s = okS < Infinity ? okS : 2 * s; !(okS < Infinity); s *= 1.5) {
+    // never under the target (degenerate radii): grow until it is
+    const cells = assign(s, cellOf);
+    if (cells <= target) {
+      okS = s;
+      okCells = cells;
+    }
+  }
+  const cells = okCells;
+  // search scratch is garbage now (the merge allocates the output)
+  spare = new Int32Array(0);
+  table = null;
+  // per-cell level (cell size) for the merged radius
+  const cellLevel = new Uint8Array(cells);
+  for (let i = 0; i < n; i++) if (cellOf[i] >= 0) cellLevel[cellOf[i]] = level[i];
+  return mergeCells(pc, cellOf, cells, (c) => okS * levelSize[cellLevel[c]]);
+}
+
+/**
+ * Set of integer cells (x, y, z) → dense index (insertion order): open addressing, linear
+ * probing, one interleaved (x, y, z, index) slot per entry (one cache line per probe), sized once
+ * and cleared between the scale-search passes (no reallocation).
+ */
+class CellTable {
+  private readonly slots: Int32Array;
+  private readonly cap: number;
+  size = 0;
+
+  /** `maxEntries`: upper bound of the entries (no growth; load factor ≤ 0.6). */
+  constructor(maxEntries: number) {
+    this.cap = Math.max(1024, Math.ceil(maxEntries / 0.6));
+    this.slots = new Int32Array(4 * this.cap);
+    this.clear();
+  }
+
+  clear(): void {
+    const s = this.slots;
+    for (let i = 3; i < s.length; i += 4) s[i] = -1;
+    this.size = 0;
+  }
+
+  getOrInsert(x: number, y: number, z: number): number {
+    let h = Math.imul(x, 0x8da6b343) ^ Math.imul(y, 0xd8163841) ^ Math.imul(z, 0xcb1ab31f);
+    h = Math.imul(h ^ (h >>> 15), 0x2c1b3c6d);
+    h ^= h >>> 13;
+    const cap = this.cap;
+    const s = this.slots;
+    let i = Math.floor(((h >>> 0) / 4294967296) * cap);
+    for (;;) {
+      const k = 4 * i;
+      const v = s[k + 3];
+      if (v < 0) {
+        s[k] = x;
+        s[k + 1] = y;
+        s[k + 2] = z;
+        s[k + 3] = this.size;
+        return this.size++;
+      }
+      if (s[k] === x && s[k + 1] === y && s[k + 2] === z) return v;
+      if (++i === cap) i = 0;
+    }
+  }
+}
+
+/**
+ * One point per cell (`cellOf[i]` in [0, cells), −1 = drop): mean position / colour / confidence,
+ * mean normal (sign-aligned to the cell's first normal), radius max(mean radius, 0.6 · cell size).
+ * The points are counting-sorted by cell first, so the only per-cell scratch is the bucket
+ * offsets (8 B per cell besides the output, instead of ~100 B of accumulators).
+ */
+function mergeCells(pc: PointCloud, cellOf: Int32Array, cells: number, cellSize: (c: number) => number): PointCloud {
+  const n = pc.count;
+  const P = pc.positions;
+  const C = pc.colors;
+  const N = pc.normals;
+  const R = pc.radii;
+  const F = pc.confidence;
+  const start = new Int32Array(cells + 1);
+  for (let i = 0; i < n; i++) if (cellOf[i] >= 0) start[cellOf[i] + 1]++;
+  for (let c = 0; c < cells; c++) start[c + 1] += start[c];
+  const cursor = start.slice(0, cells);
+  const order = new Int32Array(start[cells]);
   for (let i = 0; i < n; i++) {
     const c = cellOf[i];
-    cnt[c]++;
-    for (let k = 0; k < 3; k++) {
-      sp[3 * c + k] += P[3 * i + k];
-      sc[3 * c + k] += pc.colors[3 * i + k];
-    }
-    if (sn) {
-      const N = pc.normals!;
-      let s = 1;
-      if (first![c] < 0) first![c] = i;
-      else {
-        const f = first![c];
-        if (N[3 * i] * N[3 * f] + N[3 * i + 1] * N[3 * f + 1] + N[3 * i + 2] * N[3 * f + 2] < 0) s = -1;
-      }
-      sn[3 * c] += s * N[3 * i];
-      sn[3 * c + 1] += s * N[3 * i + 1];
-      sn[3 * c + 2] += s * N[3 * i + 2];
-    }
-    if (sr) sr[c] += pc.radii![i];
-    if (sconf) sconf[c] += pc.confidence![i];
+    if (c >= 0) order[cursor[c]++] = i;
   }
   const positions = new Float32Array(3 * cells);
   const colors = new Uint8Array(3 * cells);
-  const normals = sn ? new Float32Array(3 * cells) : undefined;
-  const radii = sr ? new Float32Array(cells) : undefined;
-  const confidence = sconf ? new Float32Array(cells) : undefined;
+  const normals = N ? new Float32Array(3 * cells) : undefined;
+  const radii = R ? new Float32Array(cells) : undefined;
+  const confidence = F ? new Float32Array(cells) : undefined;
   for (let c = 0; c < cells; c++) {
-    const ic = 1 / cnt[c];
-    for (let k = 0; k < 3; k++) {
-      positions[3 * c + k] = sp[3 * c + k] * ic;
-      colors[3 * c + k] = Math.round(sc[3 * c + k] * ic);
+    const a = start[c];
+    const b = start[c + 1];
+    const ic = 1 / (b - a);
+    let px = 0;
+    let py = 0;
+    let pz = 0;
+    let cr = 0;
+    let cg = 0;
+    let cb = 0;
+    let nx = 0;
+    let ny = 0;
+    let nz = 0;
+    let sr = 0;
+    let sf = 0;
+    const f = order[a];
+    for (let k = a; k < b; k++) {
+      const i = order[k];
+      px += P[3 * i];
+      py += P[3 * i + 1];
+      pz += P[3 * i + 2];
+      cr += C[3 * i];
+      cg += C[3 * i + 1];
+      cb += C[3 * i + 2];
+      if (N) {
+        const sgn = N[3 * i] * N[3 * f] + N[3 * i + 1] * N[3 * f + 1] + N[3 * i + 2] * N[3 * f + 2] < 0 ? -1 : 1;
+        nx += sgn * N[3 * i];
+        ny += sgn * N[3 * i + 1];
+        nz += sgn * N[3 * i + 2];
+      }
+      if (R) sr += R[i];
+      if (F) sf += F[i];
     }
+    positions[3 * c] = px * ic;
+    positions[3 * c + 1] = py * ic;
+    positions[3 * c + 2] = pz * ic;
+    colors[3 * c] = Math.round(cr * ic);
+    colors[3 * c + 1] = Math.round(cg * ic);
+    colors[3 * c + 2] = Math.round(cb * ic);
     if (normals) {
-      let nx = sn![3 * c];
-      let ny = sn![3 * c + 1];
-      let nz = sn![3 * c + 2];
       let l = Math.hypot(nx, ny, nz);
       if (!(l > 1e-12)) {
-        const f = first![c];
-        nx = pc.normals![3 * f];
-        ny = pc.normals![3 * f + 1];
-        nz = pc.normals![3 * f + 2];
+        nx = N![3 * f];
+        ny = N![3 * f + 1];
+        nz = N![3 * f + 2];
         l = Math.hypot(nx, ny, nz) || 1;
       }
       normals[3 * c] = nx / l;
       normals[3 * c + 1] = ny / l;
       normals[3 * c + 2] = nz / l;
     }
-    if (radii) radii[c] = Math.max(sr![c] * ic, 0.6 * voxelSize);
-    if (confidence) confidence[c] = sconf![c] * ic;
+    if (radii) radii[c] = Math.max(sr * ic, 0.6 * cellSize(c));
+    if (confidence) confidence[c] = sf * ic;
   }
   const out: PointCloud = { count: cells, positions, colors };
   if (normals) out.normals = normals;

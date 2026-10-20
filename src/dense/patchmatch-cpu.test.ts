@@ -107,6 +107,25 @@ describe('patchMatchCPU', () => {
     expect(s.medianRelError).toBeLessThan(0.003);
   });
 
+  it('affine window warp matches the projective one (same window)', () => {
+    const ds = makeSyntheticDataset('near', { width: 160, height: 120 });
+    const mask = surfaceMask(ds.views[0].cam, ds.gtDepth[0], ds.gtNormal[0]);
+    const proj = patchMatchCPU(ds.views[0], ds.views.slice(1), ds.range);
+    const tp = lastPatchMatchCPUStats().timeMs;
+    const aff = patchMatchCPU(ds.views[0], ds.views.slice(1), ds.range, { affineWindow: true });
+    const ta = lastPatchMatchCPUStats().timeMs;
+    const p = evaluateDepthMap(proj, ds.gtDepth[0], ds.gtNormal[0], { mask });
+    const a = evaluateDepthMap(aff, ds.gtDepth[0], ds.gtNormal[0], { mask });
+    log(`near 160x120 projective ${tp.toFixed(0)} ms: ${formatDepthStats(p)}`);
+    log(`near 160x120 affine     ${ta.toFixed(0)} ms: ${formatDepthStats(a)}`);
+    // measured: within 1 % 89.2 → 88.9 % (the 13 px / 25-sample window of the presets loses
+    // 5 pt at this tiny size, where it spans 8 % of the image; it is tuned at 800–1600 px)
+    expect(a.validFraction).toBeGreaterThanOrEqual(p.validFraction - 0.01);
+    expect(a.accurateFraction).toBeGreaterThanOrEqual(p.accurateFraction - 0.01);
+    expect(Math.abs(a.medianNormalErrorDeg - p.medianNormalErrorDeg)).toBeLessThan(1);
+    for (let i = 0; i < aff.depth.length; i++) if (aff.depth[i] > 0) expect(aff.cost[i]).toBeLessThanOrEqual(0.5);
+  });
+
   it('handles edge cases', () => {
     const ds = makeSyntheticDataset('near', { width: 32, height: 24, numSources: 2 });
     const empty = patchMatchCPU(ds.views[0], [], ds.range);

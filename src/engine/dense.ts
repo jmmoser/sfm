@@ -14,10 +14,10 @@ import { removeDepthHalos, worldUpInCamera } from '../dense/depth-filter';
 import { fuseDepthMaps } from '../dense/fusion';
 import { patchMatchCPU } from '../dense/patchmatch-cpu';
 import { PatchMatchGPU } from '../dense/patchmatch-gpu';
-import { filterPointCloud, voxelDownsample } from '../dense/pointcloud';
+import { filterPointCloud, footprintDownsample } from '../dense/pointcloud';
 import { simplifyMesh } from '../dense/simplify';
 import { tsdfMesh } from '../dense/tsdf';
-import type { DenseView, DepthMap, DepthMapStore } from '../dense/types';
+import type { DenseView, DepthMap, DepthMapStore, PatchMatchOptions } from '../dense/types';
 import { undistortImage, undistortedCamera } from '../dense/undistort';
 import { rsCorrectPinholeImage } from '../sfm/rolling-shutter';
 import { neighboursFromSelection, selectSourceViews, type SourceViewSelection } from '../dense/view-selection';
@@ -145,11 +145,14 @@ export function denseSkyUp(pose: Pose, gravityAligned: boolean, gravityCam?: Arr
   return null;
 }
 
+/** PatchMatch pass: ½-resolution photometric (multi-scale), photometric, geometric. */
+type PassKind = 'half' | 'photo' | 'geo';
+
 /** Persisted dense progress (`dense/progress` in the depth backend): resume after a kill / cancel. */
 interface DenseProgress {
   /** Hash of the model + view selection inputs + settings the maps were computed with. */
   key: string;
-  /** Pass in progress (0 = photometric), or = number of passes when fusing. */
+  /** Pass in progress (index into the pass kinds: [½ photometric,] photometric, geometric…), or = number of passes when fusing. */
   pass: number;
   /**
    * Quality preset of the run (the key covers its settings): a resume must use the same one — the
@@ -174,7 +177,7 @@ function fnv1a(s: string): string {
 function denseKey(
   model: SparseModel,
   refs: number[],
-  settings: { maxSize: number; passes: number; mode: string; preset: DensePresetConfig; halo: boolean; sky?: string },
+  settings: { maxSize: number; passes: string; mode: string; preset: DensePresetConfig; halo: boolean; sky?: string },
 ): string {
   const r6 = (v: number): number => Math.round(v * 1e6) / 1e6;
   const poses = model.images.map((im) => [im.id, im.cameraId, ...Array.from(im.pose.R, r6), ...Array.from(im.pose.t, r6)]);
@@ -192,7 +195,7 @@ function denseKey(
       halo: settings.halo,
       sky: settings.sky ?? null,
       rs: model.rollingShutter ? [model.rollingShutter.axis, model.rollingShutter.readoutMs, !!model.rollingShutter.nu] : null,
-      pm: [p.iterations, p.geometricIterations, p.numSources, p.patchMatch ?? {}, p.viewSelection ?? {}],
+      pm: [p.iterations, p.geometricIterations, p.numSources, p.patchMatch ?? {}, p.viewSelection ?? {}, p.fullResIterations ?? null],
     }),
   );
 }
@@ -295,7 +298,13 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
 
   // ---- memory plan (iPhone tab budget): cache sizes, fusion neighbours / pixel step / point cap;
   // the image size is lowered (× 0.85 steps, not below 480 px) when even that does not fit
-  const passes = 1 + Math.max(0, Math.round(preset.geometricPasses));
+  // PatchMatch passes: [½-resolution photometric (multi-scale),] photometric (prior-initialised
+  // from the ½-resolution map when multi-scale), geometric × geometricPasses
+  const geometricPasses = Math.max(0, Math.round(preset.geometricPasses));
+  const multiScale = !!preset.multiScale;
+  const passKinds: PassKind[] = [...(multiScale ? (['half'] as const) : []), 'photo', ...new Array<PassKind>(geometricPasses).fill('geo')];
+  const passes = passKinds.length;
+  if (multiScale) stats.denseMultiScale = 1;
   // colour-guided halo / sky clean-up of the final depth maps before fusion
   const halo = preset.haloFilter === false ? null : removeDepthHalos;
   if (halo) stats.haloFilter = 1;
@@ -323,7 +332,7 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
       width: d.width,
       height: d.height,
       numSources: Math.min(16, preset.numSources),
-      geometricPasses: passes - 1,
+      geometricPasses,
       fusionMaxNeighbours: preset.fusionMaxNeighbours,
       gpu: !!pm,
       haloFilter: !!halo,
@@ -406,6 +415,22 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
       perf.load += now() - tl;
       return view;
     });
+  // ½-resolution views of the multi-scale pass: decoded and undistorted at half the size (exact
+  // §2-rule pinhole of the full view), cached separately (¼ of the bytes: all views usually fit)
+  const halfSize = Math.max(32, Math.round(maxSize / 2));
+  const halfCache = new LruCache<number, DenseView>(multiScale ? plan.imageCacheBytes : 0, (v) => rgbaBytes(v.image));
+  const loadHalfView = (id: number): Promise<DenseView> =>
+    halfCache.getOrLoad(id, async () => {
+      const tl = now();
+      perf.decodes++;
+      const g = geomById.get(id)!;
+      const stored = await deps.store.getFrameImage(id);
+      if (!stored) throw new Error(`keyframe image ${id} missing`);
+      const hc = undistortedCamera(g.distorted, halfSize);
+      const und = denseViewImage(await decodeStoredImage(stored, hc.width, hc.height), g.distorted, halfSize, model, id);
+      perf.load += now() - tl;
+      return { id, cam: und.cam, pose: g.pose, image: und.image };
+    });
 
   // ---- depth maps
   // Resident maps are bounded explicitly: the pass stores keep ONE full map (write-through to
@@ -416,7 +441,7 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   const backend = deps.depthBackend;
   const persistent = !!backend?.persistent;
   // resume after a kill / cancel: same model + settings ⇒ keep the maps already computed
-  const planKey = denseKey(model, ordered.map((g) => g.id), { maxSize, passes, mode: deps.mode, preset, halo: !!halo, sky: halo ? skySource : undefined });
+  const planKey = denseKey(model, ordered.map((g) => g.id), { maxSize, passes: passKinds.join(','), mode: deps.mode, preset, halo: !!halo, sky: halo ? skySource : undefined });
   let resumePass = 0;
   if (persistent) {
     const prog = await backend!.getValue<DenseProgress>(PROGRESS_KEY).catch(() => null);
@@ -438,17 +463,18 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   let skipped = 0;
   const tDepth = now();
   for (let pass = resumePass; pass < passes; pass++) {
+    const kind = passKinds[pass];
+    // maps of the previous pass this pass reads: the reference's (prior) and, geometric, the sources'
+    const reads = (id: number): number[] => (pass === 0 ? [] : kind === 'geo' ? [id, ...sel.get(id)!.sources] : [id]);
     await setProgress(pass);
     cur = new EngineDepthStore(backend, `pm${pass}`, 0);
     const have = new Set(persistent && pass === resumePass ? await cur.scan() : []);
     // last reference (index in `ordered`) that reads each previous-pass map
     const lastUse = new Map<number, number>();
-    if (pass > 0) ordered.forEach((g, i) => [g.id, ...sel.get(g.id)!.sources].forEach((id) => lastUse.set(id, i)));
+    ordered.forEach((g, i) => reads(g.id).forEach((id) => lastUse.set(id, i)));
     const releasePrev = async (i: number): Promise<void> => {
       if (!prev) return;
-      const gi = ordered[i];
-      const ids = [gi.id, ...sel.get(gi.id)!.sources];
-      for (const id of ids) {
+      for (const id of reads(ordered[i].id)) {
         if (lastUse.get(id) !== i) continue;
         srcDepth.delete(id);
         await prev.delete(id);
@@ -464,9 +490,10 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
         continue;
       }
       const s = sel.get(g.id)!;
-      const ref = await loadView(g.id);
+      const load = kind === 'half' ? loadHalfView : loadView;
+      const ref = await load(g.id);
       const srcs: DenseView[] = [];
-      for (const sid of s.sources) srcs.push(await loadView(sid));
+      for (const sid of s.sources) srcs.push(await load(sid));
       const range = { min: s.depthMin, max: s.depthMax };
       let geometric: { prior: DepthMap; sourceDepths: DepthMap[] } | undefined;
       const ti = now();
@@ -478,17 +505,23 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
         }
         const sourceDepths: DepthMap[] = [];
         const p0 = prev;
-        for (const sid of s.sources) {
-          const d = await srcDepth.getOrLoad(sid, async () => depthOnly(await p0.get(sid)));
-          sourceDepths.push(d.width > 0 ? d : emptyDepth());
+        if (kind === 'geo') {
+          for (const sid of s.sources) {
+            const d = await srcDepth.getOrLoad(sid, async () => depthOnly(await p0.get(sid)));
+            sourceDepths.push(d.width > 0 ? d : emptyDepth());
+          }
         }
         geometric = { prior, sourceDepths };
       }
       perf.inputs += now() - ti;
-      const pmOpts =
-        pass === 0
-          ? { ...(preset.patchMatch ?? {}), iterations: preset.iterations }
-          : { ...(preset.patchMatch ?? {}), geometric: true, geometricIterations: preset.geometricIterations };
+      const pmBase = preset.patchMatch ?? {};
+      const pmOpts: Partial<PatchMatchOptions> =
+        kind === 'geo'
+          ? { ...pmBase, geometric: true, geometricIterations: preset.geometricIterations }
+          : // the full-resolution photometric pass of multi-scale starts from the ½-resolution map
+            kind === 'photo' && geometric
+            ? { ...pmBase, geometric: false, iterations: Math.max(1, Math.round(preset.fullResIterations ?? 2)) }
+            : { ...pmBase, iterations: preset.iterations };
       let dm: DepthMap;
       const tv = now();
       if (pm) {
@@ -536,11 +569,13 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
       await releasePrev(i);
       perf.store += now() - tp;
       done++;
-      report('depth_maps', done / total, `${pass === 0 ? 'photometric' : `geometric ${pass}`} ${done}/${total} (${Math.round(now() - tv)} ms)`);
+      const label = kind === 'half' ? 'photometric ½' : kind === 'photo' ? 'photometric' : `geometric ${pass - passKinds.indexOf('geo') + 1}`;
+      report('depth_maps', done / total, `${label} ${done}/${total} (${Math.round(now() - tv)} ms)`);
       await tick();
     }
     if (prev) await prev.clear();
     srcDepth.clear();
+    halfCache.clear();
     prev = cur;
   }
   if (skipped) stats.denseResumedMaps = skipped;
@@ -609,11 +644,10 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   report('fusion', 0.92, `filtering ${cloud.count} points`);
   await tick();
   const tCap = now();
-  if (cloud.count > preset.maxPoints) {
-    // voxel size from the median radius so that about maxPoints remain
-    const r = cloud.radii ? median(Array.from(cloud.radii.subarray(0, Math.min(cloud.count, 100_000)))) : 0;
-    if (r > 0) cloud = voxelDownsample(cloud, 2 * r * Math.sqrt(cloud.count / preset.maxPoints));
-  }
+  // point cap: footprint-adaptive LOD (cells ∝ each point's own radius). A single voxel size
+  // from the median radius merged the close-range object of a scan ~10× (object-real 800 px:
+  // 3.5 M → 0.57 M points, accuracy p50 0.31 → 0.45 mm; yard-real precision 0.96 → 0.80).
+  if (cloud.count > preset.maxPoints) cloud = footprintDownsample(cloud, preset.maxPoints);
   if (preset.sorK > 0 && cloud.count > preset.sorK + 1) cloud = filterPointCloud(cloud, { statistical: { k: preset.sorK, std: preset.sorStd } });
   stats.densePoints = cloud.count;
   stats.fusionMs = Math.round(now() - tFuse);

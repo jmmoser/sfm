@@ -27,6 +27,14 @@ export interface DensePresetConfig {
   geometricPasses: number;
   /** Iterations of each geometric pass. */
   geometricIterations: number;
+  /**
+   * Multi-scale photometric initialisation (src/dense `DensePreset.multiScale`): photometric at ½
+   * resolution for all views (`iterations`), then a prior-initialised full-resolution photometric
+   * pass (`fullResIterations`), then the geometric passes. Default false.
+   */
+  multiScale?: boolean;
+  /** Full-resolution prior-initialised photometric iterations when `multiScale`. Default 2. */
+  fullResIterations?: number;
   /** Maximum number of reference views. */
   maxViews: number;
   /** Source views per reference. */
@@ -149,6 +157,7 @@ const DENSE_ALIASES: Record<string, keyof DensePresetConfig> = {
   geometricPasses: 'geometricPasses',
   geomPasses: 'geometricPasses',
   geometricIterations: 'geometricIterations',
+  fullResIterations: 'fullResIterations',
   maxViews: 'maxViews',
   numSources: 'numSources',
   sources: 'numSources',
@@ -196,6 +205,7 @@ export function parseDensePresetEntry(entry: unknown): Partial<DensePresetConfig
     for (const [k, v] of Object.entries(obj)) {
       if (typeof v === 'number' && Number.isFinite(v) && DENSE_ALIASES[k]) (dst as Record<string, number>)[DENSE_ALIASES[k]] = v;
       else if (typeof v === 'boolean' && k === 'haloFilter') dst.haloFilter = v;
+      else if (typeof v === 'boolean' && k === 'multiScale') dst.multiScale = v;
       else if (typeof v === 'boolean' && k === 'geometric' && !v) dst.geometricPasses = 0;
       else if (v && typeof v === 'object' && !Array.isArray(v) && depth < 2) {
         // nested blocks like { patchMatch: { iterations }, fusion: { minViews } }

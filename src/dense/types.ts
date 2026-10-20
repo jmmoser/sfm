@@ -87,6 +87,13 @@ export interface PatchMatchOptions {
   /** Sampling step inside the window (offsets −r, −r+step, …, ≤ r). Default 2. */
   patchStep: number;
   /**
+   * Warp the window into a source with the homography's affine approximation at the window
+   * centre (its Jacobian) instead of a projective divide per sample: two multiply-adds per
+   * sample. The error is second order in the window offset (well below 0.1 px for a 13 px window
+   * except on grazing planes). Default false (the tuned `DENSE_PRESETS` enable it).
+   */
+  affineWindow: boolean;
+  /**
    * Number of refinement proposals evaluated per pixel per iteration (1..6), in
    * this order: (perturbed depth, current normal), (current depth, perturbed normal),
    * (random depth, random normal), (perturbed both), (random depth, current normal),
@@ -155,6 +162,7 @@ export const DEFAULT_PATCHMATCH_OPTIONS: Readonly<PatchMatchOptions> = Object.fr
   iterations: 6,
   patchRadius: 5,
   patchStep: 2,
+  affineWindow: false,
   numSamplesPerIter: 6,
   geometric: false,
   geometricIterations: 3,

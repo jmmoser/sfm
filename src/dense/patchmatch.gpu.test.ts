@@ -78,6 +78,26 @@ describe('PatchMatchGPU', () => {
     }
   });
 
+  it('affine 13 px window (preset kernel) on the GPU is statistically equal to the CPU reference', async () => {
+    const W = 256;
+    const H = 192;
+    const ds = makeSyntheticDataset('near', { width: W, height: H });
+    const opts = { patchRadius: 6, patchStep: 3, affineWindow: true, numSamplesPerIter: 3 };
+    const dm = await pm.compute(ds.views[0], ds.views.slice(1), ds.range, opts);
+    log(`near ${W}x${H} GPU affine r6/s3/3 proposals: ${fmtTimings()}`);
+    const dc = patchMatchCPU(ds.views[0], ds.views.slice(1), ds.range, opts);
+    const mask = surfaceMask(ds.views[0].cam, ds.gtDepth[0], ds.gtNormal[0]);
+    const g = evaluateDepthMap(dm, ds.gtDepth[0], ds.gtNormal[0], { mask });
+    const c = evaluateDepthMap(dc, ds.gtDepth[0], ds.gtNormal[0], { mask });
+    log(`  GPU mask: ${formatDepthStats(g)}`);
+    log(`  CPU mask: ${formatDepthStats(c)}`);
+    expect(g.validFraction).toBeGreaterThanOrEqual(0.7);
+    expect(g.accurateFraction).toBeGreaterThanOrEqual(0.8);
+    expect(Math.abs(g.validFraction - c.validFraction)).toBeLessThan(0.03);
+    expect(Math.abs(g.accurateFraction - c.accurateFraction)).toBeLessThan(0.03);
+    expect(Math.abs(g.medianNormalErrorDeg - c.medianNormalErrorDeg)).toBeLessThan(1.5);
+  });
+
   it('far scene (5–60 m) 256×192 works with inverse-depth sampling', async () => {
     const ds = makeSyntheticDataset('far', { width: 256, height: 192 });
     const dm = await pm.compute(ds.views[0], ds.views.slice(1), ds.range);

@@ -27,6 +27,8 @@ export interface PatchMatchShaderConfig {
   maxSources: number;
   patchRadius: number;
   patchStep: number;
+  /** Affine window warp (`PatchMatchOptions.affineWindow`): Jacobian at the window centre, no divide per sample. */
+  affine?: boolean;
 }
 
 /** Byte size of the Params uniform block (must match the struct below). */
@@ -121,7 +123,29 @@ export function patchMatchWGSL(cfg: PatchMatchShaderConfig): string {
 
   // ---- warped source window ----
   let sampleBody: string;
-  if (unroll) {
+  // Affine: the window centre's Jacobian ju / jv (texture units per pixel offset) replaces the
+  // projective divide per sample; clamping to [0, size − 1] px is the same as the projective path.
+  const affineSetup = `  let ic = 1.0 / h.z;
+  let ju = (hu.xy - c * hu.z) * ic * isz;
+  let jv = (hv.xy - c * hv.z) * ic * isz;
+  let b0 = (c + 0.5) * isz;
+  let lo2 = 0.5 * isz;
+  let hi2 = (sz + 0.5) * isz;`;
+  if (unroll && cfg.affine) {
+    const lines: string[] = [];
+    let k = 0;
+    for (const dy of offs) {
+      lines.push(`  br = b0 + ${f(dy)} * jv;`);
+      for (const dx of offs) {
+        lines.push(
+          `  v = textureSampleLevel(srcTex, samp, clamp(br + ${f(dx)} * ju, lo2, hi2), layer, 0.0).r; ` +
+            `sws += wk[${k}] * v; swss += wk[${k}] * v * v; swrs += wrk[${k}] * v;`,
+        );
+        k++;
+      }
+    }
+    sampleBody = `${affineSetup}\n  var br: vec2f;\n  var v: f32;\n${lines.join('\n')}`;
+  } else if (unroll) {
     const lines: string[] = [];
     let k = 0;
     for (const dy of offs) {
@@ -135,6 +159,17 @@ export function patchMatchWGSL(cfg: PatchMatchShaderConfig): string {
       }
     }
     sampleBody = `  var hr: vec3f;\n  var q: vec3f;\n  var v: f32;\n${lines.join('\n')}`;
+  } else if (cfg.affine) {
+    sampleBody = `${affineSetup}
+  var k = 0u;
+  for (var a = 0u; a < ${np}u; a++) {
+    let br = b0 + f32(i32(a) * ${cfg.patchStep} - ${cfg.patchRadius}) * jv;
+    for (var b = 0u; b < ${np}u; b++) {
+      let v = textureSampleLevel(srcTex, samp, clamp(br + f32(i32(b) * ${cfg.patchStep} - ${cfg.patchRadius}) * ju, lo2, hi2), layer, 0.0).r;
+      sws += wk[k] * v; swss += wk[k] * v * v; swrs += wrk[k] * v;
+      k++;
+    }
+  }`;
   } else {
     sampleBody = `  var k = 0u;
   for (var a = 0u; a < ${np}u; a++) {

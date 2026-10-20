@@ -171,7 +171,7 @@ export class PatchMatchGPU {
   }
 
   /**
-   * Create the matcher and compile the pipelines for the (patchRadius, patchStep) of
+   * Create the matcher and compile the pipelines for the (patchRadius, patchStep, affineWindow) of
    * `opts` up front: the source-count buckets (4/8/12/16) up to the one holding
    * `maxSources` (default all). Larger buckets compile lazily on first use; Safari's
    * shader compile is slow, so callers that know their source count should pass it.
@@ -181,7 +181,7 @@ export class PatchMatchGPU {
     const o = resolvePatchMatchOptions(opts);
     const top = SOURCE_BUCKETS.find((b) => b >= maxSources) ?? MAX_PATCHMATCH_SOURCES;
     try {
-      for (const b of SOURCE_BUCKETS) if (b <= top) await pm.getPipelines(b, o.patchRadius, o.patchStep);
+      for (const b of SOURCE_BUCKETS) if (b <= top) await pm.getPipelines(b, o.patchRadius, o.patchStep, o.affineWindow);
     } catch (e) {
       pm.destroy();
       throw e;
@@ -296,11 +296,11 @@ export class PatchMatchGPU {
     }
   }
 
-  private getPipelines(maxSources: number, patchRadius: number, patchStep: number): Promise<Pipelines> {
-    const key = `${maxSources}|${patchRadius}|${patchStep}`;
+  private getPipelines(maxSources: number, patchRadius: number, patchStep: number, affine: boolean): Promise<Pipelines> {
+    const key = pipelineKey(maxSources, patchRadius, patchStep, affine);
     let p = this.pipelines.get(key);
     if (!p) {
-      const code = patchMatchWGSL({ maxSources, patchRadius, patchStep });
+      const code = patchMatchWGSL({ maxSources, patchRadius, patchStep, affine });
       const module = this.device.createShaderModule({ code, label: `patchmatch-${key}` });
       p = (async () => {
         const init = await this.createPipeline({ label: `pm-init-${key}`, layout: this.pipelineLayout, compute: { module, entryPoint: 'init' } });
@@ -483,9 +483,9 @@ export class PatchMatchGPU {
     if (W > maxDim || H > maxDim) throw new Error(`PatchMatchGPU: image ${W}×${H} exceeds maxTextureDimension2D ${maxDim}`);
 
     const maxSources = SOURCE_BUCKETS.find((b) => b >= N) ?? MAX_PATCHMATCH_SOURCES;
-    const key = `${maxSources}|${o.patchRadius}|${o.patchStep}`;
-    if (!this.pipelines.has(key)) console.warn(`[PatchMatchGPU] compiling pipeline ${key} lazily (pass patchRadius/patchStep to create() to precompile)`);
-    const pipes = await this.getPipelines(maxSources, o.patchRadius, o.patchStep);
+    const key = pipelineKey(maxSources, o.patchRadius, o.patchStep, o.affineWindow);
+    if (!this.pipelines.has(key)) console.warn(`[PatchMatchGPU] compiling pipeline ${key} lazily (pass patchRadius/patchStep/affineWindow to create() to precompile)`);
+    const pipes = await this.getPipelines(maxSources, o.patchRadius, o.patchStep, o.affineWindow);
     this.checkAlive();
 
     let texW = 1;
@@ -662,6 +662,10 @@ export class PatchMatchGPU {
     };
     return out;
   }
+}
+
+function pipelineKey(maxSources: number, patchRadius: number, patchStep: number, affine: boolean): string {
+  return `${maxSources}|${patchRadius}|${patchStep}|${affine ? 'affine' : 'projective'}`;
 }
 
 function fillParams(
