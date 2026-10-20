@@ -185,6 +185,36 @@ describe('PatchMatchGPU', () => {
     }
   });
 
+  it('upload caches: a repeated source image / depth map is not uploaded again, results are unchanged', async () => {
+    const ds = makeSyntheticDataset('near', { width: 96, height: 72, numSources: 4, supersample: 1 });
+    const fresh = await PatchMatchGPU.create(ctx!);
+    try {
+      const a = await fresh.compute(ds.views[0], ds.views.slice(1), ds.range, { iterations: 2 });
+      const s0 = fresh.cacheStats;
+      expect(s0.imageMisses).toBe(4);
+      // the same sources again (another order) + the reference as a source: 4 hits, 1 upload
+      const b = await fresh.compute(ds.views[1], [ds.views[0], ds.views[4], ds.views[3], ds.views[2]], ds.range, { iterations: 2 });
+      const s1 = fresh.cacheStats;
+      expect(s1.imageHits - s0.imageHits).toBe(3);
+      expect(s1.imageMisses - s0.imageMisses).toBe(1);
+      expect(b.depth.some((z) => z > 0)).toBe(true);
+      // a geometric pass twice with the same depth maps: the second one uploads none of them
+      const geo = { prior: a, sourceDepths: [a, a, a, a].map((m) => ({ ...m, depth: m.depth.slice() })) };
+      const g1 = await fresh.compute(ds.views[0], ds.views.slice(1), ds.range, { geometricIterations: 1 }, geo);
+      const s2 = fresh.cacheStats;
+      const g2 = await fresh.compute(ds.views[0], ds.views.slice(1), ds.range, { geometricIterations: 1 }, geo);
+      const s3 = fresh.cacheStats;
+      expect(s3.depthMisses).toBe(s2.depthMisses);
+      expect(s3.depthHits - s2.depthHits).toBe(4);
+      expect(Array.from(g2.depth)).toEqual(Array.from(g1.depth));
+      // the first result again from cached sources equals a fresh instance's
+      const again = await fresh.compute(ds.views[0], ds.views.slice(1), ds.range, { iterations: 2 });
+      expect(Array.from(again.depth)).toEqual(Array.from(a.depth));
+    } finally {
+      fresh.destroy();
+    }
+  });
+
   it('supports 16 source views, truncates more, and reuses / reallocates resources across sizes', async () => {
     const ds = makeSyntheticDataset('near', { width: 80, height: 60, numSources: 17 });
     const warn = console.warn;

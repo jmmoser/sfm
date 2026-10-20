@@ -603,7 +603,8 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
       'info',
       `dense depth maps ${s(depthMapsMs)} s: view loads ${s(perf.load)} s (${perf.decodes} decodes), pass inputs ${s(perf.inputs)} s, ` +
         `PatchMatch ${s(perf.compute)} s (upload ${s(perf.upload)}, GPU passes ${s(perf.gpu)}${perf.gpuTs > 0 ? ` [GPU timestamps ${s(perf.gpuTs)}]` : ''}, readback ${s(perf.readback)}), ` +
-        `halo filter ${s(perf.halo)} s, store ${s(perf.store)} s`,
+        `halo filter ${s(perf.halo)} s, store ${s(perf.store)} s` +
+        (pm ? `; GPU upload caches: images ${pm.cacheStats.imageHits} hits / ${pm.cacheStats.imageMisses} uploads, depth maps ${pm.cacheStats.depthHits} / ${pm.cacheStats.depthMisses}` : ''),
     );
   }
   const finalStore = cur!;
