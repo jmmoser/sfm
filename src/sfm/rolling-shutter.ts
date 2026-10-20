@@ -383,7 +383,38 @@ export function searchRollingShutter(cost: RSCostFunction, opts: Partial<Rolling
       const num = (b - a) ** 2 * (fb - fc) - (b - c) ** 2 * (fb - fa);
       const den = (b - a) * (fb - fc) - (b - c) * (fb - fa);
       let v = den !== 0 ? b - (0.5 * num) / den : NaN;
-      if (!(v > a && v < c) || Math.abs(v - b) < 0.5 * tol) v = b - a > c - b ? 0.5 * (a + b) : 0.5 * (b + c);
+      if (v > a && v < c && Math.abs(v - b) < 0.5 * tol) {
+        // the parabola puts the minimum at b: confirm it on both sides at ±tol/2 (Brent's minimum
+        // step) instead of bisecting the larger half of the bracket one side at a time
+        const l = b - 0.5 * tol;
+        if (l > a) {
+          const fl = f(l);
+          if (fl < fb) {
+            c = b;
+            fc = fb;
+            b = l;
+            fb = fl;
+            continue;
+          }
+          a = l;
+          fa = fl;
+        }
+        const r = b + 0.5 * tol;
+        if (r < c) {
+          const fr = f(r);
+          if (fr < fb) {
+            a = b;
+            fa = fb;
+            b = r;
+            fb = fr;
+          } else {
+            c = r;
+            fc = fr;
+          }
+        }
+        continue;
+      }
+      if (!(v > a && v < c)) v = b - a > c - b ? 0.5 * (a + b) : 0.5 * (b + c);
       const fv = f(v);
       if (fv < fb) {
         if (v < b) {
