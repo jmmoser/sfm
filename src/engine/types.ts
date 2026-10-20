@@ -80,6 +80,11 @@ export interface EngineConfig {
   vocabulary?: { trainAfter?: number; words?: number; refineWords?: number };
   /** Dense preset overrides. */
   dense?: Partial<DensePresetConfig>;
+  /**
+   * Diagnostics: time the PatchMatch compute passes with GPU timestamp queries (when the adapter
+   * has 'timestamp-query'); the dense timing log then reports GPU time. Default false.
+   */
+  denseGpuTimestamps?: boolean;
   /** Approximate memory budget of the tab in MB (default 1200, iPhone). */
   memoryBudgetMB?: number;
   /** Guided-matching search radius as a fraction of the image long side (default 0.08). */

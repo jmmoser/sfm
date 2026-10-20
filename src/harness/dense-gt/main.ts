@@ -502,7 +502,7 @@ async function runDenseGT(configIn: DenseGTConfig): Promise<DenseGTResult> {
   let pm: PatchMatchGPU | null = null;
   let selfTest: PatchMatchSelfTestResult | null = null;
   if (!config.loadMaps && !config.oracle) {
-    pm = await PatchMatchGPU.create(ctx, { patchRadius: pmOpts.patchRadius, patchStep: pmOpts.patchStep });
+    pm = await PatchMatchGPU.create(ctx, { patchRadius: pmOpts.patchRadius, patchStep: pmOpts.patchStep, affineWindow: pmOpts.affineWindow }, undefined, { timestamps: true });
     stage('pmCreate');
     if (config.selfTest !== false) {
       selfTest = await pm.selfTest();
@@ -537,6 +537,7 @@ async function runDenseGT(configIn: DenseGTConfig): Promise<DenseGTResult> {
     put: (k: number, p: PassStats) => void,
   ): Promise<void> => {
     const tP = performance.now();
+    let gpuMs = 0;
     for (let k = 0; k < vs.length; k++) {
       const v = vs[k];
       const s = sel.get(v.id)!;
@@ -546,11 +547,14 @@ async function runDenseGT(configIn: DenseGTConfig): Promise<DenseGTResult> {
       const ms = performance.now() - t0;
       out.set(v.id, dm);
       const lt = pm!.lastTimings;
+      gpuMs += lt?.gpuMs ?? 0;
       const ps: PassStats = { ms, timings: lt ? { ...lt, iterationsMs: [...lt.iterationsMs] } : null, validPx: validFraction(dm) };
       put(k, ps);
       log(`[dense-gt] ${label} view ${k + 1}/${vs.length} (frame ${v.id}, ${srcs.length} src, z ${s.depthMin.toFixed(2)}–${s.depthMax.toFixed(2)}): ${ms.toFixed(0)} ms, valid ${(100 * ps.validPx).toFixed(1)} %`);
     }
     T[label] = (T[label] ?? 0) + performance.now() - tP;
+    if (gpuMs > 0) T[`${label}GpuTimestamps`] = (T[`${label}GpuTimestamps`] ?? 0) + gpuMs;
+    log(`[dense-gt] ${label}: ${((performance.now() - tP) / 1000).toFixed(1)} s wall${gpuMs > 0 ? `, ${(gpuMs / 1000).toFixed(2)} s GPU (timestamps)` : ''}`);
     tStage = performance.now();
   };
 

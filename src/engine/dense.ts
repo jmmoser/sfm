@@ -46,6 +46,7 @@ export class PatchMatchHolder {
   constructor(
     private readonly preferGPU: boolean,
     private readonly denseOverrides: Partial<DensePresetConfig> = {},
+    private readonly gpuTimestamps = false,
   ) {}
 
   async get(): Promise<PatchMatchGPU | null> {
@@ -64,7 +65,7 @@ export class PatchMatchHolder {
       // Precompile only the source buckets densify can use (any quality, with the config's
       // overrides): a compile failure then still falls back to the CPU here, not mid-densify.
       const maxSources = Math.max(...(['fast', 'balanced', 'max'] as const).map((q) => Math.min(16, resolveDensePreset(q, this.denseOverrides).numSources)));
-      const pm = await PatchMatchGPU.create(ctx, undefined, maxSources);
+      const pm = await PatchMatchGPU.create(ctx, undefined, maxSources, { timestamps: this.gpuTimestamps });
       const st = await pm.selfTest();
       if (!st.ok) {
         pm.destroy();
@@ -392,7 +393,7 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   const colour = new Map<number, RGBAImage>();
   const geomById = new Map(geom.map((g) => [g.id, g]));
   // wall-time breakdown of the depth-map stage (ms; logged at its end)
-  const perf = { decodes: 0, load: 0, inputs: 0, compute: 0, upload: 0, gpu: 0, readback: 0, halo: 0, store: 0 };
+  const perf = { decodes: 0, load: 0, inputs: 0, compute: 0, upload: 0, gpu: 0, gpuTs: 0, readback: 0, halo: 0, store: 0 };
   const loadView = (id: number): Promise<DenseView> =>
     cache.getOrLoad(id, async () => {
       const tl = now();
@@ -552,6 +553,7 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
         perf.upload += lt.uploadMs;
         perf.gpu += lt.initMs + lt.iterationsMs.reduce((a, b) => a + b, 0);
         perf.readback += lt.readbackMs;
+        perf.gpuTs += lt.gpuMs ?? 0;
       }
       geometric = undefined;
       const th = now();
@@ -586,7 +588,8 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
     deps.log(
       'info',
       `dense depth maps ${s(depthMapsMs)} s: view loads ${s(perf.load)} s (${perf.decodes} decodes), pass inputs ${s(perf.inputs)} s, ` +
-        `PatchMatch ${s(perf.compute)} s (upload ${s(perf.upload)}, GPU passes ${s(perf.gpu)}, readback ${s(perf.readback)}), halo filter ${s(perf.halo)} s, store ${s(perf.store)} s`,
+        `PatchMatch ${s(perf.compute)} s (upload ${s(perf.upload)}, GPU passes ${s(perf.gpu)}${perf.gpuTs > 0 ? ` [GPU timestamps ${s(perf.gpuTs)}]` : ''}, readback ${s(perf.readback)}), ` +
+        `halo filter ${s(perf.halo)} s, store ${s(perf.store)} s`,
     );
   }
   const finalStore = cur!;

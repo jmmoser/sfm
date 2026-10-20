@@ -59,6 +59,27 @@ export interface PatchMatchGPUTimings {
   bandRows: number;
   /** Full recomputations because GPU work was dropped. */
   retries: number;
+  /** GPU execution time of the compute passes (timestamp queries; only with `create(…, { timestamps: true })`). */
+  gpuMs?: number;
+}
+
+/** Instance options of `PatchMatchGPU.create`. */
+export interface PatchMatchGPUCreateOptions {
+  /**
+   * Measure the GPU time of every compute pass with timestamp queries (`lastTimings.gpuMs`) when
+   * the device has 'timestamp-query'. Diagnostics: costs one extra readback per compute(), and
+   * WebKit's timestamps are expensive. Default false.
+   */
+  timestamps?: boolean;
+}
+
+/** Timestamp-query state (2 queries per compute pass). */
+interface Timestamps {
+  set: GPUQuerySet;
+  resolve: GPUBuffer;
+  read: GPUBuffer;
+  /** Capacity in passes. */
+  passes: number;
 }
 
 export interface PatchMatchSelfTestResult {
@@ -124,6 +145,7 @@ export class PatchMatchGPU {
   private res: Resources | null = null;
   private srcArr: ArrayTex | null = null;
   private depthArr: ArrayTex | null = null;
+  private ts: Timestamps | null = null;
   private lost = false;
   private destroyed = false;
   private busy: Promise<unknown> = Promise.resolve();
@@ -176,8 +198,17 @@ export class PatchMatchGPU {
    * `maxSources` (default all). Larger buckets compile lazily on first use; Safari's
    * shader compile is slow, so callers that know their source count should pass it.
    */
-  static async create(ctx: GPUContext, opts?: Partial<PatchMatchOptions>, maxSources = MAX_PATCHMATCH_SOURCES): Promise<PatchMatchGPU> {
+  static async create(ctx: GPUContext, opts?: Partial<PatchMatchOptions>, maxSources = MAX_PATCHMATCH_SOURCES, inst: PatchMatchGPUCreateOptions = {}): Promise<PatchMatchGPU> {
     const pm = new PatchMatchGPU(ctx, opts ?? {});
+    if (inst.timestamps && ctx.device.features.has('timestamp-query')) {
+      const passes = 1024;
+      pm.ts = {
+        set: ctx.device.createQuerySet({ label: 'pm-timestamps', type: 'timestamp', count: 2 * passes }),
+        resolve: createBuffer(ctx.device, 16 * passes, GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC, 'pm-ts-resolve'),
+        read: ctx.device.createBuffer({ label: 'pm-ts-read', size: 16 * passes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+        passes,
+      };
+    }
     const o = resolvePatchMatchOptions(opts);
     const top = SOURCE_BUCKETS.find((b) => b >= maxSources) ?? MAX_PATCHMATCH_SOURCES;
     try {
@@ -266,6 +297,12 @@ export class PatchMatchGPU {
     this.paramsBuf.destroy();
     this.camsBuf.destroy();
     this.statusBuf.destroy();
+    if (this.ts) {
+      this.ts.set.destroy();
+      this.ts.resolve.destroy();
+      this.ts.read.destroy();
+      this.ts = null;
+    }
     this.pipelines.clear();
   }
 
@@ -384,6 +421,20 @@ export class PatchMatchGPU {
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
     return { tex, width: W, height: H, layers: keep };
+  }
+
+  /** Sum of the GPU durations (ms) of the first `passes` timed compute passes. */
+  private async readTimestamps(ts: Timestamps, passes: number): Promise<number> {
+    const enc = this.device.createCommandEncoder({ label: 'pm-ts' });
+    enc.resolveQuerySet(ts.set, 0, 2 * passes, ts.resolve, 0);
+    enc.copyBufferToBuffer(ts.resolve, 0, ts.read, 0, 16 * passes);
+    this.device.queue.submit([enc.finish()]);
+    await ts.read.mapAsync(GPUMapMode.READ, 0, 16 * passes);
+    const t = new BigUint64Array(ts.read.getMappedRange(0, 16 * passes).slice(0));
+    ts.read.unmap();
+    let ns = 0;
+    for (let k = 0; k < passes; k++) if (t[2 * k + 1] > t[2 * k]) ns += Number(t[2 * k + 1] - t[2 * k]);
+    return ns / 1e6;
   }
 
   /** Chunked GPU → CPU copy through the (bounded) staging buffer; one getMappedRange per map. */
@@ -586,6 +637,8 @@ export class PatchMatchGPU {
 
     let submits = 0;
     let maxSubmitMs = 0;
+    const ts = this.ts;
+    let timed = 0;
     let lastRows = 0;
     const iterTimes: number[] = [];
     let tInit = tUpload;
@@ -603,7 +656,9 @@ export class PatchMatchGPU {
         device.pushErrorScope('validation');
         q.writeBuffer(this.paramsBuf, slot * PARAMS_STRIDE, params);
         const enc = device.createCommandEncoder({ label: 'pm-band' });
-        const pass = enc.beginComputePass({ label: 'pm' });
+        const tsw = ts && timed < ts.passes ? { querySet: ts.set, beginningOfPassWriteIndex: 2 * timed, endOfPassWriteIndex: 2 * timed + 1 } : undefined;
+        if (tsw) timed++;
+        const pass = enc.beginComputePass({ label: 'pm', ...(tsw ? { timestampWrites: tsw } : {}) });
         pass.setPipeline(pipeline);
         pass.setBindGroup(0, bindGroup, [slot * PARAMS_STRIDE]);
         pass.dispatchWorkgroups(Math.ceil((isInit ? W : halfW) / WORKGROUP_X), Math.ceil(rows / WORKGROUP_Y), 1);
@@ -642,6 +697,8 @@ export class PatchMatchGPU {
     if (status[0] !== submits) {
       throw new DroppedWorkError(`PatchMatchGPU: ${submits - status[0]} of ${submits} command buffers were not executed (page hidden?)`);
     }
+    let gpuMs: number | undefined;
+    if (ts && timed > 0) gpuMs = await this.readTimestamps(ts, timed);
     const planes = new Float32Array(4 * n);
     const photo = new Float32Array(n);
     await this.readInto(res.planes, planes, res.staging);
@@ -659,6 +716,7 @@ export class PatchMatchGPU {
       maxSubmitMs,
       bandRows: lastRows,
       retries: 0,
+      ...(gpuMs !== undefined ? { gpuMs } : {}),
     };
     return out;
   }
