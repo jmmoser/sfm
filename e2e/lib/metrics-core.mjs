@@ -300,6 +300,13 @@ function denseMetrics(dataset, rawPoints, sim, se3, opts) {
       if (ang < 1e-6 && Math.hypot(...step.t) < 1e-4 * tau) break;
     }
     icp = { iterations: it, rotationDeg: rotationAngleBetween(total.R, [1, 0, 0, 0, 1, 0, 0, 0, 1]) * DEG, translation: Math.hypot(...total.t) };
+    // completeness reads every point (`all`) when P is a subsample: move them as well
+    if (step > 1) {
+      for (let i = 0; i < nAll; i++) {
+        const q = applySim3(total, [all[3 * i], all[3 * i + 1], all[3 * i + 2]]);
+        all[3 * i] = q[0]; all[3 * i + 1] = q[1]; all[3 * i + 2] = q[2];
+      }
+    }
   }
   // ---- accuracy: result → GT surface (nearest sample, point-to-plane refined) ----
   const acc = new Float64Array(nP);
