@@ -723,6 +723,19 @@ export class MockEngine implements EngineLike {
     return 'restarted';
   }
 
+  /** Like EngineClient.closeSession: the session is forgotten (a running operation is rejected). */
+  async closeSession(id: string): Promise<void> {
+    if (this.disposed) throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');
+    if (this.sessionId !== id) return;
+    if (this.longOp) {
+      this.cancelled = true;
+      this.abortCurrent?.(namedError(ENGINE_ERRORS.cancelled, 'The session was closed'));
+      this.releaseStall?.();
+    }
+    this.forgetSession();
+    if (this.st.state === 'ready') this.setState('idle', 'closed');
+  }
+
   /** Forget the session (EngineClient.release: a fresh worker). A running operation is rejected. */
   async release(): Promise<void> {
     if (this.disposed) throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');

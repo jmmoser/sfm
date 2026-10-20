@@ -25,6 +25,10 @@
  *   finish-stuck-home  same, "Back to home" keeps the scan (status captured)
  *   finish-stuck-discard  finishCapture hangs, X (keyboard) → Discard: the scan is deleted only after the
  *                    engine let go of it (no re-opening restart), a new scan starts right away
+ *   discard-no-replay  real EngineClient + the protocol fixture worker: X → Discard during a capture
+ *                    closes the session in the engine; a later engine restart replays nothing
+ *   delete-open-session  deleting the scan the engine holds (opened in the viewer) on Home makes the
+ *                    engine let go of it
  *   memory-limit     the engine's capture memory cap → "Memory limit reached — finish scan now?",
  *                    Continue (tracking only) adds no keyframes, Finish works
  *   dense-resume     an interrupted densify (loadSession stats.denseResumablePass) → "Resume dense
@@ -488,6 +492,47 @@ await scenario('finish-stuck-discard', async () => {
   await page.waitForFunction(() => Number(document.querySelector('[data-testid="kf-count"]')?.textContent) >= 2, null, { timeout: 60000 });
   check(true, 'a new scan starts right after the discard');
   check((await list()).length === 1, 'only the new scan is stored');
+  await context.close();
+});
+
+await scenario('discard-no-replay', async () => {
+  const { page, context } = await newPage();
+  // the protocol fixture of engine-client.gpu.test.ts answers in place of the engine worker
+  await context.route(/engine\.worker\.ts/, (route) => route.fulfill({ contentType: 'text/javascript', body: `import '/src/app/engine-client.worker-fixture.ts';` }));
+  await startCapture(page, base);
+  await page.waitForFunction(() => Number(document.querySelector('[data-testid="kf-count"]')?.textContent) >= 6, null, { timeout: 90000 });
+  await by(page, 'capture-cancel').tap();
+  await by(page, 'dialog-confirm').tap();
+  await by(page, 'new-scan').waitFor({ timeout: 15000 });
+  const status = () => page.evaluate(() => globalThis.__sfmApp.engine.status);
+  const st = await status();
+  check(st.state === 'idle' && st.reason === 'closed', `the discarded scan is closed in the engine (state ${st.state}, ${st.reason})`);
+  // a later engine restart (e.g. a GPU loss while on Home) must not replay the discarded scan's init
+  await page.evaluate(() => globalThis.__sfmApp.engine.restart('test'));
+  await sleep(1000);
+  check((await status()).state === 'idle', `the restart re-opened nothing (state ${(await status()).state})`);
+  const n = await page.evaluate(async () => {
+    const { SessionStore } = await import('/src/io/storage.ts');
+    return (await (await SessionStore.open()).listSessions()).length;
+  });
+  check(n === 0, `the discarded scan is deleted (${n} stored)`);
+  await context.close();
+});
+
+await scenario('delete-open-session', async () => {
+  const { page, context } = await newPage();
+  await page.goto(`${base}?mock=1`);
+  await by(page, 'new-scan').waitFor();
+  await seedMeshed(page);
+  await by(page, 'session-item').first().tap();
+  await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  await by(page, 'viewer-back').tap();
+  await by(page, 'session-more').first().tap();
+  await by(page, 'session-delete').tap();
+  await by(page, 'dialog-confirm').tap();
+  await page.waitForSelector('.empty-state', { timeout: 5000 });
+  const st = await page.evaluate(() => globalThis.__sfmApp.engine.status);
+  check(st.state === 'idle' && st.reason === 'closed', `deleting the open scan makes the engine let go of it (state ${st.state}, ${st.reason})`);
   await context.close();
 });
 

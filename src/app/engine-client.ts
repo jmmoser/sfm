@@ -97,10 +97,17 @@ export interface EngineLike {
    * respawned and the last init / loadSession replayed with `resume`, so the persisted capture
    * comes back and later calls do not queue behind the stuck one). Resolves with what happened:
    * 'none' (nothing running), 'cancelled' (the engine stopped it), 'restarted'.
-   * `reinit: false`: such a restart does NOT replay the last init / loadSession — the session is
-   * being discarded, and a replay with `resume` would re-open (re-create) it.
+   * `reinit: false`: the session is being discarded — neither such a restart nor any later one
+   * replays the last init / loadSession (a replay with `resume` would re-open, re-create, it).
    */
   abortLongOperation(opts?: { graceMs?: number; reinit?: boolean }): Promise<AbortOutcome>;
+  /**
+   * Let go of session `id` before it is deleted (no-op when the engine holds another one): the
+   * engine is disposed in the worker (nothing more is written to the session; the compiled GPU
+   * pipelines stay for the next scan) and no later restart replays its init / loadSession.
+   * Resolves when the worker answered.
+   */
+  closeSession(id: string): Promise<void>;
   /**
    * Free everything the engine holds in memory (capture state, models, GPU device / pipelines),
    * e.g. before the on-device benchmark. EngineClient terminates the worker WITHOUT replaying the
@@ -365,6 +372,8 @@ export class EngineClient implements EngineLike {
   }
 
   abortLongOperation(opts: { graceMs?: number; reinit?: boolean } = {}): Promise<AbortOutcome> {
+    // a discarded session must not be re-opened by any later replay (`resume` would re-create it)
+    if (opts.reinit === false) this.setup = null;
     const id = this.longOp;
     const p = id !== null ? this.pending.get(id) : undefined;
     if (id === null || !p) return Promise.resolve('none');
@@ -421,6 +430,16 @@ export class EngineClient implements EngineLike {
     } finally {
       this.superseding--;
     }
+  }
+
+  async closeSession(id: string): Promise<void> {
+    this.assertUsable();
+    const s = this.setup;
+    if (s && (s.kind === 'init' ? s.options.sessionId : s.id) === id) this.setup = null;
+    if (!this.worker) return;
+    // (a worker that does not answer is stuck: restarted, like on a stuck init)
+    const closed = await this.call('close', { sessionId: id }, { timeoutMs: this.opts.callTimeoutMs, bypassGate: true, fatalOnTimeout: true });
+    if (closed && !this.setup && this.st.state === 'ready') this.setState('idle', 'closed');
   }
 
   async release(): Promise<void> {

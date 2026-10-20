@@ -2,17 +2,21 @@
  * iPhone-specific engine behaviour on a PERSISTENT store (the app's IndexedDB path, emulated by
  * a MemoryEngineStore flagged persistent): dense resume after a kill / cancel, the live session
  * released before the dense stage (and restored by a later refine), the capture state kept
- * intact across state writes without a live session, and store back-pressure during capture.
+ * intact across state writes without a live session, store back-pressure during capture, results
+ * whose write failed or was cut short by a kill, a deleted session not re-created by a resume,
+ * and no writes after dispose.
  */
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 import type { FeaturePipeline } from '../features/extractor';
 import type { ProgressEvent } from '../core/types';
+import { decodePLY } from '../io/ply';
 import { readZip } from '../io/zip';
 import { createCpuFeaturePipeline } from './cpu-pipeline';
 import { PhotogrammetryEngine } from './engine';
 import { MemoryEngineStore, type EngineStateRecord, type EngineStore, type StoredImage } from './persistence';
 import { frameInputs, makeCapture, type SynthCapture } from './testutil';
 import type { KeyframeRecord } from './types';
+import type { SessionSummary } from '../workers/protocol';
 
 let pipeline: FeaturePipeline;
 let cap: SynthCapture;
@@ -193,5 +197,169 @@ describe('capture memory cap', () => {
     const res = await e.refine();
     expect(res.cameras.length).toBeGreaterThanOrEqual(2);
     e.dispose();
+  }, 300_000);
+});
+
+/**
+ * Persistent MemoryEngineStore whose writes can fail (`fail`: a full disk, or every write after a
+ * simulated kill of the worker) — StorageQuotaError, like IndexedDB's QuotaExceededError.
+ */
+class FaultyStore extends MemoryEngineStore {
+  fail: (op: 'put' | 'delete', key: string) => boolean = () => false;
+  /** Called after each successful write. */
+  written: (key: string) => void = () => undefined;
+  constructor(id: string) {
+    super(id);
+    Object.defineProperty(this, 'persistent', { value: true });
+  }
+  private async write(op: 'put' | 'delete', key: string, run: () => Promise<void>): Promise<void> {
+    if (this.fail(op, key)) throw Object.assign(new Error(`quota exceeded storing '${key}'`), { name: 'StorageQuotaError' });
+    await run();
+    this.written(key);
+  }
+  override putValue(key: string, value: unknown): Promise<void> {
+    return this.write('put', key, () => super.putValue(key, value));
+  }
+  override putBinary(key: string, data: ArrayBuffer | ArrayBufferView): Promise<void> {
+    return this.write('put', key, () => super.putBinary(key, data));
+  }
+  override deleteBinary(key: string): Promise<void> {
+    return this.write('delete', key, () => super.deleteBinary(key));
+  }
+}
+
+describe('stored results after a failed or interrupted write', () => {
+  const DENSE = { maxImageSize: 80, maxViews: 6 };
+  /** Another setting: a cloud that differs from the stored one. */
+  const DENSE_2 = { maxImageSize: 64, maxViews: 6 };
+  let base: FaultyStore;
+  let baseDense = 0;
+  beforeAll(async () => {
+    base = new FaultyStore('r');
+    const e = new PhotogrammetryEngine({ ...opts, sessionId: 'r' }, { pipeline, store: base, mapping: 'inline' });
+    await e.init();
+    for (const f of frameInputs(cap, { to: 30 })) await e.processFrame(f);
+    await e.finishCapture();
+    await e.refine();
+    baseDense = (await e.densify(DENSE)).count;
+    await e.mesh();
+    e.dispose();
+  }, 300_000);
+
+  /** A copy of the meshed session (every test changes its own). */
+  async function meshedScan(): Promise<FaultyStore> {
+    const s = new FaultyStore('r');
+    await s.ensureSession({ mode: 'object', quality: 'fast' });
+    for (const r of await base.getFrameRecords()) await s.putFrame(r.id, structuredClone((await base.getFrameImage(r.id))!), structuredClone(r));
+    for (const k of await base.listValueKeys()) await s.putValue(k, structuredClone(await base.getValue(k)));
+    for (const k of await base.listBinaryKeys()) await s.putBinary(k, new Uint8Array((await base.getBinary(k))!));
+    return s;
+  }
+
+  async function open(store: EngineStore): Promise<{ e: PhotogrammetryEngine; errors: string[]; sum: SessionSummary }> {
+    const e = new PhotogrammetryEngine({ mode: 'auto', quality: 'fast' }, { pipeline, store, mapping: 'inline' });
+    const errors: string[] = [];
+    e.on('error', (err, _fatal, reason) => errors.push(`${reason}: ${err.name}`));
+    return { e, errors, sum: await e.loadSession('r') };
+  }
+
+  /** What a reload (a fresh engine) finds in the store. */
+  async function reload(store: FaultyStore): Promise<{ status: string; sparse: boolean; dense: number | null; mesh: boolean }> {
+    store.fail = () => false;
+    const { e, sum } = await open(store);
+    e.dispose();
+    return { status: sum.status, sparse: !!sum.sparse, dense: sum.dense?.count ?? null, mesh: !!sum.mesh };
+  }
+
+  it('a dense cloud that could not be stored stays in memory for exports; no older cloud or mesh comes back after a reload', async () => {
+    const store = await meshedScan();
+    const { e, errors } = await open(store);
+    store.fail = (op, key) => op === 'put' && key === 'dense/points';
+    const pc = await e.densify(DENSE_2);
+    expect(pc.count).not.toBe(baseDense);
+    expect(errors).toEqual(['storage: StorageQuotaError']);
+    // the worker must not drop the only copy (it clones it instead)
+    expect(e.releaseResultMemory('dense')).toBe(false);
+    const ply = decodePLY(await (await e.exportModel('ply-points')).arrayBuffer());
+    expect(ply.points?.count).toBe(pc.count);
+    e.dispose();
+    expect(await reload(store)).toEqual({ status: 'sparse', sparse: true, dense: null, mesh: false });
+  }, 300_000);
+
+  it('a mesh that could not be stored stays in memory for exports; the older mesh does not come back after a reload', async () => {
+    const store = await meshedScan();
+    const { e, errors } = await open(store);
+    store.fail = (op, key) => op === 'put' && key === 'mesh';
+    const mesh = await e.mesh();
+    expect(errors).toEqual(['storage: StorageQuotaError']);
+    expect(e.releaseResultMemory('mesh')).toBe(false);
+    const ply = decodePLY(await (await e.exportModel('ply-mesh')).arrayBuffer());
+    expect(ply.mesh?.triangleCount).toBe(mesh.triangleCount);
+    e.dispose();
+    expect(await reload(store)).toEqual({ status: 'dense', sparse: true, dense: baseDense, mesh: false });
+  }, 300_000);
+
+  it('a kill right after a rebuilt dense cloud was stored does not pair it with the mesh of the old cloud', async () => {
+    const store = await meshedScan();
+    const { e } = await open(store);
+    let killed = false;
+    store.written = (key) => (killed ||= key === 'dense/points');
+    store.fail = () => killed; // nothing is written after the kill
+    const pc = await e.densify(DENSE_2);
+    e.dispose();
+    expect(await reload(store)).toEqual({ status: 'dense', sparse: true, dense: pc.count, mesh: false });
+  }, 300_000);
+
+  it('a kill right after a re-refined model was stored does not pair it with the old cameras, cloud or mesh', async () => {
+    const store = await meshedScan();
+    const { e } = await open(store);
+    let killed = false;
+    store.written = (key) => (killed ||= key === 'sparse/model');
+    store.fail = () => killed;
+    await e.refine();
+    e.dispose();
+    // (a model without its meta is not loaded: the scan is processed again)
+    expect(await reload(store)).toEqual({ status: 'captured', sparse: false, dense: null, mesh: false });
+  }, 300_000);
+});
+
+describe('session lifetime', () => {
+  it('init with resume does not re-create a stored session whose record is gone (deleted); one kept in memory still resumes', async () => {
+    const store = persistentStore('gone');
+    const e = new PhotogrammetryEngine({ ...opts, sessionId: 'gone', resume: true }, { pipeline, store });
+    await expect(e.init()).rejects.toMatchObject({ name: 'SessionNotFoundError' });
+    expect(await store.getSessionMeta()).toBeNull();
+    expect(await store.getValue('engine/state')).toBeNull();
+    e.dispose();
+    // no IndexedDB (a MemoryEngineStore fallback): nothing is stored to tell, the capture goes on
+    const mem = new PhotogrammetryEngine({ ...opts, sessionId: 'mem', resume: true }, { pipeline, store: new MemoryEngineStore('mem') });
+    await expect(mem.init()).resolves.toMatchObject({ gpu: false });
+    mem.dispose();
+  });
+
+  it('a disposed engine stores nothing more: a keyframe still being matched in the background is dropped', async () => {
+    // slow matching (CPU tier): a mapping backlog when the engine is disposed
+    const slow: FeaturePipeline = {
+      ...pipeline,
+      match: async (...a) => {
+        await new Promise((r) => setTimeout(r, 150));
+        return pipeline.match(...a);
+      },
+    };
+    const store = new FaultyStore('d');
+    const e = new PhotogrammetryEngine({ ...opts, sessionId: 'd' }, { pipeline: slow, store });
+    await e.init();
+    for (const f of frameInputs(cap)) {
+      const u = await e.processFrame(f);
+      if (u.decision === 'keyframe' && u.numKeyframes >= 4) break;
+    }
+    const live = e.liveSession!;
+    expect(live.pendingMapping).toBeGreaterThan(0);
+    await new Promise((r) => setTimeout(r, 50)); // the keyframe's job is matching its pairs
+    const late: string[] = [];
+    e.dispose();
+    store.fail = (op, key) => (late.push(`${op} ${key}`), false);
+    await vi.waitFor(() => expect(live.pendingMapping).toBe(0), { timeout: 30_000 });
+    expect(late).toEqual([]);
   }, 300_000);
 });

@@ -1342,6 +1342,8 @@ export class LiveSession {
         stored.push(pairToStored(c.other, id, g));
       }
     }
+    // disposed while matching (e.g. a discarded scan, deleted next): nothing more is stored
+    if (this.disposed) return;
     const res = this.mapper.addKeyframe(id);
     this.consecutiveUnregistered = res.registered ? 0 : this.consecutiveUnregistered + 1;
     this.modelVersion++;

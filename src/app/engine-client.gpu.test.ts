@@ -2,7 +2,7 @@
  * EngineClient against a tiny in-test worker (engine-client.worker-fixture.ts) in Chromium:
  * request ids, transfers, progress routing, live / log events, back-pressure, cancel, init /
  * frame timeouts, fatal worker death → respawn + re-init (resume), startup failure, respawn
- * cap, visibility forwarding, dispose.
+ * cap, visibility forwarding, dispose, a discarded / deleted session never replayed.
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import type { LiveUpdate, LogMessage } from '../workers/protocol';
@@ -217,6 +217,52 @@ describe('EngineClient', () => {
     // the next scan starts a fresh worker, without resume
     expect((await c.init({ mode: 'object', quality: 'fast', sessionId: 's2' })).adapter).toBe('fixture:ok:resume=false:gpu=true');
     expect(spawned).toEqual(['stuck-finish', 'ok']);
+  });
+
+  it('abortLongOperation with reinit: false forgets the session also when nothing was stuck: a later restart does not re-open it', async () => {
+    const idle = client('ok');
+    await idle.c.init({ mode: 'object', quality: 'fast', sessionId: 's1' });
+    expect(await idle.c.abortLongOperation({ reinit: false })).toBe('none');
+    const honoured = client('slow-finish');
+    await honoured.c.init({ mode: 'object', quality: 'fast', sessionId: 's1' });
+    const settled = honoured.c.finishCapture().catch((e: Error) => e);
+    await new Promise((r) => setTimeout(r, 80));
+    expect(await honoured.c.abortLongOperation({ graceMs: 3000, reinit: false })).toBe('cancelled');
+    expect(await settled).toMatchObject({ name: 'CancelledError' });
+    for (const { c } of [idle, honoured]) c.restart('test'); // e.g. a GPU loss later, on Home
+    await new Promise((r) => setTimeout(r, 200)); // a replay would spawn a worker here
+    expect(idle.spawned).toEqual(['ok']);
+    expect(honoured.spawned).toEqual(['slow-finish']);
+    expect(idle.c.status.state).toBe('idle');
+    expect(honoured.c.status.state).toBe('idle');
+  });
+
+  it('closeSession: the worker lets go of that session only (the worker stays); a later restart does not re-open it', async () => {
+    const { c, spawned } = client('ok');
+    await c.init({ mode: 'object', quality: 'fast', sessionId: 's1' });
+    await c.closeSession('other');
+    expect(c.status.state).toBe('ready');
+    await c.closeSession('s1');
+    expect(c.status).toMatchObject({ state: 'idle', reason: 'closed' });
+    expect((await c.loadSession('probe')).stats.closes).toBe('other:false,s1:true');
+    expect(spawned).toEqual(['ok']);
+
+    const deleted = client('ok');
+    await deleted.c.init({ mode: 'object', quality: 'fast', sessionId: 's1' });
+    await deleted.c.closeSession('s1');
+    deleted.c.restart('test');
+    await new Promise((r) => setTimeout(r, 200));
+    expect(deleted.spawned).toEqual(['ok']);
+    expect(deleted.c.status.state).toBe('idle');
+
+    // another session's deletion: the one the engine holds is still replayed (resume)
+    const other = client('ok');
+    await other.c.init({ mode: 'object', quality: 'fast', sessionId: 's1' });
+    await other.c.closeSession('s2');
+    other.c.restart('test');
+    await waitFor(() => other.c.status.state === 'ready' && other.c.status.respawns === 1);
+    expect(other.spawned).toEqual(['ok', 'ok']);
+    expect(other.c.status.init?.adapter).toBe('fixture:ok:resume=true:gpu=true');
   });
 
   it('a new init while an abort of a stuck request is pending waits for it: not rejected by the restart, the old session not replayed', async () => {

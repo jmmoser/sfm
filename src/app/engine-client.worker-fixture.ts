@@ -8,6 +8,8 @@
  *   'slow-finish'  `finishCapture` runs (progress every 30 ms) until cancelled
  *   'stuck-finish' `finishCapture` never answers and ignores `cancel` (progress keeps coming); an
  *                  `init` while it hangs takes 1 s (the real worker builds a new engine meanwhile)
+ * `close` answers whether the last `init` was of that session; the `close`s it got are reported in
+ * the `loadSession` stats.
  */
 import {
   ENGINE_ERRORS,
@@ -33,6 +35,7 @@ let hidden = false;
 let initOptions: unknown = null;
 let frames = 0;
 let inits = 0;
+const closes: string[] = [];
 let finishing = false;
 const longOps = new Map<number, () => void>();
 
@@ -143,7 +146,7 @@ async function handle(req: EngineRequest): Promise<void> {
         sparse: null,
         dense: null,
         mesh: null,
-        stats: { hidden: String(hidden), init: JSON.stringify(initOptions), inits },
+        stats: { hidden: String(hidden), init: JSON.stringify(initOptions), inits, closes: closes.join(',') },
       });
       return;
     case 'cancel': {
@@ -172,6 +175,14 @@ async function handle(req: EngineRequest): Promise<void> {
           });
       });
       fail(req.id, namedError(ENGINE_ERRORS.cancelled, 'finishCapture cancelled'));
+      return;
+    }
+    case 'close': {
+      const id = (req.params as { sessionId: string }).sessionId;
+      const held = (initOptions as { sessionId?: string } | null)?.sessionId === id;
+      closes.push(`${id}:${held}`);
+      if (held) initOptions = null;
+      ok(req.id, held);
       return;
     }
     case 'dispose':

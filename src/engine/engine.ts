@@ -147,6 +147,9 @@ export class PhotogrammetryEngine {
   /** A dense cloud / mesh exists (in memory or only in the store after releaseResultMemory). */
   private hasDense = false;
   private hasMesh = false;
+  /** The in-memory dense cloud / mesh is in the store too (releaseResultMemory may drop it). */
+  private densePersisted = false;
+  private meshPersisted = false;
   private readonly holder: PatchMatchHolder;
   private hiddenFlag = false;
   private visibleWaiters: (() => void)[] = [];
@@ -468,6 +471,11 @@ export class PhotogrammetryEngine {
     const o = this.options;
     await this.openStore(o.sessionId);
     this.stopInitIfDisposed();
+    // a stored session to resume whose record is gone was deleted (a respawn replaying the init of
+    // a discarded scan): it must not be re-created
+    const deleted = !!o.resume && this.store!.persistent && (await this.store!.getSessionMeta().catch(() => undefined)) === null;
+    this.stopInitIfDisposed();
+    if (deleted) throw namedError('SessionNotFoundError', `Session not found: ${o.sessionId}`);
     try {
       await this.store!.ensureSession({ mode: o.mode, quality: o.quality });
     } catch (e) {
@@ -748,14 +756,17 @@ export class PhotogrammetryEngine {
       rollingShutter: this.model.rollingShutter ?? null,
     };
     try {
-      await this.store.putBinary('sparse/model', packSparseModel(this.model));
-      await this.store.putValue('sparse/meta', meta);
+      // dependents first (every write is a transaction of its own: a kill in between must not pair
+      // the new model with the old meta, dense cloud or mesh)
       await this.store.deleteBinary('dense/points').catch(() => undefined);
       await this.store.deleteBinary('mesh').catch(() => undefined);
       // depth maps of an earlier model (poses changed): no meshing / resuming from them, and
       // free their storage (up to ≈ 2 GB of float16 maps at `max`)
       await this.store.putValue('dense/meta', null);
       await this.store.putValue('dense/progress', null);
+      await this.store.putValue('sparse/meta', null);
+      await this.store.putBinary('sparse/model', packSparseModel(this.model));
+      await this.store.putValue('sparse/meta', meta);
       await this.clearDepthMaps(this.store);
       await this.store.putValue('engine/state', this.stateRecord());
     } catch (e) {
@@ -855,15 +866,21 @@ export class PhotogrammetryEngine {
       this.meshModel = null;
       this.hasDense = true;
       this.hasMesh = false;
+      this.densePersisted = false;
       Object.assign(this.stats, out.stats);
       if (this.sparse) Object.assign(this.sparse.stats, out.stats);
       try {
-        await this.store.putBinary('dense/points', serializePointCloud(out.cloud, { float16: true }));
-        await this.store.putValue('dense/meta', out.meta);
+        // the mesh of the previous cloud goes first: a kill after the cloud's write must not pair them
         await this.store.deleteBinary('mesh').catch(() => undefined);
+        await this.store.putBinary('dense/points', serializePointCloud(out.cloud, { float16: true }));
+        this.densePersisted = true;
+        await this.store.putValue('dense/meta', out.meta);
         await this.store.putValue('engine/state', this.stateRecord());
       } catch (e) {
         this.onStorageError(e);
+        // the cloud stays in memory only (exports use it); the previous run's stored cloud must not
+        // come back under this run's stats after a reload
+        if (!this.densePersisted) await this.store.deleteBinary('dense/points').catch(() => undefined);
       }
       out.stats.memoryMB = this.logMemory('densify');
       return out.cloud;
@@ -954,14 +971,18 @@ export class PhotogrammetryEngine {
       );
       this.meshModel = mesh;
       this.hasMesh = true;
+      this.meshPersisted = false;
       stats.memoryMB = this.logMemory('mesh');
       Object.assign(this.stats, stats);
       if (this.sparse) Object.assign(this.sparse.stats, stats);
       try {
         await this.store.putBinary('mesh', serializeTriangleMesh(mesh, { float16: true }));
+        this.meshPersisted = true;
         await this.store.putValue('engine/state', this.stateRecord());
       } catch (e) {
         this.onStorageError(e);
+        // in memory only (as densify): no earlier stored mesh under this one's stats after a reload
+        if (!this.meshPersisted) await this.store.deleteBinary('mesh').catch(() => undefined);
       }
       return mesh;
     });
@@ -990,13 +1011,20 @@ export class PhotogrammetryEngine {
   }
 
   /**
-   * Drop the in-memory copy of a PERSISTED dense cloud / mesh (e.g. after the worker transferred
-   * it to the page); it is reloaded from the store when needed (export). No-op without persistence.
+   * Drop the in-memory copy of a STORED dense cloud / mesh (e.g. when the worker transfers it to
+   * the page); it is reloaded from the store when needed (export). Returns false and keeps it
+   * without persistence or when its write failed (the only copy).
    */
-  releaseResultMemory(kind: 'dense' | 'mesh'): void {
-    if (!this.store?.persistent) return;
-    if (kind === 'dense') this.denseCloud = null;
-    else this.meshModel = null;
+  releaseResultMemory(kind: 'dense' | 'mesh'): boolean {
+    if (!this.store?.persistent) return false;
+    if (kind === 'dense') {
+      if (!this.densePersisted) return false;
+      this.denseCloud = null;
+    } else {
+      if (!this.meshPersisted) return false;
+      this.meshModel = null;
+    }
+    return true;
   }
 
   private async reloadResults(dense = true, mesh = true): Promise<void> {
@@ -1089,12 +1117,14 @@ export class PhotogrammetryEngine {
       this.denseCloud = dense;
       this.denseMeta = await store.getValue<DenseMetaRecord>('dense/meta').catch(() => null);
       this.hasDense = true;
+      this.densePersisted = true;
     }
     const mb2 = await store.getBinary('mesh').catch(() => null);
     const mesh = mb2 && this.model ? decode('mesh', () => deserializeTriangleMesh(mb2)) : null;
     if (mesh) {
       this.meshModel = mesh;
       this.hasMesh = true;
+      this.meshPersisted = true;
     }
     void st;
   }

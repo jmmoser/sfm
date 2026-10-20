@@ -174,6 +174,19 @@ describe('MockEngine', () => {
     expect(e.status.state).toBe('ready');
   });
 
+  it('closeSession lets go of that session only (like the worker: a running operation ends)', async () => {
+    const e = new MockEngine({ speed: 50, sessions: async () => null });
+    await e.init({ mode: 'object', quality: 'fast', sessionId: 's1' });
+    for (let i = 0; i < 20; i++) await e.processFrame(frame(100 + i * 400));
+    await e.closeSession('other');
+    expect(e.status.state).toBe('ready');
+    const r = e.refine().catch((err: Error) => err);
+    await e.closeSession('s1');
+    expect(await r).toMatchObject({ name: 'CancelledError' });
+    expect(e.status).toMatchObject({ state: 'idle', reason: 'closed' });
+    await expect(e.refine()).rejects.toMatchObject({ name: 'EngineNotInitializedError' });
+  });
+
   it('memoryLimitKeyframes: one out-of-memory event, then tracking only (no new keyframes)', async () => {
     const e = new MockEngine({ speed: 60, memoryLimitKeyframes: 3, sessions: async () => null });
     await e.init({ mode: 'object', quality: 'fast' });

@@ -390,10 +390,13 @@ export class App {
   async deleteSession(id: string): Promise<boolean> {
     const s = await this.sessions();
     if (!s) return false;
+    // The engine lets go of the scan first: none of its writes may land after the deletion, and no
+    // later engine restart may replay its init (`resume` would re-create the deleted scan).
+    await this.engine.closeSession(id).catch(() => undefined);
+    if (this.loadedSessionId === id) this.loadedSessionId = null;
     try {
       await s.deleteSession(id);
       if (this.results.sessionId === id) this.results = App.emptyResults(this.config);
-      if (this.loadedSessionId === id) this.loadedSessionId = null;
       return true;
     } catch (e) {
       toast(`Could not delete the scan: ${(e as Error)?.message ?? e}`, { tone: 'bad' });

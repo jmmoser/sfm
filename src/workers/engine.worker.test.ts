@@ -1,7 +1,7 @@
 /**
  * Engine worker (Node; the module runs against a fake worker scope): the feature pipeline handed
- * from one engine to the next, and GPU device-loss recovery for engines created by `init` and by
- * `loadSession`. gpu/device and the WebGPU feature pipeline are mocked; a device loss clears the
+ * from one engine to the next (also across `close`), and GPU device-loss recovery for engines
+ * created by `init` and by `loadSession`. gpu/device and the WebGPU feature pipeline are mocked; a device loss clears the
  * fake pipelines' `gpu` the way FeaturePipelineImpl falls back to the CPU on device.lost.
  */
 import { describe, expect, it, vi, type Mock } from 'vitest';
@@ -130,6 +130,37 @@ describe('engine worker: feature pipeline hand-over and GPU device loss', () => 
     loseDevice();
     await vi.waitFor(() => expect(fatal()).toHaveLength(1));
     expect(fatal()[0]).toMatchObject({ type: 'error', fatal: true, reason: 'gpu-lost' });
+    await call('dispose');
+  });
+});
+
+describe('engine worker: close', () => {
+  const S1 = { ...SCAN, sessionId: 's1' };
+
+  it('close lets go of that session only: its engine is gone, its pipeline is destroyed by dispose', async () => {
+    await freshWorker();
+    expect(await call('init', S1)).toMatchObject({ ok: true });
+    expect(await call('close', { sessionId: 'other' })).toMatchObject({ ok: true, result: false });
+    expect(await call('finishCapture')).toMatchObject({ ok: true });
+    expect(await call('close', { sessionId: 's1' })).toMatchObject({ ok: true, result: true });
+    expect(await call('finishCapture')).toMatchObject({ ok: false, error: { name: 'EngineNotInitializedError' } });
+    expect(h.pipelines[0].destroy).not.toHaveBeenCalled();
+    await call('dispose');
+    expect(h.pipelines[0].destroy).toHaveBeenCalledTimes(1);
+  });
+
+  it('the next scan reuses the pipeline of a closed one, unless it lost its device meanwhile', async () => {
+    await freshWorker();
+    expect(await call('init', S1)).toMatchObject({ ok: true });
+    expect(await call('close', { sessionId: 's1' })).toMatchObject({ result: true });
+    expect(await call('init', S1)).toMatchObject({ ok: true, result: { gpu: true } });
+    expect(h.pipelines).toHaveLength(1);
+    expect(await call('close', { sessionId: 's1' })).toMatchObject({ result: true });
+    loseDevice(); // no engine holds the pipeline: nothing recovers it
+    expect(await call('init', S1)).toMatchObject({ ok: true, result: { gpu: true } });
+    expect(h.pipelines).toHaveLength(2);
+    expect(h.pipelines[0].destroy).toHaveBeenCalledTimes(1);
+    expect(fatal()).toHaveLength(0);
     await call('dispose');
   });
 });

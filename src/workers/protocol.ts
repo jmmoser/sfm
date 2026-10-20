@@ -14,7 +14,8 @@
  * sender no longer needs (a transferred buffer is detached on the sending side).
  *
  * Extensions over ENGINE.md (superset, nothing removed): the `visibility` request (workers get
- * no `visibilitychange`; the engine must not submit GPU work while the page is hidden),
+ * no `visibilitychange`; the engine must not submit GPU work while the page is hidden), the
+ * `close` request (let go of a session before it is deleted),
  * `EngineOptions.resume` (re-open a persisted session after a worker respawn), optional
  * FramePump metadata on `FrameInput`, `SessionSummary` carries the stored models.
  */
@@ -275,6 +276,12 @@ export interface EngineMethodMap {
   cancel: { params: { target?: number } | undefined; result: void };
   /** Extension: page visibility (pause GPU submissions while hidden). */
   visibility: { params: { hidden: boolean }; result: void };
+  /**
+   * Extension: let go of session `sessionId` before it is deleted — its engine is disposed (no
+   * more writes to it), the compiled feature pipeline is kept for the next init. Result: whether
+   * the engine held that session.
+   */
+  close: { params: { sessionId: string }; result: boolean };
   dispose: { params: undefined; result: void };
 }
 
@@ -293,6 +300,7 @@ export const ENGINE_METHODS: readonly EngineMethod[] = [
   'loadSession',
   'cancel',
   'visibility',
+  'close',
   'dispose',
 ];
 
