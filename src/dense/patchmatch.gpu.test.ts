@@ -215,6 +215,81 @@ describe('PatchMatchGPU', () => {
     }
   });
 
+  /**
+   * Simulated dropped work (iOS discards queue work while the page is hidden): `hidden(true)`
+   * drops source uploads (writeTexture into the 'pm-src' cache) and every command buffer until
+   * the first one was dropped; `dropReadbacks` drops that many 'pm-readback' command buffers.
+   */
+  const withDroppedWork = async <T>(fn: (sim: { hidden: boolean; dropReadbacks: number; dropped: number }) => Promise<T>): Promise<T> => {
+    const device = ctx!.device;
+    const q = device.queue;
+    const sim = { hidden: false, dropReadbacks: 0, dropped: 0 };
+    const drop = new WeakSet<GPUCommandBuffer>();
+    const origSubmit = q.submit;
+    const origWriteTexture = q.writeTexture;
+    const origEncoder = device.createCommandEncoder;
+    q.submit = (bufs: Iterable<GPUCommandBuffer>): undefined => {
+      const keep = [...bufs].filter((b) => !drop.has(b));
+      if (sim.hidden) {
+        sim.hidden = false; // visible again after this submission
+        sim.dropped++;
+        return undefined;
+      }
+      sim.dropped += [...bufs].length - keep.length;
+      return origSubmit.call(q, keep);
+    };
+    q.writeTexture = ((dst: GPUTexelCopyTextureInfo, ...rest: unknown[]) => {
+      if (sim.hidden && dst.texture.label === 'pm-src') return undefined;
+      return (origWriteTexture as (...a: unknown[]) => undefined).call(q, dst, ...rest);
+    }) as typeof q.writeTexture;
+    device.createCommandEncoder = (d?: GPUCommandEncoderDescriptor): GPUCommandEncoder => {
+      const enc = origEncoder.call(device, d);
+      if (d?.label === 'pm-readback' && sim.dropReadbacks > 0) {
+        sim.dropReadbacks--;
+        const finish = enc.finish.bind(enc);
+        enc.finish = (fd?: GPUCommandBufferDescriptor): GPUCommandBuffer => {
+          const cb = finish(fd);
+          drop.add(cb);
+          return cb;
+        };
+      }
+      return enc;
+    };
+    try {
+      return await fn(sim);
+    } finally {
+      delete (q as unknown as Record<string, unknown>).submit;
+      delete (q as unknown as Record<string, unknown>).writeTexture;
+      delete (device as unknown as Record<string, unknown>).createCommandEncoder;
+    }
+  };
+
+  it('a dropped source upload is redone by the retry (upload caches are invalidated)', async () => {
+    const ds = makeSyntheticDataset('near', { width: 96, height: 72, numSources: 4, supersample: 1 });
+    const opts = { iterations: 2, targetSubmitMs: 0 };
+    const ref = await PatchMatchGPU.create(ctx!);
+    const sim = await PatchMatchGPU.create(ctx!);
+    const warn = console.warn;
+    console.warn = () => undefined;
+    try {
+      const want = await ref.compute(ds.views[0], ds.views.slice(1), ds.range, opts);
+      const got = await withDroppedWork(async (s) => {
+        s.hidden = true;
+        const out = await sim.compute(ds.views[0], ds.views.slice(1), ds.range, opts);
+        expect(s.dropped).toBe(1);
+        return out;
+      });
+      expect(Array.from(got.depth)).toEqual(Array.from(want.depth));
+      expect(Array.from(got.cost)).toEqual(Array.from(want.cost));
+      expect(sim.lastTimings!.retries).toBe(1);
+      expect(sim.cacheStats.imageMisses).toBe(8);
+    } finally {
+      console.warn = warn;
+      ref.destroy();
+      sim.destroy();
+    }
+  });
+
   it('supports 16 source views, truncates more, and reuses / reallocates resources across sizes', async () => {
     const ds = makeSyntheticDataset('near', { width: 80, height: 60, numSources: 17 });
     const warn = console.warn;

@@ -11,7 +11,8 @@
  *    per row), capped by `maxPixelViewsPerSubmit`;
  *  - every dispatch increments a sentinel counter; if the count read back with the
  *    results does not match the number of submissions (work silently dropped while
- *    the page was hidden) the whole computation is retried (max 2×) and then fails;
+ *    the page was hidden) the whole computation is retried (max 2×, every source
+ *    uploaded again: uploads may have been dropped too) and then fails;
  *  - all pipelines are compiled in `create()` (compilation blocks the GPU process
  *    on Safari 26), raced against device loss and a timeout.
  * Textures and buffers are reused across compute() calls. Source grey images and source depth
@@ -190,6 +191,12 @@ class LayerCache {
     this.misses++;
     taken.add(best);
     return best;
+  }
+
+  /** Forget every layer's content (the texture stays): the next acquire of any key uploads again. */
+  invalidate(): void {
+    this.slotId.fill(0);
+    this.slotUse.fill(0);
   }
 
   destroy(): void {
@@ -641,6 +648,11 @@ export class PatchMatchGPU {
         if (this.lastTimings) this.lastTimings.retries = attempt;
         return out;
       } catch (e) {
+        // the uploads of a dropped call may have been dropped too: cached layers are not trusted
+        if (e instanceof DroppedWorkError) {
+          this.srcCache.invalidate();
+          this.depthCache.invalidate();
+        }
         if (!(e instanceof DroppedWorkError) || attempt >= maxRetries) {
           if (e instanceof DroppedWorkError) throw new Error(`${e.message} (after ${attempt + 1} attempts)`);
           throw e;
