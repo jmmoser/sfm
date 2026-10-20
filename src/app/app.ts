@@ -121,6 +121,8 @@ export class App {
    * takes a screenshot: software GPU emulation starves the compositor while frames are grabbed).
    */
   readonly debug: { holdFrames?: (hold: boolean) => void; /** Last Diagnostics benchmark report (e2e). */ benchReport?: unknown } = {};
+  /** Bumped by each ensureSessionLoaded and by what supersedes it (new scan, release, delete): a stale load is not applied. */
+  private loadSeq = 0;
   private permissions: Promise<CapturePermissionStatus> | null = null;
   private sessionsP: Promise<SessionStore | null> | null = null;
   private screen: Screen | null = null;
@@ -326,6 +328,7 @@ export class App {
     this.results = App.emptyResults(this.config);
     this.results.sessionId = id;
     this.loadedSessionId = null;
+    this.loadSeq++;
     this.navigate({ type: 'START_CAPTURE', sessionId: id });
   }
 
@@ -390,6 +393,8 @@ export class App {
   async deleteSession(id: string): Promise<boolean> {
     const s = await this.sessions();
     if (!s) return false;
+    // (a load still running may be of this scan: it is not applied, and its failure is not shown)
+    this.loadSeq++;
     // The engine lets go of the scan first: none of its writes may land after the deletion, and no
     // later engine restart may replay its init (`resume` would re-create the deleted scan).
     await this.engine.closeSession(id).catch(() => undefined);
@@ -419,6 +424,7 @@ export class App {
    * loaded again when opened.
    */
   async releaseEngine(): Promise<void> {
+    this.loadSeq++; // a load still running ends with the release: not applied, no toast
     await this.engine.release();
     this.loadedSessionId = null;
     this.results = App.emptyResults(this.config);
@@ -426,12 +432,17 @@ export class App {
 
   /**
    * Make the engine hold `sessionId` (loadSession when it holds another one) and copy the
-   * stored models into `results`. Returns false when it failed (a toast explains).
+   * stored models into `results`. Returns false when it failed (a toast explains) or was
+   * superseded before it ended (another scan opened, a new scan, a release): its result is dropped.
    */
   async ensureSessionLoaded(sessionId: string | null): Promise<boolean> {
     if (!sessionId || this.loadedSessionId === sessionId) return true;
+    const seq = ++this.loadSeq;
+    // The engine lets go of the scan it held as soon as it loads another one, also when that fails.
+    this.loadedSessionId = null;
     try {
       const sum = await this.engine.loadSession(sessionId);
+      if (seq !== this.loadSeq) return false;
       this.loadedSessionId = sessionId;
       this.results = {
         ...App.emptyResults({ mode: sum.mode, quality: sum.quality ?? this.config.quality }),
@@ -444,6 +455,7 @@ export class App {
       };
       return true;
     } catch (e) {
+      if (seq !== this.loadSeq) return false;
       toast(`Couldn’t open the scan: ${(e as Error)?.message ?? e}`, { tone: 'bad' });
       return false;
     }

@@ -226,6 +226,8 @@ export class EngineClient implements EngineLike {
   private st: EngineStatus = { state: 'idle', respawns: 0 };
   private setup: Setup | null = null;
   private gate: Promise<void> = Promise.resolve();
+  /** Bumped by every restart: only the replay of the latest one sets the state. */
+  private replayEpoch = 0;
   private respawnTimes: number[] = [];
   private gpuFailures = 0;
   private frameBusy = false;
@@ -593,7 +595,18 @@ export class EngineClient implements EngineLike {
         }
       });
     if (o.bypassGate || FIRE_AND_FORGET.has(method)) return send();
-    return this.gate.then(send);
+    return this.waitGate().then(send);
+  }
+
+  /**
+   * Wait for the replay of the last restart. A restart while waiting replaces the gate with a
+   * newer replay (the older one settles when its worker is killed): wait for that one too.
+   */
+  private async waitGate(): Promise<void> {
+    for (let g = this.gate; ; g = this.gate) {
+      await g;
+      if (g === this.gate) return;
+    }
   }
 
   /**
@@ -720,6 +733,7 @@ export class EngineClient implements EngineLike {
    */
   private respawn(reason: string, gpu: boolean, manual = false): void {
     if (this.disposed) return;
+    const epoch = ++this.replayEpoch;
     const err = namedError(ENGINE_ERRORS.crashed, `Engine restarted: ${reason}`);
     this.rejectAll(err);
     this.frameBusy = false;
@@ -748,16 +762,17 @@ export class EngineClient implements EngineLike {
           const options: EngineOptions = { ...setup.options, resume: !!setup.options.sessionId };
           if (cpu) options.preferGPU = false;
           const res = await this.call('init', options, { timeoutMs: this.opts.initTimeoutMs, bypassGate: true, fatalOnTimeout: true });
-          this.setState('ready', `recovered after: ${reason}`, res);
+          if (epoch === this.replayEpoch) this.setState('ready', `recovered after: ${reason}`, res);
         } else {
           const options: Partial<EngineOptions> = { ...(setup.options ?? {}) };
           if (cpu) options.preferGPU = false;
           await this.call('loadSession', { id: setup.id, options }, { bypassGate: true });
-          this.setState('ready', `recovered after: ${reason}`);
+          if (epoch === this.replayEpoch) this.setState('ready', `recovered after: ${reason}`);
         }
       } catch (e) {
-        // A failed replay leaves the engine usable for a fresh init (unless it is dead).
-        if (this.st.state === 'respawning') this.setState('idle', `re-initialisation failed: ${(e as Error)?.message ?? e}`);
+        // A failed replay leaves the engine usable for a fresh init (unless it is dead). One
+        // that failed because a later restart killed its worker leaves the state to that restart.
+        if (epoch === this.replayEpoch && this.st.state === 'respawning') this.setState('idle', `re-initialisation failed: ${(e as Error)?.message ?? e}`);
       }
     };
     this.gate = replay();
