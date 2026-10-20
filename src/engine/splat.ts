@@ -23,7 +23,7 @@ import type { DepthMap } from '../dense/types';
 import { footprintDownsample } from '../dense/pointcloud';
 import { undistortedCamera } from '../dense/undistort';
 import type { GPUContext } from '../gpu/device';
-import { SplatTrainer, SplatWorkDroppedError, DEFAULT_SPLAT_GEOMETRY, type SplatTrainerOptions, type SplatTrainerState, type SplatTrainingView } from '../splat/trainer';
+import { SplatTrainer, SplatWorkDroppedError, DEFAULT_SPLAT_GEOMETRY, geometryMode, type SplatTrainerOptions, type SplatTrainerState, type SplatTrainingView } from '../splat/trainer';
 import { packDepthTarget } from '../splat/depth-target';
 import { backgroundShell, concatModels, initFromPointCloud, type ColourSource } from '../splat/init';
 import { splatCamera, type SplatModel } from '../splat/types';
@@ -196,12 +196,14 @@ export async function runSplat(deps: SplatDeps, opts: SplatOptions = {}, progres
   const t0 = now();
   const model = deps.model;
   const quality = opts.quality ?? deps.quality;
-  const { trainer: trainerOverrides = {}, ...presetOverrides } = deps.config.splat ?? {};
+  const { trainer: trainerConfig = {}, ...presetOverrides } = deps.config.splat ?? {};
   const preset: SplatPresetConfig = resolveSplatPreset(
     quality,
     { ...presetOverrides, iterations: opts.iterations ?? presetOverrides.iterations, maxGaussians: opts.maxGaussians ?? presetOverrides.maxGaussians, maxImageSize: opts.maxImageSize ?? presetOverrides.maxImageSize, maxViews: opts.maxViews ?? presetOverrides.maxViews },
     deps.config.dense ?? {},
   );
+  // the preset's trainer defaults, EngineConfig.splat.trainer field by field on top
+  const trainerOverrides: Partial<SplatTrainerOptions> = { ...preset.trainer, ...trainerConfig };
   const iterations = Math.max(1, Math.round(preset.iterations));
   const shDegree = trainerOverrides.shDegree ?? preset.shDegree;
   const stats: Record<string, number | string> = {};
@@ -245,7 +247,7 @@ export async function runSplat(deps: SplatDeps, opts: SplatOptions = {}, progres
     shDegree,
     loadedCloudPoints: deps.denseResident ? 0 : deps.densePoints,
     initPoints: denseTarget + model.numPoints + (shellOn ? preset.shellCount : 0),
-    geometry: geoOpt && depthIds.size ? { views: depthIds.size, factor: geoOpt.factor } : undefined,
+    geometry: geoOpt && depthIds.size ? { views: depthIds.size, factor: geoOpt.factor, normals: geometryMode(geoOpt) === true } : undefined,
   };
   const fit = fitSplatPlan(planBase, { views: Math.min(preset.maxViews, withImage.length), size: preset.maxImageSize, maxGaussians: preset.maxGaussians }, { dims: (s) => dims(s), maxBufferBytes: ctx.limits.maxStorageBufferBindingSize });
   // the dense cloud (read from the store unless resident) seeds the Gaussians and identifies the run

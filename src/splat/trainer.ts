@@ -142,15 +142,18 @@ export interface SplatColourCorrection {
 
 /**
  * Geometry supervision from the dense stage's depth maps (`setViewDepth`; DN-Splatter-style):
- * L = (1 / pixels) Σ w (λ_d |D·z_t − 1| + λ_n ‖N − n_t‖₁) over the target pixels, D = rendered
- * alpha-blended inverse depth, N = rendered blended normal (smallest-scale axis), z_t / n_t / w the
- * target depth, normal and weight (depth-target.ts). Weights decay exponentially from `[0]` to
- * `[1]` over the first `until` of the run (linearly when one end is 0), then 0.
+ * L = (1 / pixels) Σ w (λ_d |D̂·z_t − 1| + λ_n ‖N̂ − n_t‖₁) over the target pixels, D̂ / N̂ = rendered
+ * alpha-blended inverse depth / normal (smallest-scale axis) divided by the accumulated alpha,
+ * z_t / n_t / w the target depth, normal and weight (depth-target.ts). Weights decay exponentially
+ * from `[0]` to `[1]` over the first `until` of the run (linearly when one end is 0), then 0 and
+ * the trainer switches to the plain kernels. Defaults (measured, ARCHITECTURE "Geometry
+ * supervision …"): inverse depth only, 0.5 → 0.05 over the first 30 %; the normal term
+ * (e.g. 0.1 → 0.01) did not add anything on the test scenes and costs more.
  */
 export interface SplatGeometryOptions {
   depth: [number, number];
   normal: [number, number];
-  /** Fraction of the iterations the losses run for (default 1). */
+  /** Fraction of the iterations the losses run for (default 0.3: the ¼ / ½-resolution part). */
   until: number;
   /** Targets at 1/factor of the training-view size (default 2; memory 8 B per target pixel). */
   factor: number;
@@ -162,7 +165,7 @@ export interface SplatGeometryOptions {
   grazing: number;
 }
 
-export const DEFAULT_SPLAT_GEOMETRY: SplatGeometryOptions = { depth: [0.5, 0.05], normal: [0.1, 0.01], until: 1, factor: 2, grazing: 0 };
+export const DEFAULT_SPLAT_GEOMETRY: SplatGeometryOptions = { depth: [0.5, 0.05], normal: [0, 0], until: 0.3, factor: 2, grazing: 0 };
 
 /**
  * Shader configuration of a geometry option: full channels (inverse depth + normal), 'depth' when

@@ -376,8 +376,8 @@ export interface SplatPlanInput {
   loadedCloudPoints: number;
   /** Points the initialisation seeds Gaussians from (dense LOD + sparse points + shell). */
   initPoints: number;
-  /** Trainer geometry supervision: views with a depth target and the target downscale. */
-  geometry?: { views: number; factor: number };
+  /** Trainer geometry supervision: views with a depth target, the target downscale, normal channels. */
+  geometry?: { views: number; factor: number; normals?: boolean };
 }
 
 export interface SplatStagePeak {
@@ -411,7 +411,7 @@ export function planSplat(p: SplatPlanInput): SplatPlan {
   const budget = p.budgetMB * MB;
   const share = Math.max(64 * MB, budget - MEM.reserve - p.residentBytes);
   const px = Math.max(1, p.width * p.height);
-  const geometry = p.geometry ? { views: Math.min(p.views, p.geometry.views), factor: p.geometry.factor } : undefined;
+  const geometry = p.geometry ? { views: Math.min(p.views, p.geometry.views), factor: p.geometry.factor, normals: p.geometry.normals } : undefined;
   const est = estimateSplatMemory({ maxGaussians: p.maxGaussians, shDegree: p.shDegree, width: p.width, height: p.height, views: p.views, geometry });
   // a SplatModel row: mean 3 + log-scale 3 + quaternion 4 + opacity 1 + SH (f32)
   const modelRow = 4 * (paramFloatsPerGaussian(p.shDegree) - 2);

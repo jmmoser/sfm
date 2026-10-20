@@ -108,7 +108,7 @@ describe('SplatTrainer geometry channels (GPU) vs CPU reference', () => {
     it(`rendered inverse depth / normal and parameter gradients match, SH degree ${deg}`, async () => {
       const m = randomScene({ count: 300, seed: 131 + deg, shDegree: deg });
       const cam = testCamera(120, 100);
-      const t = await trainer(m, [viewOf(cam)], { geometry: {} });
+      const t = await trainer(m, [viewOf(cam)], { geometry: { normal: [0.1, 0.01] } });
       const rng = new Rng(19);
       const w = new Float32Array(3 * cam.width * cam.height).map(() => rng.uniform(-1, 1));
       const wG = new Float32Array(4 * cam.width * cam.height).map((_, i) => rng.uniform(-1, 1) * (i % 4 === 0 ? 3 : 1));
@@ -255,7 +255,7 @@ describe('SplatTrainer geometry channels (GPU) vs CPU reference', () => {
     const pin = { width: W, height: H, f: 70, cx: 31.5, cy: 23.5 };
     // same run with the losses switched off (weights 0: the kernel writes zero gradients)
     const run = async (weight: number): Promise<{ e0: number; e1: number; loss: number }> => {
-      const t = await trainer(init, views, { ...opts, geometry: { depth: [weight, weight / 10], normal: [0, 0], factor: 1 } });
+      const t = await trainer(init, views, { ...opts, geometry: { depth: [weight, weight / 10], normal: [0, 0], factor: 1, until: 1 } });
       maps.forEach((mp, k) => t.setViewDepth(k, packDepthTarget(mp, pin, pin, { factor: 1 })));
       const e0 = await depthErr(t);
       const r = await t.step(400);
