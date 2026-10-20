@@ -15,9 +15,12 @@ import {
   SORT_UNIFORM_STRIDE,
 } from './wgsl/sort';
 
-export const STORAGE = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+/** Storage + copy usage (a function: GPUBufferUsage does not exist where WebGPU is missing). */
+export function storageUsage(): GPUBufferUsageFlags {
+  return GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+}
 
-export function makeBuffer(device: GPUDevice, bytes: number, label: string, usage: GPUBufferUsageFlags = STORAGE): GPUBuffer {
+export function makeBuffer(device: GPUDevice, bytes: number, label: string, usage: GPUBufferUsageFlags = storageUsage()): GPUBuffer {
   return device.createBuffer({ size: Math.max(16, Math.ceil(bytes / 16) * 16), usage, label });
 }
 
@@ -107,7 +110,7 @@ export class RadixSorter {
     if (16 * nb > 1024 * 1024) throw new Error(`RadixSorter: capacity ${capacity} too large`);
     this.keys = [makeBuffer(device, capacity * 4, `${label}-keys0`), makeBuffer(device, capacity * 4, `${label}-keys1`)];
     this.vals = [makeBuffer(device, capacity * 4, `${label}-vals0`), makeBuffer(device, capacity * 4, `${label}-vals1`)];
-    this.ctl = makeBuffer(device, CTL.words * 4, `${label}-ctl`, STORAGE | GPUBufferUsage.INDIRECT);
+    this.ctl = makeBuffer(device, CTL.words * 4, `${label}-ctl`, storageUsage() | GPUBufferUsage.INDIRECT);
     this.hist = makeBuffer(device, 16 * nb * 4, `${label}-hist`);
     this.blockSums = makeBuffer(device, 1024 * 4, `${label}-blocksums`);
     this.passUniform = device.createBuffer({ size: 8 * SORT_UNIFORM_STRIDE, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, label: `${label}-passes` });
