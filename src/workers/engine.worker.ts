@@ -2,8 +2,9 @@
  * Engine worker (module worker): dispatches the RPC requests of ./protocol.ts to a
  * PhotogrammetryEngine (src/engine) and forwards its events.
  *
- *  - `init` creates a new engine (the previous one is disposed; its feature pipeline is reused
- *    when the SIFT configuration matches, so a new scan does not recompile the GPU pipelines).
+ *  - `init` creates a new engine (the previous one is disposed; its feature pipeline is handed
+ *    over when the SIFT configuration matches and it has not fallen back to the CPU, so a new
+ *    scan does not recompile the GPU pipelines).
  *    `loadSession` works without `init` (an engine is created from the stored session).
  *  - Long operations (finishCapture / refine / densify / mesh / export / loadSession) report
  *    `progress` events with their `requestId` (throttled) and are cancelled by `cancel`
@@ -55,9 +56,7 @@ const scope = self as unknown as WorkerScope;
 type InitParams = EngineOptions & { engineConfig?: EngineConfig };
 
 let engine: PhotogrammetryEngine | null = null;
-let engineHadGPU = false;
 let hidden = false;
-let spare: { pipeline: FeaturePipeline; key: string } | null = null;
 /** Cancel tokens of running long operations by request id. */
 const tokens = new Map<number, { cancelled: boolean }>();
 let currentLong: number | null = null;
@@ -103,24 +102,17 @@ function splitOptions(p: InitParams | Partial<InitParams> | undefined): { option
 }
 
 function newEngine(options: EngineOptions, config: EngineConfig): PhotogrammetryEngine {
-  let cfg = config;
+  let spare: { pipeline: FeaturePipeline; key: string } | null = null;
   if (engine) {
-    const rel = engine.releasePipeline();
+    spare = engine.releasePipeline();
     engine.dispose();
     engine = null;
-    if (rel) {
-      if (spare && spare.pipeline !== rel.pipeline) destroyPipeline(spare.pipeline);
-      spare = rel;
-    }
   }
+  const e = new PhotogrammetryEngine(options, config);
   const key = pipelineKey(options.quality, options.preferGPU !== false, config);
-  if (spare && spare.key === key && !config.pipeline) {
-    cfg = { ...config, pipeline: spare.pipeline };
-  } else if (spare) {
-    destroyPipeline(spare.pipeline);
-    spare = null;
-  }
-  const e = new PhotogrammetryEngine(options, cfg);
+  // the new engine owns the reused pipeline (it recreates it after a device loss)
+  if (spare && spare.key === key && !config.pipeline) e.adoptPipeline(spare.pipeline, spare.key);
+  else if (spare) destroyPipeline(spare.pipeline);
   attach(e);
   engine = e;
   return e;
@@ -172,9 +164,7 @@ async function dispatch(req: EngineRequest): Promise<{ result: unknown; transfer
     case 'init': {
       const { options, config } = splitOptions(req.params as InitParams);
       const e = newEngine(options as EngineOptions, config);
-      const res = await e.init();
-      engineHadGPU = res.gpu;
-      return { result: res, transfer: false };
+      return { result: await e.init(), transfer: false };
     }
     case 'frame': {
       const f = req.params as FrameInput;
@@ -252,14 +242,9 @@ async function dispatch(req: EngineRequest): Promise<{ result: unknown; transfer
     }
     case 'dispose': {
       for (const t of tokens.values()) t.cancelled = true;
-      if (engine) {
-        const rel = engine.releasePipeline();
-        engine.dispose();
-        engine = null;
-        if (rel) destroyPipeline(rel.pipeline);
-      }
-      if (spare) destroyPipeline(spare.pipeline);
-      spare = null;
+      // the engine owns its feature pipeline (created or adopted): dispose() destroys it
+      engine?.dispose();
+      engine = null;
       return { result: undefined, transfer: false };
     }
     default:
@@ -308,7 +293,8 @@ scope.addEventListener('unhandledrejection', (ev: Event) => {
 
 // GPU device loss: try to recover in place; when no adapter can be obtained the worker is unusable.
 onDeviceLost((info) => {
-  if (info.reason === 'destroyed' || !engine || !engineHadGPU) return;
+  // hadGPU, not usesGPU: the feature pipeline may already have fallen back to the CPU on this loss
+  if (info.reason === 'destroyed' || !engine || !engine.hadGPU) return;
   const e = engine;
   log('warn', `GPU device lost (${info.reason}): ${info.message}`);
   void e

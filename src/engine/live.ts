@@ -721,11 +721,14 @@ export class LiveSession {
         dbg.reason = `${d.decision}: ${d.reason}`;
         return finish(this.baseUpdate(frameIndex, d.decision, this.mapGuidance(d.guidance), timings));
       }
-      // features
-      const pipeline = this.deps.pipeline();
+      // features (the pipeline is read when the GPU job runs: a GPU-loss recovery queued ahead of
+      // it has replaced it by then; either input kind works on either backend)
       const tf = now();
-      const fi = prep.featureInput(pipeline.gpu && !this.bitmapInputBroken, this.featureMaxSide());
-      let fs = await this.deps.gpu(() => (fi.kind === 'bitmap' ? pipeline.extractFromBitmap(fi.source, W, H) : pipeline.extract(fi.gray, W, H)));
+      const fi = prep.featureInput(this.deps.pipeline().gpu && !this.bitmapInputBroken, this.featureMaxSide());
+      let fs = await this.deps.gpu(() => {
+        const pipeline = this.deps.pipeline();
+        return fi.kind === 'bitmap' ? pipeline.extractFromBitmap(fi.source, W, H) : pipeline.extract(fi.gray, W, H);
+      });
       if (fi.kind === 'bitmap' && fs.count < this.selector.options.minFeatures && this.bitmapProbes < LiveSession.MAX_BITMAP_PROBES) {
         // The GPU bitmap upload (copyExternalImageToTexture) is not covered by the start-up
         // self-test, and on some WebKit builds it yields a blank texture for camera frames
@@ -734,7 +737,7 @@ export class LiveSession {
         this.bitmapProbes++;
         const gi = prep.featureInput(false, this.featureMaxSide());
         if (gi.kind === 'gray') {
-          const gfs = await this.deps.gpu(() => pipeline.extract(gi.gray, W, H));
+          const gfs = await this.deps.gpu(() => this.deps.pipeline().extract(gi.gray, W, H));
           if (gfs.count >= this.selector.options.minFeatures && gfs.count > 4 * fs.count) {
             this.bitmapInputBroken = true;
             this.deps.log('warn', `GPU bitmap input gave ${fs.count} features, gray input ${gfs.count}: using gray input for this session`);
@@ -938,7 +941,7 @@ export class LiveSession {
     t: number,
     timings: Record<string, number>,
   ): Promise<{ geom: TwoViewGeometry | null; numMatches: number; numInliers: number; parallax: number; rotation: number }> {
-    const pipeline = this.deps.pipeline();
+    // the pipeline is read when each GPU job runs (a GPU-loss recovery may replace it in between)
     const cam = this.intrinsics(ref.width, ref.height);
     const Rc = this.gyroRotation(ref.t, t);
     const minInl = this.selector.options.minInliers;
@@ -953,10 +956,10 @@ export class LiveSession {
     if (Rc) {
       const Hm = mat3Mul(mat3Mul(kMatrix(cam), Rc), kInverse(cam));
       const radius = Math.max(24, (this.deps.config.guidedRadiusFrac ?? ENGINE_DEFAULTS.guidedRadiusFrac) * Math.max(ref.width, ref.height));
-      matches = await this.deps.gpu(() => pipeline.matchGuided(ref.fs, fs, { kind: 'H', H: Hm, maxErrorPx: radius }));
+      matches = await this.deps.gpu(() => this.deps.pipeline().matchGuided(ref.fs, fs, { kind: 'H', H: Hm, maxErrorPx: radius }));
       guided = true;
     } else {
-      matches = await this.deps.gpu(() => pipeline.match(ref.fs, fs));
+      matches = await this.deps.gpu(() => this.deps.pipeline().match(ref.fs, fs));
     }
     timings.match = now() - tm;
     const tv = now();
@@ -965,7 +968,7 @@ export class LiveSession {
     if (guided && nInl < minInl) {
       // gyro prediction wrong (time offset, fast motion, wrong R_cam_device?) → unguided
       this.stats.guidedFallbacks++;
-      const m2 = await this.deps.gpu(() => pipeline.match(ref.fs, fs));
+      const m2 = await this.deps.gpu(() => this.deps.pipeline().match(ref.fs, fs));
       const g2 = m2.length >= 16 ? verify(m2) : null;
       const n2 = usable(g2, 8) ? g2!.inliers.length >> 1 : 0;
       if (n2 > nInl) {
