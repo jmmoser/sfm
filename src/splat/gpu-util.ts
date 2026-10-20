@@ -100,14 +100,19 @@ export class RadixSorter {
   private readonly bgScanTop: GPUBindGroup;
   private readonly bgScanDown: GPUBindGroup;
 
+  /** Throws when one sorter cannot hold `capacity` elements (16 counters per 1024 in one ≤ 1 M buffer: ≤ 64 M). */
+  static checkCapacity(capacity: number): void {
+    if (16 * Math.max(1, Math.ceil(capacity / 1024)) > 1024 * 1024) throw new Error(`RadixSorter: capacity ${capacity} too large`);
+  }
+
   constructor(
     private readonly device: GPUDevice,
     private readonly pipes: SortPipelines,
     readonly capacity: number,
     label: string,
   ) {
+    RadixSorter.checkCapacity(capacity);
     const nb = Math.max(1, Math.ceil(capacity / 1024));
-    if (16 * nb > 1024 * 1024) throw new Error(`RadixSorter: capacity ${capacity} too large`);
     this.keys = [makeBuffer(device, capacity * 4, `${label}-keys0`), makeBuffer(device, capacity * 4, `${label}-keys1`)];
     this.vals = [makeBuffer(device, capacity * 4, `${label}-vals0`), makeBuffer(device, capacity * 4, `${label}-vals1`)];
     this.ctl = makeBuffer(device, CTL.words * 4, `${label}-ctl`, storageUsage() | GPUBufferUsage.INDIRECT);

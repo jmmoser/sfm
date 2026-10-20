@@ -120,6 +120,30 @@ describe('SplatRenderer (GPU) vs CPU reference', () => {
     expect(d).toBeLessThan(1e-4);
   });
 
+  it('a rejected reservation or model leaves the renderer intact (review)', async () => {
+    const m = randomScene({ count: 200, seed: 26 });
+    const cam = testCamera(96, 80);
+    const r = await SplatRenderer.create(ctx, { maxWidth: 160, maxHeight: 128 });
+    try {
+      r.setModel(m);
+      await r.render(cam, { background: [0.1, 0.2, 0.3] });
+      const isect = r.isectCapacity;
+      // beyond one sorter (64 M intersections) and beyond 1 M Gaussians: refused before anything is freed
+      expect(() => r.reserveIntersections(100_000_000)).toThrow(/too large/);
+      expect(r.isectCapacity).toBe(isect);
+      expect(() => r.setModel({ ...m, count: 1_100_000 })).toThrow(/1M Gaussians/);
+      expect(r.modelCount).toBe(m.count);
+      const bg: [number, number, number] = [0.7, 0.1, 0.4];
+      const g = await r.render(cam, { background: bg });
+      const c = renderCPU(m, cam, { background: bg });
+      let d = 0;
+      for (let i = 0; i < cam.width * cam.height; i++) for (let ch = 0; ch < 3; ch++) d = Math.max(d, Math.abs(g.data[4 * i + ch] - c.color[3 * i + ch]));
+      expect(d).toBeLessThan(1e-4);
+    } finally {
+      r.destroy();
+    }
+  });
+
   it('empty model and a model outside the view render the background', async () => {
     const m = randomScene({ count: 10, seed: 24 });
     for (let i = 0; i < 10; i++) m.means.set([0, 50, 0], 3 * i); // far behind

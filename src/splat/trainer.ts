@@ -507,6 +507,8 @@ export class SplatTrainer {
     this.count = n;
     const P = this.pipes;
     const layout = paramOffsets(cap, this.shDegree);
+    // (throws before anything is allocated: what init allocates is freed by destroy() even when it fails)
+    SplatForward.check({ capacity: cap, isectCapacity: Math.ceil(cap * (this.opts.intersectionsPerGaussian ?? 12)) });
     this.params = makeBuffer(d, layout.total * 4, 'splat-params');
     this.adamM = makeBuffer(d, layout.total * 4, 'splat-adam-m');
     this.adamV = makeBuffer(d, layout.total * 4, 'splat-adam-v');
@@ -1332,11 +1334,11 @@ export class SplatTrainer {
     return { l1, ssim, valid, dLdC, render: r, target: t, width: cam.width, height: cam.height };
   }
 
+  /** Frees the GPU buffers (also those of an init that threw half-way). */
   destroy(): void {
-    if (!this.initialised) return;
-    this.fwd.destroy();
+    this.fwd?.destroy();
     for (const b of [this.params, this.adamM, this.adamV, this.grad2d, this.target, this.pqr, this.dLdC, this.lossPartial, this.colourPartial, this.colour, this.statsBuf, this.optU, this.lossU, this.colourU, this.relocU, ...this.images])
-      b.destroy();
+      b?.destroy();
     this.relocList?.destroy();
     this.staging?.destroy();
     this.readStampBuf?.destroy();

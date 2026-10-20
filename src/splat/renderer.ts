@@ -67,6 +67,7 @@ export class SplatRenderer {
     if (model.shDegree !== this.pipes.cfg.shDegree) throw new Error(`SplatRenderer: model SH degree ${model.shDegree}, renderer ${this.pipes.cfg.shDegree}`);
     const cap = Math.max(1, this.opts.capacity ?? 0, model.count);
     if (!this.fwd || this.fwd.capacity < model.count) {
+      SplatForward.check({ capacity: cap, isectCapacity: this.opts.isectCapacity }); // before the current model is freed
       this.fwd?.destroy();
       this.params?.destroy();
       this.params = makeBuffer(this.device, paramOffsets(cap, model.shDegree).total * 4, 'splat-render-params');

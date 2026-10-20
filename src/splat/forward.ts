@@ -135,6 +135,7 @@ export class SplatForward {
     public pipes: ForwardPipelines,
     opts: SplatForwardOptions,
   ) {
+    SplatForward.check(opts);
     this.params = opts.params;
     const label = opts.label ?? 'splat';
     const N = opts.capacity;
@@ -155,10 +156,20 @@ export class SplatForward {
     this.outColor = makeBuffer(device, maxPx * 16, `${label}-color`);
     this.outN = makeBuffer(device, maxPx * 4, `${label}-n`);
     this.outGeo = pipes.cfg.geometry ? makeBuffer(device, maxPx * 32, `${label}-geo`) : null;
-    if (N > 1024 * 1024) throw new Error('SplatForward: capacity above 1M Gaussians');
     this.depthSort = new RadixSorter(device, pipes.sort, N, `${label}-depthsort`);
-    this.isectSort = new RadixSorter(device, pipes.sort, Math.max(4096, opts.isectCapacity ?? 12 * N), `${label}-isectsort`);
+    this.isectSort = new RadixSorter(device, pipes.sort, SplatForward.isectCapacityOf(opts), `${label}-isectsort`);
     this.makeBindGroups();
+  }
+
+  private static isectCapacityOf(o: Pick<SplatForwardOptions, 'capacity' | 'isectCapacity'>): number {
+    return Math.max(4096, o.isectCapacity ?? 12 * o.capacity);
+  }
+
+  /** Throws for capacities the constructor cannot honour (before anything is allocated or freed). */
+  static check(o: Pick<SplatForwardOptions, 'capacity' | 'isectCapacity'>): void {
+    if (o.capacity > 1024 * 1024) throw new Error('SplatForward: capacity above 1M Gaussians');
+    RadixSorter.checkCapacity(o.capacity);
+    RadixSorter.checkCapacity(SplatForward.isectCapacityOf(o));
   }
 
   private makeBindGroups(): void {
@@ -198,8 +209,9 @@ export class SplatForward {
     this.bgRaster = [0, 1].map((k) => bindGroup(d, P.raster, [this.frame, this.ranges, S.vals[k], this.proj, this.outColor, this.outN, ...(P.cfg.geometry ? [this.outGeo!] : [])]));
   }
 
-  /** Reallocates the intersection buffers (between frames). */
+  /** Reallocates the intersection buffers (between frames; a capacity that cannot be honoured throws first). */
   resizeIntersections(capacity: number): void {
+    RadixSorter.checkCapacity(capacity);
     this.isectSort.destroy();
     this.isectSort = new RadixSorter(this.device, this.pipes.sort, capacity, 'splat-isectsort');
     this.makeIsectBindGroups();

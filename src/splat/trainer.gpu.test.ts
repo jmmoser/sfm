@@ -54,6 +54,49 @@ function relErr(a: ArrayLike<number>, b: ArrayLike<number>): number {
   return Math.sqrt(num / Math.max(den, 1e-300));
 }
 
+describe('SplatTrainer resources', () => {
+  /** Buffers created on the shared device while `fn` runs (the `failAt`-th creation throws) and whether each was destroyed. */
+  const tracked = (fn: () => void, failAt = Infinity): { created: GPUBuffer[]; destroyed: Set<GPUBuffer> } => {
+    const device = ctx.device;
+    const created: GPUBuffer[] = [];
+    const destroyed = new Set<GPUBuffer>();
+    const createBuffer = device.createBuffer;
+    device.createBuffer = (d: GPUBufferDescriptor): GPUBuffer => {
+      if (created.length + 1 >= failAt) throw new Error('simulated failure');
+      const b = createBuffer.call(device, d);
+      created.push(b);
+      const destroy = b.destroy.bind(b);
+      b.destroy = (): undefined => {
+        destroyed.add(b);
+        return destroy();
+      };
+      return b;
+    };
+    try {
+      fn();
+    } finally {
+      delete (device as unknown as Record<string, unknown>).createBuffer;
+    }
+    return { created, destroyed };
+  };
+
+  it('a failed init frees what it allocated (review)', async () => {
+    const m = randomScene({ count: 50, seed: 41 });
+    const views = [viewOf(testCamera(64, 48))];
+    // an intersection reservation beyond one sorter (64 M): refused before anything is allocated
+    const a = await SplatTrainer.create(ctx, { maxGaussians: 1000, iterations: 10, shDegree: 0, intersectionsPerGaussian: 100_000 });
+    const ra = tracked(() => expect(() => a.init(m, views)).toThrow(/too large/));
+    a.destroy();
+    expect(ra.created.map((b) => b.label)).toEqual([]);
+    // init throwing half-way (its 5th buffer, the forward pass's first): destroy() frees the first four
+    const b = await SplatTrainer.create(ctx, { maxGaussians: 1000, iterations: 10, shDegree: 0 });
+    const rb = tracked(() => expect(() => b.init(m, views)).toThrow(/simulated/), 5);
+    b.destroy();
+    expect(rb.created.map((x) => x.label)).toEqual(['splat-params', 'splat-adam-m', 'splat-adam-v', 'splat-grad2d']);
+    expect(rb.created.filter((x) => !rb.destroyed.has(x)).map((x) => x.label)).toEqual([]);
+  });
+});
+
 describe('SplatTrainer backward (GPU) vs CPU reference', () => {
   for (const deg of [0, 1] as const) {
     it(`parameter gradients match, SH degree ${deg}`, async () => {
