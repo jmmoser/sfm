@@ -172,9 +172,12 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   }
 
   // ---- content -----------------------------------------------------------------------------------
-  /** Splats can be shown: a trained model exists and the viewer did not give up on its layer. */
+  /**
+   * Splats can be shown: a trained model exists, the viewer did not give up on its layer and no
+   * photoreal build runs (it frees the layer: `releaseSplats`).
+   */
   function splatsAvailable(): boolean {
-    return !!app.results.splat && splatState !== 'unavailable' && !!viewer;
+    return !building && !!app.results.splat && splatState !== 'unavailable' && !!viewer;
   }
 
   function availableLayers(): LayerId[] {
@@ -219,7 +222,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     if (display.layer !== 'splats' || !r.splat) display.layer = fallbackLayer();
     applyDisplay();
     if (first) frameView(false);
-    if (r.splat && splatState === 'none' && !splatFetching) void loadSplats(false);
+    if (r.splat && splatState === 'none' && !splatFetching && !building) void loadSplats(false);
   }
 
   /** Header sub line: the shown layer's size and the photo count. */
@@ -348,6 +351,20 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       if (display.layer === 'splats') display.layer = fallbackLayer();
       applyDisplay();
     }
+  }
+
+  /**
+   * Frees the viewer's splat layer and drops a model load in flight. The layer (≈ 150–220 MB of GPU
+   * memory plus the host copy of the model at 300–500 k Gaussians) is not part of the page reserve
+   * the engine plans the training with, so a rebuild must not run next to it.
+   */
+  function releaseSplats(): void {
+    if (!viewer) return;
+    splatLoadToken++;
+    splatFetching = false;
+    if (splatState !== 'none' && splatState !== 'unavailable') void viewer.setSplats(null);
+    if (display.layer === 'splats') display.layer = fallbackLayer();
+    applyDisplay();
   }
 
   let splatUnavailableToast = false;
@@ -750,9 +767,11 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
 
   // ---- photoreal build ----------------------------------------------------------------------------
   /**
-   * Trains the Gaussian splats (engine.splat) while the model stays explorable: progress card with
-   * Cancel; the wake lock is held and leaving the page asks first. A cancelled / failed run is
-   * marked resumable (the engine keeps checkpoints; the same quality continues from the last one).
+   * Trains the Gaussian splats (engine.splat) while the model stays explorable (points / mesh: the
+   * splat layer of a previous model is freed meanwhile and loaded again when the build stops):
+   * progress card with Cancel; the wake lock is held and leaving the page asks first. A cancelled /
+   * failed run is marked resumable (the engine keeps checkpoints; the same quality continues from
+   * the last one).
    */
   async function buildSplats(q: QualityPreset): Promise<void> {
     if (building || closed || !app.results.sparse) return;
@@ -761,6 +780,10 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     app.busy = true;
     // iOS suspends a hidden page; the engine pauses its GPU work while hidden anyway
     void app.wakeLock.acquire();
+    // the previous model's layer is freed while the trainer runs (the points / mesh show meanwhile)
+    const wasSplats = display.layer === 'splats';
+    releaseSplats();
+    let built = false;
     jobBar.set(-1);
     jobSub.textContent = 'Starting';
     jobCancel.disabled = false;
@@ -775,6 +798,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       });
       const r = app.results;
       r.splat = res;
+      built = true;
       const timings: Record<string, number> = {};
       for (const k of ['splatPrepareMs', 'splatTrainMs', 'splatFinishMs']) if (typeof res.stats[k] === 'number') timings[k] = res.stats[k] as number;
       r.stats = { ...r.stats, ...timings, splatQuality: q };
@@ -802,6 +826,9 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
         app.busy = false;
         void app.wakeLock.release();
         renderBadges();
+        // stopped / failed: the previous model (still the stored one) is shown again
+        if (!built && app.results.splat && viewer && splatState === 'none' && !splatFetching) void loadSplats(wasSplats);
+        else applyDisplay();
       }
     }
   }

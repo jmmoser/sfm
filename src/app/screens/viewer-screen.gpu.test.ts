@@ -2,12 +2,15 @@
  * The viewer screen's photoreal build (createViewerScreen with a fake App and a fake engine whose
  * splat() / exportModel() the test settles, in Chromium: the real Viewer, WebGL and — on a
  * hardware adapter, E2E_GPU=host — the WebGPU splat layer): a rebuild drops the Gaussian-splat
- * PLY prepared from the previous model; a build settling after the screen was left does not take
- * the wake lock / busy flag of the next screen.
+ * PLY prepared from the previous model; the previous model's splat layer is freed while the
+ * trainer runs and shown again when the build stops; a build settling after the screen was left
+ * does not take the wake lock / busy flag of the next screen.
  */
 import { afterEach, describe, expect, it } from 'vitest';
+import { getGPU } from '../../gpu/device';
 import { lookAt } from '../../splat/testutil';
 import { SH_C0, allocSplatModel, logit } from '../../splat/types';
+import type { Viewer } from '../../viewer';
 import { ENGINE_ERRORS, namedError, type ExportFormat, type SparseResult, type SplatModelPayload, type SplatOptions, type SplatResult } from '../../workers/protocol';
 import type { App, Results } from '../app';
 import { closeAllModals } from '../components/layers';
@@ -229,5 +232,43 @@ describe('viewer screen: photoreal build', () => {
     await new Promise((r) => setTimeout(r, 30));
     expect(app.wakeLock.active).toBe(true);
     expect(app.busy).toBe(true);
+  });
+
+  it('a rebuild frees the shown splat layer while the trainer runs and shows the stored model again when it stops (review)', async () => {
+    const gpu = await getGPU();
+    // the screen's viewer refuses software adapters: the layer exists on a hardware GPU only
+    const hw = !!gpu && !gpu.isSoftware;
+    const engine = new FakeEngine();
+    engine.model = payload(40);
+    const app = fakeApp(engine, info(40));
+    const screen = mount(app);
+    await loaded(app, screen);
+    const viewer = app.debug.viewer as Viewer;
+    if (hw) {
+      expect(screen.el.dataset.splats).toBe('ready');
+      expect(viewer.getStats().splatLayer).not.toBeNull();
+      expect(q('layer-switch')!.dataset.layer).toBe('splats');
+    }
+    const loads = engine.modelLoads;
+    await startBuild('balanced');
+    expect(engine.builds.length).toBe(1);
+    // the old layer is not in the engine's page reserve: freed for the training, points shown
+    expect(viewer.getStats().splatLayer).toBeNull();
+    expect(viewer.getStats().splatsShown).toBe(false);
+    expect(document.querySelector('[data-testid="layer-switch"] .segment[data-value="splats"]')).toBeNull();
+    // cancelled: the previous model (still the stored one) comes back
+    engine.builds[0].reject(namedError(ENGINE_ERRORS.cancelled, 'Cancelled'));
+    await waitFor(() => q('splat-progress')!.hidden === true);
+    if (hw) {
+      await waitFor(() => screen.el.dataset.splats === 'ready' && viewer.getStats().splatLayer !== null);
+      expect(engine.modelLoads).toBe(loads + 1);
+      await waitFor(() => q('layer-switch')!.dataset.layer === 'splats');
+    }
+    // a successful rebuild shows the new model
+    await startBuild('balanced');
+    expect(viewer.getStats().splatLayer).toBeNull();
+    engine.model = payload(70);
+    engine.builds[1].resolve(info(70));
+    if (hw) await waitFor(() => screen.el.dataset.splats === 'ready' && viewer.getStats().splatLayer?.gaussians === 70);
   });
 });

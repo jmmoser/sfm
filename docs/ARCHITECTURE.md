@@ -3396,9 +3396,12 @@ the app builds them from the viewer screen. UI contract: ENGINE.md §3 "Splat pr
 * **App** (viewer screen): Build sheet item "Photoreal model" (needs a sparse model and WebGPU in the browser; "Needs
   WebGPU" otherwise) runs `engine.splat({ quality })` ON the viewer: progress card (prepare ≈ 8 %, training ≈ 89 %,
   finishing ≈ 3 % of the bar; "1,250 / 3,000 iterations · ~2 min left" from `SplatTrainingDetail`), Cancel (confirm →
-  `abortLongOperation` with 8 s grace), wake lock, `App.busy` makes leaving the page ask, Back asks and stops it,
-  the other builds wait. Done: `results.splat`, session stats `splatGaussians` / `splatIterations` / `splatQuality` /
-  timings, `engine.splatModel()` → `Viewer.setSplats` → shown. Cancelled / failed: "Photoreal model interrupted ·
+  `abortLongOperation({ method: 'splat' })` with 8 s grace), wake lock, `App.busy` makes leaving the page ask, Back
+  asks and stops it, the other builds wait. A rebuild frees the previous model's splat layer while the trainer runs
+  (≈ 150–220 MB of GPU memory at 300–500 k Gaussians that the engine's page reserve does not cover; points / mesh
+  meanwhile) and loads it again when the build stops. Done: `results.splat`, session stats `splatGaussians` /
+  `splatIterations` / `splatQuality` / timings, a prepared splat PLY of the old model dropped,
+  `engine.splatModel()` → `Viewer.setSplats` → shown. Cancelled / failed: "Photoreal model interrupted ·
   Resume" card + Build-sheet Resume (engine `splatResumableIteration` / `Quality` or the app's own marker); refine
   clears the splats. Layer pill above the toolbar (and in the Display sheet): Splats / Points / Mesh, one at a time;
   a scan with splats opens on them (the points while they load; header counts the shown layer); 'unavailable' falls
