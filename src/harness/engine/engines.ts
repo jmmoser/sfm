@@ -20,6 +20,8 @@ import type {
   LogMessage,
   MeshOptions,
   SparseResult,
+  SplatOptions,
+  SplatResult,
 } from '../../workers/protocol';
 import type { HarnessEngineKind, HarnessTimeouts } from './types';
 
@@ -31,6 +33,7 @@ export interface HarnessEngine {
   refine(onProgress?: ProgressCallback): Promise<SparseResult>;
   densify(options?: DenseOptions, onProgress?: ProgressCallback): Promise<PointCloud>;
   mesh(options?: MeshOptions, onProgress?: ProgressCallback): Promise<TriangleMesh>;
+  splat(options?: SplatOptions, onProgress?: ProgressCallback): Promise<SplatResult>;
   exportModel(format: ExportFormat): Promise<Blob>;
   /** Cancel the running long operation. */
   cancel(): void;
@@ -59,6 +62,7 @@ interface InlineEngineInstance {
   refine(progress?: ProgressCallback, cancel?: CancelToken): Promise<SparseResult>;
   densify(opts?: DenseOptions, progress?: ProgressCallback, cancel?: CancelToken): Promise<PointCloud>;
   mesh(opts?: MeshOptions, progress?: ProgressCallback, cancel?: CancelToken): Promise<TriangleMesh>;
+  splat?(opts?: SplatOptions, progress?: ProgressCallback, cancel?: CancelToken): Promise<SplatResult>;
   exportModel(format: ExportFormat): Promise<Blob>;
   dispose(): void;
   /** Optional event hooks (either style; src/engine EngineEvents: live / log / error). */
@@ -161,6 +165,10 @@ class InlineEngine implements HarnessEngine {
   }
   mesh(options?: MeshOptions, onProgress?: ProgressCallback): Promise<TriangleMesh> {
     return this.e.mesh(options, this.progress(onProgress), this.fresh());
+  }
+  splat(options?: SplatOptions, onProgress?: ProgressCallback): Promise<SplatResult> {
+    if (!this.e.splat) return Promise.reject(new Error("engine 'inline': this src/engine has no splat()"));
+    return this.e.splat(options, this.progress(onProgress), this.fresh());
   }
   exportModel(format: ExportFormat): Promise<Blob> {
     return this.e.exportModel(format);

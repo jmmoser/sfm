@@ -5,7 +5,7 @@
  *   JPEG (createImageBitmap, one frame decoded ahead) → FrameInput { bitmap, t, screenAngle, imu
  *   since the previous delivered frame, latest GPS fix / heading ≤ t, gravityDevice, index } →
  *   engine.processFrame (one frame in flight = FramePump back-pressure) → record the LiveUpdate
- *   → finishCapture → refine (progress) → [densify] → [mesh] → [exports, sizes only].
+ *   → finishCapture → refine (progress) → [densify] → [mesh] → [splat] → [exports, sizes only].
  *
  * Every step is guarded: a failure is recorded in `errors` and the steps that depend on it are
  * skipped, so a partial result is always returned. Big outputs (PLY files) are streamed to
@@ -25,6 +25,8 @@ import {
   type MeshOptions,
   type ScreenAngle,
   type SparseResult,
+  type SplatOptions,
+  type SplatResult,
 } from '../../workers/protocol';
 import { debugKeyframes, debugPairs } from './debug-dump';
 import { createHarnessEngine, type HarnessEngine } from './engines';
@@ -192,6 +194,7 @@ function resolveConfig(c: HarnessConfig, meta: DatasetMeta | null): ResolvedHarn
     hfovPriorDegUsed: used,
     densify: c.densify ?? false,
     mesh: c.mesh ?? false,
+    splat: c.splat ?? false,
     exports: c.exports ?? false,
     persist: c.persist ?? false,
     preferGPU: c.preferGPU ?? true,
@@ -697,12 +700,51 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
     } else if (cfg.mesh && !cloud) {
       log('[harness] mesh skipped (no dense cloud)');
     }
+    if (abortReason !== null) return finalize();
+
+    // ---- splat ----
+    let splat: SplatResult | null = null;
+    if (cfg.splat) {
+      curStep = 'splat';
+      t0 = performance.now();
+      try {
+        const sopts: SplatOptions | undefined = typeof cfg.splat === 'object' ? cfg.splat : undefined;
+        const rec = onProgress('splat');
+        let lastDetail: Record<string, number> | null = null;
+        splat = await eng.splat(sopts, (p) => {
+          if (p.detail) lastDetail = { ...p.detail };
+          rec(p);
+        });
+        mark('splat', t0);
+        result.splat = { ...splat, stats: { ...splat.stats }, lastDetail, file: null };
+        const st = splat.stats;
+        log(
+          `[harness] splat done: ${splat.count} Gaussians, ${splat.iterations} iterations, ${st.splatViews} views ${st.splatWidth}×${st.splatHeight}, ${st.splatItPerSec} it/s, memory plan ≈ ${st.splatMemPeakMB} MB (GPU ${st.splatGpuMB} MB) (${Math.round(result.timings.splat)} ms)`,
+        );
+      } catch (e) {
+        mark('splat', t0);
+        fail('splat', e);
+      }
+      if (splat && splat.count > 0 && cfg.output && cfg.output.splat !== false && window.__e2eWrite) {
+        try {
+          const tw = performance.now();
+          const blob = await eng.exportModel('ply-splat');
+          const path = `${result.config.output?.prefix ?? ''}splats.ply`;
+          await writeBinary(path, blob);
+          result.files.push(path);
+          if (result.splat) result.splat.file = path;
+          log(`[harness] wrote ${path} (${(blob.size / 1048576).toFixed(1)} MB, ${Math.round(performance.now() - tw)} ms)`);
+        } catch (e) {
+          fail('write splats.ply', e);
+        }
+      }
+    }
 
     // ---- exports (sizes only) ----
     if (cfg.exports && abortReason === null) {
       const formats: ExportFormat[] = Array.isArray(cfg.exports)
         ? cfg.exports
-        : EXPORT_FORMATS.filter((fm) => fm !== 'ply-mesh' || !!mesh);
+        : EXPORT_FORMATS.filter((fm) => (fm !== 'ply-mesh' || !!mesh) && (fm !== 'ply-splat' || !!splat));
       curStep = 'export';
       const te = performance.now();
       for (const fm of formats) {

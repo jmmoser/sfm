@@ -6,16 +6,16 @@
  *        (<dataset> = any directory of e2e/data, e.g. the presets object-real / yard-real;
  *        the capture mode and thresholds follow its meta.scene)
  *        [--quality fast|balanced|max] [--stride N] [--max-frames N] [--no-dense] [--no-mesh]
- *        [--timeout-min M] … (--help for every option)
+ *        [--splat [--splat-iterations N] [--splat-max N]] [--nvs] [--timeout-min M] … (--help for every option)
  *
  * Starts Vite (root = repo, free port) and Chromium with the WebGPU flags, opens harness.html
  * per dataset and calls window.runPipeline(config) (src/harness/engine): frames are decoded
  * from e2e/data/<dataset>/frames/*.jpg and fed to the engine with IMU / GPS / compass like the
- * FramePump would, then finishCapture → refine → densify → mesh → exports. Progress is streamed
- * to stdout. Writes to e2e/out/e2e/<dataset>[-tag]/:
+ * FramePump would, then finishCapture → refine → densify → mesh → [splat] → exports. Progress is
+ * streamed to stdout. Writes to e2e/out/e2e/<dataset>[-tag]/:
  *   result.json   harness result + the e2e/metrics.mjs input fields (intrinsics, images, metric,
  *                 numInputImages, pointsFile) — re-score with `node e2e/metrics.mjs e2e/data/<d> result.json`
- *   sparse.ply / dense.ply / mesh.ply   (streamed from the page)
+ *   sparse.ply / dense.ply / mesh.ply / splats.ply   (streamed from the page; splats with --splat)
  *   metrics.json  metrics (e2e/lib/metrics-core.mjs) + sparse-cloud accuracy + live-trajectory
  *                 metrics + threshold checks (e2e/thresholds.json) [+ novel-view summary with --nvs]
  *   nvs/nvs.json  with --nvs: novel-view evaluation of the output (e2e/nvs.mjs; informational)
@@ -96,6 +96,14 @@ function printTimings(r, log) {
   }
   if (r.dense) log(`dense: ${r.dense.count} points${r.dense.file ? ` → ${r.dense.file}` : ''}`);
   if (r.mesh) log(`mesh: ${r.mesh.vertexCount} vertices, ${r.mesh.triangleCount} triangles`);
+  if (r.splat) {
+    const s = r.splat.stats ?? {};
+    log(
+      `splat: ${r.splat.count} Gaussians, ${r.splat.iterations} iterations in ${fmtNum(r.splat.ms / 1000, 1)} s (prepare ${fmtNum((s.splatPrepareMs ?? 0) / 1000, 1)} s, train ${fmtNum((s.splatTrainMs ?? 0) / 1000, 1)} s at ${s.splatItPerSec} it/s, finish ${fmtNum((s.splatFinishMs ?? 0) / 1000, 1)} s); ` +
+        `${s.splatViews} views ${s.splatWidth}×${s.splatHeight}, init ${s.splatInitGaussians} (dense ${s.splatInitDense ?? 0}, sparse ${s.splatInitSparse ?? 0}, shell ${s.splatShell ?? 0}), memory plan ≈ ${s.splatMemPeakMB} MB (GPU ${s.splatGpuMB} MB)` +
+        `${s.splatDegraded ? `, degraded: ${s.splatDegraded}` : ''}; checkpoints ${s.splatCheckpoints} × ${s.splatCheckpoints ? Math.round(s.splatCheckpointMs / s.splatCheckpoints) : 0} ms${r.splat.file ? ` → ${r.splat.file}` : ''}`,
+    );
+  }
   if (r.exports && Object.keys(r.exports).length) {
     log(`exports: ${Object.entries(r.exports).map(([k, v]) => `${k} ${'bytes' in v ? `${fmtNum(v.bytes / 1048576, 2)} MB` : `ERROR ${v.error}`}`).join(', ')}`);
   }
@@ -114,7 +122,7 @@ async function runDataset(browser, name, opts, outRoot, thresholdsSpec) {
   }
   const dir = join(outRoot, runName);
   await mkdir(dir, { recursive: true });
-  for (const f of ['result.json', 'metrics.json', 'sparse.ply', 'dense.ply', 'mesh.ply']) await rm(join(dir, f), { force: true });
+  for (const f of ['result.json', 'metrics.json', 'sparse.ply', 'dense.ply', 'mesh.ply', 'splats.ply']) await rm(join(dir, f), { force: true });
 
   const cfg = { ...structuredClone(opts.config), dataset: name, output: { prefix: `${runName}/` } };
   log(`=== run ${JSON.stringify(cfg)}`);
@@ -202,7 +210,7 @@ async function runDataset(browser, name, opts, outRoot, thresholdsSpec) {
   // ---- novel-view evaluation (informational: never fails the run) ----
   let nvs = null;
   if (opts.nvs) {
-    if (!pointsFile && !(await exists(join(dir, 'mesh.ply')))) log('nvs skipped: no dense.ply or mesh.ply');
+    if (!pointsFile && !(await exists(join(dir, 'mesh.ply'))) && !(await exists(join(dir, 'splats.ply')))) log('nvs skipped: no dense.ply, mesh.ply or splats.ply');
     else {
       try {
         const res = await runNvs({ ...parseNvsArgs([dsDir, dir]), views: opts.nvsViews }, { log: (m) => log(`[nvs] ${m}`) });
@@ -215,7 +223,11 @@ async function runDataset(browser, name, opts, outRoot, thresholdsSpec) {
   }
   await writeFile(
     join(dir, 'metrics.json'),
-    JSON.stringify({ dataset: name, run: runName, engine: cfg.engine, pipelineOk: !!r.ok, errors: r.errors ?? [], metrics, sparseCloud, live: liveMetrics, checks, thresholdsEnforced: enforced, ...(nvs ? { nvs } : {}) }, null, 2),
+    JSON.stringify(
+      { dataset: name, run: runName, engine: cfg.engine, pipelineOk: !!r.ok, errors: r.errors ?? [], metrics, sparseCloud, live: liveMetrics, checks, thresholdsEnforced: enforced, ...(r.splat ? { splat: r.splat } : {}), ...(nvs ? { nvs } : {}) },
+      null,
+      2,
+    ),
   );
   log(`wrote ${dir}/{result.json, metrics.json${r.files?.length ? ', ' + r.files.map((f) => f.split('/').pop()).join(', ') : ''}} (${wall.toFixed(1)} s)`);
   const checkFail = enforced && checks.some((c) => c.status === 'fail');

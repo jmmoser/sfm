@@ -8,6 +8,9 @@ export interface E2EArgs {
   mesh: boolean;
   denseOpts: { maxImageSize?: number; maxViews?: number };
   meshOpts: { voxelSize?: number; targetTriangles?: number };
+  /** Run the Gaussian-splatting stage (implied by any --splat-* option). */
+  splat: boolean;
+  splatOpts: { iterations?: number; maxGaussians?: number; maxImageSize?: number; maxViews?: number };
   exports: boolean | string[];
   /** Run the novel-view evaluation (e2e/nvs.mjs) on the output. */
   nvs: boolean;
