@@ -1,13 +1,14 @@
 /**
  * Forward-only splat renderer (viewer, evaluation): `render(camera)` → RGB + transmittance per
  * pixel. Holds its own copy of a `SplatModel` on the GPU. The trainer renders with the same
- * kernels (`SplatForward`) on its live parameters.
+ * kernels (`SplatForward`) on its live parameters. `encodeFrame` records a frame without a
+ * readback (the viewer presents the colour buffer with `SplatPresenter`, ./present.ts).
  */
 import type { GPUContext } from '../gpu/device';
 import { getForwardPipelines, SplatForward, type ForwardPipelines } from './forward';
 import { PassProfiler, makeBuffer } from './gpu-util';
 import { packParams, paramOffsets } from './layout';
-import type { ShDegree, SplatCamera, SplatModel } from './types';
+import { TILE_SIZE, type ShDegree, type SplatCamera, type SplatModel } from './types';
 
 export interface SplatRendererOptions {
   shDegree?: ShDegree;
@@ -49,7 +50,7 @@ export class SplatRenderer {
   private profiler: PassProfiler | null = null;
 
   private constructor(
-    private readonly device: GPUDevice,
+    readonly device: GPUDevice,
     private readonly lost: Promise<unknown>,
     private readonly pipes: ForwardPipelines,
     private readonly opts: SplatRendererOptions,
@@ -58,7 +59,7 @@ export class SplatRenderer {
   /** Compiles the pipelines, cached per device (do this at stage start: compilation blocks the queue on Safari). */
   static async create(ctx: Pick<GPUContext, 'device'>, opts: SplatRendererOptions): Promise<SplatRenderer> {
     const pipes = await getForwardPipelines(ctx.device, { shDegree: opts.shDegree ?? 0, antialiased: opts.antialiased ?? true });
-    return new SplatRenderer(ctx.device, ctx.device.lost, pipes, opts);
+    return new SplatRenderer(ctx.device, ctx.device.lost, pipes, { ...opts });
   }
 
   /** Uploads a model (re-allocates when it exceeds the capacity). */
@@ -69,17 +70,95 @@ export class SplatRenderer {
       this.fwd?.destroy();
       this.params?.destroy();
       this.params = makeBuffer(this.device, paramOffsets(cap, model.shDegree).total * 4, 'splat-render-params');
-      this.fwd = new SplatForward(this.device, this.pipes, {
-        capacity: cap,
-        maxWidth: this.opts.maxWidth,
-        maxHeight: this.opts.maxHeight,
-        isectCapacity: this.opts.isectCapacity,
-        params: this.params,
-        label: 'splat-render',
-      });
+      this.fwd = this.makeForward(cap, this.opts.isectCapacity);
     }
     this.device.queue.writeBuffer(this.params!, 0, packParams(model, this.fwd.capacity));
     this.count = model.count;
+  }
+
+  private makeForward(capacity: number, isectCapacity: number | undefined): SplatForward {
+    return new SplatForward(this.device, this.pipes, {
+      capacity,
+      maxWidth: this.opts.maxWidth,
+      maxHeight: this.opts.maxHeight,
+      isectCapacity,
+      params: this.params!,
+      label: 'splat-render',
+    });
+  }
+
+  get shDegree(): ShDegree {
+    return this.pipes.cfg.shDegree;
+  }
+
+  get antialiased(): boolean {
+    return this.pipes.cfg.antialiased;
+  }
+
+  /** Gaussians of the current model. */
+  get modelCount(): number {
+    return this.count;
+  }
+
+  get maxWidth(): number {
+    return this.opts.maxWidth;
+  }
+
+  get maxHeight(): number {
+    return this.opts.maxHeight;
+  }
+
+  /** Tile intersections reserved (0 before the first model). */
+  get isectCapacity(): number {
+    return this.fwd?.isectCapacity ?? 0;
+  }
+
+  /**
+   * Changes the largest frame (between frames): the per-pixel / per-tile buffers are reallocated,
+   * the model and the intersection reservation are kept.
+   */
+  setMaxSize(maxWidth: number, maxHeight: number): void {
+    if (maxWidth === this.opts.maxWidth && maxHeight === this.opts.maxHeight) return;
+    this.opts.maxWidth = maxWidth;
+    this.opts.maxHeight = maxHeight;
+    const f = this.fwd;
+    if (!f) return;
+    const isect = f.isectCapacity;
+    f.destroy();
+    this.fwd = this.makeForward(f.capacity, isect);
+  }
+
+  /** Reserves `capacity` tile intersections (between frames; only grows). */
+  reserveIntersections(capacity: number): void {
+    const f = this.fwd;
+    if (f && capacity > f.isectCapacity) f.resizeIntersections(Math.ceil(capacity));
+  }
+
+  /** GPU memory held (bytes, ±1 %): parameters, projection / sort / intersection and per-pixel buffers. */
+  get gpuBytes(): number {
+    const f = this.fwd;
+    if (!f) return 0;
+    const N = f.capacity;
+    const px = f.maxWidth * f.maxHeight;
+    const tiles = Math.ceil(f.maxWidth / TILE_SIZE) * Math.ceil(f.maxHeight / TILE_SIZE);
+    const params = paramOffsets(N, this.pipes.cfg.shDegree).total * 4;
+    return params + N * (48 + 8 + 4 + 4 + 16) + f.isectCapacity * 16 + px * 20 + tiles * 8;
+  }
+
+  /**
+   * Records the forward pass of `cam` without a readback (viewer): when the encoder has run,
+   * the returned buffer holds per pixel (x, y), at index y·width + x (rows top to bottom), the
+   * colour with T·background added and the final transmittance T (vec4 f32). The frame's tile
+   * intersections (uncapped — above `isectCapacity` the farthest were dropped) are copied to
+   * `countTo` when given (4 bytes).
+   */
+  encodeFrame(enc: GPUCommandEncoder, cam: SplatCamera, o: { background?: ArrayLike<number>; countTo?: { buffer: GPUBuffer; offset: number } } = {}): GPUBuffer {
+    const f = this.fwd;
+    if (!f) throw new Error('SplatRenderer: setModel first');
+    f.setFrame(cam, this.count, o.background);
+    f.encode(enc);
+    if (o.countTo) enc.copyBufferToBuffer(f.binCtl, 13 * 4, o.countTo.buffer, o.countTo.offset, 4);
+    return f.outColor;
   }
 
   /**
