@@ -702,13 +702,21 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   `measureTap(p)` (screen points = CSS px relative to the container, `{x,y}` or `[x,y]`);
   `worldToScreen`, `setOrbitTarget`/`getOrbitTarget` (world frame), `getWorldUp`,
   `getContentBounds`, `requestRender`, `renderNow`, `readPixels`, `getStats`, `framePending`.
+  `setCameras` cameras may carry `upCam`; `fitToContent` picks the view direction on the
+  first fit, and again on the first fit with cameras unless the view was moved since; a
+  devicePixelRatio change alone (resolution media query) resizes like a container resize.
 * **Frames**: content lives under world roots rotated so world up → three +Y ('z':
-  −90° about X, `(x,y,z) → (x,z,−y)`). `setWorldUp('auto')`: up from camera poses —
-  smallest eigenvector of Σ xxᵀ of the camera x axes (phones are held level; IRLS
-  Cauchy weights drop rolled frames), sign from the mean of the camera up vectors
-  (−Rᵀe_y); falls back to that mean when the x axes are parallel / not level. Unlike
-  the plain mean it is not biased by camera pitch on partial orbits. When up changes,
-  the camera is carried along (view kept, horizon levelled). Grid only in 'z' mode.
+  −90° about X, `(x,y,z) → (x,z,−y)`). `setWorldUp('auto')`: up from the camera poses
+  and each camera's optional `upCam` (physical up in the camera frame: −gravity, else up
+  for the frame's UI rotation; the live cameras and the final ones of refine /
+  loadSession carry it; absent = image up −y, which is wrong when the images are upright
+  for another θ than the phone was held in, e.g. raw iOS buffers with θ₀ = 90 in a
+  portrait UI). Up is the smallest eigenvector of Σ xxᵀ of the camera right axes
+  Rᵀ(e_z × up) (phones are held level; IRLS Cauchy weights drop rolled frames), with its
+  sign from the mean of the camera up vectors Rᵀ·up; it falls back to that mean when the
+  right axes are parallel / not level. Unlike the plain mean it is not biased by camera
+  pitch on partial orbits. When up changes, the camera is carried along (view kept,
+  horizon levelled). Grid only in 'z' mode.
 * **Colour**: point / vertex colours are sRGB Uint8 and are converted to linear in the
   shaders (three treats vertex colours as linear); output via three's colour-space
   conversion, so direct and EDL paths match (exact sRGB value for unlit content).
@@ -846,6 +854,10 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   root was lost or split in 14k rounded-coefficient trials. `solveQuadratic` scales by a
   power of two (b²−4ac overflowed/underflowed), returns [] for non-finite coefficients
   and drops overflowing roots. `polyRealRootsSturm` keeps a single scaling (cross-check only).
+  Newton polish stops once |p| is within the Horner error bound (at a multiple root the step
+  p/p′ is noise and used to jump onto another root, which then absorbed it);
+  `polyRealRootsSturm` records an exact root at lo / hi and deflates it out of q with its full
+  multiplicity before building the chain.
 * **NaN policy**: non-finite input now yields NaN instead of a plausible default in
   `symEig`, `mat3ToRotvec`, `mat3ToQuat`, `quatNormalize`, `axisAngleToMat3`,
   `rotationBetweenVectors`, `vec3Normalize` (zero input keeps the documented
@@ -1000,10 +1012,15 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   Rate limit uses half a frame of tolerance (30 fps → exactly 10 Hz); never more than one frame
   in the consumer; skips while hidden, after θ changes and when the bitmap aspect contradicts θ
   (transient, re-baselined after 1.5 s). The consumer owns the bitmap (closed by the pump only if
-  the consumer throws). `geo` = interpolated fix (or nearest within 30 s).
+  the consumer throws). `geo` = the raw fix nearest in time, with its own timestamp (within 30 s;
+  never restamped to the frame time: alignToGps interpolates the trajectory at the fix times).
+  `screenAngleSince` = the time θ took its value (ScreenAngleTracker.lastChangeTime, −∞ if no
+  rotation was seen), so the engine's settle window starts at the rotation and not at the first
+  frame the pump delivers after its own window.
 * **GeoSensor**: `watchPosition({enableHighAccuracy: true, maximumAge: 0})`; `t = timestamp −
-  (Date.now() − performance.now())` at delivery; `interpolate(t)` (≤ 5 s gaps, antimeridian-safe),
-  `latest`, `status`, `approximate` (accuracy > 1 km ⇒ iOS "Precise Location" off), `onFix`.
+  (Date.now() − performance.now())` at delivery; `interpolate(t)` (≤ 5 s gaps, antimeridian-safe;
+  not used for engine input: its result is stamped t), `nearest(t)`, `latest`, `status`,
+  `approximate` (accuracy > 1 km ⇒ iOS "Precise Location" off), `onFix`.
   **`GeoFix.alt` is orthometric (MSL/EGM2008) on iOS**, not WGS84-ellipsoidal.
 * **requestCapturePermissions()** must be called synchronously in a click/touchend handler: it
   calls `DeviceMotionEvent.requestPermission()` before returning, then (awaited) orientation,
@@ -1392,10 +1409,13 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   no cube face (such an edge cannot occur in another cube ⇒ edge-manifold; the noisy-SDF test had 14
   non-manifold edges with plain fans, 0 now; a centre-vertex fallback exists but no case needs it), ≤ 5
   triangles per cube. Vertices welded through an (owner voxel, axis) hash; normals = interpolated central-
-  difference TSDF gradients; triangles CCW seen from free space (normals point to the cameras). Edges between
-  two saturated values are skipped (ghost surfaces).
+  difference TSDF gradients; colours interpolated from the voxel colours, except that an edge end that was
+  never coloured (only free-space updates, e.g. beside a silhouette seen from one side) takes the other end's
+  colour instead of pulling it towards black; triangles CCW seen from free space (normals point to the
+  cameras). Edges between two saturated values are skipped (ghost surfaces).
 * **Simplification**: Garland–Heckbert with area-weighted quadrics, boundary planes (weight 100·|e|²),
-  4-ary heap with lazy versioned entries, link condition + boundary-pinch test, normal-flip test
+  4-ary heap with lazy versioned entries, link condition (vertex and edge parts: a closed tetrahedron no
+  longer collapses into two coincident faces of opposite winding) + boundary-pinch test, normal-flip test
   (cos ≥ 0.2), colours/normals interpolated at the target's projection on the edge. Output keeps the input
   vertex order (compacted).
 * **Point-cloud filters — deviation**: SOR uses an exact k-d tree (points stored in tree order) instead of a
@@ -1433,9 +1453,13 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   each matched axis correlates ≥ 0.8 (`stats.gyroCheck.excited/minAxisCorrelation`); until then it keeps
   accumulating. Before, a pure pan with the phone upright (rotation about device y only — the usual
   capture motion) "corrected" x/z into a random signed permutation in ~90 % of runs.
+* **Check B″** initialises its 1 s low-pass only on its first event (and after `reset()`); a
+  same-millisecond burst event (1 ms `timeStamp` after a main-thread stall) votes without a low-pass
+  step instead of re-seeding it; an out-of-order timestamp is skipped.
 * **CompassSensor**: ψ is reset when the relative event stream has a gap > `restartGapMs` (1 s) and on
   `start()` — iOS restarts CoreMotion after a suspension with a NEW arbitrary yaw reference (the old ψ
-  biased attitude/heading for ~20 s). `stats.yawResets`.
+  biased attitude/heading for ~20 s). `stats.yawResets`. `headingAt` skips platform readings worse
+  than `maxAccuracyDeg` (they were returned as `source: 'compass'`); they stay visible in `latest()`.
 * **chooseCamera**: several unidentified rear cameras (locale not covered by the label lists; iOS
   enumerates Ultra Wide before Wide) ⇒ the median `focusDistance.min` one (ultra-wide shortest, tele
   longest); `lensMaySwitch` is set for such an ambiguous Apple choice, and an unidentified Apple rear
@@ -1445,6 +1469,8 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   the 3-per-10 s limit ('manual'/'visible' do not); the `<video>` is `play()`ed again on unmute/visible
   (WebKit pauses media of a backgrounded page ⇒ rVFC stalls); returning to visible with a live,
   unmuted track starts the new `segment` immediately (frames no longer carry the old segment for 1.2 s).
+  A `restart()` cancels the frame loop of the old source before re-opening (a pending rVFC callback
+  fired for the new stream's first frames with the old segment while still 'restarting').
 * **FramePump**: a grab still in flight at `stop()` is discarded (bitmap closed, IMU not drained); failed
   grabs count towards the rate limit (no 30 Hz error storm).
 * **WakeLock**: a late `release` event of a previous sentinel (iOS dispatches it after resume) no longer
@@ -1581,7 +1607,8 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   mode.
 * **Memory cap**: with a user-given `voxelSize`, the counting hash map was unbounded (cap = ∞).
   It is now capped at `maxBlocks`, followed by greedy allocation that stops at the budget.
-  The module-level per-pixel scratch (16 B/px) is released after `buildTsdfVolume`.
+  The module-level per-pixel scratch (16 B/px) is released when `buildTsdfVolume` finishes
+  integrating, also when it is cancelled or a depth-map read fails.
 * **Non-finite input**: one `Infinity` depth made the band sample count infinite. NaN block keys
   all hash to one slot, so probing went quadratic and the run hung. NaN and ±∞ depths are now
   invalid everywhere: TSDF, fusion, and the scene-scale sampling. In fusion, an `Infinity`
@@ -1674,10 +1701,12 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   or the more certain one when they disagree by > 3σ (warning); GPS ⇒ ENU translation +
   `originLatLonAlt` (alt = mean MSL altitude, 0 without altitudes), else first camera at the origin.
   Apply with `Reconstruction.transform(s, R, t)`; `transformPose` gives R' = R_p Rᵀ, t' = s t_p − R' t.
-* **Limits**: `estimateTimeOffset` cost ∝ keyframes × 250 grid points (2000 keyframes ≈ 1 s); a single
-  constant gyro bias and constant accelerometer biases are assumed per capture; the scale needs
-  band-limited (0.3–3 Hz) acceleration ≥ 0.08 m/s² RMS (`excitationRms`) — tripod-smooth motion gets
-  `reliable: false`; segments are split at keyframe gaps > 3 s / IMU gaps > 250 ms.
+* **Limits**: `estimateTimeOffset` cost ∝ keyframes × 2 × 250 grid points (the grid is evaluated again
+  under the final robust scale, so `quality` = 1 − min cost / median grid cost uses one kernel; 2000
+  keyframes ≈ 1 s per grid pass); a single constant gyro bias and constant accelerometer biases are
+  assumed per capture; the scale needs band-limited (0.3–3 Hz) acceleration ≥ 0.08 m/s² RMS
+  (`excitationRms`) — tripod-smooth motion gets `reliable: false`; segments are split at keyframe
+  gaps > 3 s / IMU gaps > 250 ms.
 
 ### `src/sfm` core (database, correspondence graph, reconstruction, triangulator, mapper, live, synthetic)
 
@@ -1706,10 +1735,10 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   `RayTriangulator`: 2-view minimal samples (exhaustive for ≤ 15 observations), angular residuals, cheirality
   via the camera z-axis, LO = weighted LS ray intersection (re-weighted by 1/distance² ≈ angular error; no
   DLT/SVD, no allocation). Deviations: a track never gets two observations of the same image
-  (continue/complete skip images already in the track); `completeImage` only scans the image's own
-  correspondences (COLMAP re-scans every element of its tracks — 5× slower; `completeAllTracks` after global
-  BA covers the rest); `completeAllTracks` iterates untriangulated features (fewer) instead of all tracks;
-  `mergeAllTracks` scans each graph edge once.
+  (continue/complete skip images already in the track; merge skips point pairs that share an image);
+  `completeImage` only scans the image's own correspondences (COLMAP re-scans every element of its tracks —
+  5× slower; `completeAllTracks` after global BA covers the rest); `completeAllTracks` iterates
+  untriangulated features (fewer) instead of all tracks; `mergeAllTracks` scans each graph edge once.
 * **Mapper** (`MapperOptions`, `DEFAULT_MAPPER_OPTIONS`, `resolveMapperOptions`): cameras are shared per image
   size (or `cameraKey(frameId)`), initial guess from `intrinsics` (object or per-frame function, rescaled to the
   frame size) else `hfovPriorDeg` = 69° across the long side. Initial pair: first image by #correspondences,
@@ -1738,11 +1767,13 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
 * **LiveMapper** (`LiveMapperOptions` = mapper options + live ones): the engine must add the keyframe to the DB
   and its verified pairs to the graph BEFORE `addKeyframe`. Initialises from the best pair among the last 30
   keyframes (≥ 60 inliers, ≥ 5° median angle, ≤ 6 re-estimations per call), then registers the pending
-  keyframes; each new keyframe: PnP → triangulate → local BA (120 ms BA budget); failures stay pending and are
-  retried (nearest first, ≤ 4 per success) when their visible-point count grew (relocalisation). Global BA
-  with an 800 ms budget at 3, 4, 6, 8, 11, … ≤ 30 images, then every 15 registrations. `refine(ms?)` for a
-  final global refinement; `incrementalMapper`, `pendingIds()`, `timings`. No re-initialisation of a second
-  model while lost (offline `runIncrementalSfM` handles that).
+  keyframes (outward from the initial pair, passes repeated while one registers any); each new keyframe:
+  PnP → triangulate → local BA (120 ms BA budget); failures stay pending and are retried (nearest first, ≤ 4
+  per success) when their visible-point count grew (relocalisation). Global BA with an 800 ms budget at 3, 4,
+  6, 8, 11, … ≤ 30 images, then every 15 registrations. `refine(ms?)` for a final global refinement;
+  `incrementalMapper`, `pendingIds()` (also lists keyframes a refinement through `incrementalMapper`
+  dropped), `timings`. No re-initialisation of a second model while lost (offline `runIncrementalSfM`
+  handles that).
 * **synthetic.ts** (test data for any module; not re-exported): `generateScene({ kind: 'orbit' | 'walk', … })`
   (orbit: object 0.3 m at 0.5 m; walk: 60 m yard, houses/trees 5–50 m, sideways walk with panning), RADIAL
   projections + noise, clutter features, RootSIFT-like descriptors (true-match distance ≈ 0.4, random ≈ 0.75),
@@ -1808,7 +1839,12 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
 * **Protocol** (`src/workers/protocol.ts`, ENGINE.md §2–3 types verbatim + extensions, nothing
   removed): `EngineMethodMap` types every request (`init`, `frame`, `finishCapture`, `refine`,
   `densify`, `mesh`, `export`, `loadSession`, `cancel`, `dispose`) plus **`visibility`**
-  `{hidden}` (workers get no `visibilitychange`; the engine must not submit GPU work while hidden).
+  `{hidden}` (workers get no `visibilitychange`; the engine must not submit GPU work while hidden)
+  and **`close`** `{sessionId}` → boolean (the engine of a session about to be deleted is
+  disposed, so nothing more is written to it; the feature pipeline is kept for the next init).
+  EngineClient.closeSession sends it only when its replay setup names that session or there is no
+  setup (a discard forgot it); with a setup naming another session the worker cannot hold the
+  deleted one, so nothing is sent (no 30 s timeout or restart for a busy worker).
   Requests `{id, method, params}`; responses `{id, ok, result | error}`; events `{type: 'progress'
   (requestId?, stage, progress, message?) | 'live' (update) | 'log' | 'error' (fatal, reason)}`.
   Errors cross as `SerializedError {name, message, stack?, code?}`; well-known names in
@@ -1832,6 +1868,10 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   `resume: true` or last `loadSession`; pending requests reject with `EngineCrashedError`) on:
   module load failure, fatal error event, init timeout, 2 consecutive frame timeouts. Cap 3 per
   60 s → state `dead`; after 2 GPU-related failures the replay uses `preferGPU: false`.
+  Calls made during a replay wait for it, and for the next one when a second restart supersedes
+  it. A frame waiting this way still counts as in flight (`frameInFlight`). Only the latest
+  restart's replay sets the state. Likewise an `init` / `loadSession` that a newer one superseded
+  leaves the status alone (no `idle` with its error, no early `ready`).
   A worker that answers every request with `NotImplementedError` (a build without the engine; the
   original placeholder `engine.worker.ts`, now the real engine) gets an "engine unavailable" card
   that suggests `?mock=1` (e2e/ui/states.mjs `engine-missing`).
@@ -1860,7 +1900,10 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   a `NotAllowedError` in Home Screen mode asks for another tap.
 * **Tests**: unit — `format`, `router`, `store`, `overlay-map` (object-fit cover/contain, quarter
   turns), `stages` (name mapping, ETA), `protocol` (transferables, envelopes, errors), `env`,
-  `mock-engine` (+ scene geometry, exports decode). Browser — `engine-client.gpu.test.ts` with
+  `mock-engine` (+ scene geometry, exports decode), `engine-client` (Node, scripted fake workers:
+  overlapping respawns, a frame waiting across them, superseded init / load) and `app`
+  (ensureSessionLoaded: failed, superseded, released, new-scan and deleted loads).
+  Browser — `engine-client.gpu.test.ts` with
   `engine-client.worker-fixture.ts` (transfers, progress routing, cancel, timeouts, respawn +
   resume, CPU fallback, respawn cap, startup failure, visibility, dispose). E2E —
   `node e2e/ui/smoke.mjs` (full mock flow at 393×852 @3x with the fake camera, downloads checked,
@@ -1899,14 +1942,19 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   `addPoint` rejects a track listing an element twice (double-counted `numPoints3D`) or an out-of-range feature, with no
   side effects. `transform` throws for s ≤ 0 / non-finite. `angularError` is π for depth ≤ 0 (was 0 — a "perfect"
   continuation — for a point at the camera centre).
-* **Smaller fixes**: `LiveMapper.refine()` reports images dropped by its image filter in `pendingIds()`;
-  `findInitialPair` reads stored pairs in canonical order (no inverted copies cached for half the pairs).
-* **Clarification**: `merge` (as COLMAP) can join two tracks that both observe an image; continue / complete never add a
-  second observation of an image. Visibility counts of images whose graph edges change AFTER they were added (pair
-  replacement / late pairs) can go stale; only next-best-view ranking reads them and registration resyncs first.
+* **Smaller fixes**: `LiveMapper.refine()` reports images dropped by its image filter in `pendingIds()` (so does a
+  refinement through `incrementalMapper`: `pendingIds()` and the pending retry resync from the reconstruction);
+  `findInitialPair` reads stored pairs in canonical order (no inverted copies cached for half the pairs);
+  `runIncrementalSfM` with `initImagePair` builds one model from that pair: it stops once a model exists and relaxes
+  the levels only while the pair fails (was: one overlapping model per threshold level).
+* **Clarification**: `merge` never joins two tracks that both observe an image (COLMAP's does; co-located SIFT
+  orientations would give a track two observations of one image); continue / complete never add a second observation
+  of an image either. Visibility counts of images whose graph edges change AFTER they were added (pair replacement /
+  late pairs) can go stale; only next-best-view ranking reads them and registration resyncs first.
 * Verified correct (no change): `transform` pose update, `invertTwoView`, visibility pyramid vs COLMAP, ray triangulator
   (cheirality, angle tests, LO), local/global gauges (largest relative-translation axis), intrinsics flags, COLMAP
-  filter / merge / complete / retriangulate semantics, multi-model registration bookkeeping, cancel at any point.
+  filter / merge (apart from the same-image check) / complete / retriangulate semantics, multi-model registration
+  bookkeeping, cancel at any point.
 * **Tests**: `core-review.test.ts` (adversarial: ids, π rotations, 1e±3 scales with 1e5 offsets, parallel / behind rays,
   60 % outlier rays, 600-step bookkeeping fuzz with an exhaustive invariant checker incl. brute-force visibility,
   next-best view, registration thresholds, bit-identical gauges / constant intrinsics, cancel at the k-th token read,
@@ -1946,7 +1994,17 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   visible (`restart()` refused it and showed a bogus "could not restart" card).
 * **Processing opened from Home** used the PREVIOUS scan's `app.results` (name, quality, stages
   shown as built) until the engine had loaded the new one; it now shows "Opening scan…" and fills
-  in name / quality / stages after `ensureSessionLoaded`. A `dead` engine is not retryable.
+  in name / quality / stages and the preview after `ensureSessionLoaded`. A `dead` engine is not
+  retryable.
+* **Stop between steps**: a Stop confirmed while loadSession ran (it ignores the cancel) or while
+  a step was past its last cancel check started the next step anyway; the step loop now checks it
+  before every step; a Stop during a load that then fails leaves when it fails (not at the 8 s
+  fallback). After a failed load the error button and PROCESSING_CANCELLED.hasModel no longer use
+  the previous scan's model ("Back to home"). The viewer's Build / Export / Info / Display do
+  nothing until the opened scan is loaded. A camera error during the engine init keeps its card.
+  `states.mjs` rejects unknown scenario names (exit 2). UI: `states.mjs processing-stop`,
+  `open-failed`, `viewer-loading`, `camera-error-init`, `memory-limit-background`,
+  `open-other-session` (preview).
 * **Export sheet**: a file finished after the sheet was closed and reopened updated the detached
   old list (stuck "Preparing…"); the open sheet's renderer is tracked. Double taps on "Share /
   Save" are ignored for 2 s or until the share settles (a second `share()` rejects with
@@ -1983,26 +2041,35 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
 * **API (ENGINE.md §2, superset)**: `new PhotogrammetryEngine(options, config?)`; `init`, `processFrame`,
   `finishCapture(progress?, cancel?)`, `refine`, `densify`, `mesh`, `exportModel`, `loadSession(id, options?)`
   (works without `init`), `setHidden`, `flush()` (wait for background mapping + writes), `on('live' | 'log' |
-  'error', cb)`, `recoverGPU()`, `releaseResultMemory()`, `releasePipeline()`, accessors `liveSession`,
-  `sparseModel`, `sparseResult`, `denseCloudResult`, `meshResult`, `engineStore`. `EngineConfig` (tuning:
-  injected store / pipeline, SIFT overrides, `mapping: 'background' | 'inline'`, keyframe / live / mapper /
-  dense overrides, pair budgets, memory budget) is the 2nd constructor argument, and the worker accepts it as
-  the `engineConfig` extension field of `init` / `loadSession` options.
+  'error', cb)`, `recoverGPU()`, `releaseResultMemory()`, `releasePipeline()` / `adoptPipeline(p, key)`
+  (worker hand-over: the adopting engine owns the pipeline; one that fell back from the GPU to the CPU is
+  not handed on), accessors `liveSession`, `sparseModel`, `sparseResult`, `denseCloudResult`, `meshResult`,
+  `engineStore`, `usesGPU`, `hadGPU`. `init()` overtaken by `dispose()` rejects with EngineCrashedError and
+  releases what it opened. `EngineConfig` (tuning: injected store / pipeline, SIFT overrides, `mapping:
+  'background' | 'inline'`, keyframe / live / mapper / dense overrides, pair budgets, memory budget) is the
+  2nd constructor argument, and the worker accepts it as the `engineConfig` extension field of `init` /
+  `loadSession` options.
 * **SparseCamera extension**: refine / loadSession cameras carry `t` (capture ms) and `frameIndex`
   (FrameInput.index of the source frame, else the engine's 0-based frame counter) — type `SparseCameraEx`
-  (`SparseCamera & { t?, frameIndex? }`, protocol.ts unchanged; structured clones keep the fields).
+  (`SparseCamera & { t?, frameIndex? }`, protocol.ts unchanged; structured clones keep the fields). They
+  also carry `SparseCamera.upCam`, the same `keyframeUpCam` as the live cameras (−gravity, else up for the
+  UI rotation), stored in `sparse/meta` and restored by `loadSession`.
 * **No static import of the WebGPU feature modules**: `sift-gpu.ts` / `match-gpu.ts` read `GPUBufferUsage` at
   module load, which throws where WebGPU does not exist (older iOS, Lockdown, Node) and would kill the whole
   worker module. `features/extractor` is imported dynamically only when `navigator.gpu` exists; otherwise
   `cpu-pipeline.ts` (extractSiftCPU + matchCPU) is used.
 * **Orientation**: canonical θ₀ = first accepted frame's θ; frames at another θ are rotated (k clockwise
-  quarter turns) before analysis; frames < 500 ms after a θ change are dropped; a landscape bitmap in a
-  portrait UI is a RAW sensor buffer (upright for θ = 90), a portrait bitmap in a landscape UI is dropped.
+  quarter turns) before analysis; frames < 500 ms after a θ change are dropped (the change is dated by
+  `FrameInput.screenAngleSince` when given, i.e. by the FramePump, which already skipped that window;
+  otherwise by the first frame at the new θ); a landscape bitmap in a portrait UI is a RAW sensor buffer
+  (upright for θ = 90), a portrait bitmap in a landscape UI is dropped.
   **Hand-eye check**: once ≥ 6 keyframes are registered (and again with the refined poses before the world
   alignment), the visual relative rotations of consecutive keyframes are compared with R_cd(θ)·ΔR_gyro·R_cdᵀ for
-  θ ∈ {0, 90, 180, 270}; a clearly better hypothesis (median < 4° and < ½ of the runner-up) replaces
-  R_cam_device of every keyframe (FrameInfo.R_cam_device / gravityCam) and is logged. LiveUpdate.overlay is in
-  the coordinates of the frame AS SUBMITTED (inverse canonical turn).
+  θ ∈ {0, 90, 180, 270} (pairs whose interval spans an IMU sample gap > IMU_MAX_GAP_MS = 500 ms are skipped);
+  a clearly better hypothesis (median < 4° and < ½ of the runner-up) replaces R_cam_device of every keyframe
+  (FrameInfo.R_cam_device / gravityCam) and is logged; only such a clear result marks θ verified (live: ≥ 6
+  keyframe pairs, refine: ≥ 4), an ambiguous one verifies nothing. LiveUpdate.overlay is in the coordinates of
+  the frame AS SUBMITTED (inverse canonical turn).
 * **Live**: per frame ≤ 640 px RGBA copy (sharpness, colours), blur / motion pre-gate (no features for
   rejected frames), SIFT at the preset working size (`extractFromBitmap` with the bitmap or the rotated
   OffscreenCanvas on the GPU, a working-size gray image on the CPU), H-guided matching to the last keyframe
@@ -2016,13 +2083,14 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   `LiveMapper.addKeyframe`. Everything that a respawned worker needs is persisted per keyframe (JPEG q 0.92,
   features, colours, pairs, IMU chunk, GPS, state).
 * **Refine**: vocabulary retrained (512 words) when it covered < 50 % of the keyframes; pairs sequential 10 +
-  retrieval 15 + spatial 10 (75°) minus every pair already tried; live model: pending keyframes retried, full
-  global refinement; offline `runIncrementalSfM` (live-refined intrinsics as the initial guess); the better
-  model (registered images, then mean reprojection error) is CLONED (the live model keeps its frame) and
-  aligned with `computeWorldAlignment` (camera–IMU offset searched around the last estimate, GPS fixes, compass
-  'auto' reference). **Deviation**: when the IMU scale is rejected only for low excitation but the fit is
-  excellent (R² ≥ 0.9, σ ≤ 3 %, excitation ≥ 0.03 m/s²) it is accepted with σ = max(2σ, 2 %) and a warning
-  (e2e `object` orbit with GT poses: 0.3 % scale error at 0.06 m/s², rejected by the 0.08 floor).
+  retrieval 15 + spatial 10 (75°) minus every pair already matched (a pair whose GPU match failed, or was
+  skipped by a cancel, is tried again); live model: pending keyframes retried, full global refinement;
+  offline `runIncrementalSfM` (live-refined intrinsics as the initial guess); the better model (registered
+  images, then mean reprojection error) is CLONED (the live model keeps its frame) and aligned with
+  `computeWorldAlignment` (camera–IMU offset searched around the last estimate, GPS fixes, compass 'auto'
+  reference). **Deviation**: when the IMU scale is rejected only for low excitation but the fit is excellent
+  (R² ≥ 0.9, σ ≤ 3 %, excitation ≥ 0.03 m/s²) it is accepted with σ = max(2σ, 2 %) and a warning (e2e
+  `object` orbit with GT poses: 0.3 % scale error at 0.06 m/s², rejected by the 0.08 floor).
 * **Dense**: preset table of ENGINE.md (engine table ← `DENSE_PRESETS` of src/dense, merged by field
   name; `removeDepthHalos` applied to the final maps) → evenly spread view subset →
   JPEG decode at the dense size + `undistortImage` through an LRU (15 % of the memory budget) → selectSourceViews
@@ -2032,10 +2100,18 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   scratch session in the separate database `sfm-scratch` (deleted on dispose, stale ones purged after 1 h).
   Mesh: TSDF on the fusion-filtered maps (object mode: maxDepth = 2 × median sparse depth; block budget ≤ 25 %
   of the memory budget) + optional simplification; after a reload the filtered maps come from IndexedDB.
-* **Worker**: one engine per `init` (the feature pipeline is reused across inits with the same SIFT config);
-  progress throttled to 10 Hz per request; cancel tokens per request; frame / live results transferred;
-  results the engine keeps are cloned, persisted dense clouds / meshes are transferred and dropped from the
-  engine (reloaded for export); GPU device loss ⇒ `recoverGPU()`, fatal `gpu-lost` when no adapter is left.
+* **Worker**: one engine per `init` (the feature pipeline is handed to the next engine with the same SIFT
+  config, which then owns it and recreates it after a device loss; a pipeline that fell back from the GPU to
+  the CPU is destroyed instead); progress throttled to 10 Hz per request; cancel tokens per request; frame /
+  live results transferred; results the engine keeps are cloned; dense clouds / meshes that were stored are
+  transferred and dropped from the engine (reloaded for export), while one whose write failed stays in memory
+  and is cloned (`releaseResultMemory` returns false); `close` disposes the engine of a session about to be
+  deleted and keeps its feature pipeline as a spare for the next engine (not reused if it fell back to the CPU
+  while parked), frees the CPU SIFT scratch (the disposed engine's idle timer no longer does), and leaves the
+  pipeline's size-dependent GPU caches in place (a mapping job of the disposed session may still be
+  matching); GPU device loss ⇒ `recoverGPU()` for an engine whose feature pipeline ran on the GPU (also one
+  opened with `loadSession`), fatal `gpu-lost` when no adapter is left; overlapping recoveries each destroy
+  the pipeline they replace.
 * **Measured** (CPU features in Chromium, inline engine, every frame): e2e `yard` (240 frames) → 80 keyframes,
   80/80 registered, ATE 1.25 cm (3.2e-4 of the extent), scale error −0.08 % (IMU + GPS), gravity 0.017°,
   heading −2.6° (GPS 4-DOF), focal 0.05 %, time offset −24.7 ms (true −25); e2e `object` (200 frames) → 90/90,
@@ -2294,7 +2370,8 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   * *Dense* (`runDensify`): plan first, then: image LRU ≥ numSources + 2 images (15 % budget); every PatchMatch
     pass store keeps ONE full map (write-through), geometric-pass sources come from a depth-only LRU (sources read
     only `depth`: 4 instead of 20 B/px); a previous-pass map is deleted after its last use (peak storage ≈ one pass +
-    the filtered maps instead of two passes); PatchMatchGPU is destroyed after the passes (≈ 140 MB GPU at 1600 px);
+    the filtered maps instead of two passes); PatchMatchGPU is destroyed after the passes, also when they end by a
+    cancel or an error (≈ 140 MB GPU at 1600 px);
     fusion gets `maxNeighbours` (lowered from the preset only when the resident maps alone exceed 65 % of the share),
     a pixel `step` sized so ≈ 0.2 × views × px / step² fused points fit the remaining share, and `maxPoints` as a
     hard stop (logged). The 25 %-of-budget LRUs of the PatchMatch / filtered depth stores (up to 3 × 300 MB in
@@ -2371,6 +2448,12 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   it starts — the run clears (other settings) or rewrites (fusion) the stored `depth/` maps, and a cancelled
   re-densify followed by `mesh` paired the old views with the emptied / partial maps (124 instead of 807
   triangles in the test); `mesh` now runs (or resumes) densify. The previous dense CLOUD stays the result.
+* **Result writes**: every store write is its own transaction, so dependents are invalidated first. `densify`
+  deletes `mesh` before storing `dense/points`. `persistSparse` deletes `dense/points` and `mesh` and nulls
+  `dense/meta`, `dense/progress` and `sparse/meta` before storing `sparse/model` (then `sparse/meta`, depth-map
+  clear, `engine/state` last), so a kill in between never pairs a new result with old dependents. A dense cloud /
+  mesh whose write failed stays in memory for exports (not released to the page), and the previous run's stale
+  blob is deleted, so a reload does not show it under the new stats (`engine-persist.test.ts`).
 * **`loadSession` of another session** on the same engine kept the previous session's stats (summary), resolved
   mode and FOV prior (a later refine used the other session's `hfovPriorDeg`); reset now.
 * **Feature-pipeline hand-over**: `releasePipeline()` returned the key of the CURRENT quality; after a
@@ -2393,8 +2476,9 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   LiveMapper call order (DB + graph before `addKeyframe`), refine pair exclusion / model choice / clone before
   the world transform (X' = sRX + t, R'ᵢ = RᵢRᵀ), dense cameras = undistorted at the dense size with
   world-frame poses, fusion neighbours restricted to views with maps, keyframe id ↔ FrameInput.index mapping,
-  IMU time domain (t_cam + offset), worker transfer lists (fresh arrays only; persisted dense / mesh released
-  before transfer), progress stage names = `src/app/stages.ts` ids, cancellation error names.
+  IMU time domain (t_cam + offset), worker transfer lists (fresh arrays only; a stored dense / mesh is released
+  before transfer, one that could not be stored is cloned), progress stage names = `src/app/stages.ts` ids,
+  cancellation error names.
 * **Not in engine scope (reported)**: for raw sensor buffers the app maps `LiveUpdate.overlay` (relative to the
   bitmap AS SUBMITTED, protocol) onto the upright `<video>` with the bitmap size — the overlay is drawn rotated;
   `EngineClient.cancel()` does not reach a running `finishCapture` (not in the client's long-operation set).
@@ -2490,13 +2574,14 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
 
 * **Overlay of RAW sensor buffers** (`overlay-map.ts` `FrameOrientationTracker`, used by `capture.ts`): the same rule
   as the engine's `OrientationTracker` (landscape bitmap in a portrait UI = raw buffer, upright for θ = 90; raw delivery
-  fixed by the first portrait-UI frame outside the 500 ms settle window, then landscape frames of a landscape UI are raw
-  too; portrait bitmap in a landscape UI = dropped). The overlay (relative to the bitmap AS SUBMITTED) is turned by
-  `canonicalRotation(θ_display, θ_upright)` clockwise quarter turns onto the upright `<video>` (portrait UI: 1 turn);
-  overlays of frames from before a UI rotation are still dropped. Fixes the rotated overlay reported by the engine
-  integration review. Tests: unit (random sequences agree with the engine tracker; a raw-buffer pixel lands where
-  `rotateImagePoint` puts it; device top / right edge projected with `R_cam_device(90)` appear up / right), e2e
-  `states.mjs raw-overlay` (the headless fake camera IS a landscape stream in the portrait UI).
+  fixed by the first portrait-UI frame outside the 500 ms settle window (dated like the engine's, by screenAngleSince
+  when given), then landscape frames of a landscape UI are raw too; portrait bitmap in a landscape UI = dropped). The
+  overlay (relative to the bitmap AS SUBMITTED) is turned by `canonicalRotation(θ_display, θ_upright)` clockwise quarter
+  turns onto the upright `<video>` (portrait UI: 1 turn); overlays of frames from before a UI rotation are still dropped.
+  Fixes the rotated overlay reported by the engine integration review. Tests: unit (random sequences agree with the
+  engine tracker; a raw-buffer pixel lands where `rotateImagePoint` puts it; device top / right edge projected with
+  `R_cam_device(90)` appear up / right), e2e `states.mjs raw-overlay` (the headless fake camera IS a landscape stream in
+  the portrait UI).
 * **Cancel / abort of `finishCapture`**: `finishCapture` is a long operation of `EngineClient` (cancel target; progress
   resets its inactivity timer). New `EngineLike.abortLongOperation({graceMs})`: cancel, and when the request has not
   settled within `graceMs` (the engine checks the token only after `live.flush()`; a hung IndexedDB wait or a stuck
@@ -2518,10 +2603,22 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   takes > 0.3 s); an `init` / `loadSession` issued while an abort is pending waits for it and the restart replays nothing
   (the new setup supersedes it). Tests: `engine-client.gpu.test.ts` (no replay, new init not rejected and the old session
   not replayed), `mock-engine.test.ts`, UI `states.mjs finish-stuck-discard`.
+  Discard / delete without a stuck step (fixed): `abortLongOperation({ reinit: false })` used to forget the replay setup
+  only on a stuck restart, and deleting a scan from Home never told the engine. A later respawn (e.g. a fatal `gpu-lost`
+  on Home) then replayed `init` with `resume` and re-created a ghost 'Scan' record, and the worker kept writing pairs /
+  state rows under the deleted id. Now `reinit: false` forgets the setup whatever the outcome. `App.deleteSession` first
+  awaits `EngineLike.closeSession(id)` (a no-op without a worker round trip when the engine holds another scan): the
+  client drops a setup naming the session, and the worker's `close` disposes that session's engine (the compiled
+  pipeline is kept; state `idle`, reason `closed`). `PhotogrammetryEngine.init({ resume })` on a persistent store refuses
+  a session whose record is gone (SessionNotFoundError) instead of re-creating it, and a mapping job that finishes after
+  dispose stores nothing. Tests: `engine-client.gpu.test.ts`, `engine.worker.test.ts`, `mock-engine.test.ts`,
+  `engine-persist.test.ts`, UI `states.mjs discard-no-replay`, `delete-open-session`.
 * **Capture memory cap** (`error` event reason `'out-of-memory'` / `CaptureMemoryLimitError`, or
   `LiveUpdate.timings.memoryLimited`): asked once — pause + card "Memory limit reached — finish scan now?" with
   **Finish scan** / **Continue (tracking only)** (fewer than 5 keyframes: Continue / Back to home), like the storage-full
-  card; afterwards a "Memory full · tracking only" chip under the counters. Elsewhere an `out-of-memory` event is a toast.
+  card. It asks only while the capture runs or is paused: a cap reached while it is interrupted (background) or on an
+  error card asks once it runs again. Afterwards a "Memory full · tracking only" chip under the counters. Elsewhere an
+  `out-of-memory` event is a toast.
 * **Dense resume**: `stats.denseResumablePass` (loadSession) or a densify cancelled / failed in Processing (app marker
   `denseInterrupted`) ⇒ viewer HUD "Dense cloud interrupted · Resume" and a "Resume dense reconstruction" item in the
   Build sheet (another quality says it starts over — the resume key includes the settings); Processing headline
@@ -2557,7 +2654,8 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   While the engine holds a scan (`App.engineHoldsData`: an opened / captured session or an initialised engine), "Run
   benchmark" asks first: **Free memory and run** (`App.releaseEngine` → `EngineLike.release()`: the worker is terminated
   without a replay, the page's models dropped; the scan reloads from storage when opened) or **Run anyway** (UI
-  `bench.mjs loaded`).
+  `bench.mjs loaded`). With nothing loaded, Run first releases the engine all the same (`App.releaseEngine`): a worker
+  that a discard or delete closed still parks the compiled feature pipeline and its GPU caches. No question is asked.
 * **MockEngine** knobs: `?mockStall=finishCapture[,refine|densify|mesh]` (hangs, ignores cancel; ends by
   `abortLongOperation` = simulated restart), `?mockMemoryLimit=<n>` (cap after n keyframes, one `out-of-memory` event,
   `timings.memoryLimited`), interrupted densify ⇒ `denseResumablePass` (also read from seeded session stats); mock stats
@@ -2763,6 +2861,9 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
 * **Gyro consistency** (`src/sfm/gyro.ts`): `GyroReference` = incremental, bias-compensated 2nd-order Magnus integration
   of the IMU log (amortised O(new samples), rebuilt only when the bias changes or a sample is inserted out of order),
   queried at CAMERA times (IMU = camera + offset), rotations camera(ta) → camera(tb) = R_cd · R_wd(tb)ᵀR_wd(ta) · R_cdᵀ;
+  an interval spanning an IMU sample gap > `IMU_MAX_GAP_MS` (500 ms: page hidden, worker respawn, ring-buffer overflow)
+  is not covered, so no rotation and no gyro check (every gate passes it); within the 60 ms slack of a gap edge ω is
+  held constant from that edge's sample, as at the ends of the log;
   `angularVelocityCam`. Tolerance = 5° + 0.3°/s·|Δt| + 5 % of the rotation (`EngineConfig.gyroTolerance`; NOT tightened
   when a bias is known: the bias estimate comes from RS-biased vision rotations — yard-real x component 0.5 instead of 3.0
   mrad/s ⇒ 5° over a 32 s loop closure — and 0.1°/s rejected correct loop-closure pairs). Gates
@@ -2810,7 +2911,8 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   Estimated in refine on the refined live model (if gyro-consistent; else on the chosen model): hypotheses scored
   by the robust (Cauchy 1 px) cost after a SHORT BA on a subset (`RSBundleCost`: every registered image free with a gauge,
   ≤ 40 points per image, ≤ 8 observations per point, shared focal free, ≤ 10 LM iterations; velocities and observation
-  depths from the input model): 0, ±10 / ±25 ms on both axes pick axis and direction, safeguarded parabolic interpolation
+  depths from the input model): 0, ±10 / ±25 ms on both axes pick axis and direction, the range end (`maxReadoutMs`,
+  40 ms) when the outer probe is best and bisection towards it while it stays best, then safeguarded parabolic interpolation
   narrows the time to ≈ 1 ms (≈ 12–18 BAs, ≈ 3–6 s on SwiftShader). A second pass (`rollingShutterOptions.passes`, default
   2) repeats it on the model re-adjusted with the first estimate, narrowed around it (0.85 / 1 / 1.15 ×, ≈ 8 BAs): the short
   BAs start from the input model, and one built on distorted keypoints pulls the readout towards 0 (synthetic orbit with

@@ -39,6 +39,8 @@ interface FrameInput {
   bitmap: ImageBitmap | RGBAImage;  // full resolution, any UI orientation
   t: number;                        // capture time, ms (performance.now domain)
   screenAngle: 0 | 90 | 180 | 270;  // θ of ARCHITECTURE §2 when the frame was captured
+  screenAngleSince?: number;        // performance.now() time θ took that value (FramePump); the 500 ms
+                                    //   settle window starts there, else at the first frame with the new θ
   imu: ImuSample[];                 // samples since the previous frame
   geo?: GeoFix | null;
   heading?: { heading: number; accuracy: number; north?: 'true' | 'magnetic' } | null;
@@ -58,7 +60,9 @@ interface LiveUpdate {
   overlay?: Float32Array;
   /** Present when the sparse model changed (decimated to ≤ 50k points). */
   sparse?: { positions: Float32Array; colors: Uint8Array };
-  cameras?: { pose: Pose; intrinsics: CameraIntrinsics }[];
+  /** upCam: physical up in the camera frame (−gravityCam, else R_cam_device · up for the keyframe's UI
+   *  rotation); the final cameras (SparseResult of refine / loadSession) carry the same upCam. */
+  cameras?: { pose: Pose; intrinsics: CameraIntrinsics; t?: number; upCam?: [number, number, number] }[];
   timings: Record<string, number>;
 }
 
@@ -73,7 +77,8 @@ class PhotogrammetryEngine {
   exportModel(format: 'ply-points' | 'ply-mesh' | 'glb' | 'colmap-zip'): Promise<Blob>
   loadSession(id: string, options?: Partial<EngineOptions>): Promise<SessionSummary>
   dispose(): void
-  // worker / harness hooks: setHidden, flush, recoverGPU, memoryReport, releaseResultMemory
+  // worker / harness hooks: setHidden, flush, recoverGPU, memoryReport, releaseResultMemory,
+  //   releasePipeline / adoptPipeline
 }
 ```
 
@@ -130,7 +135,9 @@ iPhones); iOS kills a tab at ~1.5 GB (soft) / 2 GB (hard), docs/research/ios-pla
 Request/response RPC with ids, plus unsolicited events:
 
 * requests: `init`, `frame`, `finishCapture`, `refine`, `densify`, `mesh`,
-  `export`, `loadSession`, `cancel`, `visibility` (page hidden / visible: pause GPU work), `dispose`
+  `export`, `loadSession`, `cancel`, `visibility` (page hidden / visible: pause GPU work), `close`
+  (let go of a session before it is deleted: its engine is disposed and the CPU SIFT scratch freed,
+  the compiled feature pipeline kept for the next init; answers whether the engine held it), `dispose`
 * events: `progress` (ProgressEvent), `live` (LiveUpdate), `log`, `error`
 * large typed arrays and ImageBitmaps are transferred, never copied.
 
