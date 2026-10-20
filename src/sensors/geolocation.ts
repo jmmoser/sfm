@@ -197,7 +197,8 @@ export class GeoSensor {
   /**
    * Position at time t: linear interpolation between the bracketing fixes (lat/lon/alt and
    * accuracies) when they are at most `maxInterpolationGapMs` apart; outside the covered
-   * range the nearest fix if within that gap; otherwise null.
+   * range the nearest fix if within that gap; otherwise null. The result is stamped t, so it is
+   * not a measurement: the engine takes raw fixes (FramePump delivers `nearest`).
    */
   interpolate(t: number): GeoFix | null {
     const f = this.fixes;

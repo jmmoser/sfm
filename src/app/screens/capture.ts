@@ -663,6 +663,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       bitmap: f.bitmap,
       t: f.t,
       screenAngle: f.screenAngle,
+      screenAngleSince: f.screenAngleSince,
       imu: f.imu,
       geo: f.geo,
       // platform headings are MAGNETIC until the compass knows the declination (setLocationFromFix)
@@ -676,7 +677,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       rawBuffer: f.rawBuffer,
       maxSide: f.maxSide,
     };
-    const upright = orientation.observe({ width: f.width, height: f.height, screenAngle: f.screenAngle, t: f.t, raw: f.rawBuffer });
+    const upright = orientation.observe({ width: f.width, height: f.height, screenAngle: f.screenAngle, t: f.t, raw: f.rawBuffer, screenAngleSince: f.screenAngleSince });
     inFlight = { width: f.width, height: f.height, screenAngle: f.screenAngle, upright };
     try {
       await app.engine.processFrame(input);

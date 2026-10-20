@@ -6,7 +6,8 @@
  *    captured at another θ is rotated by `canonicalRotation(θ₀, θ)` CLOCKWISE quarter turns so
  *    every keyframe shares one image frame and R_cam_device = cameraFromDevice(θ₀);
  *  - frames within `settleMs` (500 ms) of a UI rotation are dropped (Safari 26 transient
- *    mis-rotation);
+ *    mis-rotation); the rotation is dated by `FrameInput.screenAngleSince` when given (the
+ *    FramePump, which skips that window itself), else by the first frame with the new θ;
  *  - RAW sensor buffers: iOS pixel buffers are sensor-landscape and only rotated by metadata.
  *    A landscape bitmap in a portrait UI (θ ∈ {0, 180}) is such a raw buffer, which is upright
  *    for θ = 90 — it is treated as captured at θ = 90. A portrait bitmap in a landscape UI is
@@ -96,10 +97,14 @@ export class OrientationTracker {
     this.rawDelivery = raw;
   }
 
-  /** Decide for one frame (`width`/`height` = bitmap size as submitted; `raw` = declared raw buffer). */
-  classify(f: { width: number; height: number; screenAngle: number; t: number; raw?: boolean }): OrientationVerdict {
+  /**
+   * Decide for one frame (`width`/`height` = bitmap size as submitted; `raw` = declared raw buffer;
+   * `screenAngleSince` = when θ took its value, FrameInput.screenAngleSince).
+   */
+  classify(f: { width: number; height: number; screenAngle: number; t: number; raw?: boolean; screenAngleSince?: number }): OrientationVerdict {
     const ui = snap(f.screenAngle);
-    if (this.lastUI !== null && ui !== this.lastUI) this.changeT = f.t;
+    const since = f.screenAngleSince;
+    if (this.lastUI !== null && ui !== this.lastUI) this.changeT = since !== undefined && Number.isFinite(since) && since <= f.t ? since : f.t;
     this.lastUI = ui;
     if (Number.isFinite(f.t) && f.t - this.changeT < this.settleMs) return { ok: false, reason: `within ${this.settleMs} ms of a UI rotation` };
     if (f.raw) {

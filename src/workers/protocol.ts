@@ -103,6 +103,12 @@ export interface FrameInput {
   t: number;
   /** θ of ARCHITECTURE §2 when the frame was captured. */
   screenAngle: ScreenAngle;
+  /**
+   * performance.now() time θ took the value `screenAngle` (FramePump: when the UI rotated; −∞: no
+   * rotation seen). The engine's settle window after a rotation starts there, else at the first
+   * frame with the new θ.
+   */
+  screenAngleSince?: number;
   /** IMU samples since the previous frame. */
   imu: ImuSample[];
   geo?: GeoFix | null;

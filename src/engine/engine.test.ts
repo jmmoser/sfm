@@ -163,6 +163,32 @@ describe('frame ingest', () => {
     expect(v).toMatchObject({ ok: true, k: 3 });
   });
 
+  it('dates a UI rotation by screenAngleSince when the producer knows it (FramePump: settled already)', () => {
+    const portrait = (o: OrientationTracker): void => {
+      o.classify({ width: 480, height: 640, screenAngle: 0, t: 0 });
+      o.classify({ width: 480, height: 640, screenAngle: 0, t: 90 });
+    };
+    const landscape = (t: number, screenAngleSince?: number) => ({ width: 640, height: 480, screenAngle: 90, t, screenAngleSince });
+    // rotated at 1000 ms, the pump skipped [1000, 1500) itself: its first frame at the new θ is kept
+    const o = new OrientationTracker(500);
+    portrait(o);
+    expect(o.classify(landscape(1500, 1000)).ok).toBe(true);
+    // a producer that does not settle itself: the window still starts at the rotation
+    const d = new OrientationTracker(500);
+    portrait(d);
+    expect(d.classify(landscape(1200, 1000)).ok).toBe(false);
+    expect(d.classify(landscape(1400, 1000)).ok).toBe(false);
+    expect(d.classify(landscape(1500, 1000)).ok).toBe(true);
+    // without it (or with a time after the frame, or none known) the first frame at the new θ dates the rotation
+    for (const since of [undefined, 1600, -Infinity, NaN]) {
+      const p = new OrientationTracker(500);
+      portrait(p);
+      expect(p.classify(landscape(1500, since)).ok).toBe(false);
+      expect(p.classify(landscape(1900)).ok).toBe(false);
+      expect(p.classify(landscape(2000)).ok).toBe(true);
+    }
+  });
+
   it('rotates RGBA frames into the canonical orientation and maps the overlay back', () => {
     const W = 40,
       H = 30;

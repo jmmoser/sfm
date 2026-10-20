@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import type { ImuSample } from '../core/types';
+import { mergeGeoFixes } from '../engine/persistence';
 import type { FrameCallback, FrameMeta } from './camera';
 import { ScreenAngleTracker, type ScreenAngle } from './frame-orientation';
 import { FramePump, type PumpFrame } from './frame-pump';
+import { GeoSensor } from './geolocation';
 
 class FakeBitmap {
   closed = false;
@@ -123,6 +125,31 @@ describe('FramePump', () => {
     expect(frames.length).toBe(3);
   });
 
+  it('delivers the raw GPS fix nearest in time with its own timestamp (never restamped to the frame time)', async () => {
+    const cam = new FakeCamera();
+    const geo = new GeoSensor({ geolocation: null });
+    // fix k at t = k·1000 ms (1 Hz), delivered 200 ms late
+    const deliverFix = (k: number): void => void geo.handlePosition({ timestamp: k * 1000, coords: { latitude: 47 + k * 1e-5, longitude: 8, accuracy: 5, altitude: null, altitudeAccuracy: null } }, k * 1000 + 200, k * 1000 + 200);
+    const frames: PumpFrame[] = [];
+    const pump = new FramePump({ camera: cam, geo, angleTracker: new ScreenAngleTracker({ read: () => 0 }), targetHz: 10, isHidden: () => false, consumer: (f) => void frames.push(f) });
+    pump.start();
+    // 10 Hz frames over a 5 s walk
+    for (let t = 0; t <= 5000; t += 100) {
+      if (t % 1000 === 200) deliverFix((t - 200) / 1000);
+      cam.emit(t);
+      await sleep(0);
+    }
+    pump.stop();
+    expect(frames).toHaveLength(51);
+    // frame at 1300 ms: fixes at 0 and 1000 so far → the fix of 1000 ms as it is
+    const f1300 = frames.find((f) => f.t === 1300)!;
+    expect(f1300.geo).toEqual(geo.fixes[1]);
+    expect(f1300.geo!.t).toBe(1000);
+    // every delivered fix is one of the sensor's, and together they are all the fixes (no restamped entries)
+    for (const f of frames) if (f.geo) expect(geo.fixes).toContainEqual(f.geo);
+    expect(mergeGeoFixes([], frames.flatMap((f) => (f.geo ? [f.geo] : [])))).toEqual(geo.fixes);
+  });
+
   it('skips frames right after a UI rotation and frames whose aspect contradicts it', async () => {
     const cam = new FakeCamera();
     let angle: ScreenAngle = 0;
@@ -156,6 +183,31 @@ describe('FramePump', () => {
     expect(frames[1].screenAngle).toBe(90);
     expect(Array.from(frames[1].R_cam_device)).toEqual([0, -1, 0, -1, 0, 0, 0, 0, -1]);
     pump.stop();
+  });
+
+  it('passes the time the UI rotation took its value, so the engine does not settle a second time', async () => {
+    const cam = new FakeCamera();
+    let angle: ScreenAngle = 0;
+    const tracker = new ScreenAngleTracker({ read: () => angle });
+    const frames: PumpFrame[] = [];
+    const pump = new FramePump({ camera: cam, angleTracker: tracker, targetHz: 1000, isHidden: () => false, consumer: (f) => void frames.push(f) });
+    pump.start();
+    cam.w = 480;
+    cam.h = 640;
+    cam.emit(1);
+    await sleep(0);
+    angle = 90;
+    const since = performance.now() - 600; // rotated 600 ms ago: settled
+    tracker.poll(since);
+    cam.w = 640;
+    cam.h = 480;
+    cam.emit(2);
+    await sleep(0);
+    pump.stop();
+    expect(frames.map((f) => [f.screenAngle, f.screenAngleSince])).toEqual([
+      [0, -Infinity],
+      [90, since],
+    ]);
   });
 
   it('closes the bitmap when the consumer throws and keeps running', async () => {
