@@ -11,8 +11,9 @@
  *    per row), capped by `maxPixelViewsPerSubmit`;
  *  - every dispatch increments a sentinel counter; if the count read back with the
  *    results does not match the number of submissions (work silently dropped while
- *    the page was hidden) the whole computation is retried (max 2×, every source
- *    uploaded again: uploads may have been dropped too) and then fails;
+ *    the page was hidden), or a readback chunk lacks its fresh stamp (a dropped copy
+ *    leaves the staging buffer's previous contents), the whole computation is retried
+ *    (max 2×, every source uploaded again: uploads may have been dropped too) and then fails;
  *  - all pipelines are compiled in `create()` (compilation blocks the GPU process
  *    on Safari 26), raced against device loss and a timeout.
  * Textures and buffers are reused across compute() calls. Source grey images and source depth
@@ -243,6 +244,8 @@ export class PatchMatchGPU {
   private ts: Timestamps | null = null;
   private lost = false;
   private destroyed = false;
+  /** Stamp of the last readback chunk (status[1], copied with every chunk: see readOutputs). */
+  private readStamp = 0;
   private busy: Promise<unknown> = Promise.resolve();
   /** Timings of the last compute() call. */
   lastTimings: PatchMatchGPUTimings | null = null;
@@ -524,8 +527,10 @@ export class PatchMatchGPU {
 
   /**
    * Finalised outputs (`costs` = depth, `views` = octahedral normal, `photo` = cost) → DepthMap,
-   * in row chunks through the staging buffer; the first chunk also carries the dropped-work
-   * sentinel, which is checked before the rest is read.
+   * in row chunks through the staging buffer. Every chunk carries the status words: the
+   * dropped-work sentinel (dispatches executed) and a fresh stamp written just before the chunk,
+   * so a dropped readback copy (mapAsync still resolves) cannot pass off the staging buffer's
+   * previous contents — an earlier call's output or this call's previous chunk.
    */
   private async readOutputs(res: Resources, W: number, H: number, submits: number, range: DepthRange): Promise<DepthMap> {
     const n = W * H;
@@ -535,9 +540,13 @@ export class PatchMatchGPU {
     const staging = res.staging;
     const rowsPerChunk = Math.floor((staging.size - 16) / (12 * W));
     if (rowsPerChunk < 1) {
-      // staging smaller than one row (tests): buffer by buffer
+      // staging smaller than one row (> 700 k px wide at the default size): buffer by buffer,
+      // only the status read is stamped
       const status = new Uint32Array(4);
+      this.readStamp = (this.readStamp % 0xfffffff0) + 1;
+      this.device.queue.writeBuffer(this.statusBuf, 4, new Uint32Array([this.readStamp]));
       await this.readInto(this.statusBuf, status, staging);
+      if (status[1] !== this.readStamp) throw new DroppedWorkError('PatchMatchGPU: a readback was not executed (page hidden?)');
       if (status[0] !== submits) throw new DroppedWorkError(`PatchMatchGPU: ${submits - status[0]} of ${submits} command buffers were not executed (page hidden?)`);
       await this.readInto(res.costs, depth, staging);
       await this.readInto(res.views, packed, staging);
@@ -547,8 +556,11 @@ export class PatchMatchGPU {
         const rows = Math.min(rowsPerChunk, H - y0);
         const off = 4 * y0 * W;
         const len = 4 * rows * W;
+        this.readStamp = (this.readStamp % 0xfffffff0) + 1;
+        const stamp = this.readStamp;
+        this.device.queue.writeBuffer(this.statusBuf, 4, new Uint32Array([stamp]));
         const enc = this.device.createCommandEncoder({ label: 'pm-readback' });
-        if (y0 === 0) enc.copyBufferToBuffer(this.statusBuf, 0, staging, 0, 16);
+        enc.copyBufferToBuffer(this.statusBuf, 0, staging, 0, 16);
         enc.copyBufferToBuffer(res.costs, off, staging, 16, len);
         enc.copyBufferToBuffer(res.views, off, staging, 16 + len, len);
         enc.copyBufferToBuffer(res.photo, off, staging, 16 + 2 * len, len);
@@ -560,12 +572,14 @@ export class PatchMatchGPU {
           throw new Error(`PatchMatchGPU: readback failed (device lost?): ${(e as Error)?.message ?? e}`);
         }
         const m = staging.getMappedRange(0, 16 + 3 * len);
-        if (y0 === 0) {
-          const executed = new Uint32Array(m, 0, 1)[0];
-          if (executed !== submits) {
-            staging.unmap();
-            throw new DroppedWorkError(`PatchMatchGPU: ${submits - executed} of ${submits} command buffers were not executed (page hidden?)`);
-          }
+        const [executed, got] = new Uint32Array(m, 0, 2);
+        if (got !== stamp) {
+          staging.unmap();
+          throw new DroppedWorkError('PatchMatchGPU: a readback was not executed (page hidden?)');
+        }
+        if (executed !== submits) {
+          staging.unmap();
+          throw new DroppedWorkError(`PatchMatchGPU: ${submits - executed} of ${submits} command buffers were not executed (page hidden?)`);
         }
         const i0 = y0 * W;
         depth.set(new Float32Array(m, 16, rows * W), i0);

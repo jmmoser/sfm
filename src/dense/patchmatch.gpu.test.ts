@@ -290,6 +290,61 @@ describe('PatchMatchGPU', () => {
     }
   });
 
+  it('a dropped readback never returns stale staging contents (previous call or chunk)', async () => {
+    const ds = makeSyntheticDataset('near', { width: 96, height: 72, numSources: 4, supersample: 1 });
+    // fixed bands: both references take the same number of submissions (equal sentinels)
+    const opts = { iterations: 2, targetSubmitMs: 0 };
+    const srcB = [ds.views[0], ds.views[2], ds.views[3], ds.views[4]];
+    const saved = PatchMatchGPU.stagingBytes;
+    const warn = console.warn;
+    console.warn = () => undefined;
+    try {
+      for (const stagingBytes of [saved, 4096]) {
+        PatchMatchGPU.stagingBytes = stagingBytes; // 4096: several row chunks per readback
+        const ref = await PatchMatchGPU.create(ctx!);
+        const sim = await PatchMatchGPU.create(ctx!);
+        try {
+          await ref.compute(ds.views[0], ds.views.slice(1), ds.range, opts);
+          const want = await ref.compute(ds.views[1], srcB, ds.range, opts);
+          const a = await sim.compute(ds.views[0], ds.views.slice(1), ds.range, opts);
+          expect(Array.from(want.depth)).not.toEqual(Array.from(a.depth));
+          // the first readback chunk of B dropped: the staging buffer still holds A's last chunk
+          const got = await withDroppedWork(async (s) => {
+            s.dropReadbacks = 1;
+            const out = await sim.compute(ds.views[1], srcB, ds.range, opts);
+            expect(s.dropped).toBe(1);
+            return out;
+          });
+          expect(Array.from(got.depth)).toEqual(Array.from(want.depth));
+          expect(Array.from(got.cost)).toEqual(Array.from(want.cost));
+          expect(sim.lastTimings!.retries).toBe(1);
+          if (stagingBytes !== saved) {
+            // a later chunk dropped: the staging buffer holds the previous chunk of this call
+            const got2 = await withDroppedWork(async (s) => {
+              const enc = ctx!.device.createCommandEncoder;
+              let seen = 0;
+              ctx!.device.createCommandEncoder = (d?: GPUCommandEncoderDescriptor): GPUCommandEncoder => {
+                if (d?.label === 'pm-readback' && ++seen === 2) s.dropReadbacks = 1;
+                return enc.call(ctx!.device, d);
+              };
+              const out = await sim.compute(ds.views[1], srcB, ds.range, opts);
+              expect(s.dropped).toBe(1);
+              return out;
+            });
+            expect(Array.from(got2.depth)).toEqual(Array.from(want.depth));
+            expect(sim.lastTimings!.retries).toBe(1);
+          }
+        } finally {
+          ref.destroy();
+          sim.destroy();
+        }
+      }
+    } finally {
+      PatchMatchGPU.stagingBytes = saved;
+      console.warn = warn;
+    }
+  });
+
   it('supports 16 source views, truncates more, and reuses / reallocates resources across sizes', async () => {
     const ds = makeSyntheticDataset('near', { width: 80, height: 60, numSources: 17 });
     const warn = console.warn;
