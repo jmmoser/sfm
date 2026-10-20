@@ -454,6 +454,8 @@ describe('parseNvsArgs', () => {
     const d = parseNvsArgs(['yard-real', 'r']);
     expect(d).toMatchObject({ renderers: null, views: 24, maxSize: 'dense', pose: 'relative', focal: 'relative', rs: 'auto', saveImages: false, ssim: true });
     expect(parseNvsArgs(['a', 'b', '--frames', '3,9']).frames).toEqual([3, 9]);
+    // an empty item (Number('') is 0) or a repeated frame would change the scored view set silently
+    for (const bad of ['12,37,', ',', '12,12', 'a,1', '-1,2']) expect(() => parseNvsArgs(['a', 'b', '--frames', bad])).toThrow(NvsArgError);
     expect(parseNvsArgs(['a', 'b', '--test-dataset', 'a-up'])).toMatchObject({ testDataset: 'a-up', pose: 'sim3' });
     expect(parseNvsArgs(['a', 'b', '--test-dataset', 'a-up', '--pose', 'relative']).pose).toBe('relative');
     expect(d.testDataset).toBeNull();

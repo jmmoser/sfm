@@ -66,8 +66,11 @@ export function parseNvsArgs(argv) {
     };
     const intList = () => {
       const v = next();
-      const list = v.split(',').map((s) => Number(s.trim()));
-      if (!list.length || list.some((x) => !Number.isInteger(x) || x < 0)) throw new NvsArgError(`${a} needs comma-separated integers ≥ 0, got ${v}`);
+      const parts = v.split(',').map((s) => s.trim());
+      const list = parts.map(Number);
+      // (Number('') is 0: an empty item, e.g. a trailing comma, would add frame 0)
+      if (parts.some((s) => s === '') || list.some((x) => !Number.isInteger(x) || x < 0)) throw new NvsArgError(`${a} needs comma-separated integers ≥ 0, got ${v}`);
+      if (new Set(list).size !== list.length) throw new NvsArgError(`${a} has duplicate values, got ${v}`);
       return list;
     };
     switch (a) {
