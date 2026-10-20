@@ -215,6 +215,8 @@ MockEngine implements the same calls (a fast fake run whose model is one Gaussia
 Home (sessions, new scan, diagnostics) → Setup (mode, quality) → Permissions
 (one tap: motion → camera → location) → Capture (video, guidance, live sparse
 view, counters, finish) → Processing (stages + progress + cancel) → Viewer
-(points / mesh / cameras, EDL, measure, export, run dense / mesh). Not wired yet: the splat
-stage (a "Gaussian splats" build item + progress with `SplatTrainingDetail`, a splat renderer in the
-viewer fed by `splatModel`, the 'ply-splat' export row — `exportAvailability` already knows the format).
+(splats / points / mesh layer pill, cameras, EDL, measure, export, run dense / mesh / photoreal). The splat
+stage runs from the viewer itself ("Photoreal model" in the Build sheet → `splat` with a progress card fed by
+`SplatTrainingDetail`, Cancel, Resume after an interruption), the model is fetched with `splatModel` into the
+viewer's WebGPU splat layer and shown by default, and the export sheet offers 'ply-splat' (ARCHITECTURE §6
+"Splat layer in the viewer").
