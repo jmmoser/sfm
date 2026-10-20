@@ -74,8 +74,9 @@ export function buildObjectScene(o: Partial<ObjectSceneOptions> = {}): SynthScen
       const pw = 0.45 + 0.5 * pr.next();
       const ph = pw * (0.7 + 0.7 * pr.next());
       if (x + pw > roomHalf - 0.2) break;
-      // skip the region behind the bookshelf (west wall) / door (east wall)
-      const blocked = (i === 3 && x < 1.0 && x + pw > -1.0) || (i === 2 && x + pw > 0.6 && x < 1.7);
+      // skip the region behind the bookshelf (west wall), the door (east wall, along-wall x =
+      // −world y) and the window (north wall)
+      const blocked = (i === 3 && x < 1.0 && x + pw > -1.0) || (i === 2 && x + pw > -1.7 && x < -0.6) || (i === 0 && x + pw > -1.95 && x < -0.45);
       if (!blocked) {
         const style = pr.pick(styles);
         const tex = b.texture(T.posterTexture(px(Math.round(1024 * pw)), px(Math.round(1024 * ph)), pr.derive(`p${x}`), style));

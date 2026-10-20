@@ -18,6 +18,7 @@ import {
   FrontSide,
   LinearFilter,
   LinearMipmapLinearFilter,
+  Matrix3,
   Matrix4,
   Mesh,
   MeshBasicMaterial,
@@ -220,11 +221,12 @@ export function bakeShading(g: BufferGeometry, world: Matrix4, light: Vector3, a
   const pAttr = g.getAttribute('position');
   const n = pAttr.count;
   const colors = new Float32Array(3 * n);
-  const nm = new Matrix4().copy(world).invert().transpose();
+  // 3×3 normal matrix: applyMatrix4 would divide the normal by a w that depends on the translation
+  const nm = new Matrix3().getNormalMatrix(world);
   const v = new Vector3(),
     p = new Vector3();
   for (let i = 0; i < n; i++) {
-    v.set(nAttr.getX(i), nAttr.getY(i), nAttr.getZ(i)).applyMatrix4(nm).normalize();
+    v.set(nAttr.getX(i), nAttr.getY(i), nAttr.getZ(i)).applyMatrix3(nm).normalize();
     // n·L with a soft wrap so faces turned away are not flat black.
     const ndl = v.dot(light);
     let s = ambient + (1 - ambient) * Math.max(0, 0.15 + 0.85 * ndl);
