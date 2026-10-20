@@ -313,6 +313,33 @@ describe('polyRealRoots', () => {
     expectRoots(polyRealRoots(polyFromRoots([-1, -1, 1, 1, 2])), [-1, 1, 2], 1e-6);
   });
 
+  it('Newton polish does not jump from an exact multiple root to another root (it used to drop the multiple root)', () => {
+    // At a multiple root p and p′ are both rounding noise, so the step p/p′ is arbitrary; one that
+    // landed near another root was accepted (|p| no larger) and the two copies were merged.
+    expectRoots(solveQuartic(1, 17.5, 90.5, 66.5, -367.5), [-7, -5, 1.5], 1e-7); // (x+7)²(x+5)(x−1.5)
+    expectRoots(polyRealRoots(polyFromRoots([3, 8, 8, -7, -7, -6, -6])), [-7, -6, 3, 8], 1e-6);
+    expectRoots(polyRealRoots(Array.from(polyFromRoots([-39, -39, -23]), (v) => 3 * v)), [-39, -23], 1e-7);
+    expectRoots(polyRealRoots(polyFromRoots([-8, -4, 1, 1, 1, 2, 3, 3])), [-8, -4, 1, 2, 3], 1e-4);
+    // Small integer roots with multiplicities 1..3: the distinct-root count is exact, on the default
+    // range and on a bracket around the roots.
+    const rng = new Rng(18);
+    for (let trial = 0; trial < 2000; trial++) {
+      const roots: number[] = [];
+      const nd = 2 + rng.int(3);
+      while (roots.length < nd) {
+        const x = rng.int(21) - 10;
+        if (!roots.includes(x)) roots.push(x);
+      }
+      roots.sort((a, b) => a - b);
+      const all = roots.flatMap((x) => Array<number>(1 + rng.int(3)).fill(x));
+      if (all.length < 3 || all.length > 9) continue;
+      const p = polyFromRoots(all);
+      const tol = all.length - roots.length > 2 ? 1e-3 : 1e-5;
+      expectRoots(polyRealRoots(p), roots, tol);
+      expectRoots(polyRealRoots(p, roots[0] - 0.5, roots[nd - 1] + 0.5), roots, tol);
+    }
+  });
+
   it('respects [lo, hi]', () => {
     const p = polyFromRoots([-3, -1, 0.5, 2, 4]);
     expectRoots(polyRealRoots(p, -2, 3), [-1, 0.5, 2], 1e-13);
@@ -395,6 +422,16 @@ describe('polyRealRoots', () => {
     expectRoots(polyRealRootsSturm(polyMul(polyFromRoots([2, 2]), [1, 0, 1])), [2], 1e-7);
     expectRoots(polyRealRootsSturm([0, 1, -1, 0, 0]), [0, 1], 1e-15);
     expectRoots(polyRealRootsSturm(polyFromRoots([-3, -1, 0.5, 2, 4]), -2, 3), [-1, 0.5, 2], 1e-13);
+  });
+
+  it('Sturm variant: a multiple root exactly at lo or hi does not zero the Sturm count there', () => {
+    // Every chain member vanishes at a multiple root, so the count at that end was 0: the other
+    // roots were dropped (at lo) or found twice (at hi).
+    expectRoots(polyRealRootsSturm(polyFromRoots([1, 1, 2, 3]), 1, 3), [1, 2, 3], 1e-6);
+    expectRoots(polyRealRootsSturm(polyFromRoots([-2, -2, 1, 4, 6]), -2, 8), [-2, 1, 4, 6], 1e-6);
+    expectRoots(polyRealRootsSturm(polyFromRoots([-2, -2, -2, 8]), -Infinity, -2), [-2], 1e-12);
+    expectRoots(polyRealRootsSturm(polyFromRoots([1, 1, 2, 3, 3]), 1, 3), [1, 2, 3], 1e-6);
+    expect(polyRealRootsSturm(polyFromRoots([1, 1, 1]), 1, 1)).toEqual([1]);
   });
 
   it('timing (degree 10, as in the 5-point solver)', () => {

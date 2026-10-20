@@ -60,4 +60,13 @@ describe('robust losses', () => {
     expect(lossRho(LOSS_SOFT_L1, 3, 1)).toBeCloseTo(2, 12);
     expect(lossWeight(LOSS_CAUCHY, 3, 1)).toBeCloseTo(0.25, 12);
   });
+
+  it("ρ' is not clamped at the single-precision minimum for huge s (it stays consistent with ρ)", () => {
+    // The floor was FLT_MIN (1.2e-38), so ρ'·r was ~1e-38·r for an outlier with r ≳ 1e19: a bogus
+    // gradient term that swamps the inliers' once r ≳ 1e40.
+    expect(Math.abs(lossWeight(LOSS_CAUCHY, 1e100, 1) / 1e-100 - 1)).toBeLessThan(1e-12);
+    expect(Math.abs(lossWeight(LOSS_HUBER, 1e100, 1) / 1e-50 - 1)).toBeLessThan(1e-12);
+    expect(Math.abs(lossWeight(LOSS_SOFT_L1, 1e100, 1) / 1e-50 - 1)).toBeLessThan(1e-12);
+    for (const k of [LOSS_HUBER, LOSS_CAUCHY, LOSS_SOFT_L1] as LossKind[]) expect(lossWeight(k, 1e308, 1e-300)).toBeGreaterThan(0);
+  });
 });

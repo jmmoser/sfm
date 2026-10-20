@@ -604,6 +604,20 @@ describe('robustness', () => {
     }
   });
 
+  it('Cauchy absorbs one huge but finite garbage pixel (the IRLS weight floor used to stall every step)', () => {
+    const s = makeSyntheticBA({ numPoses: 8, numPoints: 300, layout: 'orbit', trackWindow: 3, noisePx: 0.3, seed: 92 });
+    fixGaugeTwoPoses(s.problem);
+    perturbBA(s, { rotSigma: 0.003, centreSigma: 0.01, pointSigma: 0.01 });
+    for (const uv of [1e40, 1e100, 1e150]) {
+      const q = cloneBAProblem(s.problem);
+      q.obsUV[2 * 6] = uv;
+      const r = bundleAdjust(q, { loss: 'cauchy', lossScalePx: 1 });
+      expect(r.successfulIterations, `uv ${uv}`).toBeGreaterThan(0);
+      expect(r.finalCost, `uv ${uv}`).toBeLessThan(0.2 * r.initialCost);
+      expect(syntheticErrors({ ...s, problem: q }).maxRotErr, `uv ${uv}`).toBeLessThan(2e-3);
+    }
+  });
+
   it('extreme loss scales do not produce NaN costs (tiny scale ≈ L1-like, huge scale ≈ trivial)', () => {
     const s = makeSyntheticBA({ numPoses: 6, numPoints: 150, layout: 'orbit', trackWindow: 2, noisePx: 0.5, seed: 93 });
     fixGaugeTwoPoses(s.problem);
