@@ -21,10 +21,15 @@ geo-referenced point cloud and mesh that you can measure and export.
 * **Dense reconstruction**: PatchMatch multi-view stereo on WebGPU (ACMH/ACMM-style, inverse-depth
   sampling for scenes from 0.2 m to 100 m), consistency-checked depth-map fusion, halo and sky
   filtering, TSDF meshing with marching cubes, and mesh simplification.
-* **Viewer**: three.js splat renderer with eye-dome lighting, mesh view, camera frustums, and a
-  tap-to-measure tool (metric when scale is known).
-* **Exports**: PLY (points and mesh), GLB, and a COLMAP text model with images in a ZIP. Exports go
-  through the iOS share sheet.
+* **Photoreal model**: 3D Gaussian Splatting trained on the phone in WebGPU (`src/splat`), seeded
+  from the metric dense cloud, with per-photo exposure / white-balance correction and MVS depth
+  supervision. On held-out views it scores about 31 dB PSNR, against about 9 dB for the mesh view
+  (e2e/README.md "Breakthrough results").
+* **Viewer**: the trained splats drawn with the trainer's own WebGPU rasteriser, a three.js point
+  view with eye-dome lighting, an unlit mesh view, camera frustums, and a tap-to-measure tool
+  (metric when scale is known).
+* **Exports**: PLY (points, mesh, and Gaussian splats in the common 3DGS layout), GLB, and a COLMAP
+  text model with images in a ZIP. Exports go through the iOS share sheet.
 * **Robust on iPhone**:
   * Memory planner that keeps the tab within ≤ 1.2 GB (iOS kills it at ~1.5–2 GB), with resume
     after the tab is killed.
@@ -57,7 +62,8 @@ and geolocation need a secure context.
    camera** brings the view back to the phone. The camera keeps
    running underneath, and the app remembers the choice for the next scan.
 4. Processing builds the sparse model and aligns it to gravity, scale and north. In the viewer you
-   can **Build dense cloud** and **Build mesh**, measure, and **Export**.
+   can **Build dense cloud**, **Build mesh** and a **Photoreal model** (Gaussian splats, about a
+   minute on an M4 at the fast preset), measure, and **Export**.
 
 The **Diagnostics** screen shows WebGPU limits, the camera list, IMU rate and sign checks, and
 storage. It also has a **Run benchmark** button that times GPU SIFT, matching, PatchMatch and bundle
@@ -94,7 +100,12 @@ npm run dev          # Vite dev server (desktop: http://localhost:5173; ?mock=1 
 npm run build        # typecheck + production build into dist/
 npm test             # unit tests (Node)
 npm run test:gpu     # WebGPU / DOM tests in headless Chromium (SwiftShader)
+E2E_GPU=host npm run test:gpu   # the same on the host's real GPU (installed Chrome; Metal on macOS)
 ```
+
+`E2E_GPU=host` works for every e2e tool too (`run-e2e.mjs`, `generate-synth.mjs`, `run-dense-gt.mjs`,
+`nvs.mjs`, `e2e/ui/*`): it runs the installed Google Chrome on the real GPU instead of SwiftShader,
+which is how the timings in e2e/README.md "Breakthrough results" were measured.
 
 To test on a phone you need HTTPS. Either:
 
@@ -149,6 +160,16 @@ white-balance drift and JPEG 0.85:
 
 Backyard completeness is limited by image resolution in the far field (0.23–0.34 even with exact poses).
 
+On a real GPU (Apple M4, Metal, `E2E_GPU=host`, fast preset, 800 px dense images; e2e/README.md "Breakthrough
+results"), with the photoreal stage and `e2e/nvs.mjs` scoring 24 held-out frames that were not keyframes:
+
+| | object-real | yard-real |
+|---|---|---|
+| full pipeline wall time, before → after (incl. the splat stage) | 236–245 s → 195 s | 180–194 s → 146 s |
+| refine / densify / splat stage (s) | 39.5 / 42.1 / 61.3 | 22.0 / 36.4 / 44.8 |
+| dense precision / median accuracy | 1.000 / 0.29 mm | 0.93 / 8.9 mm |
+| held-out view PSNR / SSIM: splats (new) vs lit mesh (old default) | 31.3 / 0.959 vs 8.7 / 0.530 | 31.0 / 0.871 vs 9.8 / 0.378 |
+
 ## How it works
 
 ```
@@ -163,7 +184,9 @@ UI ◀──────── progress / results ──────────
                                               │ self-calibrating BA → IMU/GPS/compass alignment
                                               │ dense: undistort → PatchMatch (photometric +
                                               │ geometric) → fusion → filters → TSDF mesh
-                                              └ exports: PLY · GLB · COLMAP ZIP
+                                              │ splat: dense cloud → 3D Gaussians → WebGPU training
+                                              │ (MCMC, colour correction, depth supervision)
+                                              └ exports: PLY · splat PLY · GLB · COLMAP ZIP
 ```
 
 * [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): conventions, module contracts, and per-module
@@ -179,6 +202,7 @@ UI ◀──────── progress / results ──────────
 | `src/features` | SIFT (CPU + WASM SIMD reference, WebGPU), GPU/CPU matching, guided matching |
 | `src/sfm` | feature database, correspondence graph, incremental + live mapper, keyframing, retrieval, gyro checks, rolling shutter, inertial / GPS / world alignment |
 | `src/dense` | PatchMatch MVS (WebGPU + CPU), view selection, fusion, halo/sky filters, TSDF, marching cubes, simplification |
+| `src/splat` | 3D Gaussian Splatting trainer and renderer in WGSL (projection, radix sorts, tile rasteriser forward / backward, SSIM loss, Adam, MCMC), CPU reference, 3DGS PLY |
 | `src/sensors` | camera capture, IMU normalisation (iOS sign fixes), compass + WMM2025, GPS, frame pump, permissions |
 | `src/engine`, `src/workers` | the photogrammetry engine, memory planner, persistence, worker RPC |
 | `src/core`, `src/gpu` | shared types, WebGPU device acquisition |

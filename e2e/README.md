@@ -1253,6 +1253,28 @@ and three.js's projection of their means).
 
 ## Breakthrough results (2026-10-20, Apple M4, Metal)
 
+**Final state** (`claude/breakthrough` after the review fixes and the depth-supervision default; `--tag final2`,
+one run per dataset, load 3.7–12 at start, every enforced check passes). The tables below are the earlier
+before / after comparison; the final runs agree with them within run-to-run noise:
+
+| fast preset, M4 | object-real | yard-real |
+|---|---|---|
+| pipeline total (s): before `eb131af` → final | 236.1–244.9 → 195.3 | 180.0–193.9 → 146.0 |
+| capture / refine / densify / mesh / splat (s) | 34.0 / 39.5 / 42.1 / 12.5 / 61.3 | 31.0 / 22.0 / 36.4 / 6.8 / 44.8 |
+| splat stage | 200 k Gaussians, 3000 it at 64.6 it/s, prepare 13.7 s, plan 863 MB (GPU 353 MB) | 200 k, 3000 it at 100.2 it/s, prepare 13.7 s, plan 810 MB (GPU 336 MB) |
+| ATE / extent, rotation p50, scale error | 2.88e-4, 0.049°, −0.4 % | 3.06e-4, 0.072°, +1.0 % |
+| dense P / C / F, accuracy p50 | 1.000 / 0.997 / 0.998, 0.29 mm | 0.933 / 0.396 / 0.557, 8.9 mm |
+| held-out full PSNR / SSIM: splat vs `mesh-lit` (old default) | **31.29 / 0.959** vs 8.65 / 0.530 | **31.00 / 0.871** vs 9.81 / 0.378 |
+| held-out covered PSNR: splat / `mesh-unlit` / `points` | 30.80 / 28.64 / 24.01 | 30.89 / 26.73 / 28.06 |
+| off-trajectory full PSNR, splat (`mesh-lit`) | −5 cm 30.49 (8.97), +5 cm 28.95 (8.39), +12 cm 27.04 (9.55), +25 cm 22.23 (10.73) | in 25.55 (8.97), out 28.07 (10.22), +0.75 m 21.29 (8.91), +1.5 m 18.80 (8.37) |
+| off-trajectory `--common` PSNR, splat vs `mesh-unlit` | 29.70 / 30.06 / 29.50 / 28.03 vs 27.53 / 28.39 / 28.49 / 28.34 | 30.45 / 29.00 / 29.01 / 27.08 vs 26.43 / 26.26 / 26.40 / 25.13 |
+
+```sh
+E2E_GPU=host node e2e/run-e2e.mjs object-real --engine worker --splat --nvs --tag final2      # and yard-real
+E2E_GPU=host node e2e/nvs.mjs object-real e2e/out/e2e/object-real-final2 --test-dataset object-real-up12 \
+  --common --renderers mesh-lit,mesh-unlit,splat                                            # each test set
+```
+
 Final before / after measurement of the `claude/breakthrough` work (engine splat stage, faster refine,
 footprint-adaptive dense). **Before** is the user's main at `eb131af` plus only the `E2E_GPU=host` launch patch
 (`bf55e6c`, cherry-picked; no pipeline change). **After** is `claude/breakthrough` at `7e6169c` with the measurement
