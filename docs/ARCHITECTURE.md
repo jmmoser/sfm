@@ -544,10 +544,12 @@ and extra methods that keep the documented call working are not listed.
    quality, user guidance.
 
 **Refine (after capture)**: extra pairs (sequential window, vocabulary-tree
-retrieval for loop closure, spatial neighbours) → verify → full incremental SfM
-from scratch on the enriched graph (keep the better of live/offline model) → global
+retrieval for loop closure, spatial neighbours) → verify (pairs and vocabulary on CPU helper
+workers) → refined live model → only when it is unhealthy, a full incremental SfM from scratch
+on the enriched graph (keep the better of live/offline model) → global
 BA with self-calibration → retriangulate → final BA → inertial alignment (time
-offset, gravity, metric scale), GPS Sim3 alignment, compass yaw → world frame per §2.
+offset, gravity, metric scale), GPS Sim3 alignment, compass yaw → world frame per §2
+(§6 "Refine performance").
 
 **Dense**: undistort keyframes (≤ 1600 px by preset) → source-view selection →
 PatchMatch (photometric) for all views → PatchMatch (geometric consistency) →
@@ -2946,3 +2948,64 @@ Every web platform API, JS built-in, CSS feature, WGSL construct and WebAssembly
   changed; use `'hidden'` if that matters); `npm run dev` binds all interfaces (phone testing) and serves the repository
   to the LAN; on a shared origin (`<user>.github.io/<repo>/`) every other project of that user can read this app's
   IndexedDB (scans, photos, GPS fixes) and caches — deploy on a dedicated origin (custom domain) for real use.
+
+### Refine performance (2026-10, Apple M4 / Metal; amends §5 "Refine" and the `src/ba`, `src/sfm` core and `src/engine` notes above)
+
+* **Where the time went** (e2e worker runs on the real GPU, `E2E_GPU=host`, fast preset, no dense, host load ≈ 6;
+  `stats.*Ms` below): object-real refine 153 s = matching 27 (vocabulary 9: k-means 2 + quantising 90 keyframes 7; CPU
+  verification 11.5; waiting for the GPU matcher 6) + reconstruction 125 (live refinement 1.5, rolling shutter 37 —
+  28 subset BAs 30 + 2 re-adjustments 7 —, offline SfM 59, principal point 3, per-image focal 24); yard-real 97 s =
+  32 + 64 (offline SfM 42). All CPU, one thread: BAs everywhere, the offline SfM about half of the reconstruction.
+* **Offline SfM only for an unhealthy live model** (`liveModelHealth` in `engine/refine.ts`, `stats.offlineSfM` with the
+  reason; `EngineConfig.refineOfflineSfM: 'always'` = before). The from-scratch SfM is the independent check that rescued
+  live models made of fragments (gyro breaks), with misplaced or unregistered keyframes, or with an unclosed loop; a
+  live model without those symptoms was kept in every run (it ties with the offline one). Healthy = every keyframe
+  registered, ≥ 20 images, verified gyro with no breaks / outliers, ≥ 70 % explained correspondences, and no unclosed
+  loop: `splitPairs` counts the verified correspondences the model keeps on DIFFERENT 3-D points on mostly-split
+  pairs (≥ max(15, 25 %) of the pair) — in total (≤ max(1000, 1.5 %)) and on loop-like ones whose points land
+  8 px … 0.4 f from the other feature (≤ max(150, 0.25 %)). Measured: closed yard-real live / offline models 950–1940
+  split / 60–190 loop-like of 168 k correspondences, object-real 0 / 0; unclosed live models (live retrieval and
+  spatial pairs off, `livePairs: {retrieval: 0, spatial: 0}`, or a loaded host; the loop closes live in some runs, not in
+  others) 2950–5650 split, ≥ 1200 loop-like when the gap is within 0.4 f (gaps 12–15 px, 50–255 px; rotation 0–8° off
+  the model's; a gap beyond it: 98 loop-like, caught by the split total) — the offline model then won (ATE 2.3–2.5e-4
+  vs ≈ 3e-4). False pairs on repeated structure are split too but sporadic and mostly hundreds to
+  thousands of pixels off. Any doubt runs the offline SfM: a wrong "unhealthy" only costs time. Without IMU (no
+  verified gyro) it always runs.
+* **Resumable sliced BA** (`BundleAdjuster` in `ba/solver.ts`; `bundleAdjust` is `new BundleAdjuster(…).run()`):
+  `run(pause)` iterates until the solve ends or `pause()` asks to yield after an LM iteration; the next `run` continues
+  with the same structure, linearisation, λ / ν and iteration count. `adjustGlobalBundleSliced` builds the problem once
+  (own copies of the observation arrays) and yields every `globalBASliceMs` between iterations instead of rebuilding the
+  problem, the solver structure and the linearisation for every slice — results bit-identical to the old slicing and
+  to one uninterrupted solve wherever the yields fall, and the "cut after 3 × slice" exception is gone (Node, 90-image
+  orbit, 152 k observations: 3.0–3.9 → 2.3–2.5 s per global BA).
+* **BA kernels**: the Schur elimination keeps a point's pose row block Y_k in registers for all its column blocks
+  (bit-identical); `SkylineCholesky.factor` computes two rows × two columns per step where the envelopes allow
+  (rows / columns of one parameter block share their first column): dense 541² 79 → 38 ms, 1200² 939 → 375 ms (Node).
+  The rolling-shutter subset BA (≈ 540 reduced parameters, dense) spent ≈ 60 % of its time in the factorisation.
+* **Rolling-shutter search** (`ba`-bound: one subset BA per hypothesis): the ±25 ms probes are evaluated only along the
+  direction clearly best at ±10 ms (≥ 10 % below the others and 0; else all, as before); a parabola vertex on the best
+  point is confirmed at ±tol/2 (Brent's minimum step) instead of bisecting the larger half one side per BA; and the
+  search is a coroutine (`rsSearchSteps`) whose independent hypotheses are scored in parallel on the CPU workers
+  (`searchRollingShutterBatched`, `RSBundleCost.toData / fromData`). Same estimate (Node bench −21.285 ms, curve
+  identical between the sequential and batched search); e2e 28 → 17–18 subset BAs in ≈ 10 rounds.
+* **Matching**: the one-deep GPU prefetch never overlapped — the queued match needs the event loop to encode and
+  submit, and the synchronous verification ran first; one macrotask (`yieldTask`, a message to ourselves, no 4 ms timer
+  clamp) after a match arrives lets the next one reach the GPU (GPU wait 7.6 → 2.2 s on object-real). **CPU helper
+  workers** (`engine/cpu-pool.ts`, `workers/cpu.worker.ts`; nested in the engine worker, Safari 15.5+; default hardware
+  threads − 2, ≤ 3, `EngineConfig.cpuWorkers`, 0 = off; created per refine and terminated after it) run the pair
+  verification, the vocabulary quantisation and the rolling-shutter hypotheses; results are applied in candidate order
+  (same database / graph); a failed job, or no `Worker` in scope (Node tests), runs on the engine thread.
+  `LiveSession.verifyInputs` splits `verifyPair`'s estimation inputs from its gyro gate.
+* **Not done, from the measurements**: pose-guided refine verification ('F' guide from the live poses / seeded
+  LO-MSAC). The verification time is in the retrieval candidates (object-real 8.6 of 10.1 s; yard-real 18 of 23 s, 11 s of it in pairs
+  that fail), which must stay unguided: on non-overlapping views a guided matcher returns band-consistent random
+  matches that then "verify" with the guide's own geometry (false pairs agreeing with the model). Sequential + spatial
+  pairs, where guidance would be safe, cost 1.5–2 s in total; seeding RANSAC does not lower its iteration count, which is
+  set by the inlier ratio (or the cap). Per-image focal rounds (cap 6) and the two rolling-shutter passes are kept: both
+  are accuracy-tuned (e2e/README "Real-capture robustness"); they only got faster BAs.
+* **Result** (e2e/README "Refine performance on Metal", back-to-back runs at load 8–11): refine object-real 232.8 →
+  44.8 s, yard-real 101.1 → 29.9 s (whole e2e 402 → 194 s, 200 → 135 s), accuracy and dense metrics unchanged within the
+  run-to-run noise; a live model with an open loop still gets the offline SfM.
+* **Remaining**: the per-image focal alternation (13 full BAs,
+  ≈ 16–24 s on object-real) and the rolling-shutter re-adjustments are sequential global BAs on the engine thread; the
+  next step is a parallel / GPU BA (point-partitioned linearisation + Schur on the workers or in WGSL).

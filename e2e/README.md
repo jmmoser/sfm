@@ -773,3 +773,60 @@ dense: the same with `--dense-size 480 --tag verify-dense480` (instead of `--no-
 | yard | 80/80 (live) | 2.19e-4 | 0.05 | +0.07 | 0.4 | +0.1 (imu+gps) | 0.01 | −0.64 | −24.9 | none | – | – | 140 (56 / –) |
 | object-real | 89/89 (live) | 2.84e-4 | 0.08 | +0.09 | 0.9 | −0.9 (imu) | 0.02 | −0.54 | −25.1 | cols −21.6 ms | 0.9995 / 0.9941 / 0.9968 | 0.31 / 1.06 mm | 943 (86 / 775) |
 | yard-real | 81/81 (live) | 3.17e-4 | 0.09 | +0.16 | 0.4 | +1.6 (imu+gps) | 0.06 | −0.93 | −25.1 | rows 22.0 ms | 0.961 / 0.351 / 0.515 | 8.8 / 47 mm | 843 (69 / 684) |
+
+### Refine performance on Metal (2026-10)
+
+Real GPU (`E2E_GPU=host`: headless Chrome 155 on an Apple M4, Metal), worker engine, fast preset, GPU features. The
+host was shared with other heavy jobs (load 6–19 during these runs, ±30–50 % timing noise), so the baseline and the
+final code ran back to back. Baseline = `19448e5` (the code before this work plus its timing stats); final = this
+branch (ARCHITECTURE §6 "Refine performance"). Per-phase times come from the new `stats` fields (`matchingMs`,
+`vocabularyMs`, `verifyMs`, `matchWaitMs`, `liveRefineMs`, `rsMs` / `rsSearchMs` / `rsReadjustMs` / `rsEvaluations`,
+`offlineSfMMs`, `principalPointMs`, `perImageFocalMs`; `offlineSfM` = run / skipped and why).
+
+```sh
+E2E_GPU=host node e2e/run-e2e.mjs object-real --engine worker --tag refine-final-dense       # dense + mesh
+E2E_GPU=host node e2e/run-e2e.mjs yard-real --engine worker --no-dense --tag refine-final2   # refine iterations
+```
+
+Wall time (s); reconstruction = live refinement / rolling shutter / offline SfM / principal point / per-image focal:
+
+| run (load) | refine | matching | reconstruction | total |
+|---|---|---|---|---|
+| object-real dense, baseline (9–11) | 232.8 | 30.3 | 201.8 = 3.3 / 80.4 / 63.7 / 3.7 / 50.5 | 402 |
+| object-real dense, final (10–11) | **44.8** | 12.4 | 31.9 = 1.1 / 12.1 / – / 2.0 / 16.5 | 194 |
+| yard-real dense, baseline (8–11) | 101.1 | 35.3 | 65.4 = 3.4 / 12.6 / 42.9 / 1.3 / 4.9 | 200 |
+| yard-real dense, final (8) | **29.9** | 15.4 | 14.2 = 2.9 / 6.2 / – / 1.0 / 3.9 | 135 |
+| object-real sparse, baseline ×2 (5–7 / 10–12) | 153.0 / 229.6 | 27.4 / 28.8 | 125.2 / 200.5 | 191 / 278 |
+| object-real sparse, final ×2 (9–10 / 13–19) | 53.9 / 149.9 | 13.5 / 26.0 | 40.1 / 122.7 | 113 / 211 |
+| yard-real sparse, baseline ×2 (7 / 10) | 96.7 / 115.0 | 32.1 / 43.9 | 64.2 / 70.6 | 135 / 175 |
+| yard-real sparse, final ×2 (9 / 16–19, offline SfM run) | 28.5 / 177.7 | 14.7 / 42.5 | 13.4 / 134.6 | 66 / 285 |
+
+Matching (final, object-real): vocabulary 3–4 s (was 9–10: quantisation on 3 CPU workers), verification on the workers
+(14–16 s of worker time; the engine thread waits ≈ 1 s for results), GPU matcher 6–9 s (was idle during every CPU
+verification). Rolling shutter: 17–18 subset BAs in ≈ 10 parallel rounds (was 28 in sequence). The second final yard-real
+sparse run is the slow path on purpose: under load 16–19 the live model left the loop open (50 px gap), the health check
+said so (`unclosed loop? 4322 correspondences on 69 loop-like and 5644 on 128 split pairs (limits 420 / 2517)`), the
+offline SfM ran and won (87.4 vs 83.1 % explained) — what the baseline does in that case.
+
+Accuracy (same runs; every `thresholds.json` check passes as before — the yard-real dense accuracy p50 ≤ 2 cm check fails
+for both, 25 / 24 mm, as it already did in the pre-work Metal run):
+
+| run | reg | ATE / extent | rot° p50 | focal % | pp px | scale % | grav° | head° | Δt ms | rolling shutter | model | sparse p50 | dense P / C / F | dense p50 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| object-real dense, baseline | 90/90 | 2.86e-4 | 0.051 | +0.139 | 0.47 | −0.45 | 0.021 | −0.45 | −25.3 | cols −21.3 ms | live | 0.60 mm | 0.9980 / 0.9962 / 0.9971 | 0.47 mm |
+| object-real dense, final | 90/90 | 2.82e-4 | 0.053 | +0.130 | 0.49 | −0.37 | 0.021 | −0.45 | −25.3 | cols −21.4 ms | live | 0.60 mm | 0.9981 / 0.9963 / 0.9972 | 0.44 mm |
+| object-real sparse, baseline ×2 | 90/90 | 2.89 / 2.87e-4 | 0.050 / 0.051 | +0.159 / +0.160 | 0.46 / 0.45 | −0.41 / −0.42 | 0.021 | −0.45 | −25.3 / −25.2 | cols −21.3 / −21.4 | live | 0.60 mm | – | – |
+| object-real sparse, final ×2 | 90/90 | 2.88 / 2.84e-4 | 0.054 / 0.053 | +0.150 / +0.148 | 0.51 / 0.49 | −0.40 / −0.45 | 0.021 | −0.45 | −25.2 / −25.3 | cols −21.4 / −21.3 | live | 0.59 / 0.60 mm | – | – |
+| yard-real dense, baseline | 81/81 | 3.11e-4 | 0.074 | +0.157 | 0.68 | +0.98 | 0.061 | −0.91 | −25.1 | rows 22.0 ms | live | 20.5 mm | 0.803 / 0.408 / 0.541 | 25.1 mm |
+| yard-real dense, final | 81/81 | 3.12e-4 | 0.075 | +0.161 | 0.65 | +0.97 | 0.061 | −0.91 | −25.1 | rows 21.9 ms | live | 20.4 mm | 0.807 / 0.409 / 0.543 | 24.5 mm |
+| yard-real sparse, baseline ×2 | 81/81 | 3.15 / 3.07e-4 | 0.074 / 0.076 | +0.163 / +0.165 | 0.62 / 0.71 | +0.97 / +0.82 | 0.061 | −0.91 | −25.1 | rows 21.9 / 22.1 | live | 20.9 / 20.6 mm | – | – |
+| yard-real sparse, final ×2 | 81/81 | 3.02 / 2.49e-4 | 0.074 / 0.080 | +0.163 / +0.160 | 0.63 / 0.48 | +0.94 / +1.06 | 0.061 / 0.062 | −0.91 | −25.1 | rows 21.9 / 22.1 | live / offline | 20.4 / 19.1 mm | – | – |
+
+Unclosed live loops on purpose (`--set 'engineConfig={"livePairs":{"retrieval":0,"spatial":0}}'`, yard-real, sparse;
+tags `refine-noloop` (baseline), `refine-h2-noloop`, `refine-final-noloop`, `refine-final-noloop2`; load 9–24): whether
+the live model still closes the loop through refine's pairs varies by run. Final code: two runs closed (116 / 958 and
+98 / 1755 loop-like / split correspondences, 86.8 / 86.4 % explained) → offline SfM skipped, live model, ATE 2.98 / 3.46e-4,
+rotation 0.075 / 0.053°; one unclosed (98 / 2956: a gap beyond 0.4 f, caught by the split total; 85.1 % explained) → offline
+SfM run and chosen (87.6 %), ATE 2.31e-4 — as the baseline run (offline chosen, 85.3 vs 87.9 %, ATE 2.44e-4). Every
+unclosed live model of these runs (gaps 12–15 px, 50–255 px and beyond 0.4 f) exceeded at least one limit (by 1.2–10×);
+every closed live or offline model stayed ≥ 1.3× below both.
