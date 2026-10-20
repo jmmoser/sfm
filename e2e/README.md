@@ -343,7 +343,7 @@ node e2e/run-e2e.mjs [object|yard|all|<dataset> ...] [--engine worker|inline|moc
      [--quality fast|balanced|max] [--mode object|scene|auto] [--stride N] [--start N]
      [--max-frames N] [--fps F] [--no-imu] [--no-gps] [--no-heading] [--hfov DEG|gt|none]
      [--no-dense] [--no-mesh] [--dense-size N] [--dense-views N] [--mesh-voxel V]
-     [--mesh-triangles N] [--no-export | --export fmt,fmt] [--mapping inline|background]
+     [--mesh-triangles N] [--no-export | --export fmt,fmt] [--nvs] [--nvs-views N] [--mapping inline|background]
      [--timeout-min M] [--out DIR] [--tag NAME] [--thresholds FILE] [--no-thresholds]
      [--enforce] [--mock-speed X] [--set key=json ...] [--quiet] [--verbose] [--headed]
 
@@ -404,7 +404,8 @@ cancels the long operation, and saves what was done.
 |---|---|
 | `result.json` | Harness result plus the `metrics.mjs` input fields. See below. |
 | `sparse.ply`, `dense.ply`, `mesh.ply` | Streamed from the page through `window.__e2eWrite`. |
-| `metrics.json` | `computeMetrics` output, sparse-cloud accuracy, live-trajectory metrics and threshold checks. |
+| `metrics.json` | `computeMetrics` output, sparse-cloud accuracy, live-trajectory metrics and threshold checks (+ the `nvs` summary with `--nvs`). |
+| `nvs/nvs.json` | With `--nvs [--nvs-views N]`: the novel-view evaluation of the output (see "Novel-view evaluation"). |
 
 The harness fields of `result.json` are:
 
@@ -773,3 +774,193 @@ dense: the same with `--dense-size 480 --tag verify-dense480` (instead of `--no-
 | yard | 80/80 (live) | 2.19e-4 | 0.05 | +0.07 | 0.4 | +0.1 (imu+gps) | 0.01 | −0.64 | −24.9 | none | – | – | 140 (56 / –) |
 | object-real | 89/89 (live) | 2.84e-4 | 0.08 | +0.09 | 0.9 | −0.9 (imu) | 0.02 | −0.54 | −25.1 | cols −21.6 ms | 0.9995 / 0.9941 / 0.9968 | 0.31 / 1.06 mm | 943 (86 / 775) |
 | yard-real | 81/81 (live) | 3.17e-4 | 0.09 | +0.16 | 0.4 | +1.6 (imu+gps) | 0.06 | −0.93 | −25.1 | rows 22.0 ms | 0.961 / 0.351 / 0.515 | 8.8 / 47 mm | 843 (69 / 684) |
+
+## Novel-view evaluation (`nvs.mjs`)
+
+`node e2e/nvs.mjs` scores what the user sees. It renders a finished run (the output directory of
+`run-e2e.mjs`) at held-out dataset frames, the frames that did not become keyframes, and compares
+the images with the ground-truth photos. This is the yardstick for photoreal stages such as
+3D Gaussian Splatting.
+
+```sh
+node e2e/nvs.mjs <dataset> <runDir> [--renderers points,points-edl,mesh-lit,mesh-unlit,splat]
+     [--views N] [--frames i,j,...] [--max-size N|dense|full] [--pose relative|sim3]
+     [--focal relative|keyframe|shared] [--rs auto|run|gt|none] [--rs-rotation-only] [--keep-blurred]
+     [--background R,G,B] [--no-ssim] [--save-images] [--out DIR] [--verbose] [--headed]
+
+E2E_GPU=host node e2e/nvs.mjs object-real e2e/out/e2e/object-real --save-images
+E2E_GPU=host node e2e/run-e2e.mjs object-real --nvs [--nvs-views N]   # pipeline, then the evaluation
+```
+
+`<dataset>` is a name under `e2e/data` or a dataset directory. The run directory needs
+`result.json` plus `dense.ply`, `mesh.ply` and/or `splats.ply`. The page is `nvs.html`, the browser
+code is in `src/harness/nvs/`, and the pure parts are `e2e/lib/nvs-views.mjs` and
+`e2e/lib/nvs-metrics.mjs` (unit-tested in `src/harness/nvs/nvs-lib.test.ts`). With `run-e2e.mjs
+--nvs`, the summary also goes into `metrics.json` as `nvs`. It is informational and never fails a
+run.
+
+### Test views
+
+* **Held-out frames**: every frame that has no image in the result and is not in
+  `live.keyframeIndices`. Frames the capture rejected as blurred are left out (`--keep-blurred`
+  keeps them). `--views` (default 24) of them are spread evenly over the sequence. `--frames`
+  picks frames by index; keyframes are allowed, which gives a training-view score. On the
+  baselines below there are 101 (object-real) and 154 (yard-real) candidates, each 1–3 frames
+  from a keyframe.
+* **Pose** (`--pose relative`, the default): take the nearest registered keyframe k (by frame
+  index) with its estimated pose. Compose it with the GT relative motion from k to the frame, and
+  divide the translation by the Sim3 scale (Umeyama run → GT on the camera centres). Local SfM
+  error around k carries over, as it would for k itself. `--pose sim3` maps the GT pose through
+  the global Sim3 instead.
+* **Intrinsics**: the run's f, cx, cy, k1 and k2. The focal (`--focal relative`, the default) is
+  the nearest keyframe's refined per-image focal (`sparse.images[].f`, normalised to the shared f
+  by the median) times f_frame / f_k from the GT. The GT ratio covers the focus breathing of the
+  -real sets. `keyframe` drops the GT ratio, and `shared` uses the shared f.
+* **Ground-truth image**: the dataset JPEG goes through exactly what the engine does to its dense
+  views (`denseViewImage`). It is undistorted with those intrinsics to `--max-size` by
+  `undistortImage`. The default, `dense`, is the run's dense view size, taken from the "dense
+  memory plan" log line or else from the preset: 800 px (600×800) for fast. Then
+  `rsCorrectPinholeImage` corrects the rolling shutter to the frame time, which is the time of the
+  GT pose. `--rs auto` / `run` uses the run's readout, and `gt` uses the dataset's true readout.
+  Both use ω = R_cam_device · gyro(tTrue), interpolated from `imu.json`. With a GT focus distance
+  (the -real sets) they also apply the translational term ν: the camera-frame velocity of the
+  centre (central difference of the neighbouring GT frames) divided by the focus distance, as the
+  engine does with `rsTranslation`. `--rs-rotation-only` drops ν. Pixels that map outside the
+  source are left out of every metric.
+
+### Renderers
+
+Each renderer outputs RGBA8 at the undistorted pinhole camera, with premultiplied alpha and
+transparent pixels where nothing is drawn. Two settings make the projection exact: the vertical
+fov comes from f, and a three.js view offset places the principal point. The GPU test
+`src/harness/nvs/renderers.gpu.test.ts` measures the error against the pinhole projection. The
+mean centroid error is below 0.04 px for mesh squares and below 0.1 px for radius-sized splats.
+Individual squares are within 0.2 px; the spread comes from MSAA.
+
+| renderer | what is drawn |
+|---|---|
+| `points` | the app's `Viewer` drawing `dense.ply` as the viewer screen does: round splats sized by the per-point radius, EDL off |
+| `points-edl` | the same with Eye-Dome Lighting, the app default when there is no mesh |
+| `mesh-lit` | the `Viewer` drawing `mesh.ply` with vertex colours under the hemisphere light and headlight, the app default |
+| `mesh-unlit` | the same unlit (vertex colours only) |
+| `splat` | `splats.ply` (INRIA 3DGS PLY layout: `x y z nx ny nz f_dc_0..2 f_rest_* opacity scale_0..2 rot_0..3`, run world frame), drawn by `src/splat/nvs.ts` |
+
+The splat module plugs in through
+`export async function createNvsRenderer({ ply, width, height }): Promise<{ render(cam), dispose?() }>`.
+`render(cam)` gets `cam = { width, height, fx, fy, cx, cy, R (row-major world-to-camera), t }` and
+returns RGBA8 rows top to bottom with premultiplied alpha. The hook in `src/harness/nvs/renderers.ts`
+uses `import.meta.glob`, so while the module does not exist the renderer is skipped with a reason.
+By default, every renderer whose input file exists in the run directory is used.
+
+### Metrics
+
+Each metric is computed per view, then averaged over the views. The code is in `e2e/lib/nvs-metrics.mjs`.
+
+* **full**: the render composited over black (`--background`) against the GT on every valid
+  pixel. Holes count as background.
+* **covered**: only pixels with alpha ≥ 0.5, using the un-premultiplied colour.
+* **coverage**: covered valid pixels divided by valid pixels.
+* **cc** (exposure-compensated): a least-squares 3×4 affine colour transform render → GT is fitted
+  per view on the covered pixels and applied to them. Uncovered pixels stay background. This
+  removes the global part of the exposure and white-balance drift of the -real sets.
+* **PSNR**: 10·log10(255²/MSE), with the MSE over the RGB channels in 8-bit sRGB.
+* **SSIM**: 11×11 Gaussian window (σ 1.5), K1 0.01, K2 0.03, computed per RGB channel and then
+  averaged (the 3DGS convention). The windows are restricted to the scored mask (normalised
+  convolution), and the SSIM map is averaged over the mask.
+* **shift**: the residual translation render → GT. It is found by mean-removed SSD on 2×
+  downsampled luma over ±6 px, with a parabolic sub-pixel step. It is a sanity check of pose,
+  intrinsics and projection.
+
+Output goes to `<out>/nvs.json` (default `<runDir>/nvs/`):
+
+* the options, metric definitions, run info (Sim3 scale, rolling-shutter model) and setup
+  (point and triangle counts, the WebGL renderer string);
+* a per-renderer summary (mean, median, min and max);
+* per view: the frame, nearest keyframe and gap, the GT `rsPx` / `blurPx` / gain / WB, the camera,
+  render and score ms, and the scores including the affine matrix and the shift;
+* the host load.
+
+`--save-images` writes `view-<frame>-<renderer>.png` panels: GT | render | |render − GT| × 3.
+
+Cost: 6–7 s per view for 4 renderers at 600×800 (host load 9). Rendering takes 10–20 ms per image.
+Scoring takes about 1 s per renderer in JS and is dominated by SSIM; `--no-ssim` skips it. 24 views
+take about 2.5 min.
+
+### Baselines (2026-10, Metal)
+
+These are the current app outputs on the -real sets. The runs are `object-real-metal-fast` and
+`yard-real-metal-fast`: `E2E_GPU=host node e2e/run-e2e.mjs <dataset> --engine worker`, fast preset,
+dense views 600×800 / 800×600, 40 views. The command is
+`E2E_GPU=host node e2e/nvs.mjs <dataset> <runDir> --save-images`, with 24 held-out views at the dense
+size, rolling-shutter correction from the run, relative pose and relative focal. The host was an
+Apple M4 under load 7–8, and each run took 154–167 s. All values are means over the views. The
+shift is the median residual render → GT translation in px.
+
+| dataset | renderer | coverage | full PSNR / SSIM | covered PSNR / SSIM | cc full PSNR | cc covered PSNR / SSIM | shift px |
+|---|---|---|---|---|---|---|---|
+| object-real (90 keyframes, 101 held-out) | `points` | 0.751 | 10.13 / 0.428 | 23.26 / 0.745 | 10.14 | 23.66 / 0.749 | 0.27 |
+| | `points-edl` (app default without a mesh) | 0.751 | 9.35 / 0.147 | 15.13 / 0.218 | 9.84 | 18.41 / 0.355 | 0.32 |
+| | `mesh-lit` (app default) | 0.609 | 8.64 / 0.527 | 23.56 / 0.876 | 8.67 | 25.52 / 0.874 | 0.13 |
+| | `mesh-unlit` | 0.609 | 8.70 / 0.550 | **28.70 / 0.915** | 8.71 | 30.08 / 0.917 | 0.09 |
+| yard-real (81 keyframes, 154 held-out) | `points` | 0.770 | 10.73 / 0.415 | 27.03 / 0.679 | 10.73 | 27.37 / 0.683 | 0.53 |
+| | `points-edl` | 0.770 | 10.22 / 0.191 | 18.11 / 0.313 | 10.58 | 22.22 / 0.503 | 0.43 |
+| | `mesh-lit` | 0.639 | 9.73 / 0.368 | 23.10 / 0.625 | 9.80 | 25.71 / 0.638 | 0.28 |
+| | `mesh-unlit` | 0.639 | 9.83 / 0.382 | **26.90 / 0.657** | 9.83 | 27.26 / 0.658 | 0.35 |
+
+* **Holes dominate.** The mesh covers 61–64 % of the frame and the points 75–77 %. Full-frame PSNR
+  stays at 8.6–10.7 dB whatever the colour does: the missing room walls and floor (object, where
+  the TSDF is cut at 2× the median depth), and the sky, distant houses and holes (yard). Exposure
+  compensation changes it by less than 0.5 dB. Filling the frame is where a splat stage can win
+  the most.
+* **One-line fixes, measured here, defaults unchanged.**
+  * Unlit instead of lit mesh: covered +5.1 dB / +0.039 SSIM on object-real, +3.8 dB / +0.032 on
+    yard-real. Full frame +0.06 / +0.10 dB. The lighting is not affine, so the colour fit recovers
+    only part of it (cc covered 25.5 vs 30.1 dB).
+  * Points without EDL: covered +8.1 / +8.9 dB, full frame +0.8 / +0.5 dB, and full-frame SSIM
+    0.147 → 0.428 / 0.191 → 0.415.
+  * Neither fix changes coverage.
+* **Points vs mesh.** Points cover 13–14 points more of the frame than the mesh. Their covered
+  PSNR is 5.4 dB below the unlit mesh on object-real, because of disc edges, gaps and background
+  bleeding through, and equal to it on yard-real.
+
+Sensitivity of the harness (same runs; `points` and `mesh-unlit`, PSNR only with `--no-ssim`; one
+option changed at a time):
+
+| dataset | variant | mesh-unlit covered PSNR | shift px | points covered PSNR | shift px |
+|---|---|---|---|---|---|
+| object-real | default | 28.70 | 0.09 | 23.26 | 0.27 |
+| | `--rs-rotation-only` | 27.85 | 0.11 | 23.10 | 0.34 |
+| | `--rs none` | 27.97 | 0.14 | 23.01 | 0.26 |
+| | `--focal keyframe` / `shared` | 28.70 / 28.59 | 0.09 | 23.27 / 23.22 | 0.27 |
+| | `--pose sim3` | 28.05 | 0.43 | 23.25 | 0.30 |
+| | `--max-size full` (720×960) | 27.90 | 0.10 | 22.87 | 0.36 |
+| | all 110 held-out frames incl. blurred | 28.66 | 0.10 | 23.21 | 0.31 |
+| | 24 keyframes (training views, `--frames`) | 28.70 | 0.07 | 23.25 | 0.28 |
+| yard-real | default | 26.90 | 0.35 | 27.03 | 0.53 |
+| | `--rs-rotation-only` | 26.86 | 0.40 | 26.91 | 0.53 |
+| | `--rs none` | 26.29 | 0.63 | 25.96 | 0.72 |
+| | `--focal keyframe` / `shared` | 26.89 / 26.83 | 0.36 | 27.02 / 26.89 | 0.54 |
+| | `--pose sim3` | 26.69 | 0.94 | 26.47 | 0.83 |
+| | `--max-size full` (960×720) | 26.21 | 0.40 | 26.31 | 0.62 |
+| | 24 keyframes (training views) | 27.23 | 0.30 | 27.37 | 0.46 |
+
+* **The GT image needs the full rolling-shutter correction.** On the object orbit, rotation and
+  translation cancel on the object, so a rotation-only correction is no better than none (mesh
+  27.85 vs 27.97 dB, points 23.10 vs 23.01 dB), 0.85 dB below the full correction. The yard is a walk with panning, where rotation dominates and the
+  correction is worth 0.6–1.1 dB.
+* **The keyframe-relative pose beats the global Sim3**: up to 0.65 dB, with a residual shift of
+  0.1 vs 0.4 px (object) and 0.35 vs 0.9 px (yard).
+* **24 views are representative** (all 110 object-real held-out frames: −0.04 dB).
+* **Held-out frames are nearly training views.** They sit 1–3 frames (≤ 0.4 s) from a keyframe:
+  the score difference is 0.0 dB on object-real and 0.3 dB on yard-real. This tests interpolation
+  between nearby views, not extrapolation to new viewpoints.
+* **Full resolution costs 0.4–0.8 dB.** The reconstruction carries the detail of the dense
+  resolution, not of the photo.
+
+Limits of the reference: the -real images keep artefacts that no reconstruction reproduces. These
+are 18 % corner vignetting, sensor noise, JPEG q 0.85, motion blur (`blurPx` per frame in
+`nvs.json`), the per-frame exposure and white-balance drift (the `cc` metrics remove its global
+part), and the residual rolling shutter of the first-order correction. So 30 dB is not a hard
+ceiling, but the reachable PSNR is well below that of clean renders. The yard keeps a 0.3–0.5 px
+residual shift even on training views, so it comes from the reconstruction or the reference, not
+from the held-out pose mapping.

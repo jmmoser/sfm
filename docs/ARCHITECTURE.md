@@ -102,9 +102,10 @@ src/
   engine/                PhotogrammetryEngine (pipeline orchestration, runs in a worker)
   workers/               engine.worker.ts + typed message protocol
   app/                   mobile UI (vanilla TS + CSS), screens, state machine
-  harness/               test harness pages: synthetic dataset generator, engine e2e, dense GT
+  harness/               test harness pages: synthetic dataset generator, engine e2e, dense GT,
+                         novel-view evaluation
   main.ts                app entry
-e2e/                     synthetic dataset generator, end-to-end runner, metrics
+e2e/                     synthetic dataset generator, end-to-end runner, metrics, novel-view scorer
 docs/                    this file, research notes
 ```
 
@@ -894,6 +895,22 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   only where the material is periodic (bricks, shingles, grass/soil detail tiles of
   2.3 / 3.7 m). SwiftShader renders about 0.75–0.9 s per frame, so a full 240-frame
   yard dataset takes about 4 min.
+* **Novel-view evaluation** (`node e2e/nvs.mjs <dataset> <runDir>`, `run-e2e.mjs --nvs`;
+  `nvs.html`, `src/harness/nvs/`, `e2e/lib/nvs-{views,metrics}.mjs`; e2e/README.md "Novel-view
+  evaluation"): renders a run at held-out frames (non-keyframes) and scores PSNR / SSIM against the
+  GT photos — full frame (holes count), covered pixels, coverage, and after a per-view 3×4 affine
+  colour fit. Test pose = nearest keyframe's estimated pose ∘ GT relative motion (translation /
+  Sim3 scale); GT image = the JPEG through the engine's `denseViewImage` path (undistortion with
+  the run's intrinsics at the dense size + rolling-shutter correction with gyro ω and the
+  translational term from the GT velocity / focus distance — rotation-only is no better than none
+  on the object orbit). Renderers: the app's Viewer
+  (points ± EDL, mesh lit / unlit) at an exact pinhole camera (fov from f + view offset for the
+  principal point; GPU test < 0.04 px mean centroid error), and a `splat` slot that loads
+  `src/splat/nvs.ts` `createNvsRenderer` for `splats.ply` when it exists. Baselines (Metal, fast,
+  24 views; covered-pixel PSNR / coverage): object-real mesh lit (app default) 23.6 dB / 0.61,
+  unlit 28.7 dB, points 23.3 dB / 0.75, points + EDL 15.1 dB; yard-real 23.1 / 26.9 / 27.0 /
+  18.1 dB at 0.64 / 0.77 coverage; full-frame PSNR 8.6–10.7 dB on both -real sets — the missing
+  background, not the colour, dominates what a viewer of the result sees.
 
 ### `src/dense` — PatchMatch review notes (corrections to the PatchMatch subsection above)
 
