@@ -104,6 +104,8 @@ export class SplatLayer {
   private inFlight = false;
   private countBuf: GPUBuffer | null = null;
   private countDevice: GPUDevice | null = null;
+  /** The canvas texture can be copied (readPixels / screenshots). */
+  private copySrc = true;
   private frames = 0;
   private frameW = 0;
   private frameH = 0;
@@ -132,7 +134,6 @@ export class SplatLayer {
     this.context = context;
     this.format = navigator.gpu.getPreferredCanvasFormat();
     host.insertBefore(canvas, before);
-    this.configure();
     document.addEventListener('visibilitychange', this.onVisibility);
     this.watchDevice(gpu.device);
   }
@@ -155,7 +156,18 @@ export class SplatLayer {
     } satisfies Partial<CSSStyleDeclaration>);
     const context = canvas.getContext('webgpu');
     if (!context) throw new Error('WebGPU canvas context unavailable');
-    return new SplatLayer(host, before, gpu, context, canvas, opts);
+    const layer = new SplatLayer(host, before, gpu, context, canvas, opts);
+    // COPY_SRC (readPixels: tests, screenshots) is checked once: without it the layer still draws
+    const device = gpu.device;
+    device.pushErrorScope('validation');
+    layer.configure();
+    const err = await device.popErrorScope().catch(() => null);
+    if (err) {
+      console.warn('[splat-layer] canvas without COPY_SRC:', err.message);
+      layer.copySrc = false;
+      layer.configure();
+    }
+    return layer;
   }
 
   private configure(): void {
@@ -163,8 +175,7 @@ export class SplatLayer {
       device: this.gpu.device,
       format: this.format,
       alphaMode: 'premultiplied',
-      // COPY_SRC: readPixels (tests, screenshots)
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | (this.copySrc ? GPUTextureUsage.COPY_SRC : 0),
     });
   }
 
@@ -338,7 +349,7 @@ export class SplatLayer {
    */
   async readPixels(): Promise<{ width: number; height: number; data: Uint8Array } | null> {
     const view = this.lastView;
-    if (!this.ready || !view) return null;
+    if (!this.ready || !view || !this.copySrc) return null;
     while (this.inFlight) await new Promise((res) => setTimeout(res, 4));
     if (!this.ready) return null;
     const size = splatCanvasSize(view.cssWidth, view.cssHeight, devicePixelRatio, this.opts.maxPixelRatio, this.opts.maxPixels);
