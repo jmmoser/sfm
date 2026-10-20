@@ -480,10 +480,10 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
     await setProgress(pass);
     cur = new EngineDepthStore(backend, `pm${pass}`, 0);
     const have = new Set(persistent && pass === resumePass ? await cur.scan() : []);
-    // Full-resolution passes alternate direction (serpentine): the next pass starts with the
-    // views the image LRU (and PatchMatchGPU's upload caches) still hold — 30 % fewer decodes.
-    const fullIndex = passKinds.slice(0, pass + 1).filter((k) => k !== 'half').length - 1;
-    const order = kind !== 'half' && fullIndex % 2 === 1 ? [...ordered].reverse() : ordered;
+    // Full-resolution passes alternate direction (serpentine, the last one forward): the next
+    // pass starts with the views the image LRU (and PatchMatchGPU's upload caches) still hold.
+    const fullBefore = passKinds.slice(pass + 1).filter((k) => k !== 'half').length;
+    const order = kind !== 'half' && fullBefore % 2 === 1 ? [...ordered].reverse() : ordered;
     // last reference (index in `order`) that reads each previous-pass map
     const lastUse = new Map<number, number>();
     order.forEach((g, i) => reads(g.id).forEach((id) => lastUse.set(id, i)));
