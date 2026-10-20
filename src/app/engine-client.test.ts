@@ -98,6 +98,31 @@ describe('EngineClient: overlapping respawns', () => {
     expect(statuses.map((s) => s.state)).toEqual(['starting', 'ready', 'respawning', 'respawning', 'ready']);
   });
 
+  it('a frame waiting across a second respawn still counts as in flight: a second frame is refused until it is answered', async () => {
+    const { c, workers } = client();
+    await start(c, workers);
+
+    const lost = c.processFrame(frame(0)); // in flight on worker 1 when its GPU is lost
+    await flush();
+    workers[0].gpuLost(); // respawn #1
+    await expect(lost).rejects.toMatchObject({ name: 'EngineCrashedError' });
+    expect(c.frameInFlight).toBe(false); // the capture pump goes on
+    const upd = c.processFrame(frame(1)); // queued behind replay #1
+    await flush();
+
+    workers[1].gpuLost(); // respawn #2: the frame now waits for replay #2
+    await flush();
+    expect(c.frameInFlight).toBe(true); // capture's finish waits for it before finishCapture
+    await expect(c.processFrame(frame(2))).rejects.toMatchObject({ name: 'EngineBusyError' });
+
+    workers[2].reply('init', initResult('w3'));
+    await flush();
+    expect(workers[2].methods).toEqual(['init', 'frame']);
+    workers[2].reply('frame', { frameIndex: 1 });
+    await expect(upd).resolves.toMatchObject({ frameIndex: 1 });
+    expect(c.frameInFlight).toBe(false);
+  });
+
   it('a replayed init that times out: the next replay keeps the state and the queued call waits for it', async () => {
     vi.useFakeTimers();
     const { c, workers, statuses } = client({ initTimeoutMs: 1000 });

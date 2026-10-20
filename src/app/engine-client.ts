@@ -735,8 +735,9 @@ export class EngineClient implements EngineLike {
     if (this.disposed) return;
     const epoch = ++this.replayEpoch;
     const err = namedError(ENGINE_ERRORS.crashed, `Engine restarted: ${reason}`);
+    // (a frame in flight ends with this rejection; one still waiting for a replay goes on waiting
+    // for this restart's: processFrame clears frameBusy when its frame settles, not here)
     this.rejectAll(err);
-    this.frameBusy = false;
     this.killWorker();
     if (gpu) this.gpuFailures++;
     const now = Date.now();
