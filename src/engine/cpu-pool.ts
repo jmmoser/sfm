@@ -1,9 +1,10 @@
 /**
  * Pool of CPU helper workers (src/workers/cpu.worker.ts) for refine's independent CPU jobs: the
- * two-view verification of the candidate pairs and the visual-word quantisation of the keyframes,
- * which otherwise run one after another on the engine worker's single thread (e2e Metal
- * object-real / yard-real: 10–23 s and ≈ 7.5 s of refine). The jobs are pure and deterministic, so
- * the results are those of the engine thread; callers apply them in their own order.
+ * two-view verification of the candidate pairs, the visual-word quantisation of the keyframes and
+ * the rolling-shutter hypotheses (short subset BAs), which otherwise run one after another on the
+ * engine worker's single thread (e2e Metal object-real / yard-real: 10–23 s, ≈ 7.5 s and ≈ 12 s of
+ * refine). The jobs are pure and deterministic, so the results are those of the engine thread;
+ * callers apply them in their own order.
  *
  * Nested dedicated workers: Safari 15.5+ (docs/research/ios-platform.md). Without `Worker` in the
  * engine's scope (Node tests, old browsers) or when a worker cannot be created, `create` returns
@@ -25,7 +26,7 @@ interface PoolWorker {
   broken: boolean;
 }
 
-/** Workers for a pool on this device: hardware threads − 2 (the engine thread, the page), 1–3. */
+/** Workers for a pool on this device: hardware threads − 2 (the engine thread, the page), 0–3. */
 export function defaultCpuWorkers(): number {
   const hc = typeof navigator !== 'undefined' && navigator.hardwareConcurrency > 0 ? navigator.hardwareConcurrency : 2;
   return Math.max(0, Math.min(3, hc - 2));
@@ -54,6 +55,8 @@ export class CpuPool {
         ev.preventDefault?.();
         this.fail(w, new Error(`cpu worker: ${ev.message || 'error'}`));
       };
+      // a reply that cannot be deserialised would otherwise leave its job pending for ever
+      worker.onmessageerror = () => this.fail(w, new Error('cpu worker: undeliverable message'));
       return w;
     });
   }

@@ -290,12 +290,12 @@ export interface SplitPairStats {
  * Verified pairs whose correspondences a model keeps on DIFFERENT 3-D points (both features observe
  * a point, but not the same one). A model that did not close a loop triangulates both ends of it
  * separately, so the loop pairs are split — many of them, each mostly — and a's points land in b
- * a few to a few hundred pixels from b's features (the loop gap: e2e yard-real live models 12–15 px
- * and 100–255 px, rotation 0–8° off the model's). A closed model's split pairs are false pairs on
+ * a few to a few hundred pixels from b's features (the loop gap: e2e yard-real live models 12–15 px,
+ * 50–255 px and beyond 0.4 f; rotation 0–8° off the model's). A closed model's split pairs are false pairs on
  * repeated structure, which it rightly keeps apart: few correspondences in total, mostly hundreds to
- * thousands of pixels off (e2e yard-real, 168 k correspondences: 40–65 split pairs with 950–1350
- * correspondences, 60–160 of them loop-like; unclosed live models: 80–100 split pairs with
- * 4000–5000, ≥ 1200 loop-like; object-real: none).
+ * thousands of pixels off (e2e yard-real, 168 k correspondences: 40–85 split pairs with 950–1940
+ * correspondences, 60–190 of them loop-like; unclosed live models: 95–130 split pairs with
+ * 2950–5650, of them ≥ 1200 loop-like when the gap is ≤ 0.4 f; object-real: none).
  */
 export function splitPairs(rec: Reconstruction, db: FeatureDatabase, opts: Partial<SplitPairOptions> = {}): SplitPairStats {
   const o = { ...DEFAULT_SPLIT_PAIR_OPTIONS, ...opts };
@@ -416,9 +416,9 @@ export const DEFAULT_LIVE_HEALTH_OPTIONS: Readonly<Omit<LiveHealthOptions, 'spli
  *  - at least `minExplained` of the verified correspondences are explained (same 3-D point);
  *  - no unclosed loop (`splitPairs`): few correspondences on loop-like split pairs (a loop gap of a
  *    few to a few hundred pixels), and few on split pairs at all (any gap). The thresholds sit
- *    between the e2e closed models (≤ 160 loop-like / ≤ 1350 split correspondences of 168 k on
+ *    between the e2e closed models (≤ 190 loop-like / ≤ 1940 split correspondences of 168 k on
  *    yard-real: limits 420 / 2520; none on object-real) and the unclosed live models (≥ 1200
- *    loop-like, or 4000–5000 split).
+ *    loop-like, or 2950–5650 split).
  * Any doubt runs the offline SfM, as before: a wrong "unhealthy" only costs time.
  */
 export function liveModelHealth(
@@ -530,11 +530,11 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     p.catch(() => undefined);
     return p;
   };
-  // With the CPU pool the verifications run on its workers, up to `window` at a time, while this
+  // With the CPU pool the verifications run on its workers, up to `maxInflight` at a time, while this
   // thread feeds the GPU matcher; their results are gated and recorded in candidate order (the
   // same database / graph as verifying here, which is the fallback for a failed job).
   const pool = deps.pool && deps.pool.size > 0 ? deps.pool : null;
-  const window = pool ? 2 * pool.size : 0;
+  const maxInflight = pool ? 2 * pool.size : 0;
   type Verification = { geometry: TwoViewGeometry | null; ms: number };
   const verifyHere = (a: number, b: number, m: MatchPairs, maxIterations: number): Verification => {
     const t0 = now();
@@ -546,6 +546,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     const v = live.verifyInputs(a, b, m, { maxIterations });
     if (!v) return Promise.resolve({ geometry: null, ms: 0 });
     return pool!.verify(v.kp1, v.kp2, m, v.cam1, v.cam2, v.opts).catch((e: unknown) => {
+      if (cancel?.cancelled) return { geometry: null, ms: 0 };
       deps.log('warn', `pair ${a}-${b}: CPU worker failed (${(e as Error)?.message ?? e}), verifying here`);
       return verifyHere(a, b, m, maxIterations);
     });
@@ -594,7 +595,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
           void job.result.then(() => (job.done = true));
           inflight.push(job);
         }
-        await drain(window);
+        await drain(maxInflight);
       } else if (m) record(a, b, key, verifyHere(a, b, m, maxIterations));
     } catch (e) {
       deps.log('warn', `pair ${a}-${b}: ${(e as Error)?.message ?? e}`);
