@@ -172,4 +172,61 @@ describe('engine splat stage', () => {
     expect((await e.splatModel())?.model.count).toBe(info.count);
     e.dispose();
   }, 600_000);
+
+  it('a device loss in the first checkpoint, a later checkpoint or the finishing readbacks rebuilds and trains on (review)', async () => {
+    const trainers: SplatTrainer[] = [];
+    const deviceOf = (t: SplatTrainer): GPUDevice => (t as unknown as { device: GPUDevice }).device;
+    let loseOnTrainer = false;
+    const e = new PhotogrammetryEngine(
+      { mode: 'object', quality: 'fast', persist: false, hfovPriorDeg: 60 },
+      config({
+        splatDebug: {
+          onTrainer: (t) => {
+            trainers.push(t);
+            // lost right after the uploads: the iteration-0 checkpoint's readbacks fail
+            if (loseOnTrainer) {
+              loseOnTrainer = false;
+              deviceOf(t).destroy();
+            }
+          },
+        },
+      }),
+    );
+    await captureAndRefine(e);
+    // run 1: the first checkpoint (rebuilt from the initial Gaussians), then the appearance
+    // normalisation (rebuilt from the checkpoint at iteration 200, trained again to 300)
+    loseOnTrainer = true;
+    let finishLost = false;
+    const a = await e.splat(undefined, (p) => {
+      if (p.stage === 'splat_finishing' && p.progress === 0 && !finishLost) {
+        finishLost = true;
+        deviceOf(trainers[trainers.length - 1]).destroy();
+      }
+    });
+    console.log(`[splat-engine] losses at the first checkpoint + finishing: ${JSON.stringify(a.stats)}`);
+    expect(a.iterations).toBe(300);
+    expect(a.stats.splatDeviceLosses).toBe(2);
+    expect(trainers.length).toBe(3);
+    expect(Math.abs(Number(a.stats.splatMeanColourGain) - 1)).toBeLessThan(0.5);
+    expect((await e.splatModel())?.model.count).toBe(a.count);
+    // run 2: the checkpoint at iteration 200 (written right after its report): back to 100
+    let ckptLost = false;
+    const iters: number[] = [];
+    const b = await e.splat(undefined, (p) => {
+      const d = training(p);
+      if (!d) return;
+      iters.push(d.iteration);
+      if (d.iteration === 200 && !ckptLost) {
+        ckptLost = true;
+        deviceOf(trainers[trainers.length - 1]).destroy();
+      }
+    });
+    console.log(`[splat-engine] loss at a checkpoint: ${JSON.stringify(b.stats)}`);
+    expect(b.iterations).toBe(300);
+    expect(b.stats.splatDeviceLosses).toBe(1);
+    expect(trainers.length).toBe(5);
+    expect(iters.filter((i) => i === 200).length).toBe(2); // trained again from 100
+    expect((await e.splatModel())?.model.count).toBe(b.count);
+    e.dispose();
+  }, 600_000);
 });

@@ -14,8 +14,10 @@
  *             every `checkpointEvery` iterations in the session store (resume after a kill or a
  *             cancel) or the scratch store; dropped work (`SplatWorkDroppedError`) rolls back to
  *             the last checkpoint in place; a dropped readback of a checkpoint or of the final
- *             model is read again once visible (stale data is never stored); a lost device
- *             rebuilds the trainer on the new one from it (twice at most, then 'gpu-lost').
+ *             model is read again once visible (stale data is never stored); a lost device (in a
+ *             step, a checkpoint or the finishing readbacks) rebuilds the trainer on the new one
+ *             from it (from the initial Gaussians before the first one; twice at most, then
+ *             'gpu-lost'), trains again from there and finishes.
  *   finishing appearance normalisation (mean training-view colour matrix folded into the colours),
  *             read-back; the engine persists the model (`packSplatModel`) and clears the checkpoints.
  */
@@ -478,84 +480,113 @@ export async function runSplat(deps: SplatDeps, opts: SplatOptions = {}, progres
       if (!rec || rec.key !== runKey) throw new Error('no checkpoint to roll back to');
       return readCheckpoint(ckStore, rec);
     };
-    if (!resume) await writeCheckpoint(); // iteration 0: the initial Gaussians (rollback target)
+    let losses = 0;
+    const lostError = (e: unknown): Error => namedError(ENGINE_ERRORS.gpuLost, `GPU device lost during splat training: ${(e as Error)?.message ?? e}`, 'gpu-lost');
+    /**
+     * After a failed GPU operation (a step, a checkpoint, the finishing readbacks): a device loss
+     * rebuilds the trainer on the new device from the last checkpoint (`from`: from these initial
+     * Gaussians, before the first checkpoint), twice at most, then 'gpu-lost'. Anything else is
+     * rethrown.
+     */
+    const recoverLoss = async (e: unknown, from?: SplatModel): Promise<void> => {
+      if (!isDeviceLost(e)) throw e;
+      if (losses >= 2) throw lostError(e);
+      losses++;
+      deps.log('warn', `splat: GPU device lost (${(e as Error)?.message ?? e}) — rebuilding the trainer from ${from ? 'the initial Gaussians' : `the checkpoint at iteration ${lastCkpt?.iteration ?? 0}`}`);
+      try {
+        trainer.destroy();
+      } catch {
+        /* device gone */
+      }
+      ctx = await deps.gpu();
+      if (!ctx) throw lostError(e);
+      if (from) {
+        trainer = await createTrainer(from, 0, 1);
+        return;
+      }
+      const ck = await loadLast();
+      trainer = await createTrainer(ck.params, 0, 1);
+      trainer.restore(ck.state, ck.moments);
+    };
+    // iteration 0: the initial Gaussians (rollback target)
+    while (!resume) {
+      try {
+        await writeCheckpoint();
+        break;
+      } catch (e) {
+        await recoverLoss(e, init);
+      }
+    }
 
-    // ---- training
+    // ---- training, then finishing (a device loss there trains again from the last checkpoint)
     const tTrain = now();
     let trainItersThisRun = 0;
     let trainMsThisRun = 0;
     let drops = 0;
-    let losses = 0;
     let last = { loss: NaN, count: trainer.gaussians, itPerSec: 0 };
     const every = Math.max(1, Math.round(preset.checkpointEvery));
-    while (trainer.iteration < iterations) {
-      if (cancel?.cancelled) {
-        // keep the progress since the last checkpoint for the resume (cheap next to the training)
-        if (lastCkpt && trainer.iteration - lastCkpt.iteration >= 100) await writeCheckpoint().catch((e: unknown) => deps.log('warn', `splat: checkpoint on cancel failed: ${(e as Error)?.message ?? e}`));
-        throw cancelledError(SPLAT_STAGES.training);
-      }
-      await deps.waitVisible();
-      const it = trainer.iteration;
-      const nextCkpt = (Math.floor(it / every) + 1) * every;
-      const n = Math.max(1, Math.min(preset.chunk, iterations - it, nextCkpt - it));
-      const t = trainer;
-      try {
-        const r = await deps.gpuLock(() => t.step(n));
-        trainItersThisRun += n;
-        trainMsThisRun += r.ms;
-        last = { loss: r.loss, count: r.count, itPerSec: r.iterationsPerSecond };
-      } catch (e) {
-        if (e instanceof SplatWorkDroppedError && drops < 8) {
-          drops++;
-          deps.log('warn', `splat: ${e.message} — rolling back to the checkpoint at iteration ${lastCkpt?.iteration ?? 0}`);
-          const ck = await loadLast();
-          await deps.waitVisible();
-          trainer.restore(ck.state, ck.moments, ck.params);
-          continue;
+    let mean: Float64Array | null = null;
+    let out: SplatModel | null = null;
+    let tf = 0;
+    while (!out) {
+      while (trainer.iteration < iterations) {
+        if (cancel?.cancelled) {
+          // keep the progress since the last checkpoint for the resume (cheap next to the training)
+          if (lastCkpt && trainer.iteration - lastCkpt.iteration >= 100) await writeCheckpoint().catch((e: unknown) => deps.log('warn', `splat: checkpoint on cancel failed: ${(e as Error)?.message ?? e}`));
+          throw cancelledError(SPLAT_STAGES.training);
         }
-        if (isDeviceLost(e) && losses < 2) {
-          losses++;
-          deps.log('warn', `splat: GPU device lost (${(e as Error)?.message ?? e}) — rebuilding the trainer from the checkpoint at iteration ${lastCkpt?.iteration ?? 0}`);
-          try {
-            trainer.destroy();
-          } catch {
-            /* device gone */
+        await deps.waitVisible();
+        const it = trainer.iteration;
+        const nextCkpt = (Math.floor(it / every) + 1) * every;
+        const n = Math.max(1, Math.min(preset.chunk, iterations - it, nextCkpt - it));
+        const t = trainer;
+        try {
+          const r = await deps.gpuLock(() => t.step(n));
+          trainItersThisRun += n;
+          trainMsThisRun += r.ms;
+          last = { loss: r.loss, count: r.count, itPerSec: r.iterationsPerSecond };
+        } catch (e) {
+          if (e instanceof SplatWorkDroppedError && drops < 8) {
+            drops++;
+            deps.log('warn', `splat: ${e.message} — rolling back to the checkpoint at iteration ${lastCkpt?.iteration ?? 0}`);
+            const ck = await loadLast();
+            await deps.waitVisible();
+            trainer.restore(ck.state, ck.moments, ck.params);
+            continue;
           }
-          ctx = await deps.gpu();
-          if (!ctx) throw namedError(ENGINE_ERRORS.gpuLost, `GPU device lost during splat training: ${(e as Error)?.message ?? e}`, 'gpu-lost');
-          const ck = await loadLast();
-          trainer = await createTrainer(ck.params, 0, 1);
-          trainer.restore(ck.state, ck.moments);
+          await recoverLoss(e);
           continue;
         }
-        if (isDeviceLost(e)) throw namedError(ENGINE_ERRORS.gpuLost, `GPU device lost during splat training: ${(e as Error)?.message ?? e}`, 'gpu-lost');
-        throw e;
+        const cur = trainer.iteration;
+        const detail: SplatTrainingDetail = { iteration: cur, iterations, loss: last.loss, itPerSec: last.itPerSec, gaussians: last.count };
+        report(SPLAT_STAGES.training, cur / iterations, `iteration ${cur}/${iterations} · ${last.count} Gaussians · ${last.itPerSec.toFixed(1)} it/s`, detail);
+        if (cur % every === 0 && cur < iterations) await writeCheckpoint().catch((e: unknown) => recoverLoss(e));
       }
-      const cur = trainer.iteration;
-      const detail: SplatTrainingDetail = { iteration: cur, iterations, loss: last.loss, itPerSec: last.itPerSec, gaussians: last.count };
-      report(SPLAT_STAGES.training, cur / iterations, `iteration ${cur}/${iterations} · ${last.count} Gaussians · ${last.itPerSec.toFixed(1)} it/s`, detail);
-      if (cur % every === 0 && cur < iterations) await writeCheckpoint();
-    }
-    stats.splatTrainMs = Math.round(now() - tTrain);
-    stats.splatItPerSec = trainMsThisRun > 0 ? Math.round((10_000 * trainItersThisRun) / trainMsThisRun) / 10 : 0;
-    stats.splatLoss = Math.round(last.loss * 1e5) / 1e5;
-    stats.splatCheckpoints = ckpts;
-    stats.splatCheckpointMs = Math.round(ckptMs);
-    if (drops) stats.splatDroppedWork = drops;
-    if (losses) stats.splatDeviceLosses = losses;
-    deps.log(
-      'info',
-      `splat: trained ${trainItersThisRun} iterations in ${(stats.splatTrainMs / 1000).toFixed(1)} s (${stats.splatItPerSec} it/s in step, checkpoints ${ckpts} × ≈ ${ckpts ? Math.round(ckptMs / ckpts) : 0} ms), ${last.count} Gaussians, loss ${last.loss.toFixed(4)}`,
-    );
+      stats.splatTrainMs = Math.round(now() - tTrain);
+      stats.splatItPerSec = trainMsThisRun > 0 ? Math.round((10_000 * trainItersThisRun) / trainMsThisRun) / 10 : 0;
+      stats.splatLoss = Math.round(last.loss * 1e5) / 1e5;
+      stats.splatCheckpoints = ckpts;
+      stats.splatCheckpointMs = Math.round(ckptMs);
+      if (drops) stats.splatDroppedWork = drops;
+      if (losses) stats.splatDeviceLosses = losses;
+      deps.log(
+        'info',
+        `splat: trained ${trainItersThisRun} iterations in ${(stats.splatTrainMs / 1000).toFixed(1)} s (${stats.splatItPerSec} it/s in step, checkpoints ${ckpts} × ≈ ${ckpts ? Math.round(ckptMs / ckpts) : 0} ms), ${last.count} Gaussians, loss ${last.loss.toFixed(4)}`,
+      );
 
-    // ---- finishing (a cancel arriving now is ignored: the training is complete)
-    report(SPLAT_STAGES.finishing, 0, 'normalising appearance');
-    const tf = now();
-    // (a dropped readback of normaliseAppearance throws before it changes anything: read again)
-    const mean = await readBack('appearance normalisation', (t) => t.normaliseAppearance());
+      // ---- finishing (a cancel arriving now is ignored: the training is complete)
+      report(SPLAT_STAGES.finishing, 0, 'normalising appearance');
+      tf = now();
+      try {
+        // (a dropped readback of normaliseAppearance throws before it changes anything: read again)
+        mean = await readBack('appearance normalisation', (t) => t.normaliseAppearance());
+        report(SPLAT_STAGES.finishing, 0.4, 'reading the model');
+        out = await readBack('model read-back', (t) => t.readModel());
+      } catch (e) {
+        await recoverLoss(e);
+      }
+    }
     if (mean) stats.splatMeanColourGain = Math.round(((mean[0] + mean[5] + mean[10]) / 3) * 1000) / 1000;
-    report(SPLAT_STAGES.finishing, 0.4, 'reading the model');
-    const out = await readBack('model read-back', (t) => t.readModel());
     if (readRetries) stats.splatReadRetries = readRetries;
     stats.splatCount = out.count;
     stats.splatFinishMs = Math.round(now() - tf);
