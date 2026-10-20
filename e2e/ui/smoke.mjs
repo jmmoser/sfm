@@ -2,9 +2,13 @@
 /**
  * UI smoke test of the whole mock flow at iPhone size (393×852 @3x, touch):
  *   Home → Setup → Start (fake camera) → Capture (wait for keyframes) → Finish → Processing →
- *   Viewer (info, display, measure, build mesh) → Export (prepare + save → download) → Home → Diagnostics
+ *   Viewer (info, display, measure, build mesh, build the photoreal model in the viewer: progress
+ *   card, layer pill Splats / Points / Mesh) → Export (prepare + save → download, incl. the
+ *   Gaussian-splat PLY) → Home → reopen (the splats are back) → Diagnostics
  * Asserts no console errors / page exceptions and writes screenshots of every screen to
- * e2e/out/ui/. Usage: node e2e/ui/smoke.mjs [--verbose] [--keep-open]
+ * e2e/out/ui/. The splat layer needs a hardware WebGPU adapter: with E2E_GPU=host the splats must
+ * be shown; on SwiftShader the viewer refuses the software adapter and keeps the points.
+ * Usage: node e2e/ui/smoke.mjs [--verbose] [--keep-open]
  */
 import { readFile } from 'node:fs/promises';
 import { launch, shot, sleep } from './lib.mjs';
@@ -22,6 +26,8 @@ const check = (cond, msg) => {
 };
 
 const byTest = (id) => page.locator(`[data-testid="${id}"]`);
+const hostGpu = process.env.E2E_GPU === 'host';
+const layerSeg = (v) => page.locator(`[data-testid="layer-switch"] .segment[data-value="${v}"]`);
 
 /** Screenshot of the running capture screen (frame delivery held: see App.debug). */
 async function captureShot(name) {
@@ -193,6 +199,45 @@ try {
   await page.keyboard.press('Escape');
   await byTest('sheet-build').waitFor({ state: 'detached' });
 
+  step('build the photoreal model (splats) from the viewer');
+  await byTest('tool-build').tap();
+  await byTest('sheet-build').waitFor();
+  check(/Photoreal model/.test((await byTest('sheet-build').textContent()) ?? ''), 'Build sheet offers the photoreal model');
+  await byTest('build-splat').tap();
+  await byTest('splat-progress').waitFor({ state: 'visible', timeout: 10000 });
+  check((await page.locator('.viewer-screen').count()) === 1, 'the build runs on the viewer (no Processing screen)');
+  await page.waitForFunction(() => /iterations/.test(document.querySelector('[data-testid="splat-progress-text"]')?.textContent ?? ''), null, { timeout: 20000 });
+  await shot(page, '15c-splat-training');
+  await byTest('splat-progress').waitFor({ state: 'hidden', timeout: 60000 });
+  await byTest('layer-switch').waitFor({ state: 'visible', timeout: 10000 });
+  if (hostGpu) {
+    await page.waitForFunction(() => document.querySelector('.viewer-screen')?.dataset.splats === 'ready', null, { timeout: 60000 });
+    await page.waitForFunction(() => document.querySelector('[data-testid="layer-switch"]')?.dataset.layer === 'splats', null, { timeout: 10000 });
+    check((await layerSeg('splats').getAttribute('aria-checked')) === 'true', 'the new model is shown (layer Splats)');
+    check(/Gaussians/.test((await page.locator('.viewer-sub').textContent()) ?? ''), 'header counts Gaussians');
+    await sleep(800);
+    await shot(page, '15d-viewer-splats');
+    step('measure on the splats (picks the points / mesh underneath)');
+    await byTest('tool-measure').tap();
+    const vb = await page.locator('.viewer-canvas').boundingBox();
+    await page.touchscreen.tap(vb.x + vb.width * 0.45, vb.y + vb.height * 0.5);
+    await sleep(300);
+    await page.touchscreen.tap(vb.x + vb.width * 0.58, vb.y + vb.height * 0.56);
+    await sleep(600);
+    const m2 = (await byTest('measure-value').textContent())?.trim() ?? '';
+    step(`measured on splats: "${m2}"`);
+    check(m2.length > 0, 'measuring works while the splats are shown');
+    await shot(page, '15e-measure-splats');
+    await byTest('tool-measure').tap();
+    await layerSeg('points').tap();
+    await sleep(500);
+    check((await page.locator('[data-testid="layer-switch"]').getAttribute('data-layer')) === 'points', 'layer pill switches to Points');
+    await layerSeg('splats').tap();
+  } else {
+    await page.waitForFunction(() => ['unavailable', 'ready'].includes(document.querySelector('.viewer-screen')?.dataset.splats ?? ''), null, { timeout: 60000 });
+    step(`splat layer on this adapter: ${await page.locator('.viewer-screen').getAttribute('data-splats')}`);
+  }
+
   step('export');
   await byTest('tool-export').tap();
   await byTest('sheet-export').waitFor();
@@ -213,6 +258,12 @@ try {
   const [dl2] = await Promise.all([page.waitForEvent('download', { timeout: 15000 }), byTest('export-save-glb').tap()]);
   const glb = await readFile(await dl2.path());
   check(glb.subarray(0, 4).toString() === 'glTF', 'GLB magic');
+  await byTest('export-prepare-ply-splat').tap();
+  await byTest('export-save-ply-splat').waitFor({ timeout: 30000 });
+  const [dl4] = await Promise.all([page.waitForEvent('download', { timeout: 15000 }), byTest('export-save-ply-splat').tap()]);
+  const splatPly = await readFile(await dl4.path());
+  check(dl4.suggestedFilename().endsWith('splats.ply'), 'splat PLY filename');
+  check(/element vertex \d+[\s\S]*property float f_dc_0/.test(splatPly.subarray(0, 600).toString('latin1')), 'splat PLY header (INRIA layout)');
   await byTest('export-prepare-colmap-zip').tap();
   await byTest('export-save-colmap-zip').waitFor({ timeout: 30000 });
   const [dl3] = await Promise.all([page.waitForEvent('download', { timeout: 15000 }), byTest('export-save-colmap-zip').tap()]);
@@ -235,6 +286,10 @@ try {
   await byTest('session-item').first().tap();
   await page.waitForSelector('.viewer-screen', { timeout: 30000 });
   await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  if (hostGpu) {
+    await page.waitForFunction(() => document.querySelector('[data-testid="layer-switch"]')?.dataset.layer === 'splats' && document.querySelector('.viewer-screen')?.dataset.splats === 'ready', null, { timeout: 60000 });
+    check(true, 'a reopened scan opens on its splats');
+  }
   await sleep(1000);
   await byTest('viewer-back').tap();
   await byTest('session-item').first().waitFor();

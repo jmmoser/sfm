@@ -21,6 +21,7 @@
  */
 import { createServer } from 'vite';
 import { chromium } from 'playwright';
+import { launchOptions } from './lib/launch.mjs';
 import { mkdir, writeFile, appendFile, rm, readdir, stat } from 'node:fs/promises';
 import { createServer as createNetServer } from 'node:net';
 import { dirname, join, resolve, relative, isAbsolute, sep } from 'node:path';
@@ -82,7 +83,7 @@ export async function openSynthPage({ verbose = false } = {}) {
     optimizeDeps: { entries: ['synth.html'] },
   });
   await server.listen();
-  const browser = await chromium.launch({ headless: true, args: CHROMIUM_ARGS });
+  const browser = await chromium.launch(launchOptions(CHROMIUM_ARGS));
   const page = await browser.newPage();
   page.on('console', (m) => {
     if (m.type() === 'error' || m.type() === 'warning' || verbose) console.log(`[page:${m.type()}] ${m.text()}`);

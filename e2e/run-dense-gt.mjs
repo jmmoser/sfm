@@ -31,6 +31,7 @@
  */
 import { createServer } from 'vite';
 import { chromium } from 'playwright';
+import { launchOptions } from './lib/launch.mjs';
 import { mkdir, writeFile, appendFile, readFile } from 'node:fs/promises';
 import { createServer as createNetServer } from 'node:net';
 import { dirname, join, resolve, isAbsolute, relative, sep } from 'node:path';
@@ -153,7 +154,7 @@ export async function openDensePage({ verbose = false, outDir }) {
     optimizeDeps: { entries: ['dense-gt.html'] },
   });
   await server.listen();
-  const browser = await chromium.launch({ headless: true, args: CHROMIUM_ARGS });
+  const browser = await chromium.launch(launchOptions(CHROMIUM_ARGS));
   const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
   page.setDefaultTimeout(0);
   page.on('console', (m) => {

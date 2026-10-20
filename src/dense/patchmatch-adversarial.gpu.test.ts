@@ -95,7 +95,7 @@ describe('PatchMatchGPU adversarial', () => {
     const b = await pm.compute(ds.views[0], ds.views.slice(1), ds.range, { iterations: 2, maxPixelViewsPerSubmit: 1 });
     const subB = pm.lastTimings!.submits;
     log(`odd 61x45: ${subA} submits vs ${subB} with 1-row bands`);
-    expect(subB).toBe(45 * 5); // init + 2 × (red + black), one row each
+    expect(subB).toBe(45 * 5 + 1); // init + 2 × (red + black), one row each, + the finalisation
     expect(Array.from(b.depth)).toEqual(Array.from(a.depth));
     expect(Array.from(b.normal)).toEqual(Array.from(a.normal));
     expect(Array.from(b.cost)).toEqual(Array.from(a.cost));

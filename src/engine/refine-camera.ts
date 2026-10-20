@@ -30,11 +30,13 @@ import {
   rsModelToDevice,
   RSBundleCost,
   searchRollingShutter,
+  searchRollingShutterBatched,
   type RollingShutterEstimate,
   type RollingShutterEstimateOptions,
   type RollingShutterModel,
   type RSTranslation,
 } from '../sfm/rolling-shutter';
+import type { CpuPool } from './cpu-pool';
 import type { CaptureState } from './live';
 import type { SparseModel, SparseRollingShutter } from './types';
 
@@ -339,8 +341,9 @@ export interface RefineRSResult {
 /**
  * Estimate the rolling shutter on `rec` and apply it to every keyframe when accepted (otherwise
  * the originals are restored). At least `minImages` fast-rotating registered images are needed.
+ * With a CPU `pool`, independent hypotheses are scored in parallel (`searchRollingShutterBatched`).
  */
-export function refineRollingShutter(
+export async function refineRollingShutter(
   rec: Reconstruction,
   st: CaptureState,
   gyro: GyroReference,
@@ -355,7 +358,8 @@ export function refineRollingShutter(
     translation?: boolean;
   } = {},
   known: RollingShutterModel | null = null,
-): RefineRSResult {
+  pool: CpuPool | null = null,
+): Promise<RefineRSResult> {
   const camFor = (id: number): CameraIntrinsics | undefined => {
     const img = rec.images.get(id);
     if (img) return rec.cameras.get(img.cameraId);
@@ -388,7 +392,13 @@ export function refineRollingShutter(
     refinePrincipalPoint: opts.refinePrincipalPoint ?? false,
     velocityOf: trans ? (id) => trans.get(id)?.velocity ?? null : undefined,
   });
-  const est = searchRollingShutter((m) => bc.cost(m), opts, { numImages: rec.numRegisteredImages, numObservations: bc.numObservations });
+  const info = { numImages: rec.numRegisteredImages, numObservations: bc.numObservations };
+  // with CPU workers, the hypotheses that do not depend on each other are evaluated in parallel (same
+  // estimate); a failed batch is evaluated here
+  const est =
+    pool && pool.size > 0
+      ? await searchRollingShutterBatched((models) => pool.rsCosts(bc, models).catch(() => models.map((m) => bc.cost(m))), opts, info)
+      : searchRollingShutter((m) => bc.cost(m), opts, info);
   let model = est.accepted ? est.model : null;
   let reason = est.reason;
   if (!model && known && known.readoutMs !== 0) {

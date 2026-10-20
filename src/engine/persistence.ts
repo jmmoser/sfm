@@ -20,9 +20,16 @@
  *   value  dense/meta         undistorted dense views (for meshing after a reload)
  *   bin    depth/<id>         fusion-filtered depth maps (float16 normals / cost)
  *   bin    mesh               serializeTriangleMesh
+ *   bin    splat/model        trained Gaussian splats, compact (packSplatModel: f32 means, f16 rest)
+ *   value  splat/meta         SplatMetaRecord (count, SH degree, background, stats)
+ *   value  splat/progress     SplatProgressRecord: the last complete training checkpoint
+ *   bin    splat/ckpt<s>/params | m | v | colour   checkpoint slot s ∈ {0, 1} (f32 parameters,
+ *                             bf16 Adam moments, f32 colour-correction state)
  */
 import type { CameraIntrinsics, GeoFix, ImuSample, Mat3, MetricInfo, RGBAImage, TwoViewConfig, TwoViewGeometry, Vec3 } from '../core/types';
 import { SessionStore, type SessionMeta } from '../io/storage';
+import { packFloat16, unpackFloat16 } from '../io/serialize';
+import { allocSplatModel, shCoeffCount, type ShDegree, type SplatModel } from '../splat/types';
 import type { CaptureMode, QualityPreset } from '../workers/protocol';
 import type { KeyframeRecord, SparseModel, SparseRollingShutter } from './types';
 
@@ -282,6 +289,8 @@ export interface EngineStateRecord {
   hasSparse: boolean;
   hasDense: boolean;
   hasMesh: boolean;
+  /** A trained splat model is stored (`splat/model`); absent in older records. */
+  hasSplat?: boolean;
   /** Camera–IMU offset estimated by the last world alignment (ms). */
   timeOffsetMs: number | null;
   /** Gyro bias (rad/s, device frame) estimated from the live keyframes; absent in older records. */
@@ -523,4 +532,152 @@ export function mergeGeoFixes(a: readonly GeoFix[], b: readonly GeoFix[]): GeoFi
   for (const f of a) m.set(f.t, f);
   for (const f of b) m.set(f.t, f);
   return [...m.values()].sort((x, y) => x.t - y.t);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Gaussian splats (`splat/*`)
+// ---------------------------------------------------------------------------------------------
+
+/** Persisted meta of the trained splat model (`splat/meta`). */
+export interface SplatMetaRecord {
+  version: 1;
+  count: number;
+  shDegree: ShDegree;
+  /** Trained with the Mip-Splatting opacity compensation (renderers must match). */
+  antialiased: boolean;
+  /** Background colour of the training (sRGB, appearance-normalised). */
+  background: [number, number, number];
+  /** Iterations trained. */
+  iterations: number;
+  /** Bytes of `splat/model`. */
+  bytes: number;
+  stats: Record<string, number | string>;
+  createdAt: number;
+}
+
+/**
+ * The last complete training checkpoint (`splat/progress`): its binaries live in slot `slot`
+ * (`splat/ckpt<slot>/params | m | v | colour`); a new checkpoint is written to the other slot and
+ * becomes current only when this record is rewritten, so a kill mid-write keeps the previous one.
+ */
+export interface SplatProgressRecord {
+  /** Identity of the run (model, views, size, options): a resume needs the same key. */
+  key: string;
+  quality: QualityPreset;
+  iteration: number;
+  count: number;
+  slot: 0 | 1;
+  /** Adam moments stored (absent at iteration 0: zero). */
+  moments: boolean;
+  background: [number, number, number];
+  mcmc: { refinements: number; relocated: number; added: number };
+  maxIntersections: number;
+  /** The run's fitted plan (views in trainer order, image size, Gaussian cap): a resume reuses it. */
+  plan: { viewIds: number[]; size: number; maxGaussians: number };
+  updatedAt: number;
+}
+
+interface SplatContainerHeader {
+  kind: 'splat-model' | 'splat-params' | 'splat-moments';
+  count: number;
+  shDegree: ShDegree;
+  /** Encoding of every field but `means` (always f32 for 'splat-model'). */
+  encoding: 'f32' | 'f16' | 'bf16';
+  extra?: Record<string, unknown>;
+}
+
+/** f32 → bfloat16 bits (round to nearest even; Inf / NaN truncated): the f32 exponent range, 8-bit mantissa. */
+function packBF16(src: Float32Array): Uint16Array {
+  const u = new Uint32Array(src.buffer, src.byteOffset, src.length);
+  const out = new Uint16Array(src.length);
+  for (let i = 0; i < src.length; i++) {
+    const b = u[i];
+    out[i] = (b & 0x7f800000) === 0x7f800000 ? b >>> 16 : ((b + 0x7fff + ((b >>> 16) & 1)) >>> 16) & 0xffff;
+  }
+  return out;
+}
+
+function unpackBF16(src: Uint16Array): Float32Array {
+  const u = new Uint32Array(src.length);
+  for (let i = 0; i < src.length; i++) u[i] = src[i] << 16;
+  return new Float32Array(u.buffer);
+}
+
+const SPLAT_FIELDS = ['means', 'logScales', 'quats', 'opacities', 'sh'] as const;
+
+function splatFieldLengths(count: number, deg: ShDegree): number[] {
+  return [3 * count, 3 * count, 4 * count, count, 3 * shCoeffCount(deg) * count];
+}
+
+function packSplat(m: SplatModel, kind: SplatContainerHeader['kind'], encoding: SplatContainerHeader['encoding'], extra?: Record<string, unknown>): ArrayBuffer {
+  const header: SplatContainerHeader = { kind, count: m.count, shDegree: m.shDegree, encoding, ...(extra ? { extra } : {}) };
+  const arrays = SPLAT_FIELDS.map((k) => {
+    const a = m[k].subarray(0, splatFieldLengths(m.count, m.shDegree)[SPLAT_FIELDS.indexOf(k)]);
+    if (encoding === 'f32' || (kind === 'splat-model' && k === 'means')) return a;
+    if (encoding === 'bf16') return packBF16(a);
+    if (k === 'quats') {
+      // unit quaternions in f16 (the rasteriser normalises; ≈ 5e-4 relative)
+      const q = new Float32Array(a.length);
+      for (let i = 0; i < a.length; i += 4) {
+        const l = Math.hypot(a[i], a[i + 1], a[i + 2], a[i + 3]) || 1;
+        for (let c = 0; c < 4; c++) q[i + c] = a[i + c] / l;
+      }
+      return packFloat16(q);
+    }
+    return packFloat16(a);
+  });
+  return packArrays(header, arrays);
+}
+
+function unpackSplat(buf: ArrayBuffer, kind: SplatContainerHeader['kind']): { model: SplatModel; header: SplatContainerHeader } {
+  const { header, arrays } = unpackArrays<SplatContainerHeader>(buf);
+  const n = header?.count;
+  const deg = header?.shDegree;
+  if (!header || header.kind !== kind || !Number.isInteger(n) || n < 0 || (deg !== 0 && deg !== 1) || arrays.length !== 5) throw damaged(kind);
+  const lens = splatFieldLengths(n, deg);
+  const m = allocSplatModel(n, deg);
+  SPLAT_FIELDS.forEach((k, i) => {
+    const a = arrays[i];
+    if (a.length !== lens[i]) throw damaged(kind);
+    if (a instanceof Float32Array) m[k].set(a);
+    else if (a instanceof Uint16Array) m[k].set(header.encoding === 'bf16' ? unpackBF16(a) : unpackFloat16(a));
+    else throw damaged(kind);
+  });
+  return { model: m, header };
+}
+
+/**
+ * Compact stored splat model (`splat/model`, ≈ 34 B per Gaussian at SH 0): means f32 (metric
+ * scenes need sub-mm precision far from the origin), log-scales, unit quaternions, opacity logits
+ * and SH coefficients as float16 (log-scale ±0.004 ⇒ σ ±0.4 %, colour ±0.15 / 255).
+ */
+export function packSplatModel(m: SplatModel, extra?: Record<string, unknown>): ArrayBuffer {
+  return packSplat(m, 'splat-model', 'f16', extra);
+}
+
+export function unpackSplatModel(buf: ArrayBuffer): { model: SplatModel; extra: Record<string, unknown> } {
+  const r = unpackSplat(buf, 'splat-model');
+  return { model: r.model, extra: r.header.extra ?? {} };
+}
+
+/** Checkpoint parameters: exact f32 (`splat/ckpt<s>/params`). */
+export function packSplatParams(m: SplatModel): ArrayBuffer {
+  return packSplat(m, 'splat-params', 'f32');
+}
+
+export function unpackSplatParams(buf: ArrayBuffer): SplatModel {
+  return unpackSplat(buf, 'splat-params').model;
+}
+
+/**
+ * Checkpoint Adam moments (`splat/ckpt<s>/m`, `…/v`) as bfloat16: the f32 exponent range (second
+ * moments reach 1e-15; float16 would flush them to zero and blow up the next update) with ≈ 0.4 %
+ * relative precision, half the bytes.
+ */
+export function packSplatMoments(m: SplatModel): ArrayBuffer {
+  return packSplat(m, 'splat-moments', 'bf16');
+}
+
+export function unpackSplatMoments(buf: ArrayBuffer): SplatModel {
+  return unpackSplat(buf, 'splat-moments').model;
 }

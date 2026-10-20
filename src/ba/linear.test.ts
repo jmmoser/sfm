@@ -141,6 +141,30 @@ describe('skyline Cholesky', () => {
     expect(SkylineCholesky.factorCost(first)).toBeLessThan((n * n * n) / 6 / 10);
   });
 
+  it('factor reproduces L for arbitrary envelopes (row pairs with equal / different first columns)', () => {
+    const rng = new Rng(9);
+    for (const n of [1, 2, 7, 40, 61]) {
+      // random envelope; runs of equal first columns like BA parameter blocks, and ragged rows
+      const first = new Int32Array(n);
+      for (let i = 0; i < n; i++) first[i] = i > 0 && rng.next() < 0.5 ? Math.min(i, first[i - 1]) : Math.floor(rng.next() * (i + 1));
+      // L with that skyline profile (positive diagonal), A = L Lᵀ has the same envelope
+      const L = new Float64Array(n * n);
+      for (let i = 0; i < n; i++) {
+        for (let j = first[i]; j < i; j++) L[i * n + j] = rng.gaussian();
+        L[i * n + i] = 1 + rng.next();
+      }
+      const sky = new SkylineCholesky(first);
+      for (let i = 0; i < n; i++)
+        for (let j = first[i]; j <= i; j++) {
+          let v = 0;
+          for (let k = 0; k <= j; k++) v += L[i * n + k] * L[j * n + k];
+          sky.values[sky.rowBase[i] + j] = v;
+        }
+      expect(sky.factor()).toBe(true);
+      for (let i = 0; i < n; i++) for (let j = first[i]; j <= i; j++) expect(sky.values[sky.rowBase[i] + j]).toBeCloseTo(L[i * n + j], 8);
+    }
+  });
+
   it('rejects indefinite matrices and invalid envelopes', () => {
     const sky = new SkylineCholesky(Int32Array.of(0, 0));
     sky.values.set([1, 2, 1]);

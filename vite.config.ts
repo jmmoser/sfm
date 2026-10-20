@@ -11,7 +11,7 @@ export default defineConfig({
     // For on-device debugging build with `npx vite build --sourcemap`.
     sourcemap: false,
     rollupOptions: {
-      // Only the app is deployed. The test pages (harness.html, synth.html, dense-gt.html) are
+      // Only the app is deployed. The test pages (harness.html, synth.html, dense-gt.html, nvs.html) are
       // served by the Vite dev server for the e2e scripts and are NOT part of the production build:
       // harness.html exposes `window.runPipeline` (fetches `/e2e/data/<?dataset=…>/` paths, creates
       // sessions in the app's IndexedDB, runs the GPU engine on load).

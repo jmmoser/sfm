@@ -96,15 +96,18 @@ src/
                          pair selection, retrieval, keyframe selection, inertial & GPS alignment
   dense/                 undistortion, view selection, PatchMatch MVS (WebGPU + CPU),
                          depth-map fusion, TSDF + marching cubes, point-cloud filters
+  splat/                 3D Gaussian Splatting: WebGPU trainer + renderer, CPU reference,
+                         splat PLY, point-cloud initialisation, MCMC densification (§6)
   sensors/               camera capture, motion, compass, geolocation, wake lock, frame orientation
   io/                    PLY / GLB / COLMAP export, ZIP writer, IndexedDB session storage, share/download
   viewer/                three.js viewer (points as splats + EDL, mesh, cameras, measure tool)
   engine/                PhotogrammetryEngine (pipeline orchestration, runs in a worker)
   workers/               engine.worker.ts + typed message protocol
   app/                   mobile UI (vanilla TS + CSS), screens, state machine
-  harness/               test harness pages: synthetic dataset generator, engine e2e, dense GT
+  harness/               test harness pages: synthetic dataset generator, engine e2e, dense GT,
+                         splat GT, novel-view evaluation
   main.ts                app entry
-e2e/                     synthetic dataset generator, end-to-end runner, metrics
+e2e/                     synthetic dataset generator, end-to-end runner, metrics, novel-view scorer
 docs/                    this file, research notes
 ```
 
@@ -544,10 +547,12 @@ and extra methods that keep the documented call working are not listed.
    quality, user guidance.
 
 **Refine (after capture)**: extra pairs (sequential window, vocabulary-tree
-retrieval for loop closure, spatial neighbours) → verify → full incremental SfM
-from scratch on the enriched graph (keep the better of live/offline model) → global
+retrieval for loop closure, spatial neighbours) → verify (pairs and vocabulary on CPU helper
+workers) → refined live model → only when it is unhealthy, a full incremental SfM from scratch
+on the enriched graph (keep the better of live/offline model) → global
 BA with self-calibration → retriangulate → final BA → inertial alignment (time
-offset, gravity, metric scale), GPS Sim3 alignment, compass yaw → world frame per §2.
+offset, gravity, metric scale), GPS Sim3 alignment, compass yaw → world frame per §2
+(§6 "Refine performance").
 
 **Dense**: undistort keyframes (≤ 1600 px by preset) → source-view selection →
 PatchMatch (photometric) for all views → PatchMatch (geometric consistency) →
@@ -894,6 +899,26 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   only where the material is periodic (bricks, shingles, grass/soil detail tiles of
   2.3 / 3.7 m). SwiftShader renders about 0.75–0.9 s per frame, so a full 240-frame
   yard dataset takes about 4 min.
+* **Novel-view evaluation** (`node e2e/nvs.mjs <dataset> <runDir>`, `run-e2e.mjs --nvs`;
+  `nvs.html`, `src/harness/nvs/`, `e2e/lib/nvs-{views,metrics}.mjs`; e2e/README.md "Novel-view
+  evaluation"): renders a run at held-out frames (non-keyframes) and scores PSNR / SSIM against the
+  GT photos — full frame (holes count), covered pixels, coverage, and after a per-view 3×4 affine
+  colour fit. Test pose = nearest keyframe's estimated pose ∘ GT relative motion (translation /
+  Sim3 scale); GT image = the JPEG through the engine's `denseViewImage` path (undistortion with
+  the run's intrinsics at the dense size + rolling-shutter correction with gyro ω and the
+  translational term from the GT velocity / focus distance — rotation-only is no better than none
+  on the object orbit). Renderers: the app's Viewer
+  (points ± EDL, mesh lit / unlit) at an exact pinhole camera (fov from f + view offset for the
+  principal point; GPU test < 0.04 px mean centroid error), and a `splat` slot that loads
+  `src/splat/nvs.ts` `createNvsRenderer` for `splats.ply` when it exists. Baselines (Metal, fast,
+  24 views; covered-pixel PSNR / coverage): object-real mesh lit (app default) 23.6 dB / 0.61,
+  unlit 28.7 dB, points 23.3 dB / 0.75, points + EDL 15.1 dB; yard-real 23.1 / 26.9 / 27.0 /
+  18.1 dB at 0.64 / 0.77 coverage; full-frame PSNR 8.6–10.7 dB on both -real sets — the missing
+  background, not the colour, dominates what a viewer of the result sees. `--test-dataset NAME` scores
+  off-trajectory views instead: another dataset of the same seeded scene on a shifted path (object
+  `radius` / `heightAbove`, yard `height` / `lateralOffset`, which leaves the gravel path in place), GT
+  poses through the run's Sim3 (or composed with the keyframe nearest in space); scene / seed / camera
+  mismatches are refused. `--common` adds every renderer's score on the pixels all of them cover.
 
 ### `src/dense` — PatchMatch review notes (corrections to the PatchMatch subsection above)
 
@@ -2178,7 +2203,8 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   * `maxDepthError` 0.02: yard +0.5 C / −0.2 P, object ±0, too small to decide on;
   * applying the halo filter twice: it erodes edges (yard −0.3 pt C);
   * multi-scale: quality-neutral (yard Csub +0.1 / P −0.15, object −0.16 / −0.02), but 25–45 %
-    cheaper in the photometric stage. The engine has no multi-scale driver, so `multiScale: false`;
+    cheaper in the photometric stage. The engine had no multi-scale driver, so `multiScale: false`
+    (since 2026-10 it has one and the presets enable it: "Dense on a real GPU" below);
   * a second geometric pass: +0.6 / +0.9 pt Csub with the reference fusion, but within ±0.2 pt
     with the tuned one (yard +0.2 / P −0.14, object −0.1), for +33 % PatchMatch time. `max`
     therefore keeps one pass.
@@ -2249,7 +2275,7 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
     trees into the sky consistently across views. A PatchMatch-side fix is still needed, such as a
     centre-segment texture test.
   * Low-texture walls in the object room stay sparse.
-  * The engine has no multi-scale driver.
+  * The engine has no multi-scale driver (added 2026-10: "Dense on a real GPU" below).
   * The yard TSDF mesh loses precision to the noisier far points.
   * Not tested: topK, the ACMH thresholds, the perturbation schedule, sigmaColor, window size,
     and relaxing source selection at trajectory turns (yard frame 184 keeps 3 sources).
@@ -2735,6 +2761,91 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
     to re-check on device. If real walls keep good but less coherent depths, lower `skyMinCoherence`. At 0.35 the clean
     yard keeps 1,425 sky-coloured points farther than τ instead of 707 (row 6).
 
+### `src/dense` + `src/engine` — Dense on a real GPU (M4 Metal, 2026-10; amends the PatchMatch, "Dense tuning results" and `src/engine` dense notes above)
+
+* **Setup**: `E2E_GPU=host` (headless Chrome 155, Apple M4 10-core GPU, Metal), host shared with other heavy
+  jobs (load 5–20, wall times ±30 % and more); GPU time from timestamp queries
+  (`EngineConfig.denseGpuTimestamps`, `PatchMatchGPU.create(…, { timestamps: true })`, `lastTimings.gpuMs`),
+  which stay meaningful under load. The engine logs the wall-time split of the depth-map and fusion stages
+  (`dense depth maps … s: view loads …, pass inputs …, PatchMatch … (upload, GPU passes [GPU timestamps], readback),
+  halo filter …, store …` and `dense fusion … s: fuseDepthMaps …, point cap / filter …`).
+* **Where the time went** (before; yard-real `fast`, 40 views at 800×600, load 6–8): depth maps 38.1 s = view loads
+  10.4 s (83 JPEG decodes + undistort + rolling-shutter warp, ~125 ms each), PatchMatch 14.5 s (upload 3.5,
+  GPU passes 7.5 of which 5.5 s GPU execution, readback 3.5), halo filter 6.0 s, IndexedDB store 5.7 s, pass inputs
+  1.4 s; fusion 8.3 s. On a real GPU the kernel is a minority of the stage; at `balanced` (object-real, 80 views
+  720×960) it is half: depth maps 154.9 s with 47.8 s GPU execution.
+* **Point cap: footprint-adaptive LOD** (`footprintDownsample`, src/dense/pointcloud.ts). The engine used to merge a
+  fused cloud above `maxPoints` with ONE voxel size from the median radius of the first 100 k points (dominated by the
+  room / far field), which merged the close-range object ~10× and averaged points across surfaces: object-real
+  `fast` 3.29 M fused → 0.57 M points, accuracy p50 / p90 0.28 / 0.86 mm (cap lifted) → 0.44 / 1.8 mm; yard-real
+  precision 0.945 → 0.80, accuracy p50 8.3 → 25 mm (the failing `denseAccuracyMedian` check). Now every point goes
+  to a cell of s × its own splat radius (half-octave levels, so cells of very different footprints never merge);
+  s is searched on hash-sampled distinct-cell counts (1/16 of the cells in a cache-resident table) so that 0.88–0.97
+  × `maxPoints` remain, then one exact assignment; `mergeCells` counting-sorts by cell (8 B scratch per cell).
+  Offline on the same cap-lifted clouds (cap 2 M): object 0.29 / 0.93 mm, P 0.9997, C 0.9969 (global voxel 0.51 /
+  1.8 mm, P 0.9982; no cap 0.28 / 0.86 mm, P 0.9998, C 0.9969); yard p50 8.9 mm, P 0.931, C 0.390, F 0.550 (global
+  voxel 26 mm, P 0.781, C 0.402, F 0.531; no cap 8.3 mm, P 0.945, C 0.405, F 0.567). Balanced yard (6.3 M fused,
+  cap 4 M): LOD P 0.953, C 0.484, F 0.642, p50 7.1 mm; global voxel 0.898 / 0.494 / 0.637, 13.5 mm; no cap 0.962 /
+  0.494 / 0.653, 7.1 mm. The global voxel's slightly higher C comes from the far field: its cells (2.3 cm there) are
+  far below a 40 m footprint, so it merged the near field ~10× and left the far points alone. Keeping the medoid
+  instead of the mean changes nothing measurable. 1.8–3.9 s for 3.3–6.3 M points in the e2e worker.
+* **Multi-scale driver** (`runDensify` pass kinds `half` / `photo` / `geo`; `DensePresetConfig.multiScale`,
+  `fullResIterations`, now on in every preset): photometric at ½ resolution for all views (`iterations`; views decoded
+  and undistorted at half size, their own LRU), a full-resolution photometric pass initialised from the ½-resolution map
+  (`fullResIterations` 2, `{ geometric: false }` + prior), then the geometric pass(es). Resume keys / progress include
+  the pass kinds. GT-pose harness (fast, 800 px, 40 views; GPU s / P / C / F): object 9.0 → 5.8 s, 0.9999 / 0.9985 /
+  0.9992 → 0.9998 / 0.9981 / 0.9990; yard 4.5 → 3.7 s, 0.9930 / 0.4490 / 0.6184 → 0.9928 / 0.4497 / 0.6190. With only
+  4 photometric iterations (`fast`) the GPU saving is small in the engine (object-real 7.8 → 6.6 s, yard-real 5.5 →
+  4.7 s); `balanced` (6 + 3 iterations) object-real 47.8 → 39.8 s.
+* **GPU-resident PatchMatch data flow** (`PatchMatchGPU`):
+  * Source grey images and source depth maps live in LRU texture-array caches keyed by the uploaded object
+    (`LayerCache`, ids through a WeakMap so no caller data is kept alive): a view that is a source of ~5–8
+    references is converted and uploaded once while resident (N layers + ≤ 4 slack layers of ≤ 8 MB each); the
+    layer of each source is passed in `SrcCam.b.w` / `M0.w`. Callers must not modify an image / depth array in place
+    after passing it.
+  * The reference RGBA is uploaded as is; `loadRef` derives the Rec.709 grey (= `rgbaToGray8`).
+  * `finalize` pass: planes → depth / octahedral normal (`pack2x16snorm`, ≤ 3e-4 rad) / cost on the GPU, read back at
+    12 B/px together with the dropped-work sentinel in one mapping (8 MB staging, row chunks beyond) instead of 20 B/px
+    in ≤ 4 MB chunks + a separate sentinel read + `planesToDepthMap` on the CPU. The range test is repeated in double
+    precision on the CPU (the shader's bounds are f32).
+  * `priorPlanes` pass: the prior map goes up as depth + the normal's octahedral coordinates (f32, 12 B/px at its own
+    size) into the not yet used `costs` / `photo` / `views` buffers and is resampled / re-intersected on the GPU
+    (= `priorToPlanes`) instead of a CPU resampling + a 16 B/px upload at the target size.
+  * Pipelines: init / propagate / finalize / priorPlanes per source bucket and kernel shape; the engine precompiles
+    the shapes of all presets.
+* **CPU-side savings**: native `Float16Array` conversion for float16 depth maps / clouds (5–9× faster than the scalar
+  fallback, bit-identical; Chrome 135+, Safari 18.2+), so the IndexedDB store of a map got ~35 % cheaper;
+  full-resolution passes alternate direction (the last one forward) so the next pass starts on the views the caches
+  still hold; the image LRU may grow into what the PatchMatch stage leaves below the fusion / mesh peak (every view at
+  `fast` and at `balanced` 960 px), so each view is decoded once per resolution (yard-real fast 83 → 80 decodes for
+  three passes instead of two; object-real balanced 210 → 160); `planesToDepthMap` uses `Math.sqrt` (Math.hypot is
+  4–5× slower in V8).
+* **Kernel diet (opt-in, not in the presets)**: `PatchMatchOptions.affineWindow` warps the window with the
+  homography's Jacobian at the window centre (two multiply-adds per sample instead of a projective divide; mirrored
+  in the CPU reference); with `patchRadius` 6 / `patchStep` 3 (symmetric 5×5 = 25 samples over 13 px) and
+  `numSamplesPerIter` 3 it halves the GPU time again (e2e fast, with multi-scale: object-real 7.2 → 3.9 s, yard-real
+  6.3 → 3.1 s) but costs yard quality: e2e yard-real P / C / F 0.942 / 0.401 / 0.563 → 0.932 / 0.396 / 0.555, accuracy
+  p50 8.0 → 9.8 mm; clean yard (GT harness) C 0.4503 → 0.4342. Each part alone (affine + 3 proposals at 11 px, the
+  9 px / 25-sample window, the 13 px window with 6 proposals) costs 0.8–1.0 pt of clean-yard completeness. Object:
+  equal within noise (object-real 0.29 / 0.98 mm → 0.32 / 1.1 mm, C 0.9969 → 0.9981). At `balanced` the cost is
+  smaller: yard-real GPU 31.0 → 15.4 s (densify 125.9 → 111.2 s), P / C / F 0.953 / 0.483 / 0.641 → 0.946 / 0.483 /
+  0.639, p50 7.3 → 7.8 mm — a candidate for balanced / max after an on-device check. At 160×120 the 13 px window
+  spans 8 % of the image and loses 5 pt within 1 % (unit test uses the 11 px window for the affine check).
+* **Results** (e2e, worker engine, before = this branch's base with the timing log, back-to-back, same load):
+  see e2e/README.md "Dense on the real GPU". Summary, densify wall s (depth maps / fusion) and dense quality:
+  object-real fast 60.7 (47.3 / 12.3) → 51.1 (37.7 / 12.2), p50 / p90 0.44 / 1.8 → 0.29 / 0.99 mm; yard-real fast
+  47.4 (38.1 / 8.3) → 36.4 (26.8 / 8.8), P / C / F 0.803 / 0.408 / 0.541 → 0.935 / 0.397 / 0.557, p50 25 → 8.8 mm
+  (`denseAccuracyMedian` FAIL → PASS); object-real balanced 181.0 (154.9 / 24.8) → 148.3 (122.2 / 24.7), 0.37 / 1.4
+  → 0.28 / 0.87 mm; yard-real balanced 148.6 (127.8 / 19.7) → 125.9 (105.0 / 19.7), P / C / F 0.898 / 0.493 / 0.636 →
+  0.953 / 0.483 / 0.641, p50 13.7 → 7.3 mm. Completeness of clouds above 3 M points is scored on every point since
+  this change (`e2e/lib/metrics-core.mjs`; it used to read every 2nd point of a 3.5 M cloud: C 0.434 instead of 0.484).
+* **Remaining**: the CPU stages now dominate the depth-map stage: halo filter (~150–250 ms per 0.5 MP map, on the main
+  path between GPU passes), decode + undistort + rolling-shutter warp (~90 ms per view, two bilinear resamplings), the
+  IndexedDB store, and CPU fusion (7–25 s). Next steps: run halo / store in a helper worker or overlap them with the
+  next view's GPU passes (needs a cooperative halo filter), undistort + RS warp in one GPU resampling, GPU fusion
+  (research candidate 5). The error-scope round trip of `compute()`'s set-up and the ~100 band submissions per call
+  cost 20–30 % over the GPU execution time under contention.
+
 ### Real-capture robustness (gyro gates, forced / best-of-window keyframes, rolling shutter, focus breathing; amends the `src/sfm` and `src/engine` notes above)
 
 * **Problem** (e2e `yard-real` / `abl-yard-shake`, README "Yard breakdown"): a fast pan left a 35–45° keyframe gap (blur
@@ -2946,3 +3057,456 @@ Every web platform API, JS built-in, CSS feature, WGSL construct and WebAssembly
   changed; use `'hidden'` if that matters); `npm run dev` binds all interfaces (phone testing) and serves the repository
   to the LAN; on a shared origin (`<user>.github.io/<repo>/`) every other project of that user can read this app's
   IndexedDB (scans, photos, GPS fixes) and caches — deploy on a dedicated origin (custom domain) for real use.
+
+### Refine performance (2026-10, Apple M4 / Metal; amends §5 "Refine" and the `src/ba`, `src/sfm` core and `src/engine` notes above)
+
+* **Where the time went** (e2e worker runs on the real GPU, `E2E_GPU=host`, fast preset, no dense, host load ≈ 6;
+  `stats.*Ms` below): object-real refine 153 s = matching 27 (vocabulary 9: k-means 2 + quantising 90 keyframes 7; CPU
+  verification 11.5; waiting for the GPU matcher 6) + reconstruction 125 (live refinement 1.5, rolling shutter 37 —
+  28 subset BAs 30 + 2 re-adjustments 7 —, offline SfM 59, principal point 3, per-image focal 24); yard-real 97 s =
+  32 + 64 (offline SfM 42). All CPU, one thread: BAs everywhere, the offline SfM about half of the reconstruction.
+* **Offline SfM only for an unhealthy live model** (`liveModelHealth` in `engine/refine.ts`, `stats.offlineSfM` with the
+  reason; `EngineConfig.refineOfflineSfM: 'always'` = before). The from-scratch SfM is the independent check that rescued
+  live models made of fragments (gyro breaks), with misplaced or unregistered keyframes, or with an unclosed loop; a
+  live model without those symptoms was kept in every run (it ties with the offline one). Healthy = every keyframe
+  registered, ≥ 20 images, verified gyro with no breaks / outliers, ≥ 70 % explained correspondences, and no unclosed
+  loop: `splitPairs` counts the verified correspondences the model keeps on DIFFERENT 3-D points on mostly-split
+  pairs (≥ max(15, 25 %) of the pair) — in total (≤ max(1000, 1.5 %)) and on loop-like ones whose points land
+  8 px … 0.4 f from the other feature (≤ max(150, 0.25 %)). Measured: closed yard-real live / offline models 950–1940
+  split / 60–190 loop-like of 168 k correspondences, object-real 0 / 0; unclosed live models (live retrieval and
+  spatial pairs off, `livePairs: {retrieval: 0, spatial: 0}`, or a loaded host; the loop closes live in some runs, not in
+  others) 2950–5650 split, ≥ 1200 loop-like when the gap is within 0.4 f (gaps 12–15 px, 50–255 px; rotation 0–8° off
+  the model's; a gap beyond it: 98 loop-like, caught by the split total) — the offline model then won (ATE 2.3–2.5e-4
+  vs ≈ 3e-4). False pairs on repeated structure are split too but sporadic and mostly hundreds to
+  thousands of pixels off. Any doubt runs the offline SfM: a wrong "unhealthy" only costs time. Without IMU (no
+  verified gyro) it always runs.
+* **Resumable sliced BA** (`BundleAdjuster` in `ba/solver.ts`; `bundleAdjust` is `new BundleAdjuster(…).run()`):
+  `run(pause)` iterates until the solve ends or `pause()` asks to yield after an LM iteration; the next `run` continues
+  with the same structure, linearisation, λ / ν and iteration count. `adjustGlobalBundleSliced` builds the problem once
+  (own copies of the observation arrays) and yields every `globalBASliceMs` between iterations instead of rebuilding the
+  problem, the solver structure and the linearisation for every slice — results bit-identical to the old slicing and
+  to one uninterrupted solve wherever the yields fall, and the "cut after 3 × slice" exception is gone (Node, 90-image
+  orbit, 152 k observations: 3.0–3.9 → 2.3–2.5 s per global BA).
+* **BA kernels**: the Schur elimination keeps a point's pose row block Y_k in registers for all its column blocks
+  (bit-identical); `SkylineCholesky.factor` computes two rows × two columns per step where the envelopes allow
+  (rows / columns of one parameter block share their first column): dense 541² 79 → 38 ms, 1200² 939 → 375 ms (Node).
+  The rolling-shutter subset BA (≈ 540 reduced parameters, dense) spent ≈ 60 % of its time in the factorisation.
+* **Rolling-shutter search** (`ba`-bound: one subset BA per hypothesis): the ±25 ms probes are evaluated only along the
+  direction clearly best at ±10 ms (≥ 10 % below the others and 0; else all, as before); a parabola vertex on the best
+  point is confirmed at ±tol/2 (Brent's minimum step) instead of bisecting the larger half one side per BA; and the
+  search is a coroutine (`rsSearchSteps`) whose independent hypotheses are scored in parallel on the CPU workers
+  (`searchRollingShutterBatched`, `RSBundleCost.toData / fromData`). Same estimate (Node bench −21.285 ms, curve
+  identical between the sequential and batched search); e2e 28 → 17–18 subset BAs in ≈ 10 rounds.
+* **Matching**: the one-deep GPU prefetch never overlapped — the queued match needs the event loop to encode and
+  submit, and the synchronous verification ran first; one macrotask (`yieldTask`, a message to ourselves, no 4 ms timer
+  clamp) after a match arrives lets the next one reach the GPU (GPU wait 7.6 → 2.2 s on object-real). **CPU helper
+  workers** (`engine/cpu-pool.ts`, `workers/cpu.worker.ts`; nested in the engine worker, Safari 15.5+; default hardware
+  threads − 2, ≤ 3, `EngineConfig.cpuWorkers`, 0 = off; created per refine and terminated after it) run the pair
+  verification, the vocabulary quantisation and the rolling-shutter hypotheses; results are applied in candidate order
+  (same database / graph); a failed job, or no `Worker` in scope (Node tests), runs on the engine thread.
+  `LiveSession.verifyInputs` splits `verifyPair`'s estimation inputs from its gyro gate.
+* **Not done, from the measurements**: pose-guided refine verification ('F' guide from the live poses / seeded
+  LO-MSAC). The verification time is in the retrieval candidates (object-real 8.6 of 10.1 s; yard-real 18 of 23 s, 11 s of it in pairs
+  that fail), which must stay unguided: on non-overlapping views a guided matcher returns band-consistent random
+  matches that then "verify" with the guide's own geometry (false pairs agreeing with the model). Sequential + spatial
+  pairs, where guidance would be safe, cost 1.5–2 s in total; seeding RANSAC does not lower its iteration count, which is
+  set by the inlier ratio (or the cap). Per-image focal rounds (cap 6) and the two rolling-shutter passes are kept: both
+  are accuracy-tuned (e2e/README "Real-capture robustness"); they only got faster BAs.
+* **Result** (e2e/README "Refine performance on Metal", back-to-back runs at load 8–11): refine object-real 232.8 →
+  44.8 s, yard-real 101.1 → 29.9 s (whole e2e 402 → 194 s, 200 → 135 s), accuracy and dense metrics unchanged within the
+  run-to-run noise; a live model with an open loop still gets the offline SfM.
+* **Remaining**: the per-image focal alternation (13 full BAs,
+  ≈ 16–24 s on object-real) and the rolling-shutter re-adjustments are sequential global BAs on the engine thread; the
+  next step is a parallel / GPU BA (point-partitioned linearisation + Schur on the workers or in WGSL).
+
+### `src/splat` — 3D Gaussian Splatting trainer and renderer (WebGPU, 2026-10)
+
+On-device 3DGS training seeded from the metric SfM + MVS reconstruction, written from the papers (3DGS,
+EWA splatting, Mip-Splatting, 3DGS-MCMC, Taming-3DGS / Brush / gsplat design notes, all Apache-2.0 or
+papers); no INRIA-derived code. Engine stage, exports and the NVS renderer: "Splat stage in the engine" below
+(the viewer is not wired yet); measured with `e2e/run-splat-gt.mjs` (GT poses, e2e/README.md).
+
+* **Files**: `types.ts` (constants, `SplatModel`, `SplatCamera`, memory plan), `layout.ts` (GPU parameter
+  layout), `cpu-reference.ts` (f64 forward / backward / loss), `wgsl/{common,sort,raster,backward,loss}.ts`,
+  `gpu-util.ts` (radix sorter, pass profiler), `forward.ts` (`SplatForward`, shared by renderer and trainer),
+  `renderer.ts` (`SplatRenderer`), `trainer.ts` (`SplatTrainer`), `init.ts`, `mcmc.ts`, `ply.ts`, `index.ts`.
+  Nothing reads WebGPU globals at module load.
+* **Model**: per Gaussian mean, log-scale, quaternion (w, x, y, z), opacity logit and SH degree 0 (default) or 1
+  (`shDegree: 1`; 12 floats). GPU layout: one f32 buffer with SoA sections for the capacity (mean and log-scale
+  vec4-padded, quaternion, opacity, SH 3·K floats); Adam moments use the same layout. Colours are sRGB like the
+  training images; colour = max(0, SH + 0.5) at the view direction (gsplat / INRIA convention).
+* **Forward** (`forward.ts`, one compute pass each): projection (EWA with the frustum-clamped Jacobian, screen-space
+  low-pass +0.3 px² with the Mip-Splatting opacity compensation `√(det Σ / det(Σ + εI))`, `antialiased`; opacity-aware
+  extent k = √(2 ln(o / α_min)), exact ellipse-vs-tile test so a splat is binned only into the 16×16 tiles its
+  α ≥ 1/255 ellipse reaches) → depth sort of all Gaussians (32-bit f32 keys) → tile counts in depth order, exclusive
+  scan, emission of (tile, Gaussian) pairs → stable sort by tile id (⌈log₂ tiles⌉ bits) → tile ranges → rasteriser
+  (256 threads per tile, 256-splat batches in workgroup memory, front to back, α ≤ 0.99, skip α < 1/255 — tested as
+  σ > ln(o / α_min) before the exp —, stop before T < 1e-4; writes colour + T·background, T and the last
+  contributor + 1). Sort and scan: 4-bit LSD radix, reduce-then-scan over 1024-element blocks (no decoupled
+  look-back: Apple GPUs give no forward-progress guarantee); stable in-block ranking by a workgroup scan of packed
+  per-thread digit counts. The intersection count stays on the GPU and drives the sort with indirect dispatches;
+  overflow beyond the reservation drops the farthest intersections of that frame and is reported (the trainer grows
+  the reservation, checked every 25 iterations).
+* **Loss** (`wgsl/loss.ts`): x = M_v·[C, 1] with a learned 3×4 colour matrix per training view (identity at start,
+  Adam lr 2e-3, L2 pull 1e-2 towards [I | 0]) for the exposure / white-balance drift of real captures
+  (`normaliseAppearance()` moves the mean matrix into the splat colours and background, a gauge transform that
+  leaves the corrected training renders unchanged; `exportPLY` applies it);
+  (1 − λ)·L1 + λ·(1 − SSIM), λ = 0.2, SSIM per channel with the separable 11-tap σ 1.5 window and zero padding, on
+  16×16 tiles with a 5 px halo in workgroup memory (≤ 13.7 KB); ∂SSIM/∂x = G⋆P + 2x·G⋆Q + y·G⋆R from per-pixel
+  partials (the zero-padded blur is its own adjoint). Training targets are box-downscaled on the GPU from the RGBA8
+  view (one buffer per view, so no binding exceeds 256 MiB).
+* **Backward** (`wgsl/raster.ts`, no per-pixel atomics, no float atomics): front to back with the forward's final
+  colour, ∂C/∂α_i = T_i c_i − (C − C_{≤i}) / (1 − α_i) (no division by T; the forward's last-contributor index bounds
+  the walk). A 16×16 tile is 8 groups of 32 pixels; a 64-thread workgroup takes 2 groups. Lane j owns the splats
+  i ≡ j (mod 32); at step s it processes pixel k = (s − j) mod 32 of its group with splat i = s − k (diagonal
+  schedule): each pixel meets its splats in order, its (T, r = gᵀ·colour-to-come) state passing from lane to lane
+  through workgroup memory (one barrier per step), while each thread sums one splat's 9 gradients (2-D mean, conic,
+  opacity, colour) over 32 pixels in registers. Every 32 steps the two groups' partials of 32 splats are added and
+  each non-zero sum goes to the global accumulators with one compare-exchange f32 add (u32 bit pattern) per
+  (splat, workgroup, component). Then one thread per Gaussian runs the projection backward fused with Adam
+  (`wgsl/backward.ts`: visible Gaussians only, bias correction with the global step, ε 1e-15), the MCMC regularisers
+  and the MCMC position noise; the 2-D accumulators are reset in the same pass. A `grads` variant writes the raw
+  gradients (tests).
+* **Densification**: 3DGS-MCMC under a hard cap (`mcmc.ts`): every 100 iterations between 10 % and 75 % of the run
+  the opacities are read back once (N floats), Gaussians with opacity ≤ 0.005 are moved onto live ones sampled ∝
+  opacity and the count grows 5 % per step until the cap; a source sampled n times becomes n + 1 copies with
+  o' = 1 − (1 − o)^(1/(n+1)) and scales × o / Σ_i Σ_k C(i−1, k)(−1)^k o'^(k+1)/√(k+1) (paper eq. 9); the GPU copies
+  the parameters and resets their Adam moments. Opacity / scale L1 regularisers 0.01 (scale divided by the scene
+  extent so it is unit-free; gsplat uses raw scales), noise 5e5 × mean lr × sigmoid(−100(o − 0.005)) × Σε.
+  Chosen over clone / split / prune for its fixed memory budget and robustness to the MVS initialisation.
+* **Schedule and learning rates**: random view order per epoch; resolution ¼ for the first 10 % of the
+  iterations, ½ until 30 %, then full (DashGaussian-style, fixed breakpoints); 3DGS learning rates (mean 1.6e-4 →
+  1.6e-6 × scene extent, exponential; log-scale 5e-3, quaternion 1e-3, opacity 5e-2, SH0 2.5e-3, SH1 2.5e-3 / 20);
+  scene extent = 1.1 × the largest camera distance from the cameras' centroid.
+* **Initialisation** (`init.ts`): `initFromPointCloud(cloud, { maxCount, shDegree })` — random subset to the budget,
+  σ_tangent = RMS distance to the 3 nearest neighbours (at least the fusion radius), σ_normal = 0.1 σ_tangent along the
+  fused normal (isotropic without normals), opacity 0.5, SH0 from the colour. `backgroundShell` adds large Gaussians
+  on a far sphere coloured from the views (sky); `concatModels` merges (e.g. fused MVS cloud + sparse SfM points +
+  shell).
+* **Engine API** (for the integration workstream): `SplatTrainer.memoryEstimate(opts, W, H, views)` before
+  allocating (≈ 0.5 KB per Gaussian at SH 0, 0.6 KB at SH 1, incl. Adam moments and 12 reserved intersections; plus 88 B per pixel and 4 B per pixel per training view);
+  `await SplatTrainer.create(ctx, opts)` at stage start (≈ 25 pipelines, cached per device);
+  `init(model, views)` with `DenseView`-compatible views (undistorted, rolling-shutter-corrected pinhole images);
+  `await step(n)` runs n iterations — one command buffer each, the next one encoded while the GPU runs the current
+  one, awaited before submitting (iOS rule; `inFlight: 2` is a desktop option) — and returns loss, count, it/s, so
+  the worker can time-slice it; `render(cam)`, `readModel()`, `exportPLY()` (INRIA layout read by SuperSplat,
+  Brush, Spark; `ply.ts` also decodes), `readColourMatrices()`, `stats()` (incl. per-pass GPU ms with `profile`).
+  `SplatRenderer` renders a `SplatModel` without a trainer.
+* **iOS constraints**: no subgroups, no f32 atomics (CAS on u32 bits), workgroup memory ≤ 16 KB (raster 12 KB,
+  backward 7.5 KB, SSIM 13.7 KB, colour reduction 16 KB), ≤ 256 threads, ≤ 8 storage buffers per kernel, no vec3 in
+  buffers, largest buffer the parameters (600 k Gaussians × 100 B at SH 1 = 60 MB) or the intersection keys (grown
+  only while ≤ maxStorageBufferBindingSize), pipelines compiled in `create`.
+* **Tests**: `cpu-reference.test.ts` (finite differences of every parameter gradient incl. clamped-Jacobian
+  splats, SSIM loss gradient), `ply.test.ts` (PLY round trip, layout, init, MCMC formula and plan, memory plan),
+  `sort.gpu.test.ts` (stable radix sort, > 1 block, ties, odd pass counts, n = 0, depth keys),
+  `renderer.gpu.test.ts` (GPU forward vs CPU: max 1e-6, identical contributor counts; NaN / zero-size / huge /
+  behind-camera fuzz; empty views), `trainer.gpu.test.ts` (GPU parameter gradients vs CPU backward: relative error
+  ~2e-6; loss kernels vs CPU; a toy scene trains 21.8 → 37.4 dB). All pass on Metal (E2E_GPU=host) and on SwiftShader
+  (slow: ~5–8 min of pipeline compilation per test file).
+* **Results** (`e2e/run-splat-gt.mjs`, GT poses, M4 / Metal, details and ablations in e2e/README.md "Splat
+  results"): held-out frames, 300 k Gaussians, MVS-cloud + sparse initialisation:
+
+  | | 0 it | 1 000 | 3 000 | 7 000 | colour-fit @ 7k | SSIM @ 7k | train 3k / 7k |
+  |---|---|---|---|---|---|---|---|
+  | object-real 600×800 | 19.1 | 28.5 | 30.4 | 30.9 dB | 33.3 dB | 0.948 | 48 s / 177 s |
+  | object-real 720×960 | 18.9 | 27.9 | 29.7 | 30.1 dB | 32.0 dB | 0.930 | 50 s / 160 s |
+  | yard-real 800×600 (+ sky shell) | 17.2 | 27.9 | 29.5 | 29.9 dB | 30.9 dB | 0.843 | 23 s / 73 s |
+  | yard-real 960×720 (+ sky shell) | 17.0 | 27.1 | 28.5 | 28.9 dB | 29.7 dB | 0.803 | 27 s / 87 s |
+
+  Today's object-real renderings score 9.2 dB full frame (lit TSDF mesh, 61 % coverage) and 15.8 dB on covered pixels
+  (points + EDL). GPU time per full-resolution iteration (600×800, 300 k Gaussians): ≈ 20 ms, half of it the
+  rasteriser backward; 39–48 it/s (target was 15–30 at 0.5–0.7 MP). Random initialisation reaches only 20.2 dB at 3k
+  (MVS seeding: +10 dB); 500 k Gaussians +0.2 dB at 3k; SH degree 1: no gain on these Lambertian scenes; the sky shell
+  +1.4 dB on the yard.
+* **Deviations from the design brief**: backward re-traverses front to back with the stored final colour instead of
+  back to front with the final transmittance (same information, no division by T); MCMC relocation is planned on the
+  host from one opacity readback per 100 iterations (sampling is easy there) and applied on the GPU; the scale
+  regulariser is divided by the scene extent; Adam updates only Gaussians projected into the frame; the SSIM uses
+  zero padding (its own adjoint); the projection Jacobian is evaluated at the frustum-clamped point (gsplat); the
+  backward groups 2 × 32 pixels per workgroup (measured best), not one 256-thread workgroup per tile.
+* **Open issues / next steps**: engine integration, viewer and UI done (below: "Splat stage in the engine",
+  "Splat layer in the viewer"); iPhone measurements (an iteration is
+  one ~20 ms command buffer on the M4 — split forward / backward if it exceeds ~30 ms on a phone); depth-sorting only
+  the visible Gaussians and 16-bit depth keys; f16 Adam moments; an off-trajectory test set to settle the colour
+  correction trade-off (raw held-out PSNR is 1.2 dB higher without it, colour-fit PSNR 0.5 dB lower); MVS depth /
+  normal supervision.
+
+### `src/engine` + `src/splat` — Splat stage in the engine (2026-10; amends the `src/splat` and `src/engine` notes above)
+
+`PhotogrammetryEngine.splat()` trains the `src/splat` Gaussians as a long engine stage after densify (or after refine
+without a dense cloud); protocol and UI contract in ENGINE.md §2 "Splat" / §3 "Splat protocol".
+
+* **Files**: `src/engine/splat.ts` (`runSplat`, run key, checkpoints), `presets.ts` (`SPLAT_PRESETS`,
+  `resolveSplatPreset`), `memory.ts` (`planSplat`, `fitSplatPlan`), `persistence.ts` (`SplatMetaRecord`,
+  `SplatProgressRecord`, `packSplatModel` / `packSplatParams` / `packSplatMoments`), `engine.ts` (`splat`,
+  `splatModel`, `splatResult`, refine invalidation, `loadSession`), `export.ts` ('ply-splat'), `dense.ts`
+  (`loadDenseViewImage`, shared by PatchMatch and the splat views), protocol / worker / `EngineClient` / `MockEngine`;
+  `src/splat/nvs.ts` (NVS harness renderer). Trainer additions: optional view images + `setViewImage`, dropped-work
+  stamps + `SplatWorkDroppedError`, `readState` / `readMoments` / `restore(state, moments, params?)`, section-wise
+  `readModel`, `simulateDroppedWork` (test hook).
+* **Views**: every registered keyframe with a stored photo (evenly spread to the preset's `maxViews`: 120 / 160 /
+  200), built exactly like the dense views (`loadDenseViewImage` → `denseViewImage`: decoded at the undistorted size,
+  undistorted, rolling-shutter corrected to the frame-stamp pose) at the preset's long side (800 / 1024 / 1280 px,
+  never above the dense size). Uploaded one at a time, so the host never holds them all. All keyframes rather than
+  the dense subset (40 at fast): more viewpoints is what novel views need, and at 600×800 an image is only 1.9 MB of
+  GPU memory.
+* **Initialisation**: the fused dense cloud through the footprint LOD (`footprintDownsample`, ½ of the Gaussian cap:
+  keeps the screen-space density of the MVS cloud instead of a random subset), the sparse SfM points (they reach the
+  walls / far structure MVS misses), `initFromPointCloud` on the union (3-NN scales, at least the fusion radius,
+  normal-oriented discs); scene captures (or `SplatOptions.backgroundShell`) add `backgroundShell` (20 k / 20 k / 30 k
+  Gaussians, radius max(20 × camera extent, 3 × the 98th-percentile sparse-point distance from the cameras' centre),
+  coloured from 160 px thumbnails of the training views). The dense cloud is read from the store for this only when
+  it is not resident and dropped after the LOD.
+* **Memory plan** (`planSplat`): stage 'prepare' (cloud as stored + decoded 55 B / point, LOD scratch 32 B / point,
+  initialisation 120 B per seeded point, thumbnails) and 'training' (`SplatTrainer.memoryEstimate` — the GPU buffers
+  count against the same iOS process — plus the largest host transient: decoding one view, a checkpoint ≈ 3 × 56 B +
+  16 B per Gaussian, or the final model); peak = max + 250 MB reserve + resident engine data. `fitSplatPlan` lowers,
+  until it fits, the training images or the Gaussians (whichever uses more GPU memory) down to soft floors (½ the views,
+  ½ the Gaussians, ¾ of the size), then to hard floors (16 views, 480 px, 50 k), and keeps the largest buffer ≤
+  `maxStorageBufferBindingSize`. Examples (90 keyframes / 160 / 300, 40 MB resident): fast fits 1.2 GB / 850 MB
+  unchanged (GPU 301 MB, peak 626 MB) and 600 MB with 64–73 views; balanced 1.2 GB keeps 160 views at 1024 px (GPU
+  689 MB, peak 1032 MB), 850 MB → 97 views; max 1.2 GB → ≈ 100 views at 1280 px, 500 k (peak ≈ 1.19 GB), 850 MB →
+  45–100 views, 1037–1280 px, 250–361 k Gaussians. Logged as `splat memory plan (…)`.
+* **iOS rules**: pipelines compiled at stage start (`SplatTrainer.create`); one command buffer per iteration, awaited
+  (`inFlight` 1); ≤ 25 iterations per GPU-lock hold (cancel / visibility latency ≈ 0.5 s on the M4); the engine waits
+  while the page is hidden before every chunk and upload; PatchMatchGPU, feature caches, capture state and (persistent
+  sessions) the dense colour views are released first.
+* **Dropped work**: every iteration writes a per-trainer submission counter (`ColourCfg.stamp`, f32-exact < 2²⁴) into
+  its stats slot, every MCMC relocation copies its own counter into slot 64 (`copyBufferToBuffer` of its uniform);
+  `step` reads the 65 slots once and throws `SplatWorkDroppedError` when a stamp of its last ≤ 64 iterations or of its
+  relocation is missing. A dropped relocation would leave grown slots uninitialised (zero log-scale = 1 world unit),
+  so the engine rolls back to the last checkpoint in place (`restore(state, moments, params)`: the view images stay on
+  the GPU) rather than counting lost iterations. Every readback (`readBuffer`) also copies a fresh stamp behind its
+  data in the same command buffer and throws `SplatWorkDroppedError` when it is missing (mapAsync resolves on a dropped
+  copy with the previous staging contents); the engine reads checkpoints and the final model again once visible
+  (`normaliseAppearance` throws before it changes anything), so stale data is never committed. A device loss (`waitGPU` / readback race `device.lost`) destroys the
+  trainer, takes the new device (`getGPU`), recompiles, re-uploads the views and restores the checkpoint; twice at
+  most, then `GPUDeviceLostError` 'gpu-lost' (the worker posts it fatal, the client respawns).
+* **Checkpoints**: every 500 iterations (and at iteration 0 = the initial Gaussians; on cancel when ≥ 100 iterations
+  old): `splat/ckpt<slot>/params` (f32, exact), `/m`, `/v` (bf16: the f32 exponent range — second moments reach 1e-15,
+  float16 would flush them to zero and blow up the next update — at 0.4 % precision), `/colour` (f32) and
+  `splat/progress` (key, iteration, count, slot, background, MCMC counters, intersection high-water mark, plan) in
+  the session store (persistent) or the scratch store; two slots, the progress record written last, so a kill
+  mid-write keeps the previous checkpoint. 112 B per Gaussian: 22 MB at 200 k, measured 168 ms each (Chromium,
+  scratch IndexedDB). The run key hashes poses, cameras, sparse points, rolling shutter, the dense cloud's identity,
+  preset, options and trainer overrides; the fitted plan (view ids in order, size, cap) is stored with the checkpoint
+  and reused on resume (unless it no longer fits while a fresh plan would), so a different resident set after a
+  reload does not prevent the resume. Restore reseeds the view order / MCMC sampling from the iteration.
+* **Persistence / viewer / export**: `splat/model` = f32 means + f16 log-scales, unit quaternions, opacity logits, SH
+  (34 B per Gaussian: 6.8 MB at 200 k) + `splat/meta`; never kept in engine memory; `splatModel()` decodes it into a
+  transferable `SplatModelPayload`, `exportModel('ply-splat')` encodes the INRIA PLY (68 B per Gaussian). The model is
+  appearance-normalised before it is stored. `refine` deletes splats and checkpoints; densify / mesh keep them.
+* **NVS renderer** (`src/splat/nvs.ts`): `SplatRenderer` over a black background — the colour channels are the
+  premultiplied sRGB radiance (the model is fitted to the sRGB images, no transfer function), alpha = 1 − T; GPU test:
+  centroid error ≤ 0.004 px against the pinhole projection.
+* **Tests**: `src/engine/splat-plan.test.ts` (presets, plan = trainer estimate, degradation, encodings incl. bf16
+  range, run key, 'ply-splat' export), `mock-engine.test.ts` (stages, detail, resumable cancel, export),
+  `src/engine/splat-engine.gpu.test.ts` (E2E_GPU=host: persistent session densify → splat cancelled at 160 → engine
+  dropped → new engine reports `splatResumableIteration` 100, resumes at 120, persists, clears checkpoints, exports;
+  in-memory session without dense cloud + sky shell: a simulated drop rolls back, `device.destroy()` at 140 rebuilds),
+  `src/splat/trainer.gpu.test.ts` (restore round trip, drop detection), `src/splat/nvs.gpu.test.ts`.
+* **Measured** (`E2E_GPU=host node e2e/run-e2e.mjs object-real --engine worker --splat --nvs --tag int-object`,
+  fast, M4 / Metal, headless Chrome, host load 4–6 from other apps): every enforced check passes (ATE 2.89e-4 of the
+  extent, dense completeness 0.997); splat stage 60.3 s = prepare 12.6 s (initial Gaussians 1.1 s: 90 113 dense +
+  12 316 sparse; 90 view uploads 11.5 s) + training 47.5 s (3 000 iterations, 64.6 it/s over the coarse-to-fine
+  schedule, 53.8 it/s at full 600×800 resolution at the end, 6 checkpoints ≈ 1.0 s) + finishing 0.1 s; 200 000
+  Gaussians, loss 0.0148; memory plan peak ≈ 811 MB of 1.2 GB (training 336 MB: GPU 301 MB — images 165, pixels 40,
+  intersections 37, Adam 24 — + host 35 MB; resident 225 MB in this non-persistent run). Novel views (24 held-out
+  frames at 600×800, `nvs.mjs` defaults, same run):
+
+  | renderer | coverage | full PSNR / SSIM | covered PSNR / SSIM | cc full PSNR | cc covered PSNR | shift px |
+  |---|---|---|---|---|---|---|
+  | `points` | 0.763 | 10.39 / 0.475 | 24.02 / 0.755 | 10.41 | 24.52 | 0.19 |
+  | `mesh-lit` (app default) | 0.610 | 8.65 / 0.530 | 23.55 / 0.877 | 8.68 | 25.50 | 0.13 |
+  | `mesh-unlit` | 0.610 | 8.71 / 0.552 | 28.65 / 0.915 | 8.72 | 30.00 | 0.08 |
+  | **`splat`** | **0.999** | **31.24 / 0.958** | **30.62 / 0.950** | **33.74** | **33.44** | 0.08 |
+
+  Splat full-frame PSNR per view: median 31.13, min 23.36, max 35.14 dB. The splats fill the frame (the walls and
+  floor the mesh cuts away) and beat the best covered-pixel renderer (unlit mesh) by 2 dB on its own pixels. Not
+  directly comparable with the GT-pose `run-splat-gt` table above (other test frames: here held-out frames 1–3 frames
+  from a keyframe; 90 SfM-posed training views; 200 k Gaussians).
+* **Open issues**: view preparation runs on the engine thread (≈ 128 ms per 600×800 view: JPEG decode, undistortion,
+  rolling-shutter remap — 19 % of the fast stage; on a phone more): decode / remap on the CPU helper workers
+  (`cpu-pool.ts`) or reuse the dense stage's undistorted views; no iPhone measurement (iteration time, IndexedDB
+  checkpoint writes of 22–56 MB every 500 iterations, budget headroom of `max`); 'auto' mode without a resolved mode
+  gets no sky shell; the shell radius is a heuristic. Viewer / app UI: "Splat layer in the viewer" below.
+* **Final before / after measurement** (e2e/README.md "Breakthrough results", fast, M4, two runs each): post-capture
+  processing 202.9 → 156.1 s on object-real and 149.8 → 112.2 s on yard-real with the splat stage (96.5 / 70.4 s without
+  it), sparse accuracy unchanged, dense accuracy p50 0.43 → 0.30 mm / 25.0 → 8.9 mm. The splat view scores 31.3 / 31.1 dB
+  full frame on held-out frames against 8.6 / 9.8 dB for the app's lit mesh. Off trajectory (same seeded scene,
+  shifted paths) it changes by +0.1 to −3.3 dB (object ±5 cm radius, +12 cm height) and 1.3–8.3 dB (yard ±1.5 m sideways,
+  +0.75 m height). The stress cases lose 8.0 dB (+25 cm) and 11.0 dB (+1.5 m). Height is the weak axis: the
+  captures never see tree tops or the ground behind the fence. Even so, it stays 9.8–21.2 dB above `mesh-lit` and
+  ahead of the unlit mesh on the mesh's own pixels except at object +25 cm (−0.4 dB). The off-trajectory sets
+  (`--test-dataset`) can now settle the colour-correction trade-off above; not done here.
+
+### `src/viewer` + `src/app` — Splat layer in the viewer, photoreal UI, unlit mesh (2026-10; amends the `src/viewer`, `src/app` and splat notes above)
+
+The viewer shows the trained Gaussians with the trainer's own forward kernels (so it shows exactly what was trained);
+the app builds them from the viewer screen. UI contract: ENGINE.md §3 "Splat protocol".
+
+* **Files**: `src/viewer/splat-layer.ts` (`SplatLayer`, a lazy chunk of ≈ 43 kB loaded by the first `setSplats`),
+  `src/viewer/splat-camera.ts` (pure: three camera → `SplatCamera`, canvas / frame sizes), `src/splat/present.ts`
+  (`SplatPresenter`), `SplatRenderer.encodeFrame` / `setMaxSize` / `reserveIntersections` / `gpuBytes`;
+  `src/app/screens/viewer.ts`, `model-info.ts` (splat resume / progress helpers), `mock-engine.ts`.
+* **Stacking**: a WebGPU canvas (`canvas.viewer-splats`, `pointer-events: none`) is inserted under the WebGL canvas.
+  While the splats are shown (`DisplayOptions.splats`, default true, and the layer is ready) the WebGL frame clears to
+  alpha 0 and draws only the overlay scene (camera frustums, measure markers; no depth to test against, so always on
+  top); points, mesh and grid are hidden. The WebGL context is now always created with `alpha: true` (every viewer
+  shader writes alpha 1; an opaque background clears with alpha 1, so nothing else changes). Transparent viewer
+  backgrounds get a premultiplied splat canvas (alpha = 1 − T).
+* **Camera**: `splatCameraFromView(camera.matrixWorldInverse × worldRoot.matrixWorld, camera.projectionMatrix, W, H,
+  near)`: rows 1 and 2 of the view change sign (three looks down −z, +y up); fx = W/2·P₀₀, fy = H/2·P₁₁,
+  cx = W/2·(1 − P₀₂) − 0.5, cy = H/2·(1 + P₁₂) − 0.5 (NDC ±1 = image edges −0.5 / W − 0.5), so fov, aspect, zoom and
+  view offsets carry over. Unit test against three's projection: < 1e-3 px over 40 random cameras / roots; GPU test:
+  Gaussian centroids on `worldToScreen` of their means within 0.06 px. Near plane = min(clip near, 0.05 × target
+  distance).
+* **Frames**: `draw(view)` from every viewer frame, skipped when the signature (view, projection, sizes, near, model
+  version, background) equals the last frame's — the canvas keeps the last presented image, so a still view costs
+  nothing. One command buffer per frame (forward + present + a 4-byte intersection-count copy, no image readback),
+  at most one in flight: a view asked for meanwhile is drawn when the frame's count map resolves (latest view
+  wins). Overflow (count > reservation, the farthest intersections were dropped) grows the reservation ×1.25 (start
+  max(1 M, 16 × N), cap 6 M = 96 MB) and redraws.
+* **Pixel budget**: canvas = CSS size × min(devicePixelRatio, `maxPixelRatio` 2, √(2 MP / CSS area)) — 786×1704 =
+  1.34 MP on a 393×852 iPhone (DPR 3), ≤ 2 MP on large windows. While the view moves (damping, gestures) and the
+  last full frame took > 16 ms, frames are rendered at ≤ 0.5 MP and upscaled bilinearly by the presenter; the
+  still view is drawn at full size. The per-pixel buffers follow the canvas (reallocated when it does not fit or is
+  > 2× too big).
+* **iOS rules**: pipelines (forward, cached per device; present) compiled in `setModel` before the first frame;
+  nothing is submitted while `document.hidden` and the frame is redrawn on `visibilitychange` (dropped work);
+  device loss (`device.lost`) → state 'lost' (the points show), rebuilt on the new `getGPU()` device from the host
+  copy of the model (kept, not copied: ≈ 56 B / Gaussian), twice, then 'unavailable'. Software adapters
+  (SwiftShader) are refused — pipeline compilation falls back to synchronous after 30 s and would block the page
+  for minutes (`splatAllowSoftware` for tests). GPU memory (`getStats().splatLayer.gpuMB`): parameters 64 B,
+  projection / sort 80 B, intersections 16 B × reservation per Gaussian, 20 B per canvas pixel.
+* **Framing**: splats are photoreal near the photos and show unconstrained floaters / the sky shell far outside the
+  capture (e2e/README.md "Viewer splat layer": the from-above overview of yard-real is a blur). `viewFromCamera(i?,
+  { pullBack, animate })` looks along capture camera i (default: the middle one) at the median depth of the content
+  samples inside its image, the eye pulled back 15 % of that depth, orbit controls on. The app opens a scan with
+  splats this way (and "Reset view" on the splat layer does it), with the camera frustums off by default (no depth
+  to hide behind, they would cover the view near the photos).
+* **Measured** (`e2e/ui/splat-shots.mjs`, E2E_GPU=host, M4 / Metal, iPhone emulation 393×852 @3x → splat canvas
+  786×1704 = 1.34 MP, 200 k Gaussians, host load 5–8): submit → done per full-size frame while orbiting, median /
+  p90 16.3 / 22.5 ms on object-real (0.93 M intersections), 12.7 / 18.1 ms on yard-real (0.34 M); splat layer GPU
+  memory 107 MB (reservation 3.2 M intersections = 51 MB, pixels 27 MB). No iPhone measurement yet: a full frame
+  there is expected to take several times longer, which is what the 0.5 MP interactive frames are for.
+* **Picking**: while the splats are shown, `pickPoints` / the CPU picker use the dense / sparse points AND the mesh
+  (hidden; the surfaces the splats were initialised from) regardless of the display flags; measuring and double-tap
+  focus work unchanged (GPU test: 1.0438 measured vs 1.0440).
+* **App** (viewer screen): Build sheet item "Photoreal model" (needs a sparse model and WebGPU in the browser; "Needs
+  WebGPU" otherwise) runs `engine.splat({ quality })` ON the viewer: progress card (prepare ≈ 8 %, training ≈ 89 %,
+  finishing ≈ 3 % of the bar; "1,250 / 3,000 iterations · ~2 min left" from `SplatTrainingDetail`), Cancel (confirm →
+  `abortLongOperation({ method: 'splat' })` with 8 s grace), wake lock, `App.busy` makes leaving the page ask, Back
+  asks and stops it, the other builds wait. A rebuild frees the previous model's splat layer while the trainer runs
+  (≈ 150–220 MB of GPU memory at 300–500 k Gaussians that the engine's page reserve does not cover; points / mesh
+  meanwhile) and loads it again when the build stops. Done: `results.splat`, session stats `splatGaussians` /
+  `splatIterations` / `splatQuality` / timings, a prepared splat PLY of the old model dropped,
+  `engine.splatModel()` → `Viewer.setSplats` → shown. Cancelled / failed: "Photoreal model interrupted ·
+  Resume" card + Build-sheet Resume (engine `splatResumableIteration` / `Quality` or the app's own marker); refine
+  clears the splats. Layer pill above the toolbar (and in the Display sheet): Splats / Points / Mesh, one at a time;
+  a scan with splats opens on them (the points while they load; header counts the shown layer); 'unavailable' falls
+  back to mesh / points with a toast. Export sheet: "Gaussian splats (.ply)". `App.debug.viewer` exposes the 3D view
+  to e2e scripts.
+* **Unlit mesh** (measured quick win, e2e/README.md "Baselines"): `DisplayOptions.unlit` defaults to true (vertex
+  colours are photo colours that already contain the shading; lit, they are shaded twice: covered PSNR 23.6 → 28.7 dB
+  object-real, 23.1 → 26.9 dB yard-real); the Display sheet's "Mesh lighting" switch (off) brings the lighting back.
+  The GLB export marks the mesh material `KHR_materials_unlit`. Points keep EDL.
+* **Tests**: `src/viewer/splat-camera.test.ts` (projection vs three, sizes), `src/viewer/splat-layer.gpu.test.ts`
+  (E2E_GPU=host: centroids, overlays-only transparency, measuring on hidden points, redraw only on change, pixel
+  budget, setSplats(null) / dispose, screenshot compositing), `model-info.test.ts`, `mock-engine.test.ts` (persisted
+  splats, `injectSession`), `engine.test.ts` (unlit GLB); `e2e/ui/smoke.mjs` (build in the viewer, measure on the
+  splats, layer pill, splat PLY export, reopened scan on its splats) and `e2e/ui/states.mjs` `splat-build` /
+  `splat-no-webgpu`; screenshots of real runs: `e2e/ui/splat-shots.mjs` (e2e/README.md "Viewer splat layer").
+
+
+### `src/splat` + `src/engine` — Geometry supervision, shape regularisers and colour correction against off-trajectory views (2026-10; amends the `src/splat` and splat-stage notes above)
+
+Classical 3DGS interpolates well and extrapolates poorly, mostly in height (e2e/README.md "Breakthrough results":
+object +12 / +25 cm −3.3 / −8.0 dB, yard +0.75 / +1.5 m −8.3 / −11.0 dB against held-out). This experiment adds
+geometry supervision from the metric MVS, surfel / anisotropy regularisers and settles the colour-correction
+question, each measured on held-out AND the off-trajectory sets of both scenes (e2e/README.md "Splat-stage
+experiments on a frozen session": one e2e session per scene, the splat stage re-run per variant on identical
+inputs). Rule: a change is on by default only if it raises the mean off-trajectory full-frame PSNR, lowers held-out
+by ≤ 0.2 dB and costs ≤ ~15 % splat-stage time.
+
+* **Files**: `cpu-reference.ts` (geometry channels, ∂L/∂A), `depth-target.ts` (target packing, CPU loss),
+  `wgsl/{common,raster,backward,loss}.ts`, `forward.ts` (`outGeo`, `setPipelines`), `trainer.ts` (`geometry`,
+  `flatten`, `anisotropy`, `setViewDepth`, phase switch, `debugGeoLoss`), `types.ts` (memory),
+  `src/engine/splat.ts` (`depthMaps`, `uploadDepth`), `engine.ts`, `presets.ts` (`SplatPresetConfig.trainer`,
+  `SPLAT_TRAINER_DEFAULTS`), `memory.ts`; harness: `src/harness/engine/replay.ts`, `pipeline.ts` (`dumpSession`),
+  `e2e/splat-replay.mjs`.
+* **Geometry channels** (shader config `geometry: true | 'depth'`): the rasteriser also renders D = Σ w_i / z_i (z = camera
+  depth of the centre) and N = Σ w_i n_i, n_i = the rotation axis of the smallest scale in the camera frame, flipped to
+  face the camera (n · p < 0, the MVS convention). They are colour-like channels with a zero background, so the
+  existing front-to-back backward carries them: gᴳ · G joins r, gᴳ · (1/z, n) the splat's channel product, and each
+  Gaussian gets 4 more 2-D gradients (∂(1/z) → mean through z; ∂n → quaternion through its column, the axis choice and
+  the flip are piecewise constant). The accumulated alpha A = 1 − T is a channel of constant 1: its gradient rides in
+  dLdC.w (r += gᴬ·A, channel product += gᴬ). Layout: proj gets a 4th row (normal) and the backward 13 accumulators;
+  'depth' (normal weights 0) keeps proj at 3 rows (the depth is already in row 0) and uses 10. The per-pixel geometry
+  buffer interleaves [2o] = rendered (D, N) and [2o + 1] = ∂L/∂(D, N), so the rasteriser backward stays at 8 storage
+  bindings. iOS budget: raster forward 14 KB workgroup memory (normal staged as sC.w + a vec2 array), backward
+  ≈ 10 KB; still no f32 atomics (one CAS add per non-zero (splat, workgroup, component)).
+* **Geometry loss** (`GEO_LOSS_WGSL`, after the SSIM backward): per pixel of the current level with a target and
+  A ≥ 0.05: L = (1 / pixels) · w · (λ_d |D̂·z_t − 1| + λ_n ‖N̂ − n_t‖₁), D̂ = D / A, N̂ = N / A. Targets
+  (`packDepthTarget`): the dense stage's fusion-filtered depth map of the view (`EngineDepthStore` 'depth/<id>') resampled
+  along the rays to the training camera at ½ size (nearest source pixel; the dense and splat views are the same
+  undistorted, rolling-shutter-corrected pinholes, so z and the camera-frame normal carry over), 8 B per pixel: f16
+  inverse depth | f16 weight (w = 1 − cost, the filtered maps have cost < 0.5), octahedral normal in 2 × snorm16; optional
+  × |cos θ|^grazing between normal and ray. Weights decay exponentially λ(0) → λ(until·T); after `until` the trainer
+  swaps to the plain kernels of the same projection layout (`compilePostGeometryPipelines` shares the loss / MCMC /
+  sort pipelines; `SplatForward.setPipelines`; a rollback to before `until` swaps back). The relative inverse-depth
+  error is scale-free (object 0.3–2.5 m, yard 3–25 m). Alpha normalisation was necessary: on the un-normalised
+  blended inverse depth the loss can only be met where the render is opaque (toy test: depth error −25 % vs −94 %).
+* **Engine**: `SplatDeps.depthMaps()` (the in-memory filtered store of this engine's dense run, else an
+  `EngineDepthStore` over the depth backend: session store or scratch IndexedDB) — only when the trainer has
+  `geometry`; the training views that are dense views get a target (fast: 40 of 90 object / 81 yard views), packed on
+  the engine thread (1.0–1.5 s for 40 views) after the view uploads and again on a device-loss rebuild. Without depth
+  maps (no dense stage) geometry is switched off with a log line. Memory plan: + targets (40 × 300 × 400 × 8 B = 37 MB
+  at fast) + 32 B per training pixel (15 MB) + 4 B per Gaussian (10 accumulators; full mode: 16 + 16 B for the 4th
+  proj row and 13 accumulators); fast object: GPU 301 → 353 MB, peak 686 → 738 MB of 1.2 GB (the targets stay
+  allocated after `until`: a rollback may need them). The preset's trainer defaults (`SplatPresetConfig.trainer`) are merged under
+  `EngineConfig.splat.trainer` field by field and hashed into the run key.
+* **Shape regularisers** (Adam kernel, `opt.shape`): `flatten` — L1 on the smallest scale ÷ scene extent, mean over the
+  Gaussians (surfels); `anisotropy: { maxRatio, weight }` — max(0, ln s_max − ln s_mid − ln r), mean over the
+  Gaussians (no needles). Both act as intended (object: Gaussians with mid/min > 5 73.5 → 99.7 % with flatten 100;
+  max/mid > 5 8.3 → 0.1 % with the cap 5) but leave every PSNR within noise, so they stay off.
+* **Tests**: `cpu-reference.test.ts` (finite differences of every parameter through the geometry channels and ∂L/∂A, SH
+  0 / 1, clamped Jacobian; disc normal / inverse depth), `depth-target.test.ts` (octahedral round trip, ½-size and
+  cross-size resampling, grazing weights, loss gradient incl. ∂L/∂A vs finite differences), `trainer.gpu.test.ts`
+  (geometry forward + parameter gradients vs CPU, full and depth-only: rel. error ≈ 1e-6; loss kernel vs CPU at levels
+  1 / 2 / 4: 1e-7; depth supervision pulls perturbed Gaussians onto the target; the `until` switch renders identically
+  to `SplatRenderer` and a rollback restores the geometry kernels; flatten / anisotropy), `splat-engine.gpu.test.ts`
+  (the reloaded persistent session trains with its stored depth maps).
+* **Results** (e2e/README.md "Geometry supervision, shape regularisers, colour correction": 25 variants, full-frame
+  PSNR, off = mean of the four off-trajectory sets, drift-free = the capture path and the +12 cm / +0.75 m path without
+  exposure / white-balance drift; Δ against the five "before" runs):
+
+  | variant | object held / off (Δ) | yard held / off (Δ) | drift-free object path / +12 cm, yard path / +0.75 m | stage time |
+  |---|---|---|---|---|
+  | before (colour correction on, no geometry) | 31.28 / 27.10 | 31.10 / 22.83 | 32.53 / 27.81, 30.27 / 20.62 | 59.4 / 40.2 s |
+  | depth + normal, whole run | 31.30 / 26.99 (−0.11) | 30.84 / 22.65 (−0.18) | | +24 % |
+  | depth only, until 0.5 | 31.31 / 27.09 (−0.01) | 31.04 / 23.21 (+0.37) | | |
+  | depth + normal, until 0.3 | 31.27 / 27.10 (0.00) | 30.99 / 23.31 (+0.48) | 32.56 / 27.87, 30.26 / 21.32 | +4 / +7 % |
+  | **depth only, until 0.3 (default)** | **31.37 / 27.25 (+0.15)** | **31.01 / 23.31 (+0.48)** | **32.62 / 28.09, 30.25 / 21.12** | **+4.1 / +6.4 %** |
+  | depth only, until 0.3, grazing cos² | 31.32 / 26.95 (−0.15) | 31.03 / 23.32 (+0.49) | | |
+  | flatten 100 | 31.35 / 27.05 (−0.05) | 31.13 / 22.84 (+0.01) | | |
+  | anisotropy cap 5 | 31.29 / 27.12 (+0.01) | 31.02 / 22.80 (−0.04) | | |
+  | colour correction off | 33.76 / 27.97 (+0.87) | 31.92 / 22.78 (−0.06) | 30.72 / 27.40, 29.80 / 20.25 | (not timed alone) |
+  | colour correction off + depth only, until 0.3 | 33.41 / 27.82 (+0.72) | 31.78 / 23.34 (+0.51) | 31.02 / 27.34, 29.87 / 20.99 | |
+
+  Decisions (rule above): **inverse-depth supervision during the first 30 % is on by default** (mean off-trajectory
+  +0.31 dB, held-out +0.09 / −0.09 dB, stage +4–6 %, GPU +52 MB at fast); supervising the whole run punches holes into
+  ground the capture only saw at grazing angles (yard inward −1.7 dB, coverage 0.981), which stopping early avoids; the
+  normal term, the grazing weights, `flatten` and `anisotropy` stay options (no gain). **Per-view colour correction
+  stays on**: it loses raw held-out and regular off-trajectory PSNR only because those test frames reproduce the
+  capture's exposure drift on the same clock, which an uncorrected model bakes into region-wise colours; on drift-free
+  views the correction wins by 0.4–1.8 dB. Before this, the regular off-trajectory sets cannot judge exposure handling.
+* **Measuring on splats** (not wired): the geometry forward also renders D̂ = D / A per pixel, so the viewer's
+  `SplatLayer` could pick a 3-D point at a tap from the expected inverse depth of the splats it shows (a 1-pixel
+  readback of a `geometry`-config frame) instead of the hidden dense points / mesh it uses now.
+* **Open issues**: the remaining height gap is unseen content (object top / floor at +25 cm, tree crowns and the ground
+  behind the fence from +1.5 m): 0.5–0.9 dB of the yard's 8.3–11 dB recovered; a generative or symmetry prior would be
+  needed for the rest. Only the dense views (40 at fast) get targets; the depth targets (37 MB) stay allocated after
+  `until`; no iPhone timing (the target packing is CPU work on the engine thread, 1–1.5 s on the M4); the regular
+  off-trajectory datasets share the capture's exposure clock (use `--exposure-jitter 0 --wb-drift 0` sets for
+  appearance questions).

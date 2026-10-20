@@ -178,4 +178,22 @@ describe('yard walk', () => {
     }
     expect(outward / N).toBeGreaterThan(0.6);
   });
+
+  it('lateralOffset walks beside the loop (outward normal), same attitude; 0 is the default walk', () => {
+    const out = createYardTrajectory({ lateralOffset: 1.5 });
+    const zero = createYardTrajectory({ lateralOffset: 0 });
+    for (let k = 0; k < 50; k++) {
+      const t = (k / 50) * traj.duration;
+      const a = traj.evaluate(t),
+        b = out.evaluate(t);
+      expect(zero.evaluate(t).position).toEqual(a.position);
+      const d = [b.position[0] - a.position[0], b.position[1] - a.position[1], b.position[2] - a.position[2]];
+      expect(Math.hypot(d[0], d[1])).toBeCloseTo(1.5, 9);
+      expect(d[2]).toBe(0);
+      // outward: away from the loop centre, perpendicular to the walking direction
+      expect(d[0] * a.position[0] + d[1] * a.position[1]).toBeGreaterThan(0);
+      expect(Math.abs(d[0] * a.velocity[0] + d[1] * a.velocity[1]) / (1.5 * Math.hypot(a.velocity[0], a.velocity[1]))).toBeLessThan(0.15);
+      for (let i = 0; i < 9; i++) expect(b.R_wd[i]).toBeCloseTo(a.R_wd[i], 12);
+    }
+  });
 });

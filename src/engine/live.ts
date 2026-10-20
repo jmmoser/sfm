@@ -19,7 +19,7 @@ import type { CameraIntrinsics, CancelToken, FeatureSet, FrameInfo, GeoFix, ImuS
 import type { FeaturePipeline } from '../features/extractor';
 import { deserializeFeatureSet, serializeFeatureSet } from '../io/serialize';
 import { solvePnPRansac } from '../geometry/pnp';
-import { estimateTwoViewGeometry } from '../geometry/twoview';
+import { estimateTwoViewGeometry, type TwoViewOptions } from '../geometry/twoview';
 import { mat3Mul, mat3MulTranspose } from '../math/mat3';
 import { rotationAngle } from '../math/rotation';
 import { median } from '../math/stats';
@@ -1255,6 +1255,20 @@ export class LiveSession {
 
   /** CPU half of `matchPair`: two-view verification of putative matches and the gyro gate. */
   verifyPair(a: number, b: number, m: MatchPairs, opts: { maxIterations?: number } = {}): TwoViewGeometry | null {
+    const v = this.verifyInputs(a, b, m, opts);
+    return v ? this.gatePair(a, b, estimateTwoViewGeometry(v.kp1, v.kp2, m, v.cam1, v.cam2, v.opts)) : null;
+  }
+
+  /**
+   * Inputs of `verifyPair`'s two-view estimation (null: the pair cannot verify), for running it
+   * elsewhere (refine's CPU pool) and gating the result with `gatePair`.
+   */
+  verifyInputs(
+    a: number,
+    b: number,
+    m: MatchPairs,
+    opts: { maxIterations?: number } = {},
+  ): { kp1: Float32Array; kp2: Float32Array; cam1: CameraIntrinsics; cam2: CameraIntrinsics; opts: TwoViewOptions } | null {
     const st = this.state;
     const fa = st.db.features.get(a);
     const fb = st.db.features.get(b);
@@ -1262,11 +1276,14 @@ export class LiveSession {
     const rb = st.records.get(b);
     if (!fa || !fb || !ra || !rb) return null;
     if (m.length >> 1 < this.minPairInliers) return null;
-    const ca = this.intrinsics(ra.width, ra.height);
-    const cb = this.intrinsics(rb.width, rb.height);
     const Rp = this.gyroRotation(ra.t, rb.t);
-    const g = estimateTwoViewGeometry(fa.keypoints, fb.keypoints, m, ca, cb, { maxIterations: opts.maxIterations ?? 2000, rotationPrior: Rp ?? undefined });
-    return this.gatePair(a, b, g);
+    return {
+      kp1: fa.keypoints,
+      kp2: fb.keypoints,
+      cam1: this.intrinsics(ra.width, ra.height),
+      cam2: this.intrinsics(rb.width, rb.height),
+      opts: { maxIterations: opts.maxIterations ?? 2000, rotationPrior: Rp ?? undefined },
+    };
   }
 
   /** Record a verified pair in the DB and graph. */

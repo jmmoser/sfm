@@ -6,6 +6,8 @@ import {
   GPU_SOURCE_CAMERA_FLOATS,
   buildSourceCamera,
   checkerOffset,
+  octDecode,
+  octEncode,
   packSourceCameras,
   passSeed,
   patchOffsets,
@@ -119,6 +121,33 @@ describe('patchmatch-common', () => {
     expect(q[1] / q[2]).toBeCloseTo(pv, 8);
   });
 
+  it('octahedral normal codec round-trips unit normals to < 5e-4 rad (float16 storage: ~1e-3)', () => {
+    const out = new Float32Array(3);
+    let worst = 0;
+    let seed = 1;
+    const rnd = (): number => ((seed = pcgHash(seed)) >>> 8) / 16777216;
+    const dirs: number[][] = [
+      [0, 0, 1],
+      [0, 0, -1],
+      [1, 0, 0],
+      [0, -1, 0],
+      [0.6, -0.8, 0],
+    ];
+    for (let k = 0; k < 2000; k++) {
+      const z = 2 * rnd() - 1;
+      const a = 2 * Math.PI * rnd();
+      const r = Math.sqrt(1 - z * z);
+      dirs.push([r * Math.cos(a), r * Math.sin(a), z]);
+    }
+    for (const [x, y, z] of dirs) {
+      octDecode(octEncode(x, y, z), out, 0);
+      expect(Math.abs(Math.hypot(out[0], out[1], out[2]) - 1)).toBeLessThan(1e-6);
+      worst = Math.max(worst, Math.acos(Math.min(1, out[0] * x + out[1] * y + out[2] * z)));
+    }
+    expect(worst).toBeLessThan(5e-4);
+    expect(octEncode(0, 0, 0)).toBe(0);
+  });
+
   it('packs source cameras in the documented 40-float layout', () => {
     const ref = view(0, [0, -3, 1], [0, 0, 0]);
     const src = view(1, [0.8, -2.6, 1.4], [0.2, 0.1, 0], 50, 40);
@@ -134,6 +163,10 @@ describe('patchmatch-common', () => {
     expect([packed[b + 32], packed[b + 33]]).toEqual([50, 40]);
     expect(packed[b + 34]).toBeCloseTo(1 / 64, 7);
     expect([packed[b + 36], packed[b + 37], packed[b + 38], packed[b + 39]]).toEqual([0.5, 0.5, 25, 20]);
+    // texture-array layers: the source index by default, else the given ones
+    expect([packed[15], packed[19], packed[b + 15], packed[b + 19]]).toEqual([0, 0, 1, 1]);
+    const withLayers = packSourceCameras([sc, sc], 64, 48, undefined, { image: [7, 3], depth: [2, 5] });
+    expect([withLayers[15], withLayers[19], withLayers[b + 15], withLayers[b + 19]]).toEqual([7, 2, 3, 5]);
   });
 
   it('checkerboard pattern: procedural form equals the table, all on the opposite colour', () => {

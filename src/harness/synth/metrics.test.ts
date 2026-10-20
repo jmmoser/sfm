@@ -270,6 +270,22 @@ describe('computeMetrics', () => {
     expect(m.dense!.completeness).toBeLessThan(0.8);
     expect(m.dense!.precision).toBeGreaterThan(0.95);
   });
+
+  it('sim3+icp: completeness on the ICP-moved cloud also when it exceeds maxPoints (review)', () => {
+    const result = { images: ds.frames.map((f) => ({ index: f.index, pose: toResult(f.pose) })), metric: { metric: false, gravityAligned: false, northAligned: false } };
+    // the dense cloud 2 τ off the poses (ICP's job): completeness only when the shift is undone
+    const gt = ds.gt!.points;
+    const pts = new Float32Array(gt.length);
+    for (let i = 0; i < gt.length / 3; i++) pts.set(applySim3(S, [gt[3 * i] + 0.04, gt[3 * i + 1], gt[3 * i + 2]]), 3 * i);
+    const sim3 = computeMetrics(ds, result, { points: pts }).dense!;
+    const full = computeMetrics(ds, result, { points: pts, denseAlign: 'sim3+icp' }).dense!;
+    const sub = computeMetrics(ds, result, { points: pts, denseAlign: 'sim3+icp', maxPoints: 5000 }).dense!;
+    expect(sim3.completeness).toBeLessThan(0.7);
+    expect(full.icp!.translation).toBeGreaterThan(0.03);
+    expect(full.completeness).toBeGreaterThan(0.98);
+    expect(sub.numPointsEvaluated).toBe(5000);
+    expect(sub.completeness).toBeGreaterThan(0.98);
+  });
 });
 
 describe('k-d tree', () => {

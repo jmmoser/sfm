@@ -14,7 +14,14 @@ export const USAGE = `usage: node e2e/run-e2e.mjs [object|yard|all|<dataset> ...
   --no-dense | --no-mesh        skip densify / mesh (mesh needs dense)
   --dense-size N                DenseOptions.maxImageSize       --dense-views N   DenseOptions.maxViews
   --mesh-voxel V                MeshOptions.voxelSize (world units) --mesh-triangles N MeshOptions.targetTriangles
+  --splat                       Gaussian splatting after densify / mesh (after refine with --no-dense):
+                                engine.splat() → <dir>/splats.ply (scored by --nvs as the 'splat' renderer)
+  --splat-iterations N          SplatOptions.iterations         --splat-max N   SplatOptions.maxGaussians
+  --splat-size N                SplatOptions.maxImageSize       --splat-views N SplatOptions.maxViews
   --no-export | --export a,b    exports (sizes only); default: every applicable format
+  --nvs                         novel-view evaluation of the output (e2e/nvs.mjs: held-out frames,
+                                PSNR / SSIM of the points / mesh renders) → <dir>/nvs/nvs.json
+  --nvs-views N                 held-out views for --nvs (default 24)
   --timeout-min M               per-dataset timeout in minutes (default 120)
   --out DIR                     output root (default e2e/out/e2e); files go to <out>/<dataset>[-tag]/
   --tag NAME                    suffix of the output directory
@@ -32,7 +39,7 @@ export class ArgError extends Error {}
 const ENGINES = ['worker', 'inline', 'mock'];
 const QUALITIES = ['fast', 'balanced', 'max'];
 const MODES = ['object', 'scene', 'auto'];
-const FORMATS = ['ply-points', 'ply-mesh', 'glb', 'colmap-zip'];
+const FORMATS = ['ply-points', 'ply-mesh', 'glb', 'colmap-zip', 'ply-splat'];
 
 function setPath(obj, path, val) {
   const ks = path.split('.');
@@ -43,8 +50,8 @@ function setPath(obj, path, val) {
 }
 
 /**
- * Parse argv → { datasets, config (harness config without `dataset`), timeoutMin, out, tag,
- * thresholds, noThresholds, enforce, quiet, verbose, headed, help }.
+ * Parse argv → { datasets, config (harness config without `dataset`), nvs, nvsViews, timeoutMin,
+ * out, tag, thresholds, noThresholds, enforce, quiet, verbose, headed, help }.
  */
 export function parseArgs(argv) {
   const o = {
@@ -54,7 +61,11 @@ export function parseArgs(argv) {
     mesh: true,
     denseOpts: {},
     meshOpts: {},
+    splat: false,
+    splatOpts: {},
     exports: true,
+    nvs: false,
+    nvsViews: 24,
     timeoutMin: 120,
     out: null,
     tag: null,
@@ -117,6 +128,11 @@ export function parseArgs(argv) {
       case '--dense-views': o.denseOpts.maxViews = int(2); break;
       case '--mesh-voxel': o.meshOpts.voxelSize = num(0); break;
       case '--mesh-triangles': o.meshOpts.targetTriangles = int(4); break;
+      case '--splat': o.splat = true; break;
+      case '--splat-iterations': o.splatOpts.iterations = int(1); break;
+      case '--splat-max': o.splatOpts.maxGaussians = int(1000); break;
+      case '--splat-size': o.splatOpts.maxImageSize = int(64); break;
+      case '--splat-views': o.splatOpts.maxViews = int(2); break;
       case '--no-export': o.exports = false; break;
       case '--export': {
         const v = next();
@@ -129,6 +145,8 @@ export function parseArgs(argv) {
         }
         break;
       }
+      case '--nvs': o.nvs = true; break;
+      case '--nvs-views': o.nvsViews = int(1); break;
       case '--timeout-min': o.timeoutMin = num(0); break;
       case '--out': o.out = next(); break;
       case '--tag': o.tag = next(); break;
@@ -167,6 +185,8 @@ export function parseArgs(argv) {
   if (!o.dense && o.mesh) o.mesh = false; // mesh needs the dense cloud
   o.config.densify = o.dense ? (Object.keys(o.denseOpts).length ? { ...o.denseOpts } : true) : false;
   o.config.mesh = o.mesh ? (Object.keys(o.meshOpts).length ? { ...o.meshOpts } : true) : false;
+  if (Object.keys(o.splatOpts).length) o.splat = true;
+  o.config.splat = o.splat ? (Object.keys(o.splatOpts).length ? { ...o.splatOpts } : true) : false;
   o.config.exports = o.exports;
   o.config.logFrames = !o.quiet;
   for (const [k, v] of o.sets) setPath(o.config, k, v);

@@ -14,6 +14,9 @@
  *  - `planDense`: analytic peak of each dense stage (PatchMatch, fusion, TSDF) and the caps that
  *    keep it inside the budget: image / depth-map cache sizes, fusion neighbours, the fusion
  *    pixel step and point cap, TSDF blocks.
+ *  - `planSplat` / `fitSplatPlan`: the Gaussian-splatting stage (trainer GPU buffers from
+ *    `SplatTrainer.memoryEstimate` = `estimateSplatMemory`, initialisation, view decoding,
+ *    checkpoints) and the degradation (fewer views, Gaussians, smaller images) that fits it.
  *
  * All sizes are bytes unless a name ends in `MB`.
  */
@@ -22,6 +25,7 @@ import type { CorrespondenceGraph } from '../sfm/correspondence-graph';
 import type { FeatureDatabase } from '../sfm/database';
 import type { Reconstruction } from '../sfm/reconstruction';
 import type { VocabularyIndex } from '../sfm/vocab';
+import { estimateSplatMemory, paramFloatsPerGaussian } from '../splat/types';
 
 export const MB = 1024 * 1024;
 
@@ -44,11 +48,15 @@ export const MEM = Object.freeze({
   /** Depth-only map (geometric-pass sources need only `depth`). */
   depthOnlyPx: 4,
   rgbaPx: 4,
-  /** PatchMatchGPU (ARCHITECTURE §6 dense notes): 32 B per reference px, 1 B per source px, +4 B per source px geometric. */
+  /**
+   * PatchMatchGPU (ARCHITECTURE §6 dense notes): 32 B per reference px, 1 B per source px, +4 B
+   * per source px geometric; fixed: uniforms, ≤ 8 MB staging and the upload caches' slack layers
+   * (≤ 8 MB each, `PatchMatchGPU.cacheSlackBytes`).
+   */
   pmGpuRefPx: 32,
   pmGpuSrcPx: 1,
   pmGpuGeomSrcPx: 4,
-  pmGpuFixed: 8 * MB,
+  pmGpuFixed: 28 * MB,
   /** Fused point arrays: position + normal 3 × f32, colour 3 B, radius + confidence f32. */
   fusedPoint: 35,
   /**
@@ -72,6 +80,20 @@ export const MEM = Object.freeze({
    * 40 views; it falls with more overlapping views, so this is conservative for 80–150 views).
    */
   fusedFraction: 0.2,
+  /**
+   * Splat initialisation per input point: the dense cloud as stored (float16 container) + as
+   * decoded (35 B) when it is not resident, the footprint LOD's per-point scratch, and per seeded
+   * point the k-d tree, σ and the Gaussian (`initFromPointCloud`).
+   */
+  splatCloudLoadPoint: 55,
+  splatLodPoint: 32,
+  splatInitPoint: 120,
+  /** Decoding one training view: the full-size JPEG bitmap + canvas (≈ 2 × 12 MB at 1920×1440) … */
+  splatDecodeFixed: 24 * MB,
+  /** … and decoded / undistorted / rolling-shutter-corrected copies at the training size (RGBA). */
+  splatDecodePx: 12,
+  /** Background-shell colour thumbnails (all views, ≤ 200 px). */
+  splatThumbBytes: 4 * 200 * 150,
 });
 
 /** Named byte counts. */
@@ -259,13 +281,13 @@ export function planDense(p: DensePlanInput): DensePlan {
   const map = MEM.depthMapPx * px;
 
   // ---- PatchMatch passes
-  const imageCacheBytes = Math.max((S + 2) * img, Math.min(0.15 * budget, 24 * img));
+  const imageCacheBase = Math.max((S + 2) * img, Math.min(0.15 * budget, 24 * img));
   const geometric = p.geometricPasses > 0;
   const sourceDepthCacheBytes = geometric ? Math.max((S + 1) * MEM.depthOnlyPx * px, Math.min(0.1 * budget, 32 * MEM.depthOnlyPx * px)) : 0;
   const colourBytes = Math.max(16 * MB, 0.08 * budget);
   const gpuBytes = p.gpu ? MEM.pmGpuRefPx * px + S * px * (MEM.pmGpuSrcPx + (geometric ? MEM.pmGpuGeomSrcPx : 0)) + MEM.pmGpuFixed : 0;
   const pmParts: MemoryBreakdown = {
-    images: imageCacheBytes,
+    images: imageCacheBase,
     sourceDepths: sourceDepthCacheBytes,
     // prior (full map) + the new map + its serialised copy (+ the halo-filtered copy)
     depthMaps: (geometric ? map : 0) + map + MEM.depthStoredPx * px + (p.haloFilter ? map : 0),
@@ -302,6 +324,17 @@ export function planDense(p: DensePlanInput): DensePlan {
     mesh: 120 * MB,
   };
 
+  // The image LRU may use what the PatchMatch stage leaves below the larger of the other two
+  // stages' peaks (it never raises the plan's peak): up to every view, so each view is decoded
+  // and undistorted once per resolution instead of once per pass.
+  let imageCacheBytes = imageCacheBase;
+  const otherPeak = Math.max(sumBreakdown(fusionParts), sumBreakdown(meshParts));
+  const pmSlack = otherPeak - sumBreakdown(pmParts);
+  if (pmSlack > 0 && views * img > imageCacheBytes) {
+    imageCacheBytes = Math.min(views * img, imageCacheBytes + pmSlack);
+    pmParts.images = imageCacheBytes;
+  }
+
   const stages: DenseStagePeak[] = [
     { stage: 'patchmatch', bytes: sumBreakdown(pmParts), parts: pmParts },
     { stage: 'fusion', bytes: sumBreakdown(fusionParts), parts: fusionParts },
@@ -323,4 +356,152 @@ export function planDense(p: DensePlanInput): DensePlan {
     peakBytes,
     storageBytes: Math.round(2.2 * views * px * MEM.depthStoredPx),
   };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Splat plan
+// ---------------------------------------------------------------------------------------------
+
+export interface SplatPlanInput {
+  budgetMB: number;
+  /** Engine data that stays resident during the stage (sparse model, results kept in memory). */
+  residentBytes: number;
+  /** Training views and their (largest) image size. */
+  views: number;
+  width: number;
+  height: number;
+  maxGaussians: number;
+  shDegree: 0 | 1;
+  /** Dense-cloud points read from the store for the initialisation (0 when the cloud is resident or absent). */
+  loadedCloudPoints: number;
+  /** Points the initialisation seeds Gaussians from (dense LOD + sparse points + shell). */
+  initPoints: number;
+  /** Trainer geometry supervision: views with a depth target, the target downscale, normal channels. */
+  geometry?: { views: number; factor: number; normals?: boolean };
+}
+
+export interface SplatStagePeak {
+  stage: 'prepare' | 'training';
+  bytes: number;
+  parts: MemoryBreakdown;
+}
+
+export interface SplatPlan {
+  /** GPU buffers of the trainer (`SplatTrainer.memoryEstimate`, ±1 %), by buffer group. */
+  gpuBytes: number;
+  gpuParts: MemoryBreakdown;
+  /** Largest single GPU buffer (must stay ≤ maxStorageBufferBindingSize: 256 MiB on iOS 26.0–26.1). */
+  largestBuffer: number;
+  /** Bytes available to the engine (budget − reserve − resident). */
+  shareBytes: number;
+  stages: SplatStagePeak[];
+  /** Largest stage peak + reserve + resident. */
+  peakBytes: number;
+  fits: boolean;
+}
+
+/**
+ * Peak memory of the splat stage. 'prepare' (before the trainer exists): the dense cloud read from
+ * the store, its footprint LOD and the initial Gaussians; 'training': the trainer's GPU buffers
+ * (on iOS they count against the same process) plus the largest host transient — decoding one
+ * training view, a checkpoint (parameters read back as f32 + packed + the IndexedDB copy) or the
+ * final model (read back + compact copy).
+ */
+export function planSplat(p: SplatPlanInput): SplatPlan {
+  const budget = p.budgetMB * MB;
+  const share = Math.max(64 * MB, budget - MEM.reserve - p.residentBytes);
+  const px = Math.max(1, p.width * p.height);
+  const geometry = p.geometry ? { views: Math.min(p.views, p.geometry.views), factor: p.geometry.factor, normals: p.geometry.normals } : undefined;
+  const est = estimateSplatMemory({ maxGaussians: p.maxGaussians, shDegree: p.shDegree, width: p.width, height: p.height, views: p.views, geometry });
+  // a SplatModel row: mean 3 + log-scale 3 + quaternion 4 + opacity 1 + SH (f32)
+  const modelRow = 4 * (paramFloatsPerGaussian(p.shDegree) - 2);
+  const prepare: MemoryBreakdown = {
+    cloud: p.loadedCloudPoints * MEM.splatCloudLoadPoint,
+    lod: p.loadedCloudPoints * MEM.splatLodPoint,
+    init: p.initPoints * MEM.splatInitPoint,
+    thumbnails: p.views * MEM.splatThumbBytes,
+  };
+  const transient = Math.max(
+    MEM.splatDecodeFixed + MEM.splatDecodePx * px,
+    // checkpoint: section readback + SplatModel + packed container + IndexedDB copy
+    p.maxGaussians * modelRow * 3 + p.maxGaussians * 16,
+    // final model: read back + compact container (f32 means, f16 rest) + IndexedDB copy
+    p.maxGaussians * (modelRow + 2 * (modelRow / 2 + 6)),
+  );
+  const training: MemoryBreakdown = { ...prefixed('gpu.', est.breakdown), host: transient };
+  const stages: SplatStagePeak[] = [
+    { stage: 'prepare', bytes: sumBreakdown(prepare), parts: prepare },
+    { stage: 'training', bytes: sumBreakdown(training), parts: training },
+  ];
+  const peakBytes = Math.max(...stages.map((s) => s.bytes)) + MEM.reserve + p.residentBytes;
+  return { gpuBytes: est.total, gpuParts: est.breakdown, largestBuffer: est.largestBuffer, shareBytes: share, stages, peakBytes, fits: peakBytes <= budget };
+}
+
+function prefixed(prefix: string, b: MemoryBreakdown): MemoryBreakdown {
+  const out: MemoryBreakdown = {};
+  for (const [k, v] of Object.entries(b)) out[prefix + k] = v;
+  return out;
+}
+
+export interface SplatFitRequest {
+  views: number;
+  /** Long side of the training images (px). */
+  size: number;
+  maxGaussians: number;
+}
+
+export interface SplatFitOptions {
+  /** Training image size (undistorted pinhole) for a long side. */
+  dims(size: number): { width: number; height: number };
+  /** Never below these (defaults 16 views, 480 px, 50 000 Gaussians). */
+  minViews?: number;
+  minSize?: number;
+  minGaussians?: number;
+  /** Largest GPU buffer allowed (default 256 MiB, the iOS 26.0–26.1 binding limit). */
+  maxBufferBytes?: number;
+}
+
+export interface SplatFit extends SplatFitRequest {
+  width: number;
+  height: number;
+  plan: SplatPlan;
+  /** What was lowered ("views 160 → 120", …); empty when the request fits. */
+  degraded: string[];
+}
+
+/**
+ * Lower the request until `planSplat` fits: first down to soft floors (half the views, half the
+ * Gaussians, 0.75 × the size) taking from whichever of the training images and the Gaussians uses
+ * more GPU memory, then to the hard floors in the same order. Returns the last plan even when it
+ * still does not fit (the caller warns and tries anyway).
+ */
+export function fitSplatPlan(base: Omit<SplatPlanInput, 'views' | 'width' | 'height' | 'maxGaussians'>, want: SplatFitRequest, o: SplatFitOptions): SplatFit {
+  const minViews = Math.min(want.views, Math.max(2, o.minViews ?? 16));
+  const minSize = Math.min(want.size, Math.max(64, o.minSize ?? 480));
+  const minG = Math.min(want.maxGaussians, Math.max(1000, o.minGaussians ?? 50_000));
+  const maxBuf = o.maxBufferBytes ?? 256 * MB;
+  const soft = { views: Math.max(minViews, Math.ceil(0.5 * want.views)), size: Math.max(minSize, Math.round(0.75 * want.size)), g: Math.max(minG, Math.round(0.5 * want.maxGaussians)) };
+  let { views, size, maxGaussians } = want;
+  const evaluate = (): { plan: SplatPlan; width: number; height: number } => {
+    const d = o.dims(size);
+    return { plan: planSplat({ ...base, views, width: d.width, height: d.height, maxGaussians }), ...d };
+  };
+  let cur = evaluate();
+  const ok = (): boolean => cur.plan.fits && cur.plan.largestBuffer <= maxBuf;
+  for (let guard = 0; guard < 200 && !ok(); guard++) {
+    const imageBytes = cur.plan.gpuParts.images ?? 0;
+    const gaussBytes = cur.plan.gpuBytes - imageBytes - (cur.plan.gpuParts.pixels ?? 0);
+    const floors = views > soft.views || maxGaussians > soft.g || size > soft.size ? soft : { views: minViews, size: minSize, g: minG };
+    if (imageBytes >= gaussBytes && views > floors.views) views = Math.max(floors.views, Math.floor(views * 0.85));
+    else if (maxGaussians > floors.g) maxGaussians = Math.max(floors.g, Math.floor(maxGaussians * 0.85));
+    else if (views > floors.views) views = Math.max(floors.views, Math.floor(views * 0.85));
+    else if (size > floors.size) size = Math.max(floors.size, Math.round(size * 0.9));
+    else break;
+    cur = evaluate();
+  }
+  const degraded: string[] = [];
+  if (views !== want.views) degraded.push(`views ${want.views} → ${views}`);
+  if (maxGaussians !== want.maxGaussians) degraded.push(`Gaussians ${want.maxGaussians} → ${maxGaussians}`);
+  if (size !== want.size) degraded.push(`image size ${want.size} → ${size} px`);
+  return { views, size, maxGaussians, width: cur.width, height: cur.height, plan: cur.plan, degraded };
 }
