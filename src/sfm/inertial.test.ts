@@ -184,6 +184,21 @@ describe('estimateTimeOffset', () => {
     if (LOG && res) console.log('slow pan offset', res.offsetMs, res.stdMs, res.quality, res.reliable);
     expect(res === null || !res.reliable).toBe(true);
   });
+
+  it('quality does not depend on the initial offset (one robust kernel for min and median cost)', () => {
+    const rng = new Rng(175);
+    const traj = walkTrajectory(rng);
+    const Rcd = cameraFromDevice(90);
+    const imu = simulateImu(traj, Rcd, rng, {});
+    const kf = simulateKeyframes(traj, Rcd, rng, { offsetMs: 120, rotNoise: 0.002 });
+    // 20 % of the keyframes with a 0.05 rad rotation error (outliers of the robust cost)
+    for (const k of kf.keyframes) if (rng.uniform(0, 1) < 0.2) k.R_wc = mat3Mul(k.R_wc, rotvecToMat3([0.05 * rng.gaussian(), 0.05 * rng.gaussian(), 0.05 * rng.gaussian()]));
+    const r0 = estimateTimeOffset(kf.keyframes, imu, { initialOffsetMs: 0, searchRangeMs: 200 })!;
+    const r120 = estimateTimeOffset(kf.keyframes, imu, { initialOffsetMs: 120, searchRangeMs: 200 })!;
+    if (LOG) console.log('offset', r0.offsetMs, r120.offsetMs, 'quality', r0.quality, r120.quality);
+    expect(Math.abs(r0.offsetMs - r120.offsetMs)).toBeLessThan(0.5);
+    expect(Math.abs(r0.quality - r120.quality)).toBeLessThan(0.1);
+  });
 });
 
 describe('estimateGravity', () => {

@@ -299,7 +299,8 @@ export type RSCostFunction = (model: RollingShutterModel) => number;
 
 /**
  * Search the readout (axis, signed time) minimising `cost`: 0; ±10 and ±25 ms (for the default
- * 40 ms range) on both axes choose the axis and direction; along it, successive parabola fits
+ * 40 ms range) on both axes choose the axis and direction; along it, the range end if the outer
+ * probe is best, bisection towards the end while it stays best, then successive parabola fits
  * (≤ 3 more evaluations). Accepted when the relative decrease against 0 reaches `minImprovement`
  * and |readout| ≥ `minReadoutMs`. ≈ 12–18 cost evaluations in total.
  */
@@ -357,13 +358,20 @@ export function searchRollingShutter(cost: RSCostFunction, opts: Partial<Rolling
       xs = [...known.keys()].sort((a, b) => a - b);
       bi = xs.reduce((k, x, i) => (known.get(x)! < known.get(xs[k])! ? i : k), 0);
     }
+    const tol = Math.max(0.5, 0.2 * o.stepMs);
+    // still best at the range end: bisect towards it until bracketed (or within tol of the end)
+    for (let g = 0; g < 6 && bi === xs.length - 1 && bi > 0 && xs[bi] - xs[bi - 1] > tol; g++) {
+      const mid = 0.5 * (xs[bi - 1] + xs[bi]);
+      known.set(mid, f(mid));
+      xs = [...known.keys()].sort((a, b) => a - b);
+      bi = xs.reduce((k, x, i) => (known.get(x)! < known.get(xs[k])! ? i : k), 0);
+    }
     let a = xs[Math.max(0, bi - 1)],
       b = xs[bi],
       c = xs[Math.min(xs.length - 1, bi + 1)];
     let fa = known.get(a)!,
       fb = known.get(b)!,
       fc = known.get(c)!;
-    const tol = Math.max(0.5, 0.2 * o.stepMs);
     for (let it = 0; it < 8 && c - a > tol && a < b && b < c; it++) {
       // vertex of the parabola through (a, fa), (b, fb), (c, fc)
       const num = (b - a) ** 2 * (fb - fc) - (b - c) ** 2 * (fb - fa);

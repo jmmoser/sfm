@@ -11,6 +11,7 @@ import {
   rsLineTimeMs,
   rsModelFromDevice,
   rsModelToDevice,
+  searchRollingShutter,
   type RollingShutterModel,
   type RSImageObservations,
 } from './rolling-shutter';
@@ -162,6 +163,21 @@ describe('estimateRollingShutter', () => {
     expect(gs.accepted).toBe(false);
     expect(gs.model.readoutMs).toBe(0);
     expect(Math.abs(gs.best.readoutMs)).toBeLessThan(3);
+  });
+});
+
+describe('searchRollingShutter', () => {
+  it('a minimum between the last probe and the range end is bracketed (not returned as the end)', () => {
+    const quad = (truth: number) => (m: RollingShutterModel) => (m.axis === 'rows' && m.readoutMs >= 0 ? (m.readoutMs - truth) ** 2 : 1000 + m.readoutMs ** 2);
+    for (const truth of [22, 33, 36, 38, 39.5]) {
+      const est = searchRollingShutter(quad(truth));
+      expect(Math.abs(est.best.readoutMs - truth)).toBeLessThan(0.5);
+      expect(est.curve.length).toBeLessThanOrEqual(18);
+    }
+    // at / beyond the range end (maxReadoutMs 40): the end
+    expect(searchRollingShutter(quad(45)).best.readoutMs).toBe(40);
+    // around an earlier estimate, the extension clamped to the range end
+    expect(Math.abs(searchRollingShutter(quad(38), { around: { axis: 'rows', readoutMs: 30 } }).best.readoutMs - 38)).toBeLessThan(0.5);
   });
 });
 
