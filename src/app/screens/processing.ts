@@ -37,6 +37,8 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
   // this one (run → ensureSessionLoaded): name, quality and "already built" stages are then
   // filled in after the load instead of showing the other scan's.
   let resultsStale = !!route.sessionId && app.loadedSessionId !== route.sessionId;
+  /** This scan has a sparse model to open (not the previous scan's, while it is not loaded). */
+  const hasModel = (): boolean => !resultsStale && !!app.results.sparse;
   let quality = app.results.quality;
   let weights = stageWeights(quality);
   let closed = false;
@@ -279,6 +281,13 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
     let step: ProcessingStep | null = null;
     try {
       for (const s of steps) {
+        // A Stop that came while the previous request was ending (loadSession ignores it, a step
+        // past its last cancel check completes normally): the next step must not start.
+        if (cancelling) {
+          running = false;
+          finishProcessing(true);
+          return;
+        }
         step = s;
         if (s === 'refine') {
           setActive('matching');
@@ -354,7 +363,7 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
     if (canRetry) actions.push(button({ label: 'Try again', icon: 'refresh', variant: 'primary', size: 'md', onClick: () => void retry(), testId: 'processing-retry' }));
     actions.push(
       button({
-        label: app.results.sparse ? 'Open model' : 'Back to home',
+        label: hasModel() ? 'Open model' : 'Back to home',
         variant: 'secondary',
         size: 'md',
         onClick: () => finishProcessing(true),
@@ -403,7 +412,7 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
     closed = true;
     void app.wakeLock.release();
     if (!cancelled) app.navigate({ type: 'PROCESSING_DONE' });
-    else app.navigate({ type: 'PROCESSING_CANCELLED', hasModel: !!app.results.sparse });
+    else app.navigate({ type: 'PROCESSING_CANCELLED', hasModel: hasModel() });
   }
 
   async function cancel(): Promise<void> {

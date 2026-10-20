@@ -14,7 +14,7 @@ import type { Viewer } from '../../viewer';
 import { loadViewerModule } from '../viewer-loader';
 import { formatDistance } from '../../viewer/helpers';
 import type { ExportFormat, QualityPreset } from '../../workers/protocol';
-import type { App, Screen } from '../app';
+import type { App, Results, Screen } from '../app';
 import { button, chip, group, iconButton, kvRow, section, segmented, setButtonLabel, spinner, switchRow } from '../components/controls';
 import { openSheet, type SheetHandle } from '../components/sheet';
 import { toast } from '../components/toast';
@@ -49,6 +49,8 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   const d = new Disposer();
   let viewer: Viewer | null = null;
   let closed = false;
+  /** load() applied this scan: until then app.results may still describe the previous one. */
+  let ready = false;
   let measuring = false;
   const display: DisplayState = { points: true, mesh: false, cameras: true, edl: true, grid: true };
   const exports = new Map<ExportFormat, ExportState>();
@@ -172,6 +174,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
 
   // ---- sheets ------------------------------------------------------------------------------------
   function openDisplay(): void {
+    if (!ready) return;
     const r = app.results;
     const rows = [
       switchRow({ label: 'Points', icon: 'points', checked: display.points, testId: 'display-points', onChange: (v) => setDisplay({ points: v }) }),
@@ -193,6 +196,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   }
 
   function openBuild(): void {
+    if (!ready) return;
     const r = app.results;
     const resumable = denseResumable(r);
     // the interrupted run's preset (null: unknown — older records)
@@ -312,24 +316,6 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     }
   }
 
-  function exportAvailability(f: ExportFormat): { ok: boolean; sub: string } {
-    const r = app.results;
-    switch (f) {
-      case 'ply-points':
-        if (r.dense) return { ok: true, sub: `Dense cloud · ${formatCount(r.dense.count)} points, normals, colours` };
-        if (r.sparse) return { ok: true, sub: `Sparse points · ${formatCount(r.sparse.points.count)}` };
-        return { ok: false, sub: 'No points yet' };
-      case 'ply-mesh':
-        return r.mesh ? { ok: true, sub: `${formatCount(r.mesh.triangleCount)} triangles with vertex colours` } : { ok: false, sub: 'Build the mesh first' };
-      case 'glb':
-        if (r.mesh) return { ok: true, sub: 'Coloured mesh — opens in most 3D apps and AR' };
-        if (r.dense || r.sparse) return { ok: true, sub: 'Coloured point cloud (glTF binary)' };
-        return { ok: false, sub: 'Nothing to export yet' };
-      case 'colmap-zip':
-        return r.sparse ? { ok: true, sub: `Cameras, sparse model and ${r.sparse.cameras.length} photos` } : { ok: false, sub: 'No sparse model yet' };
-    }
-  }
-
   /** Re-renders the OPEN export sheet (null when closed): a build that finishes after the sheet
    *  was closed and opened again must update the new sheet, not the detached old list. */
   let renderExports: (() => void) | null = null;
@@ -339,6 +325,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   let sharingUntil = 0;
 
   function openExport(): void {
+    if (!ready) return;
     const list = h('div', { class: 'export-list' });
     const render = (): void => {
       replaceChildren(list, ...EXPORTS.map((e) => exportRow(e)));
@@ -358,7 +345,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   }
 
   function exportRow(e: (typeof EXPORTS)[number]): HTMLElement {
-    const av = exportAvailability(e.format);
+    const av = exportAvailability(app.results, e.format);
     const st = exports.get(e.format) ?? { status: 'idle' };
     const filename = exportFilename(app.results.name, e.ext, e.suffix);
     let action: HTMLElement;
@@ -426,6 +413,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   }
 
   function openInfo(): void {
+    if (!ready) return;
     const r = app.results;
     const sp = r.sparse;
     const m = sp?.metric;
@@ -482,6 +470,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       }
     }
     if (closed) return;
+    ready = true;
     loading.hidden = true;
     if (!app.env.webgl) {
       replaceChildren(canvasHost, h('div', { class: 'viewer-nogl' }, icon('warning', { size: 28 }), h('p', { text: 'WebGL is not available, so the model cannot be displayed. You can still export it.' })));
@@ -510,6 +499,26 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       d.dispose();
     },
   };
+}
+
+/** Whether an export format has something to export, and what (the Export sheet's sub line). */
+export function exportAvailability(r: Pick<Results, 'sparse' | 'dense' | 'mesh'>, f: ExportFormat): { ok: boolean; sub: string } {
+  // an empty dense cloud (fusion kept no point) is skipped like the engine's export does
+  const dense = r.dense && r.dense.count > 0 ? r.dense : null;
+  switch (f) {
+    case 'ply-points':
+      if (dense) return { ok: true, sub: `Dense cloud · ${formatCount(dense.count)} points, normals, colours` };
+      if (r.sparse) return { ok: true, sub: `Sparse points · ${formatCount(r.sparse.points.count)}` };
+      return { ok: false, sub: 'No points yet' };
+    case 'ply-mesh':
+      return r.mesh ? { ok: true, sub: `${formatCount(r.mesh.triangleCount)} triangles with vertex colours` } : { ok: false, sub: 'Build the mesh first' };
+    case 'glb':
+      if (r.mesh) return { ok: true, sub: 'Coloured mesh — opens in most 3D apps and AR' };
+      if (dense || r.sparse) return { ok: true, sub: 'Coloured point cloud (glTF binary)' };
+      return { ok: false, sub: 'Nothing to export yet' };
+    case 'colmap-zip':
+      return r.sparse ? { ok: true, sub: `Cameras, sparse model and ${r.sparse.cameras.length} photos` } : { ok: false, sub: 'No sparse model yet' };
+  }
 }
 
 /** Engine memory statistics (stats.memoryMB after the last step, the dense plan's peak, size caps). */

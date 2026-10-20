@@ -620,10 +620,11 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
    */
   function onMemoryLimit(): void {
     if (memoryLimited || closed) return;
-    memoryLimited = true;
     memChip.hidden = false;
     el.classList.add('memory-limited');
+    // Not now (interrupted by the background, an error card): a later marked frame asks.
     if (phase !== 'running' && phase !== 'paused') return;
+    memoryLimited = true;
     pause('user');
     const enough = numKeyframes >= MIN_KEYFRAMES;
     showCard(
@@ -893,7 +894,6 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       return;
     }
     if (closed) return;
-    showCard(null);
     pump = new FramePump({
       camera,
       consumer: consume,
@@ -906,6 +906,10 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       videoFrameOrientation: camRes?.apple ? 'raw' : 'upright',
       onError: (e) => console.warn('[capture] pump error', e),
     });
+    // The camera failed during the init: keep its error card; "Reconnect camera" (or the camera
+    // coming back by itself) starts the pump.
+    if (phase === 'error' && camera.state !== 'running') return;
+    showCard(null);
     pump.start();
     setPhase('running');
     guidance.hidden = false;
@@ -1085,7 +1089,8 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
 
   async function saveCaptured(durationMs: number): Promise<void> {
     await sessionCreated;
-    void app.updateSession(sessionId, {
+    // awaited: a later stats merge (abandon) must read these stats, not the ones before them
+    await app.updateSession(sessionId, {
       status: 'captured',
       stats: {
         keyframes: numKeyframes,

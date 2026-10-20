@@ -36,12 +36,61 @@
  *   dense-resume-quality  the interrupted run used another preset than the scan (stats
  *                    denseResumableQuality): the resume uses that preset
  *   info-sheet       Model info: magnetic-north note for compass yaw, engine memory section
+ *   processing-stop  Stop while the scan is still being opened, or after the running step already
+ *                    finished: no further step starts
+ *   open-failed      a scan that cannot be loaded after viewing another: "Back to home", not the
+ *                    other scan's "Open model"
+ *   viewer-loading   the viewer's tools do nothing while the opened scan loads (no sheet of the
+ *                    previously loaded scan)
+ *   camera-error-init  the camera fails during the engine init → its error card stays, "Reconnect
+ *                    camera" starts the scan
+ *   memory-limit-background  the memory cap is reached by the frame in flight when the app goes to
+ *                    the background → the prompt comes after Resume
  * Usage: node e2e/ui/states.mjs [name ...] [--verbose]
  */
 import { launch, layoutAudit, shot, sleep } from './lib.mjs';
 
+const SCENARIOS = [
+  'engine-missing',
+  'install-hint',
+  'cpu-mode',
+  'lockdown',
+  'camera-denied',
+  'landscape',
+  'interrupted',
+  'processing-error',
+  'storage-full-start',
+  'storage-full-capture',
+  'storage-write-error-capture',
+  'engine-dead',
+  'export-reopen',
+  'open-other-session',
+  'focus',
+  'raw-overlay',
+  'finish-stuck',
+  'finish-stuck-home',
+  'finish-stuck-discard',
+  'discard-no-replay',
+  'delete-open-session',
+  'memory-limit',
+  'dense-resume',
+  'dense-resume-quality',
+  'info-sheet',
+  'processing-stop',
+  'open-failed',
+  'viewer-loading',
+  'camera-error-init',
+  'memory-limit-background',
+];
 const args = process.argv.slice(2).filter((a) => !a.startsWith('--'));
+// A misspelled name would run nothing and still pass.
+const unknown = args.filter((a) => !SCENARIOS.includes(a));
+if (unknown.length) {
+  console.error(`[states] unknown scenario(s): ${unknown.join(', ')}\n[states] known: ${SCENARIOS.join(', ')}`);
+  process.exit(2);
+}
 const want = (n) => !args.length || args.includes(n);
+const ran = new Set();
 const { newPage, close, consoleErrors, base } = await launch({ verbose: process.argv.includes('--verbose') });
 const failures = [];
 const check = (cond, msg) => {
@@ -67,7 +116,9 @@ async function holdShot(page, name) {
 }
 
 async function scenario(name, fn) {
+  if (!SCENARIOS.includes(name)) throw new Error(`scenario ${name} is missing from SCENARIOS`);
   if (!want(name)) return;
+  ran.add(name);
   console.log(`[states] — ${name}`);
   try {
     await fn();
@@ -455,13 +506,14 @@ await scenario('finish-stuck-home', async () => {
   await stuckFinish(page);
   await by(page, 'finish-home').tap();
   await by(page, 'session-item').first().waitFor({ timeout: 15000 });
-  const status = await page.evaluate(async () => {
+  const list = await page.evaluate(async () => {
     const { SessionStore } = await import('/src/io/storage.ts');
     const s = await SessionStore.open();
-    const list = await s.listSessions();
-    return list.map((m) => m.status);
+    return (await s.listSessions()).map((m) => ({ status: m.status, stats: m.stats }));
   });
-  check(status.length === 1 && status[0] === 'captured', `the scan is kept as captured (got ${JSON.stringify(status)})`);
+  check(list.length === 1 && list[0].status === 'captured', `the scan is kept as captured (got ${JSON.stringify(list.map((m) => m.status))})`);
+  const st = list[0]?.stats ?? {};
+  check(typeof st.durationMs === 'number' && typeof st.resolution === 'string', `the capture duration and resolution are kept (got ${JSON.stringify(st)})`);
   await context.close();
 });
 
@@ -672,6 +724,206 @@ await scenario('info-sheet', async () => {
   await context.close();
 });
 
+/** Store a session record (the mock engine loads its models from the status) without a capture. */
+const seedSession = (page, rec) =>
+  page.evaluate(async (r) => {
+    const { SessionStore } = await import('/src/io/storage.ts');
+    await (await SessionStore.open()).createSession(r);
+  }, rec);
+
+/** Record the processing steps the engine is asked to run in globalThis.__steps. */
+const recordSteps = (page) =>
+  page.evaluate(() => {
+    const e = globalThis.__sfmApp.engine;
+    globalThis.__steps = [];
+    for (const m of ['refine', 'densify', 'mesh']) {
+      const orig = e[m].bind(e);
+      e[m] = (...a) => {
+        globalThis.__steps.push(m);
+        return orig(...a);
+      };
+    }
+  });
+const steps = (page) => page.evaluate(() => globalThis.__steps);
+const phaseOf = (page) => page.locator('.capture').getAttribute('data-phase');
+
+await scenario('processing-stop', async () => {
+  // Stop while the scan is still being opened: the engine's loadSession ignores the cancel.
+  const { page, context } = await newPage();
+  await page.goto(`${base}?mock=1&mockSpeed=0.1`); // loadSession takes 2.5 s
+  await by(page, 'new-scan').waitFor();
+  await seedSession(page, { id: 'stop-captured', name: 'Stop yard', mode: 'scene', status: 'captured', stats: { quality: 'fast', keyframes: 20 } });
+  await page.reload();
+  await by(page, 'session-item').first().waitFor();
+  await recordSteps(page);
+  await by(page, 'session-item').first().tap();
+  await page.waitForSelector('.processing');
+  check((await page.locator('.processing .topbar-title').textContent()) === 'Opening scan…', 'the scan is still being opened');
+  await by(page, 'processing-cancel').tap();
+  await by(page, 'dialog-confirm').tap();
+  const t0 = Date.now();
+  await by(page, 'new-scan').waitFor({ timeout: 15000 });
+  const dt = Date.now() - t0;
+  check(dt < 6000, `a Stop during the load leaves once the load ends, not at the 8 s fallback (${(dt / 1000).toFixed(1)} s)`);
+  check((await steps(page)).length === 0, `no step starts after a Stop during the load (${(await steps(page)).join(', ')})`);
+  await context.close();
+
+  // Stop that the running step no longer sees (it is writing its result): the next one must not start.
+  const b = await newPage();
+  await b.page.goto(`${base}?mock=1`);
+  await by(b.page, 'new-scan').waitFor();
+  await seedSession(b.page, { id: 'stop-sparse', name: 'Stop wall', mode: 'scene', status: 'sparse', stats: { quality: 'balanced', keyframes: 30 } });
+  await b.page.reload();
+  await by(b.page, 'session-item').first().tap();
+  await b.page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  await recordSteps(b.page);
+  await b.page.evaluate(() => {
+    globalThis.__sfmApp.engine.cancel = () => undefined;
+  });
+  await by(b.page, 'tool-build').tap();
+  await by(b.page, 'build-mesh').tap();
+  await b.page.waitForSelector('[data-testid="stage-depth_maps"][data-status="active"]', { timeout: 20000 });
+  await by(b.page, 'processing-cancel').tap();
+  await by(b.page, 'dialog-confirm').tap();
+  await b.page.waitForSelector('.viewer-screen', { timeout: 15000 });
+  const started = (await steps(b.page)).join(', ');
+  check(started === 'densify', `the mesh does not start after a Stop that the densify did not see (ran: ${started})`);
+  await b.context.close();
+});
+
+await scenario('open-failed', async () => {
+  const { page, context } = await newPage();
+  await page.goto(`${base}?mock=1&mockSpeed=4`);
+  await by(page, 'new-scan').waitFor();
+  await seedSession(page, { id: 'a-meshed', name: 'Alpha vase', mode: 'object', status: 'meshed', stats: { quality: 'max', keyframes: 20 } });
+  await seedSession(page, { id: 'b-captured', name: 'Beta yard', mode: 'scene', status: 'captured', stats: { quality: 'fast', keyframes: 20 } });
+  await page.reload();
+  await page.locator('[data-testid="session-item"]', { hasText: 'Alpha vase' }).tap();
+  await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  await by(page, 'viewer-back').tap();
+  // The other scan's stored data cannot be loaded.
+  await page.evaluate(() => {
+    globalThis.__loads = 0;
+    globalThis.__sfmApp.engine.loadSession = async () => {
+      globalThis.__loads++;
+      throw new Error('Stored data is damaged');
+    };
+  });
+  await page.locator('[data-testid="session-item"]', { hasText: 'Beta yard' }).tap();
+  await by(page, 'processing-error').waitFor({ timeout: 15000 });
+  const leave = by(page, 'processing-error').locator('button').last();
+  const label = (await leave.textContent())?.trim();
+  check(label === 'Back to home', `a scan that could not be opened offers "Back to home", not the previous scan's model (got "${label}")`);
+  await leave.tap();
+  await by(page, 'new-scan').waitFor({ timeout: 10000 });
+  await sleep(500);
+  const loads = await page.evaluate(() => globalThis.__loads);
+  check(loads === 1, `no second attempt to open the scan in the viewer (${loads} loads)`);
+  await context.close();
+});
+
+await scenario('viewer-loading', async () => {
+  const { page, context } = await newPage();
+  await page.goto(`${base}?mock=1&mockSpeed=0.1`); // loadSession takes 2.5 s
+  await by(page, 'new-scan').waitFor();
+  await seedSession(page, { id: 'a-sparse', name: 'Alpha wall', mode: 'scene', status: 'sparse', stats: { quality: 'balanced', keyframes: 30 } });
+  await seedSession(page, { id: 'b-meshed', name: 'Beta vase', mode: 'object', status: 'meshed', stats: { quality: 'balanced', keyframes: 20 } });
+  await page.reload();
+  await page.locator('[data-testid="session-item"]', { hasText: 'Alpha wall' }).tap();
+  await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  await by(page, 'viewer-back').tap();
+  await page.locator('[data-testid="session-item"]', { hasText: 'Beta vase' }).tap();
+  await page.waitForFunction(() => document.querySelector('.viewer-screen') && !document.querySelector('.screen-exit'), null, { timeout: 10000 });
+  // While "Loading model…" shows, app.results still describes Alpha wall.
+  for (const id of ['tool-build', 'tool-export', 'tool-view', 'viewer-info']) await by(page, id).evaluate((el) => el.click());
+  check(!(await page.locator('.viewer-loading').evaluate((el) => el.hidden)), 'the tools were tapped while the scan loads');
+  check((await page.locator('.sheet-wrap').count()) === 0, 'no tool opens a sheet while the scan loads (it would show the previous scan)');
+  await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  await by(page, 'tool-build').tap();
+  await by(page, 'sheet-build').waitFor();
+  check((await by(page, 'build-mesh').count()) === 0, "the Build sheet shows the opened scan's mesh as built");
+  await context.close();
+});
+
+await scenario('camera-error-init', async () => {
+  const { page, context } = await newPage();
+  await page.goto(`${base}?mock=1&mockSpeed=3`);
+  await by(page, 'new-scan').waitFor();
+  // A slow engine init (GPU programs compiled the first time).
+  await page.evaluate(() => {
+    const e = globalThis.__sfmApp.engine;
+    const orig = e.init.bind(e);
+    e.init = async (o) => {
+      await new Promise((r) => setTimeout(r, 3000));
+      const res = await orig(o);
+      globalThis.__initDone = true;
+      return res;
+    };
+  });
+  await by(page, 'new-scan').tap();
+  await by(page, 'start-capture').tap();
+  await page.locator('.capture-card-title', { hasText: 'Preparing 3D engine' }).waitFor({ timeout: 30000 });
+  // Another app takes the camera: the track ends and the automatic restart fails.
+  await page.evaluate(() => {
+    navigator.mediaDevices.getUserMedia = () => Promise.reject(new DOMException('Could not start video source', 'NotReadableError'));
+    document.querySelector('video').srcObject.getVideoTracks()[0].dispatchEvent(new Event('ended'));
+  });
+  await by(page, 'capture-error').waitFor({ timeout: 5000 });
+  check(/The camera stopped/.test((await by(page, 'capture-error').textContent()) ?? ''), 'the camera error card is shown during the engine init');
+  await page.waitForFunction(() => globalThis.__initDone === true, null, { timeout: 15000 });
+  await sleep(500);
+  check(await by(page, 'capture-error').isVisible(), 'the camera error card stays once the engine is ready');
+  check((await phaseOf(page)) === 'error', `the capture does not run with a stopped camera (phase ${await phaseOf(page)})`);
+  await page.evaluate(() => {
+    delete navigator.mediaDevices.getUserMedia;
+  });
+  await by(page, 'capture-retry').tap();
+  await page.waitForFunction(() => Number(document.querySelector('[data-testid="kf-count"]')?.textContent) >= 2, null, { timeout: 30000 });
+  check((await phaseOf(page)) === 'running', '"Reconnect camera" starts the scan');
+  await context.close();
+});
+
+await scenario('memory-limit-background', async () => {
+  const { page, context } = await newPage();
+  await startCapture(page, `${base}?mock=1&mockSpeed=3&mockMemoryLimit=6`);
+  await page.waitForFunction(() => document.querySelector('.capture')?.getAttribute('data-phase') === 'running', null, { timeout: 45000 });
+  const setHidden = (hidden) =>
+    page.evaluate((h) => {
+      Object.defineProperty(document, 'hidden', { value: h, configurable: true });
+      Object.defineProperty(document, 'visibilityState', { value: h ? 'hidden' : 'visible', configurable: true });
+      document.dispatchEvent(new Event('visibilitychange'));
+    }, hidden);
+  // The app goes to the background while the frame that reaches the cap is in flight: its
+  // reports (the error event and the marked update) arrive with the capture interrupted.
+  await page.evaluate(() => {
+    const e = globalThis.__sfmApp.engine;
+    for (const em of [e.errorE, e.live]) {
+      const orig = em.emit.bind(em);
+      em.emit = (x) => {
+        if (!globalThis.__hidden && (x?.reason === 'out-of-memory' || x?.timings?.memoryLimited)) {
+          globalThis.__hidden = true;
+          Object.defineProperty(document, 'hidden', { value: true, configurable: true });
+          Object.defineProperty(document, 'visibilityState', { value: 'hidden', configurable: true });
+          document.dispatchEvent(new Event('visibilitychange'));
+        }
+        orig(x);
+      };
+    }
+  });
+  await page.waitForFunction(() => globalThis.__hidden === true, null, { timeout: 90000 });
+  await sleep(300);
+  check((await phaseOf(page)) === 'interrupted', `the cap was reached while interrupted (phase ${await phaseOf(page)})`);
+  check((await by(page, 'capture-memory-limit').count()) === 0, 'no prompt while the capture is interrupted');
+  await setHidden(false);
+  await by(page, 'resume').waitFor({ timeout: 10000 });
+  await by(page, 'resume').tap();
+  await by(page, 'capture-memory-limit').waitFor({ timeout: 15000 });
+  check((await phaseOf(page)) === 'paused', 'the memory prompt comes once the capture runs again');
+  await context.close();
+});
+
+const notRun = SCENARIOS.filter((n) => want(n) && !ran.has(n));
+check(!notRun.length, `every requested scenario ran (not run: ${notRun.join(', ') || 'none'})`);
 const errs = consoleErrors.filter((e) => !/favicon/i.test(e));
 check(errs.length === 0, `no console errors (got ${errs.length}: ${errs.slice(0, 5).join(' | ')})`);
 console.log(failures.length ? `[states] FAILED (${failures.length})` : '[states] OK');
