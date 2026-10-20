@@ -2475,11 +2475,13 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   re-densify followed by `mesh` paired the old views with the emptied / partial maps (124 instead of 807
   triangles in the test); `mesh` now runs (or resumes) densify. The previous dense CLOUD stays the result.
 * **Result writes**: every store write is its own transaction, so dependents are invalidated first. `densify`
-  deletes `mesh` before storing `dense/points`. `persistSparse` deletes `dense/points` and `mesh` and nulls
-  `dense/meta`, `dense/progress` and `sparse/meta` before storing `sparse/model` (then `sparse/meta`, depth-map
-  clear, `engine/state` last), so a kill in between never pairs a new result with old dependents. A dense cloud /
-  mesh whose write failed stays in memory for exports (not released to the page), and the previous run's stale
-  blob is deleted, so a reload does not show it under the new stats (`engine-persist.test.ts`).
+  deletes `mesh` before storing `dense/points`. `persistSparse` deletes `dense/points`, `mesh` and `splat/model`
+  (with its checkpoints) and nulls `splat/meta`, `dense/meta`, `dense/progress` and `sparse/meta` before storing
+  `sparse/model` (then `sparse/meta`, depth-map clear, `engine/state` last). `splat` nulls `splat/meta` before
+  storing `splat/model` (then the new meta, `engine/state`). So a kill in between never pairs a new result with
+  old dependents (`engine-persist.test.ts`, `splat-persist.test.ts`). A dense cloud / mesh whose write failed
+  stays in memory for exports (not released to the page), and the previous run's stale blob is deleted, so a
+  reload does not show it under the new stats (`engine-persist.test.ts`).
 * **`loadSession` of another session** on the same engine kept the previous session's stats (summary), resolved
   mode and FOV prior (a later refine used the other session's `hfovPriorDeg`); reset now.
 * **Feature-pipeline hand-over**: `releasePipeline()` returned the key of the CURRENT quality; after a

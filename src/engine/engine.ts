@@ -1105,6 +1105,11 @@ export class PhotogrammetryEngine {
         createdAt: Date.now(),
       };
       try {
+        // dependents first (each write is its own transaction): a kill or a failed write after the
+        // new model must not pair it with the previous run's meta (loadResults needs both)
+        this.hasSplat = false;
+        this.splatInfo = null;
+        await store.putValue('splat/meta', null);
         await store.putBinary('splat/model', packed);
         await store.putValue('splat/meta', meta);
         this.hasSplat = true;
