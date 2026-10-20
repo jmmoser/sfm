@@ -27,7 +27,7 @@ struct LossCfg {
   srcH: u32,
   factor: u32,
   lambda: f32,
-  invN: f32,
+  invN: f32, // 1 / (3 · valid target pixels of the level): the loss is their mean
   pad0: f32,
   pad1: f32,
 }

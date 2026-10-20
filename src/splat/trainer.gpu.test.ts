@@ -144,6 +144,39 @@ describe('SplatTrainer backward (GPU) vs CPU reference', () => {
     expect(Math.abs(r.ssim / n - ref.ssim)).toBeLessThan(1e-4);
     expect(relErr(r.dLdC, ref.grad)).toBeLessThan(1e-3);
   });
+
+  it('masked target (alpha 0: undistortion borders): ∂loss/∂C normalised by the valid pixels like the CPU reference (review)', async () => {
+    const m = randomScene({ count: 200, seed: 42 });
+    const cam = testCamera(90, 70);
+    const rng = new Rng(11);
+    // a 13-pixel border on the left and top, and random holes
+    const img = new Uint8ClampedArray(4 * cam.width * cam.height).map((_, i) => {
+      if (i % 4 !== 3) return rng.int(256);
+      const p = i >> 2;
+      return p % cam.width < 13 || p < 13 * cam.width || rng.next() < 0.05 ? 0 : 255;
+    });
+    const t = await trainer(m, [viewOf(cam, img)], { colourCorrection: false });
+    for (const factor of [1, 2]) {
+      const r = await t.debugLoss(0, factor);
+      const px = r.width * r.height;
+      const x = new Float64Array(3 * px);
+      const y = new Float64Array(3 * px);
+      const mask = new Uint8Array(px);
+      for (let i = 0; i < px; i++) {
+        mask[i] = r.target[4 * i + 3] >= 128 ? 1 : 0;
+        for (let c = 0; c < 3; c++) {
+          x[3 * i + c] = r.render[4 * i + c];
+          y[3 * i + c] = r.target[4 * i + c] / 255;
+        }
+      }
+      const ref = lossCPU(x, y, r.width, r.height, 0.2, mask);
+      const nv = mask.reduce((a, b) => a + b, 0);
+      expect(r.valid).toBe(nv);
+      expect(nv).toBeLessThan(0.85 * px);
+      expect(Math.abs(r.l1 / (3 * nv) - ref.l1)).toBeLessThan(1e-5);
+      expect(relErr(r.dLdC, ref.grad)).toBeLessThan(1e-3);
+    }
+  });
 });
 
 describe('SplatTrainer geometry channels (GPU) vs CPU reference', () => {

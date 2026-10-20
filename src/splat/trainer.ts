@@ -307,6 +307,34 @@ async function compilePostGeometryPipelines(device: GPUDevice, cfg: SplatShaderC
   return { ...geo, fwd, geoLoss: null, ...p };
 }
 
+/**
+ * Valid target pixels of an RGBA8 training image at each level `factor` (TARGET_WGSL: the f × f
+ * box's minimum alpha ≥ 0.5, i.e. every alpha byte ≥ 128, over ⌊W / f⌋ × ⌊H / f⌋ pixels); null
+ * when no alpha byte is below 128 (every pixel of every level is valid).
+ */
+function validTargetPixels(img: RGBAImage, factors: number[]): Map<number, number> | null {
+  const d = img.data;
+  const W = img.width;
+  const H = img.height;
+  let masked = false;
+  for (let i = 3; i < 4 * W * H && !masked; i += 4) masked = d[i] < 128;
+  if (!masked) return null;
+  const out = new Map<number, number>();
+  for (const f of new Set(factors)) {
+    const w = Math.max(1, Math.floor(W / f));
+    const h = Math.max(1, Math.floor(H / f));
+    let n = 0;
+    for (let y = 0; y < h; y++)
+      for (let x = 0; x < w; x++) {
+        let ok = true;
+        for (let dy = 0; dy < f && ok; dy++) for (let dx = 0; dx < f && ok; dx++) ok = d[4 * ((y * f + dy) * W + x * f + dx) + 3] >= 128;
+        if (ok) n++;
+      }
+    out.set(f, n);
+  }
+  return out;
+}
+
 export class SplatTrainer {
   readonly shDegree: ShDegree;
   readonly antialiased: boolean;
@@ -373,6 +401,11 @@ export class SplatTrainer {
   private initialised = false;
   /** Views whose image has not been uploaded yet. */
   private missingImages = new Set<number>();
+  /**
+   * Per view, its valid target pixels (alpha ≥ 0.5 over the whole box, as TARGET_WGSL) at each
+   * level factor of the schedule; null: every pixel is valid (no alpha below 0.5 in the image).
+   */
+  private validPx: (Map<number, number> | null)[] = [];
   /** Stamp written by the iteration of each stats slot, and the submission counter. */
   private readonly slotStamp = new Uint32Array(STAT_SLOTS);
   private stamps = 0;
@@ -591,6 +624,7 @@ export class SplatTrainer {
     if (!v) throw new Error(`SplatTrainer: no view ${index}`);
     if (img.width !== v.width || img.height !== v.height) throw new Error(`SplatTrainer: view ${index} image ${img.width}×${img.height} ≠ camera ${v.width}×${v.height}`);
     this.device.queue.writeBuffer(this.images[index], 0, img.data.buffer, img.data.byteOffset, img.width * img.height * 4);
+    this.validPx[index] = validTargetPixels(img, [1, ...this.levels.map((l) => l.factor)]);
     this.missingImages.delete(index);
   }
 
@@ -726,7 +760,9 @@ export class SplatTrainer {
     const v = this.views[view];
     const lc = new ArrayBuffer(LOSS_CFG_BYTES);
     new Uint32Array(lc).set([view, v.width, v.height, factor], 0);
-    new Float32Array(lc).set([this.lambda, 1 / (3 * cam.width * cam.height)], 4);
+    // ∂loss/∂C normalised by the valid pixels, like the loss (masked targets: undistortion borders)
+    const nv = this.validPx[view]?.get(factor) ?? cam.width * cam.height;
+    new Float32Array(lc).set([this.lambda, 1 / (3 * Math.max(1, nv))], 4);
     d.queue.writeBuffer(this.lossU, 0, lc);
     const cc = new ArrayBuffer(COLOUR_CFG_BYTES);
     const slot = it % STAT_SLOTS;
