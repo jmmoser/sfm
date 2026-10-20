@@ -19,6 +19,7 @@ import {
   SPLAT_STAGES,
   namedError,
   type DenseOptions,
+  type EngineMethod,
   type EngineOptions,
   type ExportFormat,
   type FrameInput,
@@ -853,11 +854,12 @@ export class MockEngine implements EngineLike {
     this.sessionName = name;
   }
 
-  cancel(): void {
+  /** (One long operation runs at a time here — exports are not long ones —: `method` is not checked.) */
+  cancel(_method?: EngineMethod): void {
     if (this.longOp) this.cancelled = true;
   }
 
-  async abortLongOperation(opts: { graceMs?: number; reinit?: boolean } = {}): Promise<AbortOutcome> {
+  async abortLongOperation(opts: { graceMs?: number; reinit?: boolean; method?: EngineMethod } = {}): Promise<AbortOutcome> {
     if (!this.longOp) return 'none';
     this.cancel();
     const graceMs = Math.max(0, opts.graceMs ?? 5000);

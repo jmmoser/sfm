@@ -811,7 +811,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     jobCancel.disabled = true;
     jobSub.textContent = 'Stopping…';
     jobBar.set(-1);
-    void app.engine.abortLongOperation({ graceMs: 8000 });
+    void app.engine.abortLongOperation({ graceMs: 8000, method: 'splat' });
   }
 
   async function goBack(): Promise<void> {
@@ -867,7 +867,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       closed = true;
       if (building) {
         // the training must not outlive its screen (it keeps its checkpoints)
-        if (!cancelling) void app.engine.abortLongOperation({ graceMs: 8000 });
+        if (!cancelling) void app.engine.abortLongOperation({ graceMs: 8000, method: 'splat' });
         app.busy = false;
         void app.wakeLock.release();
       }

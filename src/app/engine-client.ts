@@ -97,11 +97,15 @@ export interface EngineLike {
   splatModel(): Promise<SplatModelPayload | null>;
   exportModel(format: ExportFormat): Promise<Blob>;
   loadSession(id: string, options?: Partial<EngineOptions>): Promise<SessionSummary>;
-  /** Cancel the running long operation (it rejects with CancelledError). */
-  cancel(): void;
   /**
-   * Cancel the running long operation (finishCapture / refine / densify / mesh / export /
-   * loadSession) and make sure it ENDS: when the engine has not settled it within `graceMs` (a
+   * Cancel the running long operation (it rejects with CancelledError): the newest one, or the
+   * newest one of `method` (several can run at once, e.g. an export during a splat build).
+   */
+  cancel(method?: EngineMethod): void;
+  /**
+   * Cancel the running long operation (finishCapture / refine / densify / mesh / splat / export /
+   * loadSession; the newest one, or the newest one of `method`) and make sure it ENDS: when the
+   * engine has not settled it within `graceMs` (a
    * step that ignores cancel, a hung IndexedDB wait, a stuck worker), the request is rejected
    * locally with CancelledError and the engine is restarted (EngineClient: the worker is
    * respawned and the last init / loadSession replayed with `resume`, so the persisted capture
@@ -110,7 +114,7 @@ export interface EngineLike {
    * `reinit: false`: such a restart does NOT replay the last init / loadSession — the session is
    * being discarded, and a replay with `resume` would re-open (re-create) it.
    */
-  abortLongOperation(opts?: { graceMs?: number; reinit?: boolean }): Promise<AbortOutcome>;
+  abortLongOperation(opts?: { graceMs?: number; reinit?: boolean; method?: EngineMethod }): Promise<AbortOutcome>;
   /**
    * Free everything the engine holds in memory (capture state, models, GPU device / pipelines),
    * e.g. before the on-device benchmark. EngineClient terminates the worker WITHOUT replaying the
@@ -198,7 +202,8 @@ interface Pending {
 type Setup = { kind: 'init'; options: EngineOptions } | { kind: 'load'; id: string; options?: Partial<EngineOptions> };
 
 /**
- * Long operations: `cancel()` targets the running one, progress resets their inactivity timer.
+ * Long operations: `cancel()` targets the newest pending one (or the newest of a method), progress
+ * resets their inactivity timer.
  * finishCapture is one (it drains the keyframe mapping queue; the worker gives it a cancel token).
  */
 const LONG: ReadonlySet<EngineMethod> = new Set<EngineMethod>(LONG_RUNNING_METHODS);
@@ -233,7 +238,11 @@ export class EngineClient implements EngineLike {
   private gpuFailures = 0;
   private frameBusy = false;
   private frameTimeouts = 0;
-  private longOp: number | null = null;
+  /**
+   * Pending long operations, oldest first. Several can run at once (an export started during a
+   * splat build): one finishing must not hide the others from `cancel` / `abortLongOperation`.
+   */
+  private readonly longOps: number[] = [];
   private disposed = false;
   private hidden = false;
   /** Resolvers waiting for a request to settle (abortLongOperation). */
@@ -376,14 +385,27 @@ export class EngineClient implements EngineLike {
     }
   }
 
-  cancel(): void {
-    const target = this.longOp;
-    if (target === null || !this.worker) return;
+  cancel(method?: EngineMethod): void {
+    const target = this.longTarget(method);
+    if (target !== null) this.sendCancel(target);
+  }
+
+  /** The newest pending long operation (of `method` when given); null when none. */
+  private longTarget(method?: EngineMethod): number | null {
+    for (let i = this.longOps.length - 1; i >= 0; i--) {
+      const id = this.longOps[i];
+      if (!method || this.pending.get(id)?.method === method) return id;
+    }
+    return null;
+  }
+
+  private sendCancel(target: number): void {
+    if (!this.worker) return;
     void this.call('cancel', { target }, { timeoutMs: this.opts.callTimeoutMs }).catch(() => undefined);
   }
 
-  abortLongOperation(opts: { graceMs?: number; reinit?: boolean } = {}): Promise<AbortOutcome> {
-    const id = this.longOp;
+  abortLongOperation(opts: { graceMs?: number; reinit?: boolean; method?: EngineMethod } = {}): Promise<AbortOutcome> {
+    const id = this.longTarget(opts.method);
     const p = id !== null ? this.pending.get(id) : undefined;
     if (id === null || !p) return Promise.resolve('none');
     // (an overlapping abort that asks for no replay applies to the shared one as well)
@@ -402,7 +424,7 @@ export class EngineClient implements EngineLike {
   }
 
   private async abortRequest(id: number, p: Pending, opts: { graceMs?: number }): Promise<AbortOutcome> {
-    this.cancel();
+    this.sendCancel(id);
     const graceMs = Math.max(0, opts.graceMs ?? 5000);
     const settled = await new Promise<boolean>((resolve) => {
       const timer = setTimeout(() => resolve(false), graceMs);
@@ -577,7 +599,7 @@ export class EngineClient implements EngineLike {
           frame: !!o.frame,
         };
         this.pending.set(id, p);
-        if (long) this.longOp = id;
+        if (long) this.longOps.push(id);
         this.armTimer(id, p);
         const req: EngineRequest<M> = { id, method, params };
         try {
@@ -620,7 +642,8 @@ export class EngineClient implements EngineLike {
     if (!p) return undefined;
     if (p.timer) clearTimeout(p.timer);
     this.pending.delete(id);
-    if (this.longOp === id) this.longOp = null;
+    const k = this.longOps.indexOf(id);
+    if (k >= 0) this.longOps.splice(k, 1);
     const waiters = this.settleWaiters.get(id);
     if (waiters) {
       this.settleWaiters.delete(id);
@@ -648,7 +671,7 @@ export class EngineClient implements EngineLike {
         const pe: ProgressEvent = { stage: ev.stage, progress: ev.progress };
         if (ev.message !== undefined) pe.message = ev.message;
         if (ev.detail) pe.detail = ev.detail;
-        const targetId = ev.requestId ?? this.longOp;
+        const targetId = ev.requestId ?? this.longTarget();
         const p = targetId !== null && targetId !== undefined ? this.pending.get(targetId) : undefined;
         if (p) {
           if (p.inactivity) this.armTimer(targetId as number, p);
