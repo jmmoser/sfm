@@ -120,6 +120,7 @@ JPEG compression.
 npm run synth -- all                 # render e2e/data/{object,yard}; `-- real`: object-real + yard-real
 npm run e2e -- object --engine worker # replay through the real engine worker, score vs ground truth
 npm run e2e:dense-gt -- all          # dense MVS alone, with ground-truth poses
+node e2e/run-splat-gt.mjs object-real --cloud <dense-gt ply> --sparse 20000   # Gaussian-splat training (src/splat), GT poses
 npm run ui:smoke                     # full UI flow with the mock engine at iPhone size
 node e2e/ui/states.mjs               # UI edge states; also e2e/ui/layouts.mjs (sizes), bench.mjs
 ```

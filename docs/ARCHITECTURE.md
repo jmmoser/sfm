@@ -2948,3 +2948,117 @@ Every web platform API, JS built-in, CSS feature, WGSL construct and WebAssembly
   changed; use `'hidden'` if that matters); `npm run dev` binds all interfaces (phone testing) and serves the repository
   to the LAN; on a shared origin (`<user>.github.io/<repo>/`) every other project of that user can read this app's
   IndexedDB (scans, photos, GPS fixes) and caches — deploy on a dedicated origin (custom domain) for real use.
+
+### `src/splat` — 3D Gaussian Splatting trainer and renderer (WebGPU, 2026-10)
+
+On-device 3DGS training seeded from the metric SfM + MVS reconstruction, written from the papers (3DGS,
+EWA splatting, Mip-Splatting, 3DGS-MCMC, Taming-3DGS / Brush / gsplat design notes, all Apache-2.0 or
+papers); no INRIA-derived code. Not yet wired into the engine, viewer or exports (next workstream);
+measured with `e2e/run-splat-gt.mjs` (GT poses, e2e/README.md).
+
+* **Files**: `types.ts` (constants, `SplatModel`, `SplatCamera`, memory plan), `layout.ts` (GPU parameter
+  layout), `cpu-reference.ts` (f64 forward / backward / loss), `wgsl/{common,sort,raster,backward,loss}.ts`,
+  `gpu-util.ts` (radix sorter, pass profiler), `forward.ts` (`SplatForward`, shared by renderer and trainer),
+  `renderer.ts` (`SplatRenderer`), `trainer.ts` (`SplatTrainer`), `init.ts`, `mcmc.ts`, `ply.ts`, `index.ts`.
+  Nothing reads WebGPU globals at module load.
+* **Model**: per Gaussian mean, log-scale, quaternion (w, x, y, z), opacity logit and SH degree 0 (default) or 1
+  (`shDegree: 1`; 12 floats). GPU layout: one f32 buffer with SoA sections for the capacity (mean and log-scale
+  vec4-padded, quaternion, opacity, SH 3·K floats); Adam moments use the same layout. Colours are sRGB like the
+  training images; colour = max(0, SH + 0.5) at the view direction (gsplat / INRIA convention).
+* **Forward** (`forward.ts`, one compute pass each): projection (EWA with the frustum-clamped Jacobian, screen-space
+  low-pass +0.3 px² with the Mip-Splatting opacity compensation `√(det Σ / det(Σ + εI))`, `antialiased`; opacity-aware
+  extent k = √(2 ln(o / α_min)), exact ellipse-vs-tile test so a splat is binned only into the 16×16 tiles its
+  α ≥ 1/255 ellipse reaches) → depth sort of all Gaussians (32-bit f32 keys) → tile counts in depth order, exclusive
+  scan, emission of (tile, Gaussian) pairs → stable sort by tile id (⌈log₂ tiles⌉ bits) → tile ranges → rasteriser
+  (256 threads per tile, 256-splat batches in workgroup memory, front to back, α ≤ 0.99, skip α < 1/255 — tested as
+  σ > ln(o / α_min) before the exp —, stop before T < 1e-4; writes colour + T·background, T and the last
+  contributor + 1). Sort and scan: 4-bit LSD radix, reduce-then-scan over 1024-element blocks (no decoupled
+  look-back: Apple GPUs give no forward-progress guarantee); stable in-block ranking by a workgroup scan of packed
+  per-thread digit counts. The intersection count stays on the GPU and drives the sort with indirect dispatches;
+  overflow beyond the reservation drops the farthest intersections of that frame and is reported (the trainer grows
+  the reservation, checked every 25 iterations).
+* **Loss** (`wgsl/loss.ts`): x = M_v·[C, 1] with a learned 3×4 colour matrix per training view (identity at start,
+  Adam lr 2e-3, L2 pull 1e-2 towards [I | 0]) for the exposure / white-balance drift of real captures
+  (`normaliseAppearance()` moves the mean matrix into the splat colours and background, a gauge transform that
+  leaves the corrected training renders unchanged; `exportPLY` applies it);
+  (1 − λ)·L1 + λ·(1 − SSIM), λ = 0.2, SSIM per channel with the separable 11-tap σ 1.5 window and zero padding, on
+  16×16 tiles with a 5 px halo in workgroup memory (≤ 13.7 KB); ∂SSIM/∂x = G⋆P + 2x·G⋆Q + y·G⋆R from per-pixel
+  partials (the zero-padded blur is its own adjoint). Training targets are box-downscaled on the GPU from the RGBA8
+  view (one buffer per view, so no binding exceeds 256 MiB).
+* **Backward** (`wgsl/raster.ts`, no per-pixel atomics, no float atomics): front to back with the forward's final
+  colour, ∂C/∂α_i = T_i c_i − (C − C_{≤i}) / (1 − α_i) (no division by T; the forward's last-contributor index bounds
+  the walk). A 16×16 tile is 8 groups of 32 pixels; a 64-thread workgroup takes 2 groups. Lane j owns the splats
+  i ≡ j (mod 32); at step s it processes pixel k = (s − j) mod 32 of its group with splat i = s − k (diagonal
+  schedule): each pixel meets its splats in order, its (T, r = gᵀ·colour-to-come) state passing from lane to lane
+  through workgroup memory (one barrier per step), while each thread sums one splat's 9 gradients (2-D mean, conic,
+  opacity, colour) over 32 pixels in registers. Every 32 steps the two groups' partials of 32 splats are added and
+  each non-zero sum goes to the global accumulators with one compare-exchange f32 add (u32 bit pattern) per
+  (splat, workgroup, component). Then one thread per Gaussian runs the projection backward fused with Adam
+  (`wgsl/backward.ts`: visible Gaussians only, bias correction with the global step, ε 1e-15), the MCMC regularisers
+  and the MCMC position noise; the 2-D accumulators are reset in the same pass. A `grads` variant writes the raw
+  gradients (tests).
+* **Densification**: 3DGS-MCMC under a hard cap (`mcmc.ts`): every 100 iterations between 10 % and 75 % of the run
+  the opacities are read back once (N floats), Gaussians with opacity ≤ 0.005 are moved onto live ones sampled ∝
+  opacity and the count grows 5 % per step until the cap; a source sampled n times becomes n + 1 copies with
+  o' = 1 − (1 − o)^(1/(n+1)) and scales × o / Σ_i Σ_k C(i−1, k)(−1)^k o'^(k+1)/√(k+1) (paper eq. 9); the GPU copies
+  the parameters and resets their Adam moments. Opacity / scale L1 regularisers 0.01 (scale divided by the scene
+  extent so it is unit-free; gsplat uses raw scales), noise 5e5 × mean lr × sigmoid(−100(o − 0.005)) × Σε.
+  Chosen over clone / split / prune for its fixed memory budget and robustness to the MVS initialisation.
+* **Schedule and learning rates**: random view order per epoch; resolution ¼ for the first 10 % of the
+  iterations, ½ until 30 %, then full (DashGaussian-style, fixed breakpoints); 3DGS learning rates (mean 1.6e-4 →
+  1.6e-6 × scene extent, exponential; log-scale 5e-3, quaternion 1e-3, opacity 5e-2, SH0 2.5e-3, SH1 2.5e-3 / 20);
+  scene extent = 1.1 × the largest camera distance from the cameras' centroid.
+* **Initialisation** (`init.ts`): `initFromPointCloud(cloud, { maxCount, shDegree })` — random subset to the budget,
+  σ_tangent = RMS distance to the 3 nearest neighbours (at least the fusion radius), σ_normal = 0.1 σ_tangent along the
+  fused normal (isotropic without normals), opacity 0.5, SH0 from the colour. `backgroundShell` adds large Gaussians
+  on a far sphere coloured from the views (sky); `concatModels` merges (e.g. fused MVS cloud + sparse SfM points +
+  shell).
+* **Engine API** (for the integration workstream): `SplatTrainer.memoryEstimate(opts, W, H, views)` before
+  allocating (≈ 0.5 KB per Gaussian at SH 0, 0.6 KB at SH 1, incl. Adam moments and 12 reserved intersections; plus 88 B per pixel and 4 B per pixel per training view);
+  `await SplatTrainer.create(ctx, opts)` at stage start (≈ 25 pipelines, cached per device);
+  `init(model, views)` with `DenseView`-compatible views (undistorted, rolling-shutter-corrected pinhole images);
+  `await step(n)` runs n iterations — one command buffer each, the next one encoded while the GPU runs the current
+  one, awaited before submitting (iOS rule; `inFlight: 2` is a desktop option) — and returns loss, count, it/s, so
+  the worker can time-slice it; `render(cam)`, `readModel()`, `exportPLY()` (INRIA layout read by SuperSplat,
+  Brush, Spark; `ply.ts` also decodes), `readColourMatrices()`, `stats()` (incl. per-pass GPU ms with `profile`).
+  `SplatRenderer` renders a `SplatModel` without a trainer.
+* **iOS constraints**: no subgroups, no f32 atomics (CAS on u32 bits), workgroup memory ≤ 16 KB (raster 12 KB,
+  backward 7.5 KB, SSIM 13.7 KB, colour reduction 16 KB), ≤ 256 threads, ≤ 8 storage buffers per kernel, no vec3 in
+  buffers, largest buffer the parameters (600 k Gaussians × 100 B at SH 1 = 60 MB) or the intersection keys (grown
+  only while ≤ maxStorageBufferBindingSize), pipelines compiled in `create`.
+* **Tests**: `cpu-reference.test.ts` (finite differences of every parameter gradient incl. clamped-Jacobian
+  splats, SSIM loss gradient), `ply.test.ts` (PLY round trip, layout, init, MCMC formula and plan, memory plan),
+  `sort.gpu.test.ts` (stable radix sort, > 1 block, ties, odd pass counts, n = 0, depth keys),
+  `renderer.gpu.test.ts` (GPU forward vs CPU: max 1e-6, identical contributor counts; NaN / zero-size / huge /
+  behind-camera fuzz; empty views), `trainer.gpu.test.ts` (GPU parameter gradients vs CPU backward: relative error
+  ~2e-6; loss kernels vs CPU; a toy scene trains 21.8 → 37.4 dB). All pass on Metal (E2E_GPU=host) and on SwiftShader
+  (slow: ~5–8 min of pipeline compilation per test file).
+* **Results** (`e2e/run-splat-gt.mjs`, GT poses, M4 / Metal, details and ablations in e2e/README.md "Splat
+  results"): held-out frames, 300 k Gaussians, MVS-cloud + sparse initialisation:
+
+  | | 0 it | 1 000 | 3 000 | 7 000 | colour-fit @ 7k | SSIM @ 7k | train 3k / 7k |
+  |---|---|---|---|---|---|---|---|
+  | object-real 600×800 | 19.1 | 28.5 | 30.4 | 30.9 dB | 33.3 dB | 0.948 | 48 s / 177 s |
+  | object-real 720×960 | 18.9 | 27.9 | 29.7 | 30.1 dB | 32.0 dB | 0.930 | 50 s / 160 s |
+  | yard-real 800×600 (+ sky shell) | 17.2 | 27.9 | 29.5 | 29.9 dB | 30.9 dB | 0.843 | 23 s / 73 s |
+  | yard-real 960×720 (+ sky shell) | 17.0 | 27.1 | 28.5 | 28.9 dB | 29.7 dB | 0.803 | 27 s / 87 s |
+
+  Today's object-real renderings score 9.2 dB full frame (lit TSDF mesh, 61 % coverage) and 15.8 dB on covered pixels
+  (points + EDL). GPU time per full-resolution iteration (600×800, 300 k Gaussians): ≈ 20 ms, half of it the
+  rasteriser backward; 39–48 it/s (target was 15–30 at 0.5–0.7 MP). Random initialisation reaches only 20.2 dB at 3k
+  (MVS seeding: +10 dB); 500 k Gaussians +0.2 dB at 3k; SH degree 1: no gain on these Lambertian scenes; the sky shell
+  +1.4 dB on the yard.
+* **Deviations from the design brief**: backward re-traverses front to back with the stored final colour instead of
+  back to front with the final transmittance (same information, no division by T); MCMC relocation is planned on the
+  host from one opacity readback per 100 iterations (sampling is easy there) and applied on the GPU; the scale
+  regulariser is divided by the scene extent; Adam updates only Gaussians projected into the frame; the SSIM uses
+  zero padding (its own adjoint); the projection Jacobian is evaluated at the frustum-clamped point (gsplat); the
+  backward groups 2 × 32 pixels per workgroup (measured best), not one 256-thread workgroup per tile.
+* **Open issues / next steps**: engine integration (an `engine.splat()` long run after densify: views from the
+  RS-corrected undistorted keyframes, cloud from fusion + sparse points + shell, checkpointing of parameters, Adam
+  moments and colour matrices to IndexedDB, WorkStamp dropped-work detection, cancellation between `step` calls);
+  viewer (WebGL2 splat renderer or Spark) and a splat export choice in the UI; iPhone measurements (an iteration is
+  one ~20 ms command buffer on the M4 — split forward / backward if it exceeds ~30 ms on a phone); depth-sorting only
+  the visible Gaussians and 16-bit depth keys; f16 Adam moments; an off-trajectory test set to settle the colour
+  correction trade-off (raw held-out PSNR is 1.2 dB higher without it, colour-fit PSNR 0.5 dB lower); MVS depth /
+  normal supervision.

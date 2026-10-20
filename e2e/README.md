@@ -332,6 +332,108 @@ P 0.981, C 0.352, F 0.518 (mesh F 0.348 → 0.492). With the sky test of `remove
 `yard-skyb`): yard P 0.9854, C 0.3521, F 0.5188, sky-coloured points farther than τ 5,722 → 707,
 mesh F 0.492 → 0.495; object unchanged (P 0.9997, C 0.9874, mesh F 0.9873 → 0.9868).
 
+## Gaussian splats with ground-truth poses (`run-splat-gt.mjs`)
+
+`node e2e/run-splat-gt.mjs` trains the 3D Gaussian Splatting trainer of `src/splat` (ARCHITECTURE §6
+"src/splat") without the SfM engine: exact poses and intrinsics, so the scores measure the splat
+optimisation (and its initialisation), not SfM. Held-out frames are scored as novel views.
+
+```sh
+node e2e/run-splat-gt.mjs [<dataset> ...] [--max-size N] [--iterations N] [--max-gaussians N]
+     [--init cloud|gt|random] [--cloud PATH] [--init-count N] [--sparse N] [--shell N] [--shell-radius R]
+     [--train-stride N] [--train-frames i,j,...] [--test-every N] [--eval-at i,j,...] [--sh 0|1]
+     [--no-colour-correction] [--no-mcmc] [--profile] [--panels N] [--tag NAME] [--out DIR] [--set key=json ...]
+
+# MVS initialisation: fused cloud of a dense-GT run (GT frame) at the 'fast' dense size
+E2E_GPU=host node e2e/run-dense-gt.mjs object-real --preset fast --max-size 800 --views 40 --tag splat-fast --no-render
+E2E_GPU=host node e2e/run-splat-gt.mjs object-real --cloud e2e/out/dense-gt/object-real-splat-fast.ply --sparse 20000 --iterations 3000
+E2E_GPU=host node e2e/run-splat-gt.mjs yard-real --cloud e2e/out/dense-gt/yard-real-splat-fast.ply --sparse 30000 \
+     --shell 20000 --shell-radius 200 --iterations 3000
+```
+
+The page is `splat-gt.html` (`src/harness/splat-gt/main.ts`); `window.runSplatGT(config)`:
+
+1. Training frames: every `--train-stride`-th frame (default 2: 100 of object-real's 200 frames, 120 of yard-real's
+   240) or `--train-frames`; test frames: every `--test-every`-th (default 4) of the others (25 / 30 views).
+2. Each JPEG is undistorted to pinhole with the GT k1, k2 and the frame's GT focal length (`f` in frames.json of the
+   -real datasets; `--set perFrameFocal=false` uses `meta.intrinsics.f`) at `--max-size` (default 800 = the fast
+   dense size: 600×800 / 800×600; 960 = full 720×960 / 960×720).
+3. Initial Gaussians (`initFromPointCloud`: 3-NN scale, normal-oriented discs, opacity 0.5, SH band 0 from the colour):
+   * `--cloud PATH`: a fused point cloud PLY in the GT frame, randomly subsampled to `--init-count` (default half of
+     `--max-gaussians`). A dense-GT cloud covers only what MVS reconstructs (object-real: the table region, 6 % of
+     the room; yard-real: completeness 0.27 in the ROI). `--sparse N` adds N GT surface samples over the whole scene,
+     coloured from the frames with exact GT depth maps (every 20th frame): a stand-in for the engine's sparse SfM
+     points, which do reach the room walls and the distant houses.
+   * `--init gt`: GT surface samples only (as above); `--init random`: uniform in `meta.roi`, random colours.
+   * `--shell N --shell-radius R`: N Gaussians on a sphere of radius R around the cameras' centroid, coloured from the
+     first training view that sees them (the sky; `backgroundShell`).
+4. `SplatTrainer` (`--max-gaussians`, default 300 000; `--set trainer.*` passes any `SplatTrainerOptions`, e.g.
+   `--set trainer.inFlight=2`, `--set 'trainer.lr={"mean":3.2e-4}'`, `--set 'trainer.resolution=[]'`) runs in chunks
+   of 100 iterations; at every `--eval-at` iteration (default 0, 500, 1000, 3000, 7000 up to `--iterations`) the test
+   views are rendered and scored on their valid pixels: PSNR and SSIM (11-tap Gaussian window, the loss's definition)
+   raw and after a per-view per-channel affine colour fit ("colour-fit", removes the unknowable exposure / white
+   balance of a held-out -real frame). Training time excludes evaluation.
+5. `--profile`: per-pass GPU times from timestamp queries (forces one command buffer in flight), reported per
+   evaluation segment.
+
+Output (`e2e/out/splat-gt/`): `<name>.json` (config, frames, every evaluation point with per-view scores, training
+speed and log, GPU ms per pass, memory plan, learned colour matrices vs the GT exposure × white balance),
+`<name>.splat.ply` (trained model, INRIA layout: opens in SuperSplat / Brush / Spark) and
+`<name>/test-NNNNNN.png` (GT | render | |error| of `--panels` test views).
+
+### Splat results (2026-10, Apple M4 GPU, Metal, headless Chrome 155)
+
+Defaults unless noted: SH degree 0, 300 000 Gaussians max, MCMC, per-view colour correction, ¼ → ½ → full
+resolution at 10 % / 30 % of the iterations, one command buffer in flight. Initialisation: the dense-GT fused cloud
+(`--preset fast --max-size 800 --views 40`, 3.17–3.4 M points, 150 000 used) + sparse GT points (object 20 000, yard
+30 000) + for the yard a 20 000-Gaussian sky shell at 200 m. Test views: 25 (object) / 30 (yard) held-out frames.
+"PSNR / SSIM" = raw render with the mean training-view colour matrix (≈ identity); "colour-fit" = after a per-view
+per-channel affine fit. Training time excludes evaluation; the host was shared with other GPU jobs (load 3–10), so
+times vary ±15 %.
+
+| run | size | 0 it | 500 | 1 000 | 3 000 | 7 000 | colour-fit @ 3k / 7k | SSIM @ 7k | time to 3k / 7k |
+|---|---|---|---|---|---|---|---|---|---|
+| object-real | 600×800 | 19.10 | 26.17 | 28.50 | 30.43 | **30.86** | 32.61 / **33.30** | 0.948 | 48 s / 177 s |
+| object-real | 720×960 | 18.94 | 26.08 | 27.88 | 29.72 | 30.06 | 31.53 / 32.02 | 0.930 | 50 s / 160 s |
+| yard-real | 800×600 | 17.15 | 25.59 | 27.90 | 29.50 | **29.88** | 30.45 / **30.93** | 0.843 | 23 s / 73 s |
+| yard-real | 960×720 | 17.04 | 25.19 | 27.07 | 28.50 | 28.89 | 29.25 / 29.70 | 0.803 | 27 s / 87 s |
+
+For comparison, today's renderings of object-real held-out views (research probe, SfM poses): the lit TSDF mesh
+9.2 dB full frame (61 % coverage; 21.9 dB on covered pixels), the unlit mesh 24.8 dB on covered pixels, points + EDL
+15.8 dB on covered pixels. Iteration 0 (the initial Gaussians rendered as splats) is already 19.1 dB full frame.
+
+Ablations (3 000 iterations, 600×800 / 800×600; PSNR · colour-fit PSNR · SSIM at 3k; the GT-sample, random, no-shell
+and SH 1 rows were scored before the mean colour matrix was applied, which moves PSNR by ≤ 0.15 dB):
+
+| change | object-real | yard-real |
+|---|---|---|
+| reference (above) | 30.43 · 32.61 · 0.942 | 29.50 · 30.45 · 0.829 |
+| init: GT samples only (98 k, no MVS cloud) | 29.82 · 31.78 · 0.934 | |
+| init: random in the ROI (150 k) | 20.24 · 20.76 · 0.848 | |
+| no sky shell | | 27.98 · 29.52 · 0.819 |
+| no colour correction | 31.67 · 32.15 · 0.942 | |
+| SH degree 1 | 30.34 · 32.67 · 0.943 | |
+| colour correction lr 1e-2, pull 1e-3 (default 2e-3, 1e-2) | 30.49 · 32.67 · 0.943 | |
+| 500 000 Gaussians max (263 k at the start) | 30.66 · 32.95 · 0.946 (78 s, 38 it/s) | |
+| `inFlight: 2` | same quality; 44 vs 46–51 it/s overall (the pre-encoded next iteration already hides most of the host time) | |
+
+* MVS seeding matters: +0.6 dB over GT samples of the same scene (the MVS cloud is denser on the textured
+  near field), +10 dB over random initialisation at this iteration budget.
+* Without colour correction the raw held-out PSNR is 1.2 dB higher but the colour-fit PSNR 0.5 dB lower: test frames
+  sit between training frames on a trajectory along which the exposure drifts smoothly, so an uncorrected model can
+  bake exposure into viewpoint-dependent geometry that happens to suit the neighbouring test frames. The learned
+  matrices follow the GT exposure × white balance (correlation of log M_cc with log(gain·wb_c): 0.85–0.90, slope
+  0.13–0.22 in sRGB). The correction stays on by default for real captures; an off-trajectory test set would decide.
+* SH degree 1 does not help on these Lambertian scenes (it costs 8 % memory).
+
+Speed (fixed 300 000 Gaussians, object-real 600×800, full-resolution iterations, GPU timestamps per pass):
+project 0.5 ms, depth sort 1.0, binning 0.6, tile sort 0.7, rasteriser 3.7, loss 1.6, rasteriser backward 10–11,
+projection backward + Adam 1.5: **≈ 20 ms GPU per iteration**, 39–43 it/s with one command buffer in flight (the
+rest is the completion round trip), 48 it/s with two. Backward history: 256-thread workgroups 12.0 ms → 64-thread
+workgroups 10.0 ms (32-thread 13.8, 128-thread 10.9; two splats per thread step 15.7); the float CAS adds cost ≈ 1 ms;
+exact tile culling and the σ early-out were within noise on these scenes. Yard iterations are ~2× cheaper (0.29 M vs
+0.64 M tile intersections).
+
 ## Engine end-to-end runs (`run-e2e.mjs`)
 
 `node e2e/run-e2e.mjs` replays a dataset through the whole engine like the app does, then scores the
