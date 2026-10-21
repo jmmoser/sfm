@@ -1,7 +1,6 @@
 /**
  * The engine's splat stage on a tiny synthetic orbit (src/engine/testutil.ts, CPU features, GPU
- * PatchMatch + splats; run on the host GPU: E2E_GPU=host — SwiftShader compiles the splat
- * pipelines for minutes):
+ * PatchMatch + splats; SwiftShader or E2E_GPU=host, workload: `SPLAT`):
  *  - persistent session (real IndexedDB): densify, splat cancelled mid-training (the readbacks of
  *    its checkpoint dropped first: read again, never stored stale), the engine dropped without
  *    cleanup ("killed"), a NEW engine reports the resumable iteration, resumes from the
@@ -29,7 +28,19 @@ beforeAll(() => {
   cap = makeCapture({ frames: 44, arcDeg: 55 });
 });
 
-const SPLAT = { iterations: 300, maxGaussians: 30_000, maxImageSize: 320, checkpointEvery: 100, chunk: 20 };
+/**
+ * Training schedule of every test, sized for SwiftShader (4 CPU cores) within the 600 s timeout.
+ * SwiftShader per iteration (dense-seeded model, 16.5 k Gaussians): 2.2 s at 240×320 (loss 0.62 s,
+ * rasteriser backward 0.97 s, forward 0.36 s: per-pixel work) and 1.0 s at 120×160; 6 k
+ * Gaussians: 1.7 s / 0.67 s. 300 iterations at 240×320 (checkpoints every 100) took 725 / 528 /
+ * 1066 s per test alone (160 + 200, ≈ 380 and 800 trained iterations); this schedule 280 / 143 /
+ * 267 s alone, 377 / 182 / 281 s next to four other GPU test files (timings vary with the load).
+ * 120×160 views (the 240×320 dense depth maps are resampled to the targets), 200 iterations,
+ * checkpoints at 0, 50, 100, 150 (a later checkpoint after the first mid-run one) and MCMC
+ * refinements at 100 and 150 (refineEvery 50: one in the checkpoint at 100 that is resumed or
+ * rolled back to, one after it, as at 100 / 200 of the 300 iterations before).
+ */
+const SPLAT = { iterations: 200, maxGaussians: 30_000, maxImageSize: 160, checkpointEvery: 50, chunk: 10, trainer: { mcmc: { refineEvery: 50 } } };
 
 function config(extra: Partial<EngineConfig> = {}): EngineConfig {
   return {
@@ -72,12 +83,16 @@ describe('engine splat stage', () => {
         // the checkpoint at iteration 100 (written right after this report) loses its first two
         // readbacks (iOS: the app went to the background): its staging data would be stale
         if (d.iteration === 100) trainerA!.simulateDroppedWork({ readbacks: 2 });
-        if (d.iteration >= 150) cancel.cancelled = true;
+        // cancelled between the checkpoints at 100 and 150 (< 100 iterations after the last one:
+        // no checkpoint on cancel)
+        if (d.iteration >= 120) cancel.cancelled = true;
       };
       await expect(a.splat(undefined, onProgress, cancel)).rejects.toMatchObject({ name: 'CancelledError' });
       expect([...stages]).toEqual(['splat_prepare', 'splat_training']);
-      expect(seen[0].iterations).toBe(300);
+      expect(seen[0].iterations).toBe(200);
       expect(seen.every((d) => Number.isFinite(d.loss) && d.itPerSec > 0 && d.gaussians > 0)).toBe(true);
+      // the checkpoint at 100 holds the model grown by the MCMC refinement at 100
+      expect(seen.find((d) => d.iteration === 100)!.gaussians).toBeGreaterThan(seen[0].gaussians);
       const prog = await a.engineStore!.getValue<{ iteration: number; slot: number }>('splat/progress');
       expect(prog?.iteration).toBe(100);
       expect((await a.engineStore!.listBinaryKeys(`splat/ckpt${prog!.slot}/`)).length).toBe(4);
@@ -100,11 +115,13 @@ describe('engine splat stage', () => {
         if (d) resumed.push(d);
       });
       console.log(`[splat-engine] resumed: ${JSON.stringify(info)}`);
-      expect(info.iterations).toBe(300);
+      expect(info.iterations).toBe(200);
       expect(info.stats.splatResumedFrom).toBe(100);
       // default geometry supervision: the persisted filtered depth maps of the reloaded session
       expect(Number(info.stats.splatDepthViews)).toBeGreaterThan(0);
-      expect(resumed[0].iteration).toBe(120);
+      expect(resumed[0].iteration).toBe(110);
+      // the resumed trainer refines again (MCMC at 150)
+      expect(resumed[resumed.length - 1].gaussians).toBeGreaterThan(resumed[0].gaussians);
       expect(info.count).toBeGreaterThan(1000);
       expect(Number(info.stats.splatLoss)).toBeLessThan(0.25);
       expect(info.bytes).toBe(56 * info.count);
@@ -154,13 +171,13 @@ describe('engine splat stage', () => {
       // the colour-state readbacks of the appearance normalisation are dropped twice
       if (p.stage === 'splat_finishing' && p.progress === 0) current!.simulateDroppedWork({ readbacks: 2 });
       const d = training(p);
-      if (d && d.iteration >= 140 && !lost) {
+      if (d && d.iteration >= 120 && !lost) {
         lost = true;
         void getGPU().then((ctx) => ctx?.device.destroy());
       }
     });
     console.log(`[splat-engine] drop + loss: ${JSON.stringify(info.stats)}`);
-    expect(info.iterations).toBe(300);
+    expect(info.iterations).toBe(200);
     expect(info.stats.splatDroppedWork).toBe(1);
     expect(info.stats.splatDeviceLosses).toBe(1);
     expect(info.stats.splatReadRetries).toBe(2);
@@ -194,7 +211,7 @@ describe('engine splat stage', () => {
     );
     await captureAndRefine(e);
     // run 1: the first checkpoint (rebuilt from the initial Gaussians), then the appearance
-    // normalisation (rebuilt from the checkpoint at iteration 200, trained again to 300)
+    // normalisation (rebuilt from the checkpoint at iteration 150, trained again to 200)
     loseOnTrainer = true;
     let finishLost = false;
     const a = await e.splat(undefined, (p) => {
@@ -204,28 +221,28 @@ describe('engine splat stage', () => {
       }
     });
     console.log(`[splat-engine] losses at the first checkpoint + finishing: ${JSON.stringify(a.stats)}`);
-    expect(a.iterations).toBe(300);
+    expect(a.iterations).toBe(200);
     expect(a.stats.splatDeviceLosses).toBe(2);
     expect(trainers.length).toBe(3);
     expect(Math.abs(Number(a.stats.splatMeanColourGain) - 1)).toBeLessThan(0.5);
     expect((await e.splatModel())?.model.count).toBe(a.count);
-    // run 2: the checkpoint at iteration 200 (written right after its report): back to 100
+    // run 2: the checkpoint at iteration 150 (written right after its report): back to 100
     let ckptLost = false;
     const iters: number[] = [];
     const b = await e.splat(undefined, (p) => {
       const d = training(p);
       if (!d) return;
       iters.push(d.iteration);
-      if (d.iteration === 200 && !ckptLost) {
+      if (d.iteration === 150 && !ckptLost) {
         ckptLost = true;
         deviceOf(trainers[trainers.length - 1]).destroy();
       }
     });
     console.log(`[splat-engine] loss at a checkpoint: ${JSON.stringify(b.stats)}`);
-    expect(b.iterations).toBe(300);
+    expect(b.iterations).toBe(200);
     expect(b.stats.splatDeviceLosses).toBe(1);
     expect(trainers.length).toBe(5);
-    expect(iters.filter((i) => i === 200).length).toBe(2); // trained again from 100
+    expect(iters.filter((i) => i === 150).length).toBe(2); // trained again from 100
     expect((await e.splatModel())?.model.count).toBe(b.count);
     e.dispose();
   }, 600_000);
