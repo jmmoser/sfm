@@ -7,10 +7,10 @@
  * Every output pixel is inverse-mapped through the RADIAL model into the source and
  * sampled bilinearly. When the output is smaller than the source, the source is first
  * box-filtered (exact area averaging) to the output scale, so downscaling does not
- * alias; the box-filtered image is addressed through the source frame with the per-axis §2 rule
- * (rounded output sizes give sx ≠ sy). No crop or FOV change. Output pixels that map outside the source image (or beyond the fold radius
- * of a strongly distorted lens, where the RADIAL model stops being monotone) get
- * RGBA = (0, 0, 0, 0).
+ * alias; the box-filtered image is addressed through the source frame with the per-axis
+ * §2 rule (rounded output sizes give sx ≠ sy). No crop or FOV change. Output pixels that map
+ * outside the source image (or beyond the fold radius of a strongly distorted lens, where the
+ * RADIAL model stops being monotone) get RGBA = (0, 0, 0, 0).
  */
 import type { CameraIntrinsics, RGBAImage } from '../core/types';
 import { scaleCamera } from './dense-util';

@@ -40,7 +40,16 @@
  * smooth wall gets one consistent plane. All valid depths of a sky region are rejected, halo
  * bands included. Measured (GT-pose harness, PatchMatch geometric maps, untextured = std < 2):
  * yard sky regions have coherence 0.1–0.5 (all of their area), the object room's
- * top-connected walls 0.5–1 (99.5 % of their area).
+ * top-connected walls 0.5–1 (99.5 % of their area). Coherence is per region AREA, not per valid
+ * depth: a sky PatchMatch leaves mostly invalid would otherwise look coherent (its only depths
+ * are the halo bands).
+ * Limits of the sky test: the thresholds come from synthetic renders (sky std ≈ 1 grey level);
+ * denoised iPhone frames put both sky and blank walls below 1, so the coherence test does the
+ * separating — untested on device. With simulated phone artefacts (object-real) 19 % of the
+ * top-connected wall area fell below coherence 0.5 (its depths were mostly wrong anyway); if real
+ * walls keep good but less coherent depths, lower `skyMinCoherence`. A blank wall touching the
+ * up border that PatchMatch fills incoherently is removed as sky. Sky not connected to the up
+ * border (through foliage), dark or textured (cloudy) skies are untouched.
  *
  * Measured on the GT-pose harness (480 px; fraction of valid pixels rejected by step 1 with
  * the defaults): object 66 % of the > 5 % outliers, 1.2 % of the ≤ 1 % pixels; yard 81 % of
