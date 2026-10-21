@@ -327,17 +327,17 @@ and 3 geometric iterations; default fusion; τ = `denseTau`:
 | yard | 0.989 | 0.231 | 0.374 | P 0.978, C 0.338, F 0.502 | C 0.316 / 0.461 |
 
 Tuned (`--preset balanced`, same views and 480 px: view-selection near margin 0.5, fusion
-`minViews` 2, normal 15°, `removeDepthHalos` on the final maps; see ARCHITECTURE §6 "Dense tuning
+`minViews` 2, normal 15°, `removeDepthHalos` on the final maps; see ../docs/research/dense-tuning.md "Dense tuning
 results" for every experiment): object P 0.9997, C 0.987, F 0.994 (mesh F 0.963 → 0.987); yard
 P 0.981, C 0.352, F 0.518 (mesh F 0.348 → 0.492). With the sky test of `removeDepthHalos`
-(default since 2026-10, ARCHITECTURE §6 "Sky / low-texture halo removal"; yard maps saved under
+(default since 2026-10, ../docs/research/dense-tuning.md "Sky / low-texture halo removal"; yard maps saved under
 `yard-skyb`): yard P 0.9854, C 0.3521, F 0.5188, sky-coloured points farther than τ 5,722 → 707,
 mesh F 0.492 → 0.495; object unchanged (P 0.9997, C 0.9874, mesh F 0.9873 → 0.9868).
 
 ## Gaussian splats with ground-truth poses (`run-splat-gt.mjs`)
 
-`node e2e/run-splat-gt.mjs` trains the 3D Gaussian Splatting trainer of `src/splat` (ARCHITECTURE §6
-"src/splat") without the SfM engine: exact poses and intrinsics, so the scores measure the splat
+`node e2e/run-splat-gt.mjs` trains the 3D Gaussian Splatting trainer of `src/splat` (src/splat/index.ts,
+../docs/research/splat-tuning.md) without the SfM engine: exact poses and intrinsics, so the scores measure the splat
 optimisation (and its initialisation), not SfM. Held-out frames are scored as novel views.
 
 ```sh
@@ -654,7 +654,7 @@ Every frame, IMU + compass (+ GPS for yard), GPU features, dense at the preset s
 balanced: 80 views at 960 px = the datasets' size, fusion step 2). "before" = the code before the dense work
 (+ the stage timing log and GPU timestamps), "after" = footprint-adaptive point cap, multi-scale passes,
 GPU-resident PatchMatch data flow (upload caches, GPU finalisation / prior, 12 B/px readback), native float16,
-serpentine passes, image LRU up to every view (ARCHITECTURE §6 "Dense on a real GPU"). Each before / after pair ran
+serpentine passes, image LRU up to every view (../docs/research/dense-tuning.md "Dense on a real GPU"). Each before / after pair ran
 back to back (host load 4–8, other agents' GPU jobs running: GPU-pass wall time is 1.2–1.6× the timestamped GPU
 time; exception: the object-real fast "before" ran at load 18–23 while a unit-test run overlapped, so that pair's
 times favour "after"). densify = depth maps + fusion; GPU = PatchMatch execution time from timestamp queries.
@@ -752,7 +752,7 @@ scale −7.3 %.
 
 ### Real-capture robustness (2026-10, CPU features, worker engine)
 
-What changed (details and the evidence for each choice: ARCHITECTURE §6 "Real-capture robustness"):
+What changed (details and the evidence for each choice: ../docs/research/real-capture-robustness.md):
 hard rotation limit (keyframes forced through fast pans) and best-of-window keyframing; gyro gates on
 verified pairs, registrations and initial pairs (live and refine) and gyro-consistent model choice
 (breaks, isolated outliers, explained correspondences); spatial candidates from the gyro-propagated pose;
@@ -818,7 +818,7 @@ Dense (480 px, 40 views, same preset as the baselines):
 The yard-real baseline was not densified (its sparse model is broken). The 3.1 mm of `final3` was a RIGID offset of
 the cloud against the cameras (`--dense-align sim3+icp`: 0.35 mm p50, as the baseline's 0.35 mm): every camera
 pitched by −0.26° with the object 3 mm lower — the rotation-only correction's under-corrected roll term on the
-orbit (ARCHITECTURE "Rolling shutter"); the translational term removes it.
+orbit (../docs/research/real-capture-robustness.md "Rolling shutter"); the translational term removes it.
 
 Variants measured and rejected:
 
@@ -882,7 +882,7 @@ Measured, not adopted:
 * Per-image focal with up to 12 rounds (`perImageFocalRounds: 12`, object-real): the alternation stops at round 8 with
   c_y +0.43 px from the centre (GT −1.0): pp 1.46 px, rotation 0.118° (6 rounds: 0.87 px, 0.077°) at the same
   reprojection error (0.566 px). The 6-round cap stops the slow drift along the orbit's pitch ↔ c_y mode near the truth
-  on object-real / abl-object-breath; it is not convergence (ARCHITECTURE "Real-capture robustness", Limits).
+  on object-real / abl-object-breath; it is not convergence (../docs/research/real-capture-robustness.md "Per-image focal (focus breathing)").
 * Gyro re-calibration on the rolling-shutter-corrected live model before the second readout pass (tag `rev2`): the
   offset calibrated on the distorted model is biased by where the features sit in the frame (yard-real −30.5,
   abl-yard-rs −27.9 ms; truth −25) and becomes −25.1 / −24.9 ms with the true bias, but accuracy was neutral
@@ -916,7 +916,7 @@ drift that is still short of the truth there). With ≤ 20 rounds both improve, 
 crossed at a better place (rounds 7 / 9) — another early-stopping rule tuned on the same two datasets. Anchored at the
 image centre it is worse. σ 1 px contracts faster (factor 0.67; fixed point ≈ −1.4 px, set by the anchor — the input pp,
 which the breathing biases by a dataset-dependent amount) but still stops by the tolerance (−1.86 px: pp 0.91 px) and
-doubles the focal error. Kept: the 6-round cap without a prior (ARCHITECTURE "Real-capture robustness", Limits).
+doubles the focal error. Kept: the 6-round cap without a prior (../docs/research/real-capture-robustness.md "Per-image focal (focus breathing)").
 
 #### Final verification (2026-10-17, worker engine, CPU features, fast preset)
 
@@ -936,7 +936,7 @@ dense: the same with `--dense-size 480 --tag verify-dense480` (instead of `--no-
 Real GPU (`E2E_GPU=host`: headless Chrome 155 on an Apple M4, Metal), worker engine, fast preset, GPU features. The
 host was shared with other heavy jobs (load 6–19 during these runs, ±30–50 % timing noise), so the baseline and the
 final code ran back to back. Baseline = `19448e5` (the code before this work plus its timing stats); final = this
-branch (ARCHITECTURE §6 "Refine performance"). Per-phase times come from the new `stats` fields (`matchingMs`,
+branch (../docs/research/refine-performance.md). Per-phase times come from the new `stats` fields (`matchingMs`,
 `vocabularyMs`, `verifyMs`, `matchWaitMs`, `liveRefineMs`, `rsMs` / `rsSearchMs` / `rsReadjustMs` / `rsEvaluations`,
 `offlineSfMMs`, `principalPointMs`, `perImageFocalMs`; `offlineSfM` = run / skipped and why).
 
@@ -1141,8 +1141,7 @@ shift is the median residual render → GT translation in px.
   the TSDF is cut at 2× the median depth), and the sky, distant houses and holes (yard). Exposure
   compensation changes it by less than 0.5 dB. Filling the frame is where a splat stage can win
   the most.
-* **One-line fixes, measured here** (the unlit mesh is now the default, and the GLB export is unlit too: ARCHITECTURE §6
-  "Splat layer in the viewer").
+* **One-line fixes, measured here** (the unlit mesh is now the default, and the GLB export is unlit too: ../docs/research/viewer-rendering.md).
   * Unlit instead of lit mesh: covered +5.1 dB / +0.039 SSIM on object-real, +3.8 dB / +0.032 on
     yard-real. Full frame +0.06 / +0.10 dB. The lighting is not affine, so the colour fit recovers
     only part of it (cc covered 25.5 vs 30.1 dB).

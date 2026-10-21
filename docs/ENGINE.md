@@ -137,8 +137,8 @@ vs offline (gyro breaks, then registered images, then explained correspondences,
 reprojection error; isolated gyro outliers deregistered) → final global BA (focal + principal point + k1 + k2) →
 per-image focal lengths (focus breathing; kept only if they help) → world alignment
 (`sfm/world.ts`) → persist. Pair verification, vocabulary quantisation and the rolling-shutter
-hypotheses run on CPU helper workers (`EngineConfig.cpuWorkers`). Details: ARCHITECTURE §6
-"Real-capture robustness" and "Refine performance".
+hypotheses run on CPU helper workers (`EngineConfig.cpuWorkers`). Details: research/real-capture-robustness.md
+and research/refine-performance.md.
 
 ### Dense / mesh
 Views stream from IndexedDB through an LRU image cache; depth maps go through a
@@ -149,11 +149,11 @@ PatchMatch passes (multi-scale): photometric at ½ resolution for every view, a 
 photometric pass initialised from it, then the geometric pass(es); full-resolution passes
 alternate direction so the image LRU (sized up to every view when the plan allows) and
 PatchMatchGPU's upload caches stay warm. A fused cloud above the preset's `maxPoints` is merged
-with a footprint-adaptive LOD (cells ∝ each point's radius). Details: ARCHITECTURE §6 "Dense on a
+with a footprint-adaptive LOD (cells ∝ each point's radius). Details: research/dense-tuning.md "Dense on a
 real GPU".
 
 ### Splat
-Gaussian splatting (`src/engine/splat.ts` over `src/splat`, ARCHITECTURE §6 "Splat stage in the engine"), after
+Gaussian splatting (`src/engine/splat.ts` over `src/splat`, research/splat-tuning.md "Engine splat stage"), after
 densify — or after refine when there is no dense cloud. One long operation with three progress stages:
 
 1. `splat_prepare`: training views = the registered keyframes with a stored photo, evenly spread to `maxViews`,
@@ -170,7 +170,7 @@ densify — or after refine when there is no dense cloud. One long operation wit
    (`SplatTrainer.create`), views uploaded one at a time (`setViewImage`). Training views that are dense views
    get an inverse-depth target from the dense stage's fusion-filtered depth map (½ size, 8 B per pixel,
    `setViewDepth`): the preset's trainer default `geometry` supervises the rendered depth during the first 30 % of
-   the iterations (ARCHITECTURE §6 "Geometry supervision … off-trajectory views"; off without depth maps or with
+   the iterations (src/splat/trainer.ts, research/splat-tuning.md "Geometry supervision, shape regularisers, colour correction"; off without depth maps or with
    `EngineConfig.splat.trainer.geometry: false`).
 2. `splat_training`: `trainer.step(chunk)` (25 iterations) under the engine's GPU lock, waiting while the page is
    hidden; `ProgressEvent.detail` = `SplatTrainingDetail` {iteration, iterations, loss, itPerSec, gaussians}.
@@ -194,7 +194,7 @@ rejects with `NotSupportedError` (code 'no-webgpu').
 
 Measured (object-real, fast, worker engine, M4 / Metal): 60 s for 3 000 iterations / 200 k Gaussians on 90 views at
 600×800 (prepare 12.6 s, 64.6 it/s), memory plan peak ≈ 811 MB; held-out novel views 31.2 dB full-frame PSNR vs 8.7 dB
-for the lit mesh (ARCHITECTURE §6 "Splat stage in the engine", e2e/README.md).
+for the lit mesh (research/splat-tuning.md "Engine splat stage", e2e/README.md).
 
 ## 3. Worker protocol (`src/workers/protocol.ts`)
 
@@ -233,5 +233,5 @@ view, counters, finish) → Processing (stages + progress + cancel) → Viewer
 (splats / points / mesh layer pill, cameras, EDL, measure, export, run dense / mesh / photoreal). The splat
 stage runs from the viewer itself ("Photoreal model" in the Build sheet → `splat` with a progress card fed by
 `SplatTrainingDetail`, Cancel, Resume after an interruption), the model is fetched with `splatModel` into the
-viewer's WebGPU splat layer and shown by default, and the export sheet offers 'ply-splat' (ARCHITECTURE §6
-"Splat layer in the viewer").
+viewer's WebGPU splat layer and shown by default, and the export sheet offers 'ply-splat' (src/viewer/splat-layer.ts,
+research/viewer-rendering.md).

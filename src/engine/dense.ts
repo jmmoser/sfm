@@ -321,7 +321,11 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   const passKinds: PassKind[] = [...(multiScale ? (['half'] as const) : []), 'photo', ...new Array<PassKind>(geometricPasses).fill('geo')];
   const passes = passKinds.length;
   if (multiScale) stats.denseMultiScale = 1;
-  // colour-guided halo / sky clean-up of the final depth maps before fusion
+  // ½-res ('half') views are decoded and undistorted at half size with their own LRU; resume keys
+  // and progress include the pass kinds.
+  // colour-guided halo / sky clean-up of the final depth maps before fusion. It runs on this thread
+  // between GPU passes (~150–250 ms per 0.5 MP map); overlapping it and the store with the next
+  // view's GPU passes is the next speed-up (docs/research/dense-tuning.md "Dense on a real GPU").
   const halo = preset.haloFilter === false ? null : removeDepthHalos;
   if (halo) stats.haloFilter = 1;
   // sky test orientation per view (frames are not always upright: canonical orientation, portrait lock)
