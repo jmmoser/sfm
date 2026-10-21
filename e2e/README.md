@@ -448,6 +448,7 @@ node e2e/run-e2e.mjs [object|yard|all|<dataset> ...] [--engine worker|inline|moc
      [--max-frames N] [--fps F] [--no-imu] [--no-gps] [--no-heading] [--hfov DEG|gt|none]
      [--no-dense] [--no-mesh] [--dense-size N] [--dense-views N] [--mesh-voxel V]
      [--mesh-triangles N] [--splat] [--splat-iterations N] [--splat-max N] [--splat-size N] [--splat-views N]
+     [--splat-previews]
      [--no-export | --export fmt,fmt] [--nvs] [--nvs-views N] [--mapping inline|background]
      [--timeout-min M] [--out DIR] [--tag NAME] [--thresholds FILE] [--no-thresholds]
      [--enforce] [--mock-speed X] [--set key=json ...] [--quiet] [--verbose] [--headed]
@@ -498,7 +499,7 @@ reports for an iPhone main camera; the datasets use 65°. `--hfov gt` uses the e
 The harness waits for every `LiveUpdate` before it sends the next frame, so there is one frame in
 flight. Then it runs `finishCapture`, `refine`, `densify`, `mesh`, with `--splat` the Gaussian-splatting stage
 (`engine.splat()`, after densify / mesh, or after refine with `--no-dense`; `--splat-iterations`, `--splat-max`,
-`--splat-size`, `--splat-views` set `SplatOptions` and imply `--splat`) and the exports, collecting the
+`--splat-size`, `--splat-views`, `--splat-previews` set `SplatOptions` and imply `--splat`) and the exports, collecting the
 progress events. A failing step is recorded in `errors`, the steps that depend on it are skipped,
 and a partial result is still written. On `--timeout-min` the runner calls `harnessAbort()`, which
 cancels the long operation, and saves what was done.
@@ -513,6 +514,7 @@ cancels the long operation, and saves what was done.
 | `result.json` | Harness result plus the `metrics.mjs` input fields. See below. |
 | `sparse.ply`, `dense.ply`, `mesh.ply` | Streamed from the page through `window.__e2eWrite`. |
 | `splats.ply` | With `--splat`: `exportModel('ply-splat')` (INRIA 3DGS PLY, run world frame); `--nvs` scores it as the `splat` renderer. |
+| `previews/NNN-it<i>.png` | With `--splat-previews` (`SplatOptions.preview`): the training snapshots of the splat stage (the training view nearest the middle photo, ≤ 400 px, raw trainer colours). |
 | `metrics.json` | `computeMetrics` output, sparse-cloud accuracy, live-trajectory metrics and threshold checks (+ the `nvs` summary with `--nvs`). |
 | `nvs/nvs.json` | With `--nvs [--nvs-views N]`: the novel-view evaluation of the output (see "Novel-view evaluation"). |
 
@@ -532,7 +534,9 @@ The harness fields of `result.json` are:
 * `dense`, `mesh` and `exports` (sizes only), plus `logs`, `errors` and page `memory`.
 * `splat` (with `--splat`): the `SplatResult` (count, iterations, ms, `stats`: views, size, init, it/s, memory
   plan, checkpoints, …), `lastDetail` (the last training progress `detail`) and the `splats.ply` path; also
-  copied to `metrics.json`.
+  copied to `metrics.json`. With `--splat-previews`: `previews` (iteration, arrival ms after the stage
+  started, PSNR against that training photo, file) and `firstTrainingMs`; the summary line gives the first
+  arrival, the largest gap while training and the PSNR first → last.
 
 The `metrics.mjs` fields are `intrinsics`, `images`, `metric`, `numInputImages` and `pointsFile`.
 To re-score a run, use `node e2e/metrics.mjs e2e/data/object e2e/out/e2e/object/result.json`.

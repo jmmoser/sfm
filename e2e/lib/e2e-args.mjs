@@ -18,6 +18,8 @@ export const USAGE = `usage: node e2e/run-e2e.mjs [object|yard|all|<dataset> ...
                                 engine.splat() → <dir>/splats.ply (scored by --nvs as the 'splat' renderer)
   --splat-iterations N          SplatOptions.iterations         --splat-max N   SplatOptions.maxGaussians
   --splat-size N                SplatOptions.maxImageSize       --splat-views N SplatOptions.maxViews
+  --splat-previews              SplatOptions.preview: the training snapshots → <dir>/previews/NNN-it<i>.png,
+                                arrival times and PSNR in result.json (splat.previews) and the summary
   --no-export | --export a,b    exports (sizes only); default: every applicable format
   --nvs                         novel-view evaluation of the output (e2e/nvs.mjs: held-out frames,
                                 PSNR / SSIM of the points / mesh renders) → <dir>/nvs/nvs.json
@@ -133,6 +135,7 @@ export function parseArgs(argv) {
       case '--splat-max': o.splatOpts.maxGaussians = int(1000); break;
       case '--splat-size': o.splatOpts.maxImageSize = int(64); break;
       case '--splat-views': o.splatOpts.maxViews = int(2); break;
+      case '--splat-previews': o.splatOpts.preview = true; break;
       case '--no-export': o.exports = false; break;
       case '--export': {
         const v = next();

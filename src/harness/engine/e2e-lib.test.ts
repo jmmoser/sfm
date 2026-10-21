@@ -45,6 +45,7 @@ describe('parseArgs', () => {
     expect(sp.config.splat).toEqual({ iterations: 500 });
     expect(parseArgs(['yard', '--no-dense', '--splat']).config).toMatchObject({ densify: false, splat: true });
     expect(parseArgs(['yard', '--splat-max', '100000']).config.splat).toEqual({ maxGaussians: 100000 });
+    expect(parseArgs(['object-real', '--splat-previews']).config.splat).toEqual({ preview: true });
     expect(parseArgs(['yard']).config.splat).toBe(false);
     expect(parseArgs(['yard', '--export', 'ply-splat']).config.exports).toEqual(['ply-splat']);
     const nv = parseArgs(['object-real', '--nvs', '--nvs-views', '8']);

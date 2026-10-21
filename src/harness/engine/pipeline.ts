@@ -9,14 +9,17 @@
  *
  * Every step is guarded: a failure is recorded in `errors` and the steps that depend on it are
  * skipped, so a partial result is always returned. Big outputs (PLY files) are streamed to
- * Node through `window.__e2eWrite` when the runner installed it (e2e/run-e2e.mjs).
+ * Node through `window.__e2eWrite` when the runner installed it (e2e/run-e2e.mjs). With
+ * `splat: { preview: true }` the 'splat_preview' snapshots are recorded (arrival time, PSNR) in
+ * `result.splat.previews` and streamed as `previews/NNN-it<iteration>.png`.
  */
-import type { GeoFix, ImuSample, PointCloud, ProgressEvent, TriangleMesh } from '../../core/types';
+import type { GeoFix, ImuSample, PointCloud, ProgressEvent, RGBAImage, TriangleMesh } from '../../core/types';
 import { encodeMeshPLY, encodePLY } from '../../io/ply';
 import { stageIdFor } from '../../app/stages';
 import {
   ENGINE_ERRORS,
   EXPORT_FORMATS,
+  SPLAT_STAGES,
   type DenseOptions,
   type EngineOptions,
   type ExportFormat,
@@ -44,7 +47,7 @@ import {
   type HeadingRow,
 } from './feed';
 import { bbox, keyframeSourceIndex, mapCamerasToFrames, medianIntrinsics, normalizeIntrinsics, poseToJSON, stageTimings, type CameraLike, type DeliveredRef } from './result';
-import type { CloudSummary, FrameRecord, HarnessConfig, HarnessError, HarnessResult, LiveSummary, ProgressRecord, ResolvedHarnessConfig } from './types';
+import type { CloudSummary, FrameRecord, HarnessConfig, HarnessError, HarnessResult, LiveSummary, ProgressRecord, ResolvedHarnessConfig, SplatPreviewRecord } from './types';
 
 // ------------------------------------------------------------------ dataset
 
@@ -134,6 +137,13 @@ function blobToBase64(b: Blob): Promise<string> {
     r.onerror = () => reject(r.error);
     r.readAsDataURL(b);
   });
+}
+
+/** PNG of an RGBA8 image (OffscreenCanvas). */
+async function pngOf(img: RGBAImage): Promise<Blob> {
+  const c = new OffscreenCanvas(img.width, img.height);
+  c.getContext('2d')!.putImageData(new ImageData(new Uint8ClampedArray(img.data), img.width, img.height), 0, 0);
+  return c.convertToBlob({ type: 'image/png' });
 }
 
 /** Stream a binary blob to Node in ≤ 6 MB base64 chunks. */
@@ -730,12 +740,38 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
         const sopts: SplatOptions | undefined = typeof cfg.splat === 'object' ? cfg.splat : undefined;
         const rec = onProgress('splat');
         let lastDetail: Record<string, number> | null = null;
+        // previews (SplatOptions.preview): arrival times and PSNR, the snapshots as PNG files
+        const previews: SplatPreviewRecord[] = [];
+        let firstTrainingMs: number | null = null;
+        let writes: Promise<void> = Promise.resolve();
+        const ts = t0;
         splat = await eng.splat(sopts, (p) => {
-          if (p.detail) lastDetail = { ...p.detail };
+          const ms = round(performance.now() - ts, 1);
+          if (p.stage === SPLAT_STAGES.preview) {
+            if (!p.image || !p.detail) return;
+            const pr: SplatPreviewRecord = { iteration: p.detail.iteration, ms, psnr: p.detail.psnr, viewId: p.detail.viewId, width: p.image.width, height: p.image.height, file: null };
+            previews.push(pr);
+            if (cfg.output && window.__e2eWrite) {
+              const img = p.image;
+              const path = `${result.config.output?.prefix ?? ''}previews/${String(previews.length - 1).padStart(3, '0')}-it${pr.iteration}.png`;
+              writes = writes
+                .then(async () => {
+                  await writeBinary(path, await pngOf(img));
+                  pr.file = path;
+                })
+                .catch((e: unknown) => fail('write splat preview', e));
+            }
+            return;
+          }
+          if (p.stage === SPLAT_STAGES.training && p.detail) {
+            lastDetail = { ...p.detail };
+            firstTrainingMs ??= ms;
+          }
           rec(p);
         });
+        await writes;
         mark('splat', t0);
-        result.splat = { ...splat, stats: { ...splat.stats }, lastDetail, file: null };
+        result.splat = { ...splat, stats: { ...splat.stats }, lastDetail, file: null, ...(previews.length ? { previews, firstTrainingMs } : {}) };
         const st = splat.stats;
         log(
           `[harness] splat done: ${splat.count} Gaussians, ${splat.iterations} iterations, ${st.splatViews} views ${st.splatWidth}×${st.splatHeight}, ${st.splatItPerSec} it/s, memory plan ≈ ${st.splatMemPeakMB} MB (GPU ${st.splatGpuMB} MB) (${Math.round(result.timings.splat)} ms)`,
