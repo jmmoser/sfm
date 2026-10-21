@@ -52,8 +52,11 @@ interface FrameInput {
 interface LiveUpdate {
   frameIndex: number;
   decision: 'keyframe' | 'skip' | 'reject_blur' | 'reject_motion';
-  guidance: 'good' | 'move_slower' | 'more_texture' | 'translate_more' | 'tracking_lost' | 'initializing';
+  guidance: 'good' | 'move_slower' | 'more_texture' | 'translate_more' | 'tracking_lost' | 'initializing'
+    | 'too_dark';                   // median luma of the last 5 frames < 40, or < 70 with 3 blur rejects
   tracking: 'initializing' | 'tracking' | 'lost';
+  /** Mode in effect: the session's mode, or what 'auto' resolved to ('auto' until then). */
+  resolvedMode?: 'object' | 'scene' | 'auto';
   numKeyframes: number;
   numRegistered: number;
   numPoints: number;
@@ -104,7 +107,8 @@ Gaussians and image size):
 | max | 7 000 | 500 000 | 1280 (dense 1600) | 200 | ½ of the cap | 30 000 | 500 it |
 
 Mode affects keyframe thresholds, TSDF voxel size and depth-range margins; `auto`
-picks object vs scene after initialisation from the scene depth / baseline.
+picks object vs scene after initialisation from the scene depth / baseline (`classifyScene`: the
+optical-axis convergence of ≥ 8 registered keyframes) and reports it as `LiveUpdate.resolvedMode`.
 
 ### Frame flow (live)
 1. Rotate to the session's canonical orientation (first frame's θ) when needed;
@@ -228,10 +232,21 @@ MockEngine implements the same calls (a fast fake run whose model is one Gaussia
 ## 4. UI flow (`src/app`)
 
 Home (sessions, new scan, diagnostics) → Setup (mode, quality) → Permissions
-(one tap: motion → camera → location) → Capture (video, guidance, live sparse
+(one tap: motion → camera → location) → Capture (video, guidance, coverage ring, live sparse
 view, counters, finish) → Processing (stages + progress + cancel) → Viewer
 (splats / points / mesh layer pill, cameras, EDL, measure, export, run dense / mesh / photoreal). The splat
 stage runs from the viewer itself ("Photoreal model" in the Build sheet → `splat` with a progress card fed by
 `SplatTrainingDetail`, Cancel, Resume after an interruption), the model is fetched with `splatModel` into the
 viewer's WebGPU splat layer and shown by default, and the export sheet offers 'ply-splat' (src/viewer/splat-layer.ts,
 research/viewer-rendering.md).
+
+Capture guidance (`src/app/screens/capture.ts`): the banner shows the engine's per-frame `guidance` through a
+`GuidanceGate` (`src/app/capture-policy.ts`): priority too_dark > tracking_lost > move_slower > more_texture >
+translate_more > initializing > good, a new code after 2 consecutive frames (too_dark / tracking_lost at once),
+and a shown code kept ≥ 1.5 s unless a higher-priority one replaces it; screen readers hear only severity
+changes. 'too_dark' points at the torch (which pulses) when the camera has one. In object mode — or auto once
+`resolvedMode` is 'object' — a coverage ring (`src/app/coverage.ts`, `components/coverage-ring.ts`) shows,
+per live model update, which of 12 azimuth sectors × 3 elevation bands (< 10°, 10–40°, > 40°) around the
+cameras' convergence point have ≥ 2 registered keyframes, the phone's cell from `framePose`, and one prompt
+(other side / gaps / raise the phone and look down / done); azimuth only without the motion sensor. After
+5 keyframes the Finish hint shows the readiness ("Coverage 62 % · top not captured"); it never blocks Finish.

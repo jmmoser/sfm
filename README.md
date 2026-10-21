@@ -47,14 +47,18 @@ and geolocation need a secure context.
    web app is persistent; a Safari tab's storage can be evicted after 7 days without use.
 2. Tap **New scan**, then choose:
    * **Object**: move slowly around it at a roughly constant distance, keeping ~70 % overlap. Cover
-     it from 2–3 heights.
+     it from 2–3 heights. A coverage ring at the bottom left fills in as you go — which sides and
+     heights already have photos, with a dot where the phone is — and says what is missing: walk to
+     the other side, then raise the phone for a second loop looking down. The hint above **Finish**
+     shows the coverage (e.g. "Coverage 62 % · top not captured"); it is advice, Finish always works.
    * **Large area**: walk slowly and sidestep rather than only turning on the spot. Look at
      structures from several places and come back to the start (loop closure). GPS adds scale and
      geo-referencing.
-   * **Auto**: lets the app decide.
+   * **Auto**: lets the app decide (the coverage ring appears once it has decided on an object).
    * **Quality**: *Fast / Balanced / Max* trades processing time and memory for resolution.
 3. Tap **Start**. iOS asks for motion access, then camera, then location. Follow the on-screen
-   guidance, and tap **Finish** when the live model covers what you need.
+   guidance, and tap **Finish** when the live model covers what you need. In a dark room the
+   guidance says so and points at the torch button.
    Tap the 3D thumbnail, or the cube button at the top right, to swap the camera preview for the
    live point cloud, full screen and seen from where the phone is. The view moves with every
    tracked frame, and the gyroscope keeps it turning smoothly in between. Drag to look around the

@@ -3,6 +3,7 @@
  */
 import type { SessionStatus } from '../io/storage';
 import type { CaptureMode, Guidance, QualityPreset, TrackingState } from '../workers/protocol';
+import type { Coverage, CoveragePrompt } from './coverage';
 
 const BYTE_UNITS = ['B', 'KB', 'MB', 'GB', 'TB'];
 
@@ -168,9 +169,21 @@ export interface GuidanceInfo {
   tone: Tone;
 }
 
-/** Friendly copy for each guidance code (object vs large-area wording where it matters). */
-export function guidanceInfo(g: Guidance, mode: CaptureMode = 'auto'): GuidanceInfo {
+/** The capture torch for the 'too_dark' copy: available and off / on, or none on this camera. */
+export type TorchState = 'off' | 'on' | 'none';
+
+/**
+ * Friendly copy for each guidance code (object vs large-area wording where it matters; `mode` is
+ * the mode in effect, LiveUpdate.resolvedMode). 'too_dark' points at the torch when there is one.
+ */
+export function guidanceInfo(g: Guidance, mode: CaptureMode = 'auto', torch: TorchState = 'none'): GuidanceInfo {
   switch (g) {
+    case 'too_dark':
+      return {
+        title: 'Too dark',
+        detail: torch === 'off' ? 'Turn on the torch, or add more light' : torch === 'on' ? 'Add more light, or move closer with the torch on' : 'Add more light or move to a brighter spot',
+        tone: 'bad',
+      };
     case 'good':
       return { title: 'Looking good', detail: 'Keep moving slowly and steadily', tone: 'good' };
     case 'move_slower':
@@ -190,6 +203,38 @@ export function guidanceInfo(g: Guidance, mode: CaptureMode = 'auto'): GuidanceI
     default:
       return { title: '', detail: '', tone: 'neutral' };
   }
+}
+
+/** The coverage ring's one-line prompt ('' while the object is being located). */
+export function coveragePromptText(p: CoveragePrompt, elevation = true): string {
+  switch (p) {
+    case 'other_side':
+      return 'Walk to the other side';
+    case 'fill_gaps':
+      return 'Go back over the gaps';
+    case 'look_down':
+      return 'Raise the phone, loop looking down';
+    case 'go_lower':
+      return 'Lower the phone, loop at object height';
+    case 'done':
+      return elevation ? 'Done — you can finish' : 'All sides covered — you can finish';
+    default:
+      return '';
+  }
+}
+
+/** Readiness next to Finish, e.g. "Coverage 62 % · top not captured" (null until the object is located). */
+export function coverageHint(cov: Pick<Coverage, 'stable' | 'completeness' | 'prompt'>): string | null {
+  if (!cov.stable) return null;
+  const what: Record<CoveragePrompt, string> = {
+    locating: '',
+    other_side: ' · sides missing',
+    fill_gaps: ' · gaps left',
+    look_down: ' · top not captured',
+    go_lower: ' · lower views missing',
+    done: ' · ready to finish',
+  };
+  return `Coverage ${Math.round(100 * Math.max(0, Math.min(1, cov.completeness)))} %${what[cov.prompt]}`;
 }
 
 export function trackingLabel(t: TrackingState): string {

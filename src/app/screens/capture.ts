@@ -6,6 +6,17 @@
  * gyro); a drag detaches the view to orbit freely, "Follow camera" re-attaches it. The preview
  * keeps playing underneath — frames are grabbed from it.
  *
+ * Guidance: the banner follows the engine's per-frame code through a GuidanceGate
+ * (capture-policy.ts: priority + 2-frame confirmation + 1.5 s dwell, so it cannot flicker);
+ * screen readers hear it only when its severity changes. 'too_dark' points at the torch (which
+ * then pulses) when the camera has one. Copy uses the mode in effect (LiveUpdate.resolvedMode).
+ *
+ * Coverage (object mode, or auto once the engine resolved 'object'): a ring of which sides and
+ * heights have registered keyframes (src/app/coverage.ts, components/coverage-ring.ts), recomputed
+ * per live model update, with the phone's cell from the frame pose and a one-line prompt; azimuth
+ * only without the motion sensor (no gravity, so no trusted elevation). After MIN_KEYFRAMES the
+ * Finish hint shows the readiness ("Coverage 62 % · top not captured"); it never blocks Finish.
+ *
  * Pipeline: CameraCapture → FramePump (≤ 10 Hz, back-pressure: the next frame is grabbed only
  * after engine.processFrame resolved) → engine. WakeLock while capturing (acquired in the Start
  * tap). Lifecycle (docs/research/ios-camera.md §6, ios-platform.md §6.2):
@@ -28,16 +39,18 @@ import { screenAngle, type ScreenAngle } from '../../sensors/frame-orientation';
 import type { CapturePermissionStatus } from '../../sensors/permissions';
 import type { Viewer } from '../../viewer';
 import { loadViewerModule } from '../viewer-loader';
-import { ENGINE_ERRORS, isCancelledError, type FrameInput, type LiveCamera, type LiveUpdate } from '../../workers/protocol';
+import { ENGINE_ERRORS, isCancelledError, type CaptureMode, type FrameInput, type LiveCamera, type LiveUpdate } from '../../workers/protocol';
 import type { App, Screen } from '../app';
 import type { AbortOutcome, EngineErrorInfo } from '../engine-client';
 import { button, iconButton, setButtonLabel, spinner } from '../components/controls';
+import { createCoverageRing } from '../components/coverage-ring';
 import { confirmDialog } from '../components/dialog';
 import { toast } from '../components/toast';
 import { Disposer, h, replaceChildren } from '../dom';
-import { defaultSessionName, formatAccuracy, formatBytes, formatClock, formatCount, guidanceInfo, trackingLabel } from '../format';
+import { coverageHint, defaultSessionName, formatAccuracy, formatBytes, formatClock, formatCount, guidanceInfo, trackingLabel, type TorchState } from '../format';
 import { icon, type IconName } from '../icons';
-import { frameErrorAction, isQuotaError, overlayMatchesView } from '../capture-policy';
+import { GuidanceGate, frameErrorAction, isQuotaError, overlayMatchesView } from '../capture-policy';
+import { computeCoverage, coverageCell, type Coverage } from '../coverage';
 import { FrameOrientationTracker, mapOverlay } from '../overlay-map';
 import { createDebugOverlay } from '../debug-overlay';
 import { coverFovDeg, FollowView, medianDistance, quarterTurned, splatRadii } from '../follow-view';
@@ -135,7 +148,10 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   );
   const guidanceTitle = h('span', { class: 'guidance-title' });
   const guidanceDetail = h('span', { class: 'guidance-detail' });
-  const guidance = h('div', { class: 'guidance', role: 'status', 'aria-live': 'polite', hidden: true, 'data-testid': 'guidance' }, h('span', { class: 'guidance-icon' }), h('span', { class: 'guidance-text' }, guidanceTitle, guidanceDetail));
+  const guidance = h('div', { class: 'guidance', hidden: true, 'data-testid': 'guidance' }, h('span', { class: 'guidance-icon' }), h('span', { class: 'guidance-text' }, guidanceTitle, guidanceDetail));
+  // what screen readers hear of the banner: only its severity changes (GuidanceGate)
+  const guidanceSr = h('div', { class: 'sr-only', role: 'status', 'aria-live': 'polite' });
+  const ring = createCoverageRing();
 
   const miniHost = h('div', { class: 'mini-view-canvas' });
   const miniEmptyLabel = h('span', { text: 'Live 3D' });
@@ -171,8 +187,10 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     h('div', { class: 'capture-shade-bottom', 'aria-hidden': 'true' }),
     top,
     guidance,
+    guidanceSr,
     pausedLabel,
     mini,
+    ring.el,
     cloudActions,
     debugOverlay?.el ?? null,
     controls,
@@ -186,8 +204,8 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     const paused = p === 'paused';
     pausedLabel.hidden = !paused;
     if (p !== 'running') {
-      guidance.hidden = true;
-      lastGuidance = '';
+      gate.reset();
+      renderGuidance(); // hides the banner and the torch hint
     }
     pauseBtn.setAttribute('aria-label', paused ? 'Resume capture' : 'Pause capture');
     pauseBtn.querySelector('.ctl-main-core')!.replaceChildren(icon(paused ? 'play' : 'pause', { size: 28 }));
@@ -216,8 +234,11 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   function updateFinish(): void {
     const enough = numKeyframes >= MIN_KEYFRAMES;
     finishBtn.disabled = !enough || !(phase === 'running' || phase === 'paused');
-    finishHint.hidden = enough || phase === 'starting' || phase === 'error';
+    // after the minimum, object mode shows the coverage readiness (it never blocks Finish)
+    const ready = enough && coverage && !ring.el.hidden ? coverageHint(coverage) : null;
+    finishHint.hidden = (enough && !ready) || phase === 'starting' || phase === 'error';
     if (!enough) finishHint.textContent = `${numKeyframes} / ${MIN_KEYFRAMES} keyframes — keep moving`;
+    else if (ready && finishHint.textContent !== ready) finishHint.textContent = ready;
   }
 
   function showCard(content: HTMLElement | null): void {
@@ -542,8 +563,52 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     return integrateGyro(s, t0, t1);
   }
 
+  // ---- guidance banner + coverage ring -----------------------------------------------------------
+  const gate = new GuidanceGate();
+  /** LiveUpdate.frameIndex last fed to the gate (model updates repeat their frame's index). */
+  let gateFrame = -1;
+  /** Mode in effect: the configured one, or what the engine resolved 'auto' to. */
+  let modeInEffect: CaptureMode = cfg.mode;
+  let coverage: Coverage | null = null;
+  ring.el.hidden = modeInEffect !== 'object';
+
+  function torchState(): TorchState {
+    return !camRes?.torchAvailable ? 'none' : torchOn ? 'on' : 'off';
+  }
+
+  /** Show the gate's code on the banner (and tell screen readers when `announce`). */
+  function renderGuidance(announce = false): void {
+    const code = gate.code;
+    torchBtn.classList.toggle('hint', code === 'too_dark' && torchState() === 'off');
+    if (!code) {
+      guidance.hidden = true;
+      return;
+    }
+    const g = guidanceInfo(code, modeInEffect, torchState());
+    guidance.hidden = !g.title;
+    guidance.dataset.tone = g.tone;
+    guidance.dataset.code = code;
+    guidanceTitle.textContent = g.title;
+    guidanceDetail.textContent = g.detail;
+    const ic: IconName = code === 'too_dark' ? 'torch' : g.tone === 'good' ? 'check' : g.tone === 'info' ? 'info' : 'warning';
+    guidance.querySelector('.guidance-icon')!.replaceChildren(icon(ic, { size: 18 }));
+    if (announce && g.title) guidanceSr.textContent = `${g.title}. ${g.detail}`;
+  }
+
+  /** Coverage of the registered keyframes (per live model update); the ring only in object mode. */
+  function updateCoverage(): void {
+    const want = modeInEffect === 'object';
+    ring.el.hidden = !want;
+    if (!want || !latestCameras) {
+      coverage = null;
+      return;
+    }
+    // elevation needs gravity: without the motion sensor up is a guess
+    coverage = computeCoverage(latestCameras, { elevation: !!motion?.running });
+    ring.update(coverage);
+  }
+
   // ---- live updates ------------------------------------------------------------------------------
-  let lastGuidance = '';
   function onLive(u: LiveUpdate): void {
     if (closed) return;
     const meta = inFlight;
@@ -559,15 +624,14 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       statusPill.dataset.state = u.tracking;
       trackLabel.textContent = trackingLabel(u.tracking);
     }
-    const g = guidanceInfo(u.guidance, cfg.mode);
-    const gkey = `${u.guidance}`;
-    if (gkey !== lastGuidance && phase === 'running') {
-      lastGuidance = gkey;
-      guidance.hidden = !g.title;
-      guidance.dataset.tone = g.tone;
-      guidanceTitle.textContent = g.title;
-      guidanceDetail.textContent = g.detail;
-      guidance.querySelector('.guidance-icon')!.replaceChildren(icon(g.tone === 'good' ? 'check' : g.tone === 'bad' ? 'warning' : g.tone === 'info' ? 'info' : 'warning', { size: 18 }));
+    if (u.resolvedMode && u.resolvedMode !== modeInEffect) {
+      modeInEffect = u.resolvedMode;
+      updateCoverage();
+    }
+    if (phase === 'running' && u.frameIndex !== gateFrame) {
+      gateFrame = u.frameIndex;
+      const s = gate.update(u.guidance, performance.now());
+      if (s.changed) renderGuidance(s.announce);
     }
     const live = phase === 'running';
     if (meta && u.overlay && live && !cloudView) drawOverlay(u.overlay, meta);
@@ -596,11 +660,13 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
         anchorT = -Infinity;
       } else if (newest.t === undefined || !(newest.t <= anchorT)) setAnchor(newest.pose, newest.t);
       viewerDirty = true;
+      updateCoverage();
     }
     if (u.framePose && !(u.framePose.t <= anchorT)) {
       if (u.R_cam_device) latestRcd = Float64Array.from(u.R_cam_device);
       setAnchor(u.framePose.pose, u.framePose.t);
     }
+    if (u.framePose && coverage) ring.setCurrent(coverageCell(coverage, u.framePose.pose));
     if (viewerDirty) scheduleViewer();
     // The engine marks every frame after its capture memory cap (in case the event was missed).
     if (u.timings?.memoryLimited) onMemoryLimit();
@@ -918,11 +984,8 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     showCard(null);
     pump.start();
     setPhase('running');
-    guidance.hidden = false;
-    guidanceTitle.textContent = guidanceInfo('initializing', cfg.mode).title;
-    guidanceDetail.textContent = guidanceInfo('initializing', cfg.mode).detail;
-    guidance.dataset.tone = 'info';
-    guidance.querySelector('.guidance-icon')!.replaceChildren(icon('info', { size: 18 }));
+    gate.reset('initializing', performance.now());
+    renderGuidance(true);
   }
 
   function onCameraState(s: CameraState, detail?: string): void {
@@ -1003,6 +1066,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     torchBtn.setAttribute('aria-pressed', String(want));
     torchBtn.classList.toggle('active', want);
     torchBtn.replaceChildren(icon(want ? 'torch' : 'torchOff', { size: 22 }));
+    if (gate.code === 'too_dark') renderGuidance(); // the copy follows the torch
   }
 
   function updateGps(): void {

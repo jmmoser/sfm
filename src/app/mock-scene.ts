@@ -466,13 +466,18 @@ export class MockScene {
     return Math.max(0, Math.min(1, (p[0] - 7 + 9) / 18));
   }
 
-  /** World-to-camera pose at trajectory parameter s (s = 1: one orbit / end of the path). */
+  /**
+   * World-to-camera pose at trajectory parameter s (s = 1: one orbit / end of the path). The object
+   * orbit is a level loop (≈ 14–25° elevation), then — like the coverage ring asks — a second loop
+   * 0.5 m higher looking down (≈ 46–52°, from s = 1.2 on).
+   */
   poseAt(s: number): Pose {
     let C: V3;
     let T: V3;
     if (this.kind === 'object') {
       const phi = -Math.PI / 2 + s * 2 * Math.PI;
-      const h = 0.3 + 0.08 * Math.sin(s * 4 * Math.PI);
+      const up = Math.min(1, Math.max(0, (s - 1) / 0.2));
+      const h = 0.34 + 0.07 * Math.sin(s * 4 * Math.PI) + 0.5 * up * up * (3 - 2 * up);
       C = [0.62 * Math.cos(phi), 0.62 * Math.sin(phi), h];
       T = [0, 0, 0.12];
     } else {

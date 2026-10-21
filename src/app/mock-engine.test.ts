@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { decodePLY, parseGLB, readZip } from '../io';
 import type { FrameInput, LiveUpdate } from '../workers/protocol';
+import { computeCoverage } from './coverage';
 import { MockEngine } from './mock-engine';
 import { MockScene, lookAt, poseCenter } from './mock-scene';
 
@@ -56,6 +57,38 @@ describe('mock scene', () => {
 });
 
 describe('MockEngine', () => {
+  it("auto resolves to 'object' after 8 keyframes; a level orbit, then the higher loop, fill the coverage ring", async () => {
+    const e = new MockEngine({ speed: 8, sessions: async () => null });
+    await e.init({ mode: 'auto', quality: 'fast' });
+    let t = 1000;
+    let afterLoop: LiveUpdate | null = null;
+    let last: LiveUpdate | null = null;
+    const modes: string[] = [];
+    while (e.scanProgress < 2.3) {
+      t += 100;
+      const u = await e.processFrame(frame(t));
+      modes.push(`${u.numKeyframes}:${u.resolvedMode}`);
+      if (u.cameras) {
+        last = u;
+        if (e.scanProgress < 1.05) afterLoop = u;
+      }
+    }
+    expect(modes[0]).toBe('1:auto'); // the first frame is a keyframe
+    expect(modes.find((m) => m.endsWith('object'))).toBe('8:object');
+    expect(modes.filter((m) => m.endsWith('auto')).every((m) => Number(m.split(':')[0]) < 8)).toBe(true);
+    // the mock cameras carry no upCam: up from the camera axes (the fallback path)
+    const loop = computeCoverage(afterLoop!.cameras!);
+    expect(loop.stable).toBe(true);
+    expect(loop.covered[1]).toBeGreaterThanOrEqual(11);
+    expect(loop.covered[2]).toBe(0);
+    expect(loop.prompt).toBe('look_down');
+    const both = computeCoverage(last!.cameras!);
+    expect(both.covered[1]).toBe(12);
+    expect(both.covered[2]).toBeGreaterThanOrEqual(10);
+    expect(both.prompt).toBe('done');
+    e.dispose();
+  });
+
   it('runs capture → refine → densify → mesh → export with real data', async () => {
     const e = new MockEngine({ speed: 40, sessions: async () => null });
     const lives: LiveUpdate[] = [];

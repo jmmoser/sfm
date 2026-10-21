@@ -1,9 +1,11 @@
 /**
  * MockEngine: an in-page EngineLike for UI development and tests (`?mock=1`). It fakes the
- * live pipeline (keyframe decisions, tracking state, guidance, a growing sparse cloud and
- * camera trajectory, keypoint overlays that are projections of the scene into the current
- * mock camera), runs refine / densify / mesh / splat as timed stages with progress, and returns
- * REAL PointCloud / TriangleMesh / Gaussian-splat objects and export Blobs encoded with src/io.
+ * live pipeline (keyframe decisions, tracking state, guidance, the mode 'auto' resolves to after
+ * 8 keyframes, a growing sparse cloud and camera trajectory — for objects a level orbit, then a
+ * higher loop for the coverage ring —, keypoint overlays that are projections of the scene into
+ * the current mock camera), runs refine / densify / mesh / splat as timed stages with progress,
+ * and returns REAL PointCloud / TriangleMesh / Gaussian-splat objects and export Blobs encoded
+ * with src/io.
  *
  * Time base: the mock trajectory advances with the frame timestamps (`FrameInput.t`) times
  * `speed`, so pauses in frame delivery pause the scan.
@@ -310,6 +312,7 @@ export class MockEngine implements EngineLike {
         decision,
         guidance,
         tracking,
+        resolvedMode: this.options?.mode === 'auto' ? (k >= 8 ? this.scene.kind : 'auto') : (this.options?.mode ?? 'auto'),
         numKeyframes: k,
         numRegistered: Math.max(0, k - (k > 6 ? 1 : 0)),
         numPoints: revealed,
