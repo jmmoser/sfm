@@ -12,7 +12,11 @@
  *    With `scaleAdaptive` (default when the cloud has radii) the statistic is m_i / r_i,
  *    i.e. the distance in units of the point's own pixel footprint, so sparse far-away
  *    surfaces are not mistaken for outliers of a dense close-range object (points without a
- *    usable radius use the median radius). NaN positions are removed.
+ *    usable radius use the median radius). NaN positions are removed. The statistics are global
+ *    (one μ, σ for the whole cloud); the tuned presets keep SOR off because it removes sparse
+ *    but correct far points (docs/research/dense-tuning.md "Dense tuning results").
+ *  - `footprintDownsample`: the dense point cap, a voxel LOD whose cell size follows each
+ *    point's footprint (see the function).
  */
 import type { PointCloud } from '../core/types';
 import { Int3HashMap } from './dense-util';
