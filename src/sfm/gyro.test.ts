@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import type { Mat3 } from '../core/types';
+import type { ImuSample, Mat3 } from '../core/types';
 import { mat3Mul, mat3MulTranspose, mat3Transpose } from '../math/mat3';
 import { Rng } from '../math/random';
 import { rotationAngle, rotvecToMat3 } from '../math/rotation';
 import { integrateGyro } from '../sensors/motion';
 import { cameraFromDevice, orbitTrajectory, simulateImu, simulateKeyframes } from './extras-testutil';
-import { checkPairRotation, checkPoseRotation, gyroConsistency, gyroToleranceRad, GyroReference, type TimedRotation } from './gyro';
+import { checkPairRotation, checkPoseRotation, gyroConsistency, gyroToleranceRad, GyroReference, IMU_MAX_GAP_MS, type TimedRotation } from './gyro';
 import { estimateTimeOffset } from './inertial';
 
 const DEG = Math.PI / 180;
@@ -156,5 +156,78 @@ describe('gyro checks', () => {
       b = kfs[kfs.length - 2];
     const err = rotationAngle(mat3MulTranspose(mat3MulTranspose(b.R, a.R), g.relative(a.t, b.t)!));
     expect(err).toBeLessThan(0.3 * DEG);
+  });
+});
+
+describe('IMU gaps', () => {
+  it('no rotation (so no gyro verdict) across a gap of > IMU_MAX_GAP_MS; within a segment unchanged', () => {
+    const { imu, Rcd, kfs } = setup(9);
+    // the page was hidden 12–15 s (no DeviceMotion events): the gap's rotation is unknown
+    const gapped = imu.filter((s) => s.t < 12000 || s.t > 15000);
+    const full = new GyroReference(imu, { R_cam_device: Rcd, offsetMs: -25 });
+    const g = new GyroReference(gapped, { R_cam_device: Rcd, offsetMs: -25 });
+    const pre = kfs.filter((k) => k.t < 11900),
+      post = kfs.filter((k) => k.t > 15100);
+    const a = pre[pre.length - 1],
+      b = post[0];
+    const Rba = mat3MulTranspose(b.R, a.R);
+    expect(checkPairRotation(full, a.t, b.t, Rba)!.ok).toBe(true);
+    expect(g.covers(a.t, b.t)).toBe(false);
+    expect(g.relative(a.t, b.t)).toBeNull();
+    expect(checkPairRotation(g, a.t, b.t, Rba)).toBeNull();
+    expect(checkPoseRotation(g, b.t, b.R, pre)).toBeNull();
+    expect(checkPoseRotation(g, b.t, b.R, [...pre, ...post.slice(1)])!.ok).toBe(true);
+    // a model spanning the gap: only same-segment pairs are checked
+    const c = gyroConsistency([...pre, ...post], g);
+    expect(c.breaks).toEqual([]);
+    expect(c.pairs).toBe(pre.length + post.length - 2);
+    expect(gyroConsistency([...pre, ...post], full).pairs).toBe(c.pairs + 1);
+    // within a segment: covered and the same as without the gap
+    for (const [x, y] of [
+      [pre[0], pre[pre.length - 1]],
+      [post[0], post[post.length - 1]],
+    ]) {
+      expect(rotationAngle(mat3MulTranspose(g.relative(x.t, y.t)!, full.relative(x.t, y.t)!))).toBeLessThan(1e-9);
+    }
+    expect(g.angularVelocityCam(13500)).toBeNull();
+    expect(g.angularVelocityCam(post[0].t)).not.toBeNull();
+    // gaps up to IMU_MAX_GAP_MS are still integrated
+    const short = new GyroReference(imu.filter((s) => s.t < 12000 || s.t > 12000 + IMU_MAX_GAP_MS - 50), { R_cam_device: Rcd, offsetMs: -25 });
+    expect(short.covers(11000, 13000)).toBe(true);
+    // found when the samples arrive incrementally; kept by clone; cleared by a rebuild without it
+    const inc = new GyroReference(gapped.filter((s) => s.t < 12000), { R_cam_device: Rcd, offsetMs: -25 });
+    expect(inc.covers(a.t, 11900)).toBe(true);
+    inc.sync(gapped);
+    expect(inc.covers(a.t, b.t)).toBe(false);
+    expect(inc.clone().covers(a.t, b.t)).toBe(false);
+    inc.setBias([0.001, 0, 0], gapped);
+    expect(inc.covers(a.t, b.t)).toBe(false);
+    inc.sync(imu); // the missing samples inserted: rebuilt
+    expect(inc.covers(a.t, b.t)).toBe(true);
+  });
+
+  it('a time within the slack of a gap end holds ω of the sample after it (not the step interpolated across the gap)', () => {
+    // hand-held pan rates (≈ 1 rad/s) at both ends of a 15 s gap
+    const imu: ImuSample[] = [];
+    for (let t = 5000; t < 40000; t += 1000 / 60) {
+      const s = t / 1000;
+      imu.push({ t, gyro: [0.8 * Math.sin(s / 0.7), 0.8 * Math.cos(s / 1.1), 0.8 * Math.sin(s / 1.9)], accel: null, accelG: null });
+    }
+    const full = new GyroReference(imu);
+    const gapped = imu.filter((s) => s.t < 12000 || s.t > 27000);
+    const g = new GyroReference(gapped);
+    const e = gapped.find((s) => s.t > 27000)!.t,
+      s0 = gapped.filter((s) => s.t < 12000).pop()!.t;
+    // an image up to the slack (60 ms) before the first sample after the gap, or after the last one before it
+    for (const [ta, tb] of [
+      [e - 10, e + 800],
+      [e - 55, e + 800],
+      [s0 - 800, s0 + 55],
+    ]) {
+      expect(rotationAngle(mat3MulTranspose(g.relative(ta, tb)!, full.relative(ta, tb)!))).toBeLessThan(0.5 * DEG);
+    }
+    const w = g.angularVelocityCam(e + 3)!,
+      wf = full.angularVelocityCam(e + 3)!;
+    expect(Math.hypot(w[0] - wf[0], w[1] - wf[1], w[2] - wf[2])).toBeLessThan(0.05);
   });
 });

@@ -709,7 +709,10 @@ export function estimateTimeOffset(
   const dof = Math.max(1, 3 * nIn - (o.estimateBias ? 4 : 1));
   const sigma2 = s0 / dof;
   const stdMs = curv > 0 ? Math.sqrt((2 * sigma2) / curv) : Infinity;
-  const medCost = median(costs);
+  // prominence under ONE kernel: the grid `costs` used the scale at the initial offset, bestCost the final one
+  const costsC = new Float64Array(nGrid);
+  for (let i = 0; i < nGrid; i++) costsC[i] = cf.cost(offs[i], c);
+  const medCost = median(costsC);
   const quality = medCost > 0 ? Math.min(1, Math.max(0, 1 - bestCost / medCost)) : 0;
   const atEdge = Math.abs(best - o.initialOffsetMs) > o.searchRangeMs - 2 * step;
   cf.sse(best, mask); // leave state at the optimum

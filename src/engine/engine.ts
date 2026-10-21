@@ -140,9 +140,11 @@ export class PhotogrammetryEngine {
   private ownsStore = false;
   private pipeline: FeaturePipeline | null = null;
   private ownsPipeline = false;
+  /** The feature pipeline ran on WebGPU at some point (stays set after a device loss / CPU fallback). */
+  private pipelineHadGPU = false;
   /**
-   * pipelineKey of the SIFT configuration the pipeline was created with (an injected one: the
-   * worker's spare, created for the options this engine was constructed with).
+   * pipelineKey of the SIFT configuration the pipeline was created with (an injected one: taken
+   * to be created for the options this engine was constructed with; an adopted one: its key).
    */
   private pipelineCfgKey: string;
   private live: LiveSession | null = null;
@@ -155,6 +157,9 @@ export class PhotogrammetryEngine {
   /** A dense cloud / mesh exists (in memory or only in the store after releaseResultMemory). */
   private hasDense = false;
   private hasMesh = false;
+  /** The in-memory dense cloud / mesh is in the store too (releaseResultMemory may drop it). */
+  private densePersisted = false;
+  private meshPersisted = false;
   /** A trained splat model is stored (`splat/model`; never kept in memory) and its info. */
   private hasSplat = false;
   private splatInfo: SplatResult | null = null;
@@ -350,6 +355,7 @@ export class PhotogrammetryEngine {
     if (this.config.pipeline) {
       this.pipeline = this.config.pipeline;
       this.ownsPipeline = false;
+      this.pipelineHadGPU ||= this.pipeline.gpu;
       return this.pipeline;
     }
     const t0 = now();
@@ -357,18 +363,29 @@ export class PhotogrammetryEngine {
     if (!cpuRequested && hasWebGPU()) {
       // loaded lazily: the WebGPU feature modules cannot even be imported without WebGPU
       const { createFeaturePipeline } = await import('../features/extractor');
-      this.pipeline = await createFeaturePipeline({
+      const p = await createFeaturePipeline({
         preferGPU: true,
         sift: this.siftOptions(),
         onFallback: (reason) => {
           this.log('warn', `feature pipeline fell back to the CPU: ${reason}`);
         },
       });
+      if (this.disposed) {
+        // disposed while compiling (worker re-init): nothing else would destroy it
+        try {
+          p.destroy();
+        } catch {
+          /* ignore */
+        }
+        throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');
+      }
+      this.pipeline = p;
     } else {
       const reason = this.options.preferGPU === false ? 'CPU requested (preferGPU: false)' : cpuRequested ? "CPU requested (featureBackend: 'cpu')" : 'WebGPU unavailable';
       this.pipeline = createCpuFeaturePipeline(this.siftOptions(), reason);
     }
     this.ownsPipeline = true;
+    this.pipelineHadGPU ||= this.pipeline.gpu;
     this.pipelineCfgKey = pipelineKey(this.quality, this.options.preferGPU !== false, this.config);
     this.log('info', `feature pipeline ready (${this.pipeline.gpu ? 'WebGPU' : 'CPU'}, ${Math.round(now() - t0)} ms)`);
     return this.pipeline;
@@ -467,13 +484,21 @@ export class PhotogrammetryEngine {
     if (this.disposed) throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');
     const o = this.options;
     await this.openStore(o.sessionId);
+    this.stopIfDisposed();
+    // a stored session to resume whose record is gone was deleted (a respawn replaying the init of
+    // a discarded scan): it must not be re-created
+    const deleted = !!o.resume && this.store!.persistent && (await this.store!.getSessionMeta().catch(() => undefined)) === null;
+    this.stopIfDisposed();
+    if (deleted) throw namedError('SessionNotFoundError', `Session not found: ${o.sessionId}`);
     try {
       await this.store!.ensureSession({ mode: o.mode, quality: o.quality });
     } catch (e) {
       this.log('warn', `could not create the session record: ${(e as Error)?.message ?? e}`);
       this.emitError(e instanceof Error ? e : new Error(String(e)), false, 'storage');
     }
+    this.stopIfDisposed();
     const pipeline = await this.ensurePipeline();
+    this.stopIfDisposed();
     this.live = this.createLive();
     let resumed = 0;
     if (o.resume) {
@@ -494,6 +519,7 @@ export class PhotogrammetryEngine {
         }
       }
     }
+    this.stopIfDisposed();
     this.initialized = true;
     this.persistState();
     let adapter: string | undefined;
@@ -506,10 +532,24 @@ export class PhotogrammetryEngine {
         /* ignore */
       }
     } else await this.ensureDeviceBudget();
+    this.stopIfDisposed();
     const res: InitResult = { gpu: pipeline.gpu };
     if (adapter) res.adapter = adapter;
     if (!pipeline.gpu && pipeline.fallbackReason) res.fallbackReason = pipeline.fallbackReason;
     return res;
+  }
+
+  /**
+   * init() / loadSession() after an await: when the engine was disposed meanwhile (worker re-init,
+   * a 'close'), close what they opened since — dispose() could not — and stop.
+   */
+  private stopIfDisposed(): void {
+    if (!this.disposed) return;
+    this.live?.dispose();
+    this.live = null;
+    if (this.ownsStore) this.store?.close();
+    this.store = null;
+    throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');
   }
 
   /** Recreate GPU resources after a device loss. Resolves false when no GPU can be obtained. */
@@ -520,13 +560,25 @@ export class PhotogrammetryEngine {
     this.holder.reset();
     if (!this.ownsPipeline && this.pipeline) return true; // injected pipeline: its owner recovers it
     if (this.pipeline && !this.pipeline.gpu && this.config.featureBackend === 'cpu') return true; // CPU features: nothing to recreate
-    const old = this.pipeline;
     try {
       const { createFeaturePipeline } = await import('../features/extractor');
       // under the GPU lock (and only while visible): pipeline compilation + self-tests must not
       // overlap another command stream (dense PatchMatch recreating itself after the same loss)
-      this.pipeline = await this.gpu(() => createFeaturePipeline({ preferGPU: true, sift: this.siftOptions(), context: ctx }));
+      const p = await this.gpu(() => createFeaturePipeline({ preferGPU: true, sift: this.siftOptions(), context: ctx }));
+      if (this.disposed) {
+        // disposed while compiling (worker re-init): the old pipeline went to the successor or was destroyed
+        try {
+          p.destroy();
+        } catch {
+          /* ignore */
+        }
+        return false;
+      }
+      // the pipeline held now (not the one at the start: a release or an overlapping recovery may have replaced it)
+      const old = this.ownsPipeline ? this.pipeline : null;
+      this.pipeline = p;
       this.ownsPipeline = true;
+      this.pipelineHadGPU ||= p.gpu;
       this.pipelineCfgKey = pipelineKey(this.quality, true, this.config);
       try {
         old?.destroy();
@@ -544,6 +596,11 @@ export class PhotogrammetryEngine {
   /** True while the feature pipeline runs on WebGPU. */
   get usesGPU(): boolean {
     return !!this.pipeline?.gpu;
+  }
+
+  /** True once the feature pipeline has run on WebGPU (also after it fell back to the CPU). */
+  get hadGPU(): boolean {
+    return this.pipelineHadGPU;
   }
 
   // ------------------------------------------------------------------------------------------
@@ -716,14 +773,15 @@ export class PhotogrammetryEngine {
         intrinsics: { ...c.intrinsics },
         t: c.t ?? NaN,
         frameIndex: c.frameIndex ?? -1,
+        ...(c.upCam ? { upCam: c.upCam } : {}),
       })),
       metric: this.sparse.metric,
       stats: this.sparse.stats,
       rollingShutter: this.model.rollingShutter ?? null,
     };
     try {
-      await this.store.putBinary('sparse/model', packSparseModel(this.model));
-      await this.store.putValue('sparse/meta', meta);
+      // dependents first (every write is a transaction of its own: a kill in between must not pair
+      // the new model with the old meta, dense cloud or mesh)
       await this.store.deleteBinary('dense/points').catch(() => undefined);
       await this.store.deleteBinary('mesh').catch(() => undefined);
       // splats and their checkpoints were trained on the old poses
@@ -735,6 +793,9 @@ export class PhotogrammetryEngine {
       // free their storage (up to ≈ 2 GB of float16 maps at `max`)
       await this.store.putValue('dense/meta', null);
       await this.store.putValue('dense/progress', null);
+      await this.store.putValue('sparse/meta', null);
+      await this.store.putBinary('sparse/model', packSparseModel(this.model));
+      await this.store.putValue('sparse/meta', meta);
       await this.clearDepthMaps(this.store);
       await this.store.putValue('engine/state', this.stateRecord());
     } catch (e) {
@@ -834,15 +895,21 @@ export class PhotogrammetryEngine {
       this.meshModel = null;
       this.hasDense = true;
       this.hasMesh = false;
+      this.densePersisted = false;
       Object.assign(this.stats, out.stats);
       if (this.sparse) Object.assign(this.sparse.stats, out.stats);
       try {
-        await this.store.putBinary('dense/points', serializePointCloud(out.cloud, { float16: true }));
-        await this.store.putValue('dense/meta', out.meta);
+        // the mesh of the previous cloud goes first: a kill after the cloud's write must not pair them
         await this.store.deleteBinary('mesh').catch(() => undefined);
+        await this.store.putBinary('dense/points', serializePointCloud(out.cloud, { float16: true }));
+        this.densePersisted = true;
+        await this.store.putValue('dense/meta', out.meta);
         await this.store.putValue('engine/state', this.stateRecord());
       } catch (e) {
         this.onStorageError(e);
+        // the cloud stays in memory only (exports use it); the previous run's stored cloud must not
+        // come back under this run's stats after a reload
+        if (!this.densePersisted) await this.store.deleteBinary('dense/points').catch(() => undefined);
       }
       out.stats.memoryMB = this.logMemory('densify');
       return out.cloud;
@@ -933,14 +1000,18 @@ export class PhotogrammetryEngine {
       );
       this.meshModel = mesh;
       this.hasMesh = true;
+      this.meshPersisted = false;
       stats.memoryMB = this.logMemory('mesh');
       Object.assign(this.stats, stats);
       if (this.sparse) Object.assign(this.sparse.stats, stats);
       try {
         await this.store.putBinary('mesh', serializeTriangleMesh(mesh, { float16: true }));
+        this.meshPersisted = true;
         await this.store.putValue('engine/state', this.stateRecord());
       } catch (e) {
         this.onStorageError(e);
+        // in memory only (as densify): no earlier stored mesh under this one's stats after a reload
+        if (!this.meshPersisted) await this.store.deleteBinary('mesh').catch(() => undefined);
       }
       return mesh;
     });
@@ -1034,6 +1105,11 @@ export class PhotogrammetryEngine {
         createdAt: Date.now(),
       };
       try {
+        // dependents first (each write is its own transaction): a kill or a failed write after the
+        // new model must not pair it with the previous run's meta (loadResults needs both)
+        this.hasSplat = false;
+        this.splatInfo = null;
+        await store.putValue('splat/meta', null);
         await store.putBinary('splat/model', packed);
         await store.putValue('splat/meta', meta);
         this.hasSplat = true;
@@ -1093,13 +1169,20 @@ export class PhotogrammetryEngine {
   }
 
   /**
-   * Drop the in-memory copy of a PERSISTED dense cloud / mesh (e.g. after the worker transferred
-   * it to the page); it is reloaded from the store when needed (export). No-op without persistence.
+   * Drop the in-memory copy of a STORED dense cloud / mesh (e.g. when the worker transfers it to
+   * the page); it is reloaded from the store when needed (export). Returns false and keeps it
+   * without persistence or when its write failed (the only copy).
    */
-  releaseResultMemory(kind: 'dense' | 'mesh'): void {
-    if (!this.store?.persistent) return;
-    if (kind === 'dense') this.denseCloud = null;
-    else this.meshModel = null;
+  releaseResultMemory(kind: 'dense' | 'mesh'): boolean {
+    if (!this.store?.persistent) return false;
+    if (kind === 'dense') {
+      if (!this.densePersisted) return false;
+      this.denseCloud = null;
+    } else {
+      if (!this.meshPersisted) return false;
+      this.meshModel = null;
+    }
+    return true;
   }
 
   private async reloadResults(dense = true, mesh = true): Promise<void> {
@@ -1175,6 +1258,7 @@ export class PhotogrammetryEngine {
                 intrinsics: c.intrinsics,
                 t: c.t,
                 frameIndex: c.frameIndex,
+                ...(c.upCam ? { upCam: c.upCam } : {}),
               })),
               metric: meta.metric,
               stats: meta.stats,
@@ -1193,12 +1277,14 @@ export class PhotogrammetryEngine {
       this.denseCloud = dense;
       this.denseMeta = await store.getValue<DenseMetaRecord>('dense/meta').catch(() => null);
       this.hasDense = true;
+      this.densePersisted = true;
     }
     const mb2 = await store.getBinary('mesh').catch(() => null);
     const mesh = mb2 && this.model ? decode('mesh', () => deserializeTriangleMesh(mb2)) : null;
     if (mesh) {
       this.meshModel = mesh;
       this.hasMesh = true;
+      this.meshPersisted = true;
     }
     // splats: only the info (the model is read on demand: splatModel / export)
     const sm = this.model ? await store.getValue<SplatMetaRecord>('splat/meta').catch(() => null) : null;
@@ -1250,9 +1336,12 @@ export class PhotogrammetryEngine {
     Object.assign(this.options, options, { sessionId: id });
     if (options.persist === undefined && !this.config.store) this.options.persist = true;
     await this.openStore(id);
+    this.stopIfDisposed();
     const meta = await this.store!.getSessionMeta();
+    this.stopIfDisposed();
     if (!meta) throw namedError('SessionNotFoundError', `Session not found: ${id}`);
     const st = await this.store!.getValue<EngineStateRecord>('engine/state').catch(() => null);
+    this.stopIfDisposed();
     if (st) {
       // values of a damaged / foreign record are ignored (defaults stay)
       if (!options.mode && (st.mode === 'object' || st.mode === 'scene' || st.mode === 'auto')) this.options.mode = st.mode;
@@ -1268,9 +1357,12 @@ export class PhotogrammetryEngine {
     this.sessionName = meta.name;
     if (!this.model) await this.loadResults(st);
     else await this.reloadResults();
+    // (a superseded load reads nothing more: its reads fail once the store is closed, and are caught)
+    this.stopIfDisposed();
     const status = this.hasMesh ? 'meshed' : this.hasDense ? 'dense' : this.sparse ? 'sparse' : st?.captureFinished ? 'captured' : meta.status;
     // a densify interrupted by a kill / cancel can resume from its stored depth maps
     const prog = this.store!.persistent ? await this.store!.getValue<{ pass?: number; quality?: string }>('dense/progress').catch(() => null) : null;
+    this.stopIfDisposed();
     const extra: Record<string, number | string> = {};
     if (prog && typeof prog.pass === 'number') {
       extra.denseResumablePass = prog.pass;
@@ -1328,10 +1420,26 @@ export class PhotogrammetryEngine {
     return this.store;
   }
 
-  /** Hand the feature pipeline to a successor engine (worker re-init); it is not destroyed by dispose(). */
+  /**
+   * Take over a predecessor's feature pipeline (worker re-init, before init / loadSession): the
+   * engine owns it from now on (recreates it after a device loss, destroys it on dispose).
+   * `key`: the pipelineKey it was created with.
+   */
+  adoptPipeline(p: FeaturePipeline, key: string): void {
+    this.pipeline = p;
+    this.ownsPipeline = true;
+    this.pipelineHadGPU ||= p.gpu;
+    this.pipelineCfgKey = key;
+  }
+
+  /**
+   * Hand the feature pipeline to a successor engine (worker re-init); it is not destroyed by
+   * dispose(). A pipeline that fell back from the GPU to the CPU (device loss, GPU error) is not
+   * handed on: it stays (dispose() destroys it when owned) and the successor creates a new one.
+   */
   releasePipeline(): { pipeline: FeaturePipeline; key: string } | null {
     const p = this.pipeline;
-    if (!p) return null;
+    if (!p || (this.pipelineHadGPU && !p.gpu)) return null;
     this.pipeline = null;
     this.ownsPipeline = false;
     // the configuration it was CREATED with: loadSession may have changed the quality since
@@ -1360,7 +1468,10 @@ export class PhotogrammetryEngine {
     if (this.ownsStore) this.store?.close();
     if (this.scratch) {
       const sc = this.scratch;
-      void sc.deleteSession().finally(() => sc.close());
+      void sc
+        .deleteSession()
+        .catch(() => undefined)
+        .finally(() => sc.close());
     }
     this.listeners.live.clear();
     this.listeners.log.clear();

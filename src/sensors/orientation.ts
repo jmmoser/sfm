@@ -541,9 +541,10 @@ export class CompassSensor {
   }
 
   /**
-   * Compass heading at time t: the platform value (iOS `webkitCompassHeading`, interpolated
-   * along the shorter arc, within 500 ms) or, for absolute-orientation sources, the azimuth of
-   * the same reference direction (device top, camera direction when upright).
+   * Compass heading at time t: the platform value (iOS `webkitCompassHeading` no worse than
+   * `maxAccuracyDeg`, interpolated along the shorter arc, within 500 ms) or, for
+   * absolute-orientation sources, the azimuth of the same reference direction (device top, camera
+   * direction when upright).
    * Under the 'ui-top' model the platform value refers to the UI top (±90° off the device top in
    * landscape), so the reading comes from the ψ-corrected attitude instead: consumers
    * (FrameInfo.heading, the world alignment's compassReference 'auto') always get the device-top /
@@ -552,18 +553,18 @@ export class CompassSensor {
   headingAt(t: number): HeadingReading | null {
     const ring = this.rel;
     if (ring.size > 0 && this.model === 'device-top') {
-      // nearest valid compass readings around t
+      // nearest accepted compass readings around t (invalid ones have acc NaN; inaccurate ones stay in the ring for latest())
       const i = ring.lowerBound(t);
       let before = -1;
       let after = -1;
       for (let k = i - 1; k >= ring.first && k >= i - 64; k--) {
-        if (!Number.isNaN(ring.h[k % ring.cap])) {
+        if (ring.acc[k % ring.cap] <= this.maxAcc) {
           before = k;
           break;
         }
       }
       for (let k = i; k < ring.head && k < i + 64; k++) {
-        if (!Number.isNaN(ring.h[k % ring.cap])) {
+        if (ring.acc[k % ring.cap] <= this.maxAcc) {
           after = k;
           break;
         }

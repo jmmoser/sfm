@@ -296,17 +296,20 @@ describe('feature pipeline hand-over (worker re-init)', () => {
       timeOffsetMs: null,
       updatedAt: 0,
     });
-    // the worker hands a spare pipeline created for 'fast' to the engine it builds for loadSession
-    const config: EngineConfig = { pipeline, store };
+    // the worker hands the previous engine's pipeline, created for 'fast', to the engine it builds for loadSession
+    const config: EngineConfig = { store };
+    const handed = createCpuFeaturePipeline({ maxFeatures: 1024, maxImageSize: 1024 });
     const e = new PhotogrammetryEngine({ mode: 'auto', quality: 'fast', persist: true }, config);
+    e.adoptPipeline(handed, pipelineKey('fast', true, config));
     await e.loadSession('quality');
     expect(e.options.quality).toBe('balanced');
-    // re-processing the session adopts the pipeline (refine fails later: no keyframes)
+    // re-processing the session uses the handed-over pipeline (refine fails later: no keyframes)
     await expect(e.refine()).rejects.toThrow(/at least 2 keyframes/);
     const rel = e.releasePipeline();
-    expect(rel?.pipeline).toBe(pipeline);
+    expect(rel?.pipeline).toBe(handed);
     expect(rel?.key).toBe(pipelineKey('fast', true, config));
     e.dispose();
+    handed.destroy();
   });
 });
 

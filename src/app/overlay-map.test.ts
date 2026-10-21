@@ -139,6 +139,15 @@ describe('raw sensor buffers (FrameOrientationTracker)', () => {
     expect(o.rawDelivery).toBeNull();
     expect(o.observe({ width: 1440, height: 1920, screenAngle: 0, t: 800 })).toBe(0);
     expect(o.rawDelivery).toBe(false);
+    // Dated by screenAngleSince (the FramePump settled already): the first frame after the rotation counts.
+    const p = new FrameOrientationTracker();
+    p.observe({ width: 1920, height: 1440, screenAngle: 90, t: 0 });
+    expect(p.observe({ width: 1440, height: 1920, screenAngle: 0, t: 1500, screenAngleSince: 1000 })).toBe(0);
+    expect(p.rawDelivery).toBe(false);
+    const raw = new FrameOrientationTracker();
+    raw.observe({ width: 1920, height: 1440, screenAngle: 90, t: 0, raw: true });
+    expect(raw.observe({ width: 1920, height: 1440, screenAngle: 0, t: 1500, raw: true, screenAngleSince: 1000 })).toBe(90);
+    expect(raw.observe({ width: 1920, height: 1440, screenAngle: 90, t: 1600, raw: true })).toBeNull(); // undated: from this frame
   });
 
   it('quarter turns onto the preview: the engine rule (raw is upright for 90)', () => {
@@ -158,14 +167,21 @@ describe('raw sensor buffers (FrameOrientationTracker)', () => {
       let ui = [0, 90, 180, 270][Math.floor(rng.next() * 4)];
       const rawPath = rng.next() < 0.5;
       const declared = rawPath && rng.next() < 0.5; // VideoFrame grab: FrameInput.rawBuffer
+      const dated = rng.next() < 0.5; // FramePump: FrameInput.screenAngleSince
+      let since = -Infinity;
       for (let i = 0; i < 60; i++) {
+        const prevT = t;
         t += 50 + rng.next() * 400;
-        if (rng.next() < 0.08) ui = [0, 90, 180, 270][Math.floor(rng.next() * 4)];
+        if (rng.next() < 0.08) {
+          const next = [0, 90, 180, 270][Math.floor(rng.next() * 4)];
+          if (next !== ui) since = prevT + rng.next() * (t - prevT);
+          ui = next;
+        }
         const portraitUI = ui === 0 || ui === 180;
         // Delivery path: raw buffers are always landscape; upright frames follow the UI (plus rare glitches).
         let landscape = rawPath ? true : !portraitUI;
         if (rng.next() < 0.05) landscape = !landscape;
-        const f = { width: landscape ? 1920 : 1440, height: landscape ? 1440 : 1920, screenAngle: ui, t, raw: declared };
+        const f = { width: landscape ? 1920 : 1440, height: landscape ? 1440 : 1920, screenAngle: ui, t, raw: declared, screenAngleSince: dated ? since : undefined };
         const a = app.observe(f);
         const e = eng.classify(f);
         if (!e.ok) continue; // dropped by the engine: no overlay arrives for it

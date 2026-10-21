@@ -137,6 +137,9 @@ function newtonPolish(c: ArrayLike<number>, x: number, iters: number): number {
   const n = c.length;
   let f = evalWithDeriv(c, n, x);
   for (let it = 0; it < iters && f !== 0; it++) {
+    // |p| at the Horner noise level (e.g. a multiple root, where p′ is noise too): the step carries
+    // no information and could jump to another root, which then absorbs this one in sortAndMerge.
+    if (Math.abs(f) <= polyEvalErrorBound(c, x)) break;
     const df = evalDp;
     if (df === 0 || !Number.isFinite(df)) break;
     const xn = x - f / df;
@@ -615,6 +618,18 @@ function negRemainder(a: Float64Array, b: Float64Array, deg: number): Float64Arr
   return r;
 }
 
+/** Quotient of q by (y − e) for a root e (Horner's intermediates; the remainder is polyEval(q, e)), normalised. */
+function deflate(q: Float64Array, e: number): Float64Array {
+  const d = new Float64Array(q.length - 1);
+  let acc = q[0];
+  d[0] = acc;
+  for (let i = 1; i < d.length; i++) {
+    acc = acc * e + q[i];
+    d[i] = acc;
+  }
+  return normaliseMaxAbs(d);
+}
+
 /** Number of sign changes of the Sturm chain at x (zeros skipped). */
 function signChanges(chain: Float64Array[], x: number): number {
   let changes = 0;
@@ -647,8 +662,19 @@ export function polyRealRootsSturm(c: ArrayLike<number>, lo = -Infinity, hi = In
   const roots: number[] = [];
   const pr = prepare(c, lo, hi, roots);
   if (!pr) return roots;
-  const { deg, q, ya, yb } = pr;
+  const { deg, ya, yb } = pr;
   if (deg <= 2) return polyRealRoots(c, lo, hi);
+  // A root exactly at ya is not counted by (ya, yb], and at a multiple root at either end every chain
+  // member vanishes, so the count there would be 0 (dropping or duplicating the other roots): record an
+  // end root and divide it out of q with all its multiplicity.
+  let q = pr.q;
+  const yRoots: number[] = [];
+  for (const e of ya === yb ? [ya] : [ya, yb]) {
+    if (polyEval(q, e) !== 0) continue;
+    yRoots.push(e);
+    while (q.length > 1 && polyEval(q, e) === 0) q = deflate(q, e);
+  }
+  if (q.length < 2) return finish(pr, yRoots.map((y) => ldexp(y, pr.k)), lo, hi, roots);
 
   const chain: Float64Array[] = [q];
   chain.push(normaliseMaxAbs(polyDerivative(q)));
@@ -661,9 +687,6 @@ export function polyRealRootsSturm(c: ArrayLike<number>, lo = -Infinity, hi = In
     chain.push(rnext);
   }
   const dq = polyDerivative(q);
-  const yRoots: number[] = [];
-  // A root exactly at the lower end is not counted by (ya, yb]; add it explicitly.
-  if (polyEval(q, ya) === 0) yRoots.push(ya);
 
   const stA: number[] = [ya],
     stB: number[] = [yb],

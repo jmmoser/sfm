@@ -23,11 +23,11 @@ import { estimateTwoViewGeometry, type TwoViewOptions } from '../geometry/twovie
 import { mat3Mul, mat3MulTranspose } from '../math/mat3';
 import { rotationAngle } from '../math/rotation';
 import { median } from '../math/stats';
-import { cameraFromDevice, type ScreenAngle } from '../sensors/frame-orientation';
+import { cameraFromDevice, snapScreenAngle, type ScreenAngle } from '../sensors/frame-orientation';
 import { angularSpeedAt, integrateGyro } from '../sensors/motion';
 import { CorrespondenceGraph } from '../sfm/correspondence-graph';
 import { FeatureDatabase, pairKey } from '../sfm/database';
-import { checkPairRotation, checkPoseRotation, GyroReference, type GyroToleranceOptions, type TimedRotation } from '../sfm/gyro';
+import { checkPairRotation, checkPoseRotation, GyroReference, IMU_MAX_GAP_MS, type GyroToleranceOptions, type TimedRotation } from '../sfm/gyro';
 import { estimateTimeOffset, type InertialKeyframe } from '../sfm/inertial';
 import { KeyframeSelector, rotationCompensatedParallax, type KeyframeCandidate } from '../sfm/keyframes';
 import { LiveMapper } from '../sfm/live';
@@ -131,11 +131,23 @@ export class ImuLog {
     this.persisted = this.samples.length;
   }
 
-  /** True when the samples cover [t0, t1] (within `slackMs`). */
+  /** True when the samples cover [t0, t1] (within `slackMs`) without a gap > IMU_MAX_GAP_MS (as GyroReference.covers). */
   covers(t0: number, t1: number, slackMs = 60): boolean {
     const n = this.samples.length;
     if (n < 2) return false;
-    return this.samples[0].t <= Math.min(t0, t1) + slackMs && this.samples[n - 1].t >= Math.max(t0, t1) - slackMs;
+    const lo = Math.min(t0, t1) + slackMs,
+      hi = Math.max(t0, t1) - slackMs;
+    if (!(this.samples[0].t <= lo && this.samples[n - 1].t >= hi)) return false;
+    // first sample after lo, then every sample interval that starts before hi
+    let a = 1,
+      b = n;
+    while (a < b) {
+      const mid = (a + b) >> 1;
+      if (this.samples[mid].t <= lo) a = mid + 1;
+      else b = mid;
+    }
+    for (let i = a; i < n && this.samples[i - 1].t < hi; i++) if (this.samples[i].t - this.samples[i - 1].t > IMU_MAX_GAP_MS) return false;
+    return true;
   }
 }
 
@@ -294,6 +306,23 @@ export function handEyeCheck(
   let best = 0;
   for (let h = 1; h < 4; h++) if (med[h] < med[best]) best = h;
   return { medianErrDeg: med, pairs: n, best: (best * 90) as ScreenAngle };
+}
+
+/** Direction pointing up (device frame) in a phone held in UI rotation θ: (sin θ, cos θ, 0). */
+const DEVICE_UP: Record<ScreenAngle, [number, number, number]> = { 0: [0, 1, 0], 90: [1, 0, 0], 180: [0, -1, 0], 270: [-1, 0, 0] };
+
+/**
+ * Physical up in the camera frame of a keyframe (unit; LiveCamera.upCam): −gravityCam when gravity
+ * is known, else up for the UI rotation the frame was captured in, R_cam_device · DEVICE_UP[θ_ui].
+ * The canonical image is upright for θ₀, not for θ_ui (raw sensor buffers: θ₀ = 90 in a portrait UI).
+ */
+export function keyframeUpCam(r: KeyframeRecord): [number, number, number] | undefined {
+  const g = r.info.gravityCam;
+  const gn = g ? Math.hypot(g[0], g[1], g[2]) : 0;
+  if (g && gn > 1e-9) return [-g[0] / gn, -g[1] / gn, -g[2] / gn];
+  if (!Number.isFinite(r.screenAngle)) return undefined;
+  const u = rotateVec(r.info.R_cam_device, DEVICE_UP[snapScreenAngle(r.screenAngle)]);
+  return [u[0], u[1], u[2]];
 }
 
 /** Decide 'object' vs 'scene' from the registered cameras (optical-axis convergence). */
@@ -659,7 +688,14 @@ export class LiveSession {
       this.ref = null;
     }
     this.segment = seg;
-    const verdict = this.orientation.classify({ width: f.bitmap.width, height: f.bitmap.height, screenAngle: f.screenAngle, t: f.t, raw: f.rawBuffer === true });
+    const verdict = this.orientation.classify({
+      width: f.bitmap.width,
+      height: f.bitmap.height,
+      screenAngle: f.screenAngle,
+      t: f.t,
+      raw: f.rawBuffer === true,
+      screenAngleSince: f.screenAngleSince,
+    });
     dbg.srcWidth = f.bitmap.width;
     dbg.srcHeight = f.bitmap.height;
     if (!verdict.ok) {
@@ -721,11 +757,14 @@ export class LiveSession {
         dbg.reason = `${d.decision}: ${d.reason}`;
         return finish(this.baseUpdate(frameIndex, d.decision, this.mapGuidance(d.guidance), timings));
       }
-      // features
-      const pipeline = this.deps.pipeline();
+      // features (the pipeline is read when the GPU job runs: a GPU-loss recovery queued ahead of
+      // it has replaced it by then; either input kind works on either backend)
       const tf = now();
-      const fi = prep.featureInput(pipeline.gpu && !this.bitmapInputBroken, this.featureMaxSide());
-      let fs = await this.deps.gpu(() => (fi.kind === 'bitmap' ? pipeline.extractFromBitmap(fi.source, W, H) : pipeline.extract(fi.gray, W, H)));
+      const fi = prep.featureInput(this.deps.pipeline().gpu && !this.bitmapInputBroken, this.featureMaxSide());
+      let fs = await this.deps.gpu(() => {
+        const pipeline = this.deps.pipeline();
+        return fi.kind === 'bitmap' ? pipeline.extractFromBitmap(fi.source, W, H) : pipeline.extract(fi.gray, W, H);
+      });
       if (fi.kind === 'bitmap' && fs.count < this.selector.options.minFeatures && this.bitmapProbes < LiveSession.MAX_BITMAP_PROBES) {
         // The GPU bitmap upload (copyExternalImageToTexture) is not covered by the start-up
         // self-test, and on some WebKit builds it yields a blank texture for camera frames
@@ -734,7 +773,7 @@ export class LiveSession {
         this.bitmapProbes++;
         const gi = prep.featureInput(false, this.featureMaxSide());
         if (gi.kind === 'gray') {
-          const gfs = await this.deps.gpu(() => pipeline.extract(gi.gray, W, H));
+          const gfs = await this.deps.gpu(() => this.deps.pipeline().extract(gi.gray, W, H));
           if (gfs.count >= this.selector.options.minFeatures && gfs.count > 4 * fs.count) {
             this.bitmapInputBroken = true;
             this.deps.log('warn', `GPU bitmap input gave ${fs.count} features, gray input ${gfs.count}: using gray input for this session`);
@@ -938,7 +977,7 @@ export class LiveSession {
     t: number,
     timings: Record<string, number>,
   ): Promise<{ geom: TwoViewGeometry | null; numMatches: number; numInliers: number; parallax: number; rotation: number }> {
-    const pipeline = this.deps.pipeline();
+    // the pipeline is read when each GPU job runs (a GPU-loss recovery may replace it in between)
     const cam = this.intrinsics(ref.width, ref.height);
     const Rc = this.gyroRotation(ref.t, t);
     const minInl = this.selector.options.minInliers;
@@ -953,10 +992,10 @@ export class LiveSession {
     if (Rc) {
       const Hm = mat3Mul(mat3Mul(kMatrix(cam), Rc), kInverse(cam));
       const radius = Math.max(24, (this.deps.config.guidedRadiusFrac ?? ENGINE_DEFAULTS.guidedRadiusFrac) * Math.max(ref.width, ref.height));
-      matches = await this.deps.gpu(() => pipeline.matchGuided(ref.fs, fs, { kind: 'H', H: Hm, maxErrorPx: radius }));
+      matches = await this.deps.gpu(() => this.deps.pipeline().matchGuided(ref.fs, fs, { kind: 'H', H: Hm, maxErrorPx: radius }));
       guided = true;
     } else {
-      matches = await this.deps.gpu(() => pipeline.match(ref.fs, fs));
+      matches = await this.deps.gpu(() => this.deps.pipeline().match(ref.fs, fs));
     }
     timings.match = now() - tm;
     const tv = now();
@@ -965,7 +1004,7 @@ export class LiveSession {
     if (guided && nInl < minInl) {
       // gyro prediction wrong (time offset, fast motion, wrong R_cam_device?) → unguided
       this.stats.guidedFallbacks++;
-      const m2 = await this.deps.gpu(() => pipeline.match(ref.fs, fs));
+      const m2 = await this.deps.gpu(() => this.deps.pipeline().match(ref.fs, fs));
       const g2 = m2.length >= 16 ? verify(m2) : null;
       const n2 = usable(g2, 8) ? g2!.inliers.length >> 1 : 0;
       if (n2 > nInl) {
@@ -1356,6 +1395,8 @@ export class LiveSession {
         stored.push(pairToStored(c.other, id, g));
       }
     }
+    // disposed while matching (e.g. a discarded scan, deleted next): nothing more is stored
+    if (this.disposed) return;
     const res = this.mapper.addKeyframe(id);
     this.consecutiveUnregistered = res.registered ? 0 : this.consecutiveUnregistered + 1;
     this.modelVersion++;
@@ -1578,7 +1619,8 @@ export class LiveSession {
     for (const { id, pose } of snap.poses.sort((a, b) => a.id - b.id)) {
       const cam = rec.cameras.get(rec.images.get(id)!.cameraId)!;
       const r = st.records.get(id);
-      cams.push({ pose, intrinsics: { ...cam }, ...(r ? { t: r.t + offset } : {}) });
+      const upCam = r ? keyframeUpCam(r) : undefined;
+      cams.push({ pose, intrinsics: { ...cam }, ...(r ? { t: r.t + offset } : {}), ...(upCam ? { upCam } : {}) });
     }
     u.cameras = cams;
     u.R_cam_device = Float64Array.from(st.cameraFromDevice());

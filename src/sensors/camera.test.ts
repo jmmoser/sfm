@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { candidateSizes, chooseCamera, classifyCamera, classifyCameraLabel, focalPriorPx, hfovPriorDeg, type CameraInfo } from './camera';
+import { describe, expect, it, vi } from 'vitest';
+import { CameraCapture, candidateSizes, chooseCamera, classifyCamera, classifyCameraLabel, focalPriorPx, hfovPriorDeg, type CameraInfo } from './camera';
 
 describe('classifyCameraLabel', () => {
   const cases: [string, string, string][] = [
@@ -121,5 +121,115 @@ describe('candidateSizes', () => {
     ]);
     expect(candidateSizes('fast', false)[0]).toEqual([1280, 960]);
     expect(candidateSizes('fast', true)[0]).toEqual([1920, 1440]);
+  });
+});
+
+describe('CameraCapture.restart (fake media devices)', () => {
+  /** Fake camera track: `ended` events, settings, focusMode capability, applyConstraints held on `gate`. */
+  class FakeTrack extends EventTarget {
+    kind = 'video';
+    label = 'Back Camera';
+    readyState: 'live' | 'ended' = 'live';
+    muted = false;
+    applyCalls = 0;
+    constructor(private readonly env: { gate: Promise<void> | null }) {
+      super();
+    }
+    stop(): void {
+      this.readyState = 'ended';
+    }
+    getSettings(): Record<string, unknown> {
+      return { width: 1920, height: 1440, frameRate: 30, deviceId: 'cam0' };
+    }
+    getCapabilities(): Record<string, unknown> {
+      return { focusMode: ['continuous'] };
+    }
+    applyConstraints(): Promise<void> {
+      this.applyCalls++;
+      return this.env.gate ?? Promise.resolve();
+    }
+  }
+  function fakeStream(track: FakeTrack): MediaStream {
+    return { getVideoTracks: () => [track], getTracks: () => [track] } as unknown as MediaStream;
+  }
+  /** <video> whose pending rVFC callbacks survive a srcObject change (as in Chromium). */
+  function fakeVideo(): {
+    video: HTMLVideoElement;
+    pending: Map<number, (now: number, md: Record<string, number>) => void>;
+    present: () => void;
+  } {
+    const pending = new Map<number, (now: number, md: Record<string, number>) => void>();
+    let handle = 0;
+    let frames = 0;
+    const v = {
+      srcObject: null as MediaStream | null,
+      videoWidth: 1920,
+      videoHeight: 1440,
+      readyState: 4,
+      paused: false,
+      setAttribute: () => undefined,
+      play: () => Promise.resolve(),
+      pause: () => undefined,
+      requestVideoFrameCallback: (cb: (now: number, md: Record<string, number>) => void) => {
+        pending.set(++handle, cb);
+        return handle;
+      },
+      cancelVideoFrameCallback: (h: number) => void pending.delete(h),
+    };
+    const present = (): void => {
+      const track = v.srcObject?.getVideoTracks()[0];
+      if (!track || track.readyState !== 'live') return;
+      const cbs = [...pending.values()];
+      pending.clear();
+      frames++;
+      for (const cb of cbs) cb(performance.now(), { presentationTime: performance.now(), presentedFrames: frames, width: 1920, height: 1440 });
+    };
+    return { video: v as unknown as HTMLVideoElement, pending, present };
+  }
+
+  it("a restart after the track ended delivers no frames until it is done, then only the new segment's (one loop)", async () => {
+    const env: { gate: Promise<void> | null } = { gate: null };
+    const tracks: FakeTrack[] = [];
+    vi.stubGlobal('navigator', {
+      userAgent: '',
+      mediaDevices: {
+        enumerateDevices: async () => [{ kind: 'videoinput', deviceId: 'cam0', label: 'Back Camera', groupId: 'g0' }],
+        getUserMedia: async () => {
+          const t = new FakeTrack(env);
+          tracks.push(t);
+          return fakeStream(t);
+        },
+      },
+    });
+    const { video, pending, present } = fakeVideo();
+    const cam = new CameraCapture();
+    try {
+      await cam.start(video, { quality: 'balanced' });
+      const got: { segment: number; state: string }[] = [];
+      cam.onFrame((_t, m) => got.push({ segment: m.segment, state: cam.state }));
+      present();
+      expect(got).toEqual([{ segment: 0, state: 'running' }]);
+
+      let release!: () => void;
+      env.gate = new Promise<void>((r) => (release = r));
+      tracks[0].readyState = 'ended'; // camera taken by another app while visible
+      tracks[0].dispatchEvent(new Event('ended'));
+      await vi.waitFor(() => expect(tracks[1]?.applyCalls).toBe(1)); // restart re-applies the settings
+      expect(cam.state).toBe('restarting');
+      for (let i = 0; i < 3; i++) present(); // the new stream's first frames
+      expect(got.filter((f) => f.state === 'restarting')).toEqual([]);
+      expect(pending.size).toBe(0);
+
+      env.gate = null;
+      release();
+      await vi.waitFor(() => expect(cam.state).toBe('running'));
+      expect(cam.segment).toBe(1);
+      expect(pending.size).toBe(1);
+      present();
+      expect(got.slice(1)).toEqual([{ segment: 1, state: 'running' }]);
+    } finally {
+      cam.stop();
+      vi.unstubAllGlobals();
+    }
   });
 });

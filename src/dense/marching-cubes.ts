@@ -43,6 +43,8 @@ export interface SparseVoxelVolume {
   readonly weight: Uint16Array;
   /** 3 · BLOCK_VOXELS per block (RGB × COLOR_SCALE), or null. */
   readonly color: Uint16Array | null;
+  /** BLOCK_VOXELS per block, colour weight (0 = never coloured), or null / absent. */
+  readonly colorWeight?: Uint8Array | null;
   /** Block index or −1. */
   findBlock(bx: number, by: number, bz: number): number;
 }
@@ -246,6 +248,7 @@ export function marchingCubes(vol: SparseVoxelVolume, opts: MarchingCubesOptions
   const tsdf = vol.tsdf;
   const weight = vol.weight;
   const colorArr = vol.color;
+  const colorW = useColor ? vol.colorWeight ?? null : null;
 
   const wsrc = new Int32Array(WIN);
   const wv = new Float32Array(WIN);
@@ -427,8 +430,17 @@ export function marchingCubes(vol: SparseVoxelVolume, opts: MarchingCubesOptions
               if (useColor) {
                 const s0 = 3 * wsrc[w0];
                 const s1 = 3 * wsrc[w1];
+                // an end that was never coloured (only free-space updates, e.g. beside a
+                // silhouette seen from one side) is black: take the colour of the other end
+                let tc = t;
+                if (colorW) {
+                  const a0 = colorW[wsrc[w0]];
+                  const a1 = colorW[wsrc[w1]];
+                  if (a0 === 0 && a1 > 0) tc = 1;
+                  else if (a1 === 0 && a0 > 0) tc = 0;
+                }
                 for (let k = 0; k < 3; k++) {
-                  const c = (colorArr![s0 + k] + t * (colorArr![s1 + k] - colorArr![s0 + k])) / COLOR_SCALE;
+                  const c = (colorArr![s0 + k] + tc * (colorArr![s1 + k] - colorArr![s0 + k])) / COLOR_SCALE;
                   col[p3 + k] = c < 0 ? 0 : c > 255 ? 255 : Math.round(c);
                 }
               } else {

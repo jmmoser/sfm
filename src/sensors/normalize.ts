@@ -617,7 +617,13 @@ export class MotionNormalizer {
 
     // ---- B'': sign of `acceleration` relative to `accelerationIncludingGravity` ----
     if (flags & RAW_HAS_ACCEL) {
-      if (Number.isFinite(this.lpT) && t > this.lpT) {
+      if (!Number.isFinite(this.lpT)) {
+        this.lp[0] = gx;
+        this.lp[1] = gy;
+        this.lp[2] = gz;
+        this.lpT = t;
+      } else if (t >= this.lpT) {
+        // t === lpT: a burst after a main-thread stall (1 ms timeStamp); votes, no low-pass step
         const dt = Math.min(t - this.lpT, 200);
         const hx = gx - this.lp[0],
           hy = gy - this.lp[1],
@@ -648,12 +654,8 @@ export class MotionNormalizer {
         this.lp[0] += k * (gx - this.lp[0]);
         this.lp[1] += k * (gy - this.lp[1]);
         this.lp[2] += k * (gz - this.lp[2]);
-      } else {
-        this.lp[0] = gx;
-        this.lp[1] = gy;
-        this.lp[2] = gz;
-      }
-      this.lpT = t;
+        this.lpT = t;
+      } // t < lpT (out-of-order timestamp): skipped, the low-pass state is kept
     }
 
     // Near-stillness gate for the gravity-direction checks.

@@ -55,7 +55,15 @@ export function parseArgs(argv) {
       if (!Number.isFinite(v) || v < min) throw new Error(`${a} needs a number ≥ ${min}`);
       return v;
     };
-    const list = () => next().split(',').map((s) => Number(s));
+    const list = () => {
+      const v = next();
+      const parts = v.split(',').map((s) => s.trim());
+      const ids = parts.map(Number);
+      // (Number('') is 0: an empty item, e.g. a trailing comma, would add frame / iteration 0)
+      if (parts.some((s) => s === '') || !ids.every((x) => Number.isInteger(x) && x >= 0)) throw new Error(`${a} needs comma-separated integers ≥ 0, got ${v}`);
+      if (new Set(ids).size !== ids.length) throw new Error(`${a} has duplicate values, got ${v}`);
+      return ids;
+    };
     if (a === '--max-size') o.cfg.maxSize = num(16);
     else if (a === '--iterations') o.cfg.iterations = num(1);
     else if (a === '--max-gaussians') o.cfg.maxGaussians = num(16);

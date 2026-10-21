@@ -97,6 +97,8 @@ export class MockEngine implements EngineLike {
   private scene: MockScene | null = null;
   private samples: MockSamples | null = null;
   private sizes: Sizes = { sparse: 9000, dense: 160_000 };
+  /** The init / loadSession running now: a closeSession of its scan ends it (EngineClient: 'close' disposes the engine). */
+  private pendingSetup: { id: string | null; closed: boolean } | null = null;
   private busy = false;
   private hidden = false;
   private cancelled = false;
@@ -211,7 +213,10 @@ export class MockEngine implements EngineLike {
 
   async init(options: EngineOptions): Promise<InitResult> {
     this.setState('starting');
+    const setup = (this.pendingSetup = { id: options.sessionId ?? null, closed: false });
     await sleep(350 / this.speed);
+    if (this.pendingSetup === setup) this.pendingSetup = null;
+    if (setup.closed) throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');
     try {
       this.check('init');
     } catch (e) {
@@ -775,15 +780,21 @@ export class MockEngine implements EngineLike {
 
   async loadSession(id: string, options?: Partial<EngineOptions>): Promise<SessionSummary> {
     this.setState('starting');
+    const setup = (this.pendingSetup = { id, closed: false });
+    const stopIfClosed = (): void => {
+      if (setup.closed) throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');
+    };
     try {
       this.check('loadSession');
       await sleep(250 / this.speed);
+      stopIfClosed();
       let meta: SessionMeta | null = null;
       if (this.sessionId === id && this.scene && this.options) {
         meta = null; // in-memory session: keep the current results
       } else {
         const store = await this.sessionsSrc();
         meta = store ? await store.getSession(id) : null;
+        stopIfClosed();
         if (!meta) throw new Error(`Session not found: ${id}`);
         const mode = meta.mode === 'scene' ? 'scene' : 'object';
         const quality = (options?.quality ?? (meta.stats?.quality as EngineOptions['quality'] | undefined) ?? 'balanced') as EngineOptions['quality'];
@@ -844,8 +855,10 @@ export class MockEngine implements EngineLike {
         },
       };
     } catch (e) {
-      this.setState('idle', (e as Error).message);
+      if (!setup.closed) this.setState('idle', (e as Error).message); // a close set 'closed'
       throw e;
+    } finally {
+      if (this.pendingSetup === setup) this.pendingSetup = null;
     }
   }
 
@@ -878,6 +891,24 @@ export class MockEngine implements EngineLike {
       this.setState('idle', 'restarted without re-opening the session');
     } else this.setState('ready', 'recovered after an abort');
     return 'restarted';
+  }
+
+  /** Like EngineClient.closeSession: the session is forgotten (a running operation is rejected). */
+  async closeSession(id: string): Promise<void> {
+    if (this.disposed) throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');
+    if (this.pendingSetup?.id === id) {
+      this.pendingSetup.closed = true;
+      this.pendingSetup = null;
+      this.setState('idle', 'closed');
+    }
+    if (this.sessionId !== id) return;
+    if (this.longOp) {
+      this.cancelled = true;
+      this.abortCurrent?.(namedError(ENGINE_ERRORS.cancelled, 'The session was closed'));
+      this.releaseStall?.();
+    }
+    this.forgetSession();
+    if (this.st.state === 'ready') this.setState('idle', 'closed');
   }
 
   /** Forget the session (EngineClient.release: a fresh worker). A running operation is rejected. */

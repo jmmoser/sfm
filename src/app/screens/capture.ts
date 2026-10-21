@@ -620,10 +620,11 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
    */
   function onMemoryLimit(): void {
     if (memoryLimited || closed) return;
-    memoryLimited = true;
     memChip.hidden = false;
     el.classList.add('memory-limited');
+    // Not now (interrupted by the background, an error card): a later marked frame asks.
     if (phase !== 'running' && phase !== 'paused') return;
+    memoryLimited = true;
     pause('user');
     const enough = numKeyframes >= MIN_KEYFRAMES;
     showCard(
@@ -662,6 +663,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       bitmap: f.bitmap,
       t: f.t,
       screenAngle: f.screenAngle,
+      screenAngleSince: f.screenAngleSince,
       imu: f.imu,
       geo: f.geo,
       // platform headings are MAGNETIC until the compass knows the declination (setLocationFromFix)
@@ -675,7 +677,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       rawBuffer: f.rawBuffer,
       maxSide: f.maxSide,
     };
-    const upright = orientation.observe({ width: f.width, height: f.height, screenAngle: f.screenAngle, t: f.t, raw: f.rawBuffer });
+    const upright = orientation.observe({ width: f.width, height: f.height, screenAngle: f.screenAngle, t: f.t, raw: f.rawBuffer, screenAngleSince: f.screenAngleSince });
     inFlight = { width: f.width, height: f.height, screenAngle: f.screenAngle, upright };
     try {
       await app.engine.processFrame(input);
@@ -893,7 +895,6 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       return;
     }
     if (closed) return;
-    showCard(null);
     pump = new FramePump({
       camera,
       consumer: consume,
@@ -906,6 +907,15 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       videoFrameOrientation: camRes?.apple ? 'raw' : 'upright',
       onError: (e) => console.warn('[capture] pump error', e),
     });
+    // The camera failed during the init: show its state again (this init's spinner, or an engine
+    // error card a retry came from, covers it); "Reconnect camera", or the camera coming back by
+    // itself (onCameraState 'running'), starts the pump.
+    if (phase === 'error' && camera.state !== 'running') {
+      if (camera.state === 'error') errorCard('The camera stopped', 'Tap to reconnect the camera.', () => void reconnect(), 'Reconnect camera');
+      else showCard(infoCard({ spinner: true, title: 'Reconnecting camera…' }));
+      return;
+    }
+    showCard(null);
     pump.start();
     setPhase('running');
     guidance.hidden = false;
@@ -1085,7 +1095,8 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
 
   async function saveCaptured(durationMs: number): Promise<void> {
     await sessionCreated;
-    void app.updateSession(sessionId, {
+    // awaited: a later stats merge (abandon) must read these stats, not the ones before them
+    await app.updateSession(sessionId, {
       status: 'captured',
       stats: {
         keyframes: numKeyframes,

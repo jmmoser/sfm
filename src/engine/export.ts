@@ -109,9 +109,11 @@ export async function colmapModel(src: ExportSources, ext: (id: number) => strin
 /** Build the export Blob. */
 export async function buildExport(format: ExportFormat, src: ExportSources): Promise<Blob> {
   const comments = src.comments ?? [`sfm on-device photogrammetry: ${src.name}`];
+  // an empty dense cloud (fusion kept no point) falls back to the sparse one
+  const dense = src.dense && src.dense.count > 0 ? src.dense : null;
   switch (format) {
     case 'ply-points': {
-      const pc = src.dense ?? src.sparse;
+      const pc = dense ?? src.sparse;
       if (!pc || pc.count === 0) throw new Error('No point cloud yet (run refine first)');
       return new Blob([encodePLY(pc, { comments })], { type: 'application/octet-stream' });
     }
@@ -120,7 +122,7 @@ export async function buildExport(format: ExportFormat, src: ExportSources): Pro
       return new Blob([encodeMeshPLY(src.mesh, { comments })], { type: 'application/octet-stream' });
     }
     case 'glb': {
-      const points = src.mesh ? undefined : (src.dense ?? src.sparse ?? undefined);
+      const points = src.mesh ? undefined : (dense ?? src.sparse ?? undefined);
       if (!src.mesh && (!points || points.count === 0)) throw new Error('Nothing to export yet (run refine first)');
       // unlit (KHR_materials_unlit): the vertex colours are photo colours that already contain the
       // shading; lit, viewers shade them twice (−5 dB held-out PSNR in the app's viewer)

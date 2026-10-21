@@ -396,7 +396,7 @@ export function priorToPlanes(prior: DepthMap, width: number, height: number, ou
 
 /**
  * Unit normal → octahedral snorm16 × 2 (WGSL `pack2x16snorm` layout: x in the low 16 bits). The
- * GPU finalisation writes this; `octDecode` inverts it to ≈ 1e-4 rad.
+ * GPU finalisation writes this; `octDecode` inverts it to ≤ 6.5e-5 (3·√2·0.5/32767).
  */
 export function octEncode(nx: number, ny: number, nz: number): number {
   const s = Math.abs(nx) + Math.abs(ny) + Math.abs(nz);

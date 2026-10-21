@@ -2,9 +2,13 @@
  * Engine worker (module worker): dispatches the RPC requests of ./protocol.ts to a
  * PhotogrammetryEngine (src/engine) and forwards its events.
  *
- *  - `init` creates a new engine (the previous one is disposed; its feature pipeline is reused
- *    when the SIFT configuration matches, so a new scan does not recompile the GPU pipelines).
+ *  - `init` creates a new engine (the previous one is disposed; its feature pipeline is handed
+ *    over when the SIFT configuration matches and it has not fallen back to the CPU, so a new
+ *    scan does not recompile the GPU pipelines).
  *    `loadSession` works without `init` (an engine is created from the stored session).
+ *  - `close`: a session that is about to be deleted is let go of (its engine is disposed, so
+ *    nothing more is written to it); the feature pipeline is kept for the next `init` /
+ *    `loadSession` (handed over like on a re-init, unless it fell back to the CPU meanwhile).
  *  - Long operations (finishCapture / refine / densify / mesh / splat / export / loadSession)
  *    report `progress` events with their `requestId` (throttled; `detail` passed through) and are
  *    cancelled by `cancel` (target = request id, default: the running long operation).
@@ -12,8 +16,9 @@
  *  - Engine `live` events (background keyframe mapping) and `log` / non-fatal `error` events are
  *    forwarded. Frame responses are NOT repeated as `live` events.
  *  - Results are posted with transfer lists (collectTransferables). Results the engine keeps
- *    (sparse model, dense cloud, mesh) are cloned, except persisted dense clouds / meshes, which
- *    are transferred and dropped from the engine's memory (reloaded from IndexedDB when needed).
+ *    (sparse model, dense cloud, mesh) are cloned, except dense clouds / meshes stored in
+ *    IndexedDB, which are transferred and dropped from the engine's memory (reloaded when
+ *    needed); one whose write failed stays with the engine (cloned).
  *  - `visibility`: while hidden the engine submits no GPU work (frames are skipped, long
  *    operations pause between GPU batches).
  *  - GPU device loss: the engine tries to recreate its GPU resources; when no adapter can be
@@ -25,6 +30,7 @@
 import { PhotogrammetryEngine, pipelineKey } from '../engine/engine';
 import type { EngineConfig } from '../engine/types';
 import type { FeaturePipeline } from '../features/extractor';
+import { releaseSiftCPUMemory } from '../features/sift-cpu';
 import { onDeviceLost } from '../gpu/device';
 import type { CancelToken, ProgressEvent } from '../core/types';
 import {
@@ -57,9 +63,9 @@ const scope = self as unknown as WorkerScope;
 type InitParams = EngineOptions & { engineConfig?: EngineConfig };
 
 let engine: PhotogrammetryEngine | null = null;
-let engineHadGPU = false;
+/** Feature pipeline of an engine closed by `close`, for the next engine (no recompilation). */
+let spare: { pipeline: FeaturePipeline; key: string; gpu: boolean } | null = null;
 let hidden = false;
-let spare: { pipeline: FeaturePipeline; key: string } | null = null;
 /** Cancel tokens of running long operations by request id. */
 const tokens = new Map<number, { cancelled: boolean }>();
 let currentLong: number | null = null;
@@ -105,27 +111,29 @@ function splitOptions(p: InitParams | Partial<InitParams> | undefined): { option
 }
 
 function newEngine(options: EngineOptions, config: EngineConfig): PhotogrammetryEngine {
-  let cfg = config;
-  if (engine) {
-    const rel = engine.releasePipeline();
-    engine.dispose();
-    engine = null;
-    if (rel) {
-      if (spare && spare.pipeline !== rel.pipeline) destroyPipeline(spare.pipeline);
-      spare = rel;
-    }
-  }
+  closeEngine();
+  const s = spare;
+  spare = null;
+  const e = new PhotogrammetryEngine(options, config);
   const key = pipelineKey(options.quality, options.preferGPU !== false, config);
-  if (spare && spare.key === key && !config.pipeline) {
-    cfg = { ...config, pipeline: spare.pipeline };
-  } else if (spare) {
-    destroyPipeline(spare.pipeline);
-    spare = null;
-  }
-  const e = new PhotogrammetryEngine(options, cfg);
+  // the new engine owns the reused pipeline (it recreates it after a device loss); one that fell
+  // back to the CPU since it was handed over (a device loss while no engine held it) is not reused
+  if (s && s.key === key && !config.pipeline && s.pipeline.gpu === s.gpu) e.adoptPipeline(s.pipeline, s.key);
+  else if (s) destroyPipeline(s.pipeline);
   attach(e);
   engine = e;
   return e;
+}
+
+/** Dispose the engine, keeping its feature pipeline (see releasePipeline) as the next engine's spare. */
+function closeEngine(): void {
+  if (!engine) return;
+  const rel = engine.releasePipeline();
+  engine.dispose();
+  engine = null;
+  if (!rel) return;
+  if (spare && spare.pipeline !== rel.pipeline) destroyPipeline(spare.pipeline);
+  spare = { ...rel, gpu: rel.pipeline.gpu };
 }
 
 function destroyPipeline(p: FeaturePipeline): void {
@@ -169,15 +177,13 @@ async function longOp<T>(id: number, fn: (progress: (p: ProgressEvent) => void, 
   }
 }
 
-/** Run a request; returns the result and whether its large buffers may be transferred. */
-async function dispatch(req: EngineRequest): Promise<{ result: unknown; transfer: boolean }> {
+/** Run a request; returns the result and whether its large buffers may be transferred (or which). */
+async function dispatch(req: EngineRequest): Promise<{ result: unknown; transfer: boolean | Transferable[] }> {
   switch (req.method) {
     case 'init': {
       const { options, config } = splitOptions(req.params as InitParams);
       const e = newEngine(options as EngineOptions, config);
-      const res = await e.init();
-      engineHadGPU = res.gpu;
-      return { result: res, transfer: false };
+      return { result: await e.init(), transfer: false };
     }
     case 'frame': {
       const f = req.params as FrameInput;
@@ -205,16 +211,12 @@ async function dispatch(req: EngineRequest): Promise<{ result: unknown; transfer
     case 'densify': {
       const e = requireEngine();
       const pc = await longOp(req.id, (p, c) => e.densify(req.params as DenseOptions | undefined, p, c));
-      const persistent = !!e.engineStore?.persistent;
-      if (persistent) e.releaseResultMemory('dense');
-      return { result: pc, transfer: persistent };
+      return { result: pc, transfer: e.releaseResultMemory('dense') };
     }
     case 'mesh': {
       const e = requireEngine();
       const m = await longOp(req.id, (p, c) => e.mesh(req.params as MeshOptions | undefined, p, c));
-      const persistent = !!e.engineStore?.persistent;
-      if (persistent) e.releaseResultMemory('mesh');
-      return { result: m, transfer: persistent };
+      return { result: m, transfer: e.releaseResultMemory('mesh') };
     }
     case 'splat': {
       const e = requireEngine();
@@ -240,14 +242,12 @@ async function dispatch(req: EngineRequest): Promise<{ result: unknown; transfer
       }
       const ee = e;
       const sum = await longOp(req.id, () => ee.loadSession(id, o));
-      const persistent = !!ee.engineStore?.persistent;
-      if (persistent) {
-        if (sum.dense) ee.releaseResultMemory('dense');
-        if (sum.mesh) ee.releaseResultMemory('mesh');
-        // transfer only the dense / mesh buffers (the sparse model stays with the engine)
-        return { result: sum, transfer: true };
-      }
-      return { result: sum, transfer: false };
+      // transfer only the dense / mesh buffers the engine dropped (the sparse model stays with it)
+      const transfer = [
+        ...(sum.dense && ee.releaseResultMemory('dense') ? collectTransferables(sum.dense) : []),
+        ...(sum.mesh && ee.releaseResultMemory('mesh') ? collectTransferables(sum.mesh) : []),
+      ];
+      return { result: sum, transfer };
     }
     case 'cancel': {
       const p = req.params as { target?: number } | undefined;
@@ -263,14 +263,20 @@ async function dispatch(req: EngineRequest): Promise<{ result: unknown; transfer
       engine?.setHidden(hidden);
       return { result: undefined, transfer: false };
     }
+    case 'close': {
+      if (!engine || engine.options.sessionId !== (req.params as { sessionId: string }).sessionId) return { result: false, transfer: false };
+      for (const t of tokens.values()) t.cancelled = true;
+      closeEngine();
+      // CPU SIFT scratch: the disposed engine's idle timer no longer frees it (extraction is
+      // synchronous, so no frame is using it now)
+      releaseSiftCPUMemory();
+      return { result: true, transfer: false };
+    }
     case 'dispose': {
       for (const t of tokens.values()) t.cancelled = true;
-      if (engine) {
-        const rel = engine.releasePipeline();
-        engine.dispose();
-        engine = null;
-        if (rel) destroyPipeline(rel.pipeline);
-      }
+      // the engine owns its feature pipeline (created or adopted): dispose() destroys it
+      engine?.dispose();
+      engine = null;
       if (spare) destroyPipeline(spare.pipeline);
       spare = null;
       return { result: undefined, transfer: false };
@@ -280,13 +286,10 @@ async function dispatch(req: EngineRequest): Promise<{ result: unknown; transfer
   }
 }
 
-/** Transfer list: everything for `transfer`, else nothing (structured clone). */
-function transfersOf(req: EngineRequest, result: unknown, transfer: boolean): Transferable[] {
+/** Transfer list: everything for `transfer: true`, the given list, else nothing (structured clone). */
+function transfersOf(result: unknown, transfer: boolean | Transferable[]): Transferable[] {
+  if (Array.isArray(transfer)) return transfer;
   if (!transfer || result === undefined || result === null) return [];
-  if (req.method === 'loadSession') {
-    const s = result as { dense?: unknown; mesh?: unknown };
-    return [...collectTransferables(s.dense ?? null), ...collectTransferables(s.mesh ?? null)];
-  }
   return collectTransferables(result);
 }
 
@@ -296,7 +299,7 @@ async function handle(req: EngineRequest): Promise<void> {
   try {
     const { result, transfer: tr } = await dispatch(req);
     res = { id: req.id, ok: true, result: result as never };
-    transfer = transfersOf(req, result, tr);
+    transfer = transfersOf(result, tr);
   } catch (e) {
     const err = serializeError(e);
     if ((e as Error)?.name === 'CancelledError') err.name = ENGINE_ERRORS.cancelled;
@@ -321,7 +324,8 @@ scope.addEventListener('unhandledrejection', (ev: Event) => {
 
 // GPU device loss: try to recover in place; when no adapter can be obtained the worker is unusable.
 onDeviceLost((info) => {
-  if (info.reason === 'destroyed' || !engine || !engineHadGPU) return;
+  // hadGPU, not usesGPU: the feature pipeline may already have fallen back to the CPU on this loss
+  if (info.reason === 'destroyed' || !engine || !engine.hadGPU) return;
   const e = engine;
   log('warn', `GPU device lost (${info.reason}): ${info.message}`);
   void e

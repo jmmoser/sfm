@@ -344,7 +344,7 @@ export function storedToGeometry(s: StoredPair): TwoViewGeometry {
 
 /** Persisted meta of the sparse result (`sparse/meta`); points live in `sparse/model`. */
 export interface SparseMetaRecord {
-  cameras: { id: number; pose: { R: number[]; t: number[] }; intrinsics: CameraIntrinsics; t: number; frameIndex: number }[];
+  cameras: { id: number; pose: { R: number[]; t: number[] }; intrinsics: CameraIntrinsics; t: number; frameIndex: number; upCam?: [number, number, number] }[];
   metric: MetricInfo;
   stats: Record<string, number | string>;
   /** SparseModel.rollingShutter (absent in older records). */

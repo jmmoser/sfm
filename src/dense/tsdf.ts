@@ -445,6 +445,11 @@ const TILE = 16;
 /** Interleaved per-pixel scratch of `integrateDepthMap` (grow-only, reused across views). */
 let pixScratch = new Float32Array(0);
 
+/** Bytes held by that scratch (exposed for tests; `buildTsdfVolume` releases it after integrating, also on cancel). */
+export function tsdfScratchBytes(): number {
+  return pixScratch.byteLength;
+}
+
 /** Integrate one depth map into the volume (all allocated blocks; see file header). */
 export function integrateDepthMap(
   vol: TsdfVolume,
@@ -808,25 +813,29 @@ export async function buildTsdfVolume(
   const tB = performance.now();
 
   // 3. integration
-  for (let k = 0; k < views.length; k++) {
-    progress?.({ stage: 'tsdf', progress: 0.3 + 0.6 * (k / views.length), message: `integrating ${k + 1}/${views.length}` });
-    await yielder.tick();
-    const view = views[k];
-    const dm = await cache.get(view.id);
-    if (!dm) continue;
-    const g = viewGeom(view, dm);
-    const rgb = o.color ? rgbAtResolution(view.image, dm.width, dm.height) : null;
-    integrateDepthMap(vol, dm, g.cam, view.pose, rgb, {
-      truncation: tau,
-      adaptiveTruncationPx: o.adaptiveTruncationPx,
-      sdfMode: o.sdfMode,
-      refDepth: zMed,
-      maxDepth: o.maxDepth,
-      maxCost: o.maxCost,
-      maxWeight: o.maxWeight,
-    });
+  try {
+    for (let k = 0; k < views.length; k++) {
+      progress?.({ stage: 'tsdf', progress: 0.3 + 0.6 * (k / views.length), message: `integrating ${k + 1}/${views.length}` });
+      await yielder.tick();
+      const view = views[k];
+      const dm = await cache.get(view.id);
+      if (!dm) continue;
+      const g = viewGeom(view, dm);
+      const rgb = o.color ? rgbAtResolution(view.image, dm.width, dm.height) : null;
+      integrateDepthMap(vol, dm, g.cam, view.pose, rgb, {
+        truncation: tau,
+        adaptiveTruncationPx: o.adaptiveTruncationPx,
+        sdfMode: o.sdfMode,
+        refDepth: zMed,
+        maxDepth: o.maxDepth,
+        maxCost: o.maxCost,
+        maxWeight: o.maxWeight,
+      });
+    }
+  } finally {
+    // release the per-pixel scratch (16 B/px of the largest map), also on cancel / a failed read
+    pixScratch = new Float32Array(0);
   }
-  pixScratch = new Float32Array(0); // release the per-pixel scratch (16 B/px of the largest map)
   const tC = performance.now();
   if (stats) {
     stats.voxelSize = voxel;

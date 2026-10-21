@@ -38,7 +38,7 @@ export function lossKind(name: BALossType): LossKind {
   }
 }
 
-const MIN_WEIGHT = 1.1754943508222875e-38; // like Ceres: keep ρ' strictly positive
+const MIN_WEIGHT = 2.2250738585072014e-308; // DBL_MIN, like Ceres: keep ρ' strictly positive
 
 /** ρ(s) for loss `kind` with squared scale `b` (= a²). */
 export function lossRho(kind: LossKind, s: number, b: number): number {

@@ -265,6 +265,26 @@ describe('MotionNormalizer: linear acceleration sign (check B″)', () => {
     expect(n.calibration.accelSign).toBe(-1);
     expect(n.calibration.linearAccelSign).toBe(1);
   });
+  it('same-millisecond burst events (after a main-thread stall) do not reset the low-pass', () => {
+    const votes = (repeatEvery: number): { same: number; opposite: number } => {
+      const norm = new MotionNormalizer({ accelSignPrior: 1, gyroCheck: false });
+      norm.reset();
+      const out = new Float64Array(RAW_STRIDE);
+      let stamp = 0;
+      for (let i = 0; i < 600; i++) {
+        const t = i * (1000 / 60);
+        if (i % repeatEvery !== 0) stamp = Math.floor(t); // WebKit: 1 ms timeStamp; else the previous one
+        const ax = 2 * Math.sin(2 * Math.PI * 1.5 * (t / 1000));
+        norm.acceptMotion(motionEvent(stamp, [0.01 * noise(i, 1), 0.01 * noise(i, 2), 0], [ax, 0, 0], [ax, G, 0]), 0, out, 0);
+      }
+      return { same: norm.stats.linearVotesSame, opposite: norm.stats.linearVotesOpposite };
+    };
+    const clean = votes(Infinity);
+    const burst = votes(5);
+    expect(clean.same).toBeGreaterThan(300);
+    expect(burst.opposite).toBe(0);
+    expect(burst.same).toBeGreaterThanOrEqual(0.9 * clean.same);
+  });
 });
 
 describe('MotionNormalizer: gyro axes / units check (check D)', () => {

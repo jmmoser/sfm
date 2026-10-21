@@ -111,10 +111,17 @@ export interface EngineLike {
    * respawned and the last init / loadSession replayed with `resume`, so the persisted capture
    * comes back and later calls do not queue behind the stuck one). Resolves with what happened:
    * 'none' (nothing running), 'cancelled' (the engine stopped it), 'restarted'.
-   * `reinit: false`: such a restart does NOT replay the last init / loadSession — the session is
-   * being discarded, and a replay with `resume` would re-open (re-create) it.
+   * `reinit: false`: the session is being discarded — neither such a restart nor any later one
+   * replays the last init / loadSession (a replay with `resume` would re-open, re-create, it).
    */
   abortLongOperation(opts?: { graceMs?: number; reinit?: boolean; method?: EngineMethod }): Promise<AbortOutcome>;
+  /**
+   * Let go of session `id` before it is deleted (no-op when the engine holds another one): the
+   * engine is disposed in the worker (nothing more is written to the session; the compiled GPU
+   * pipelines stay for the next scan) and no later restart replays its init / loadSession.
+   * Resolves when the worker answered.
+   */
+  closeSession(id: string): Promise<void>;
   /**
    * Free everything the engine holds in memory (capture state, models, GPU device / pipelines),
    * e.g. before the on-device benchmark. EngineClient terminates the worker WITHOUT replaying the
@@ -234,6 +241,10 @@ export class EngineClient implements EngineLike {
   private st: EngineStatus = { state: 'idle', respawns: 0 };
   private setup: Setup | null = null;
   private gate: Promise<void> = Promise.resolve();
+  /** Bumped by every restart: only the replay of the latest one sets the state. */
+  private replayEpoch = 0;
+  /** Bumped by every init / loadSession: a superseded one leaves the status to the newer one. */
+  private setupSeq = 0;
   private respawnTimes: number[] = [];
   private gpuFailures = 0;
   private frameBusy = false;
@@ -313,14 +324,15 @@ export class EngineClient implements EngineLike {
     await this.settleAborts();
     this.assertUsable();
     this.setup = { kind: 'init', options: { ...options } };
+    const seq = ++this.setupSeq;
     this.gpuFailures = 0;
     this.setState('starting');
     try {
       const res = await this.call('init', options, { timeoutMs: this.opts.initTimeoutMs, bypassGate: true, fatalOnTimeout: true });
-      this.setState('ready', undefined, res);
+      if (seq === this.setupSeq) this.setState('ready', undefined, res);
       return res;
     } catch (e) {
-      if (this.st.state === 'starting') this.setState('idle', (e as Error)?.message ?? String(e));
+      if (seq === this.setupSeq && this.st.state === 'starting') this.setState('idle', (e as Error)?.message ?? String(e));
       throw e;
     }
   }
@@ -374,13 +386,14 @@ export class EngineClient implements EngineLike {
     await this.settleAborts();
     this.assertUsable();
     this.setup = { kind: 'load', id, options };
+    const seq = ++this.setupSeq;
     this.setState('starting');
     try {
       const res = await this.call('loadSession', { id, options }, { bypassGate: true });
-      this.setState('ready');
+      if (seq === this.setupSeq) this.setState('ready');
       return res;
     } catch (e) {
-      if (this.st.state === 'starting') this.setState('idle', (e as Error)?.message ?? String(e));
+      if (seq === this.setupSeq && this.st.state === 'starting') this.setState('idle', (e as Error)?.message ?? String(e));
       throw e;
     }
   }
@@ -405,6 +418,8 @@ export class EngineClient implements EngineLike {
   }
 
   abortLongOperation(opts: { graceMs?: number; reinit?: boolean; method?: EngineMethod } = {}): Promise<AbortOutcome> {
+    // a discarded session must not be re-opened by any later replay (`resume` would re-create it)
+    if (opts.reinit === false) this.setup = null;
     const id = this.longTarget(opts.method);
     const p = id !== null ? this.pending.get(id) : undefined;
     if (id === null || !p) return Promise.resolve('none');
@@ -461,6 +476,26 @@ export class EngineClient implements EngineLike {
     } finally {
       this.superseding--;
     }
+  }
+
+  async closeSession(id: string): Promise<void> {
+    this.assertUsable();
+    // every init / loadSession replaces the worker's engine: with a setup naming another session
+    // the worker cannot hold this one (no round trip that a busy worker could time out and restart)
+    const s = this.setup;
+    if (s && (s.kind === 'init' ? s.options.sessionId : s.id) !== id) return;
+    this.setup = null;
+    // an init / load / replay of this session answered after the close leaves the status alone
+    if (s) {
+      this.setupSeq++;
+      this.replayEpoch++;
+    }
+    if (!this.worker) return;
+    // (a worker that does not answer is stuck: restarted, like on a stuck init)
+    const closed = await this.call('close', { sessionId: id }, { timeoutMs: this.opts.callTimeoutMs, bypassGate: true, fatalOnTimeout: true });
+    if (this.setup) return; // a newer init / load: its status
+    // (with its setup retired, nothing else moves the status of a closed starting / respawning setup)
+    if (s ? this.st.state !== 'idle' && this.st.state !== 'dead' : closed && this.st.state === 'ready') this.setState('idle', 'closed');
   }
 
   async release(): Promise<void> {
@@ -611,7 +646,18 @@ export class EngineClient implements EngineLike {
         }
       });
     if (o.bypassGate || FIRE_AND_FORGET.has(method)) return send();
-    return this.gate.then(send);
+    return this.waitGate().then(send);
+  }
+
+  /**
+   * Wait for the replay of the last restart. A restart while waiting replaces the gate with a
+   * newer replay (the older one settles when its worker is killed): wait for that one too.
+   */
+  private async waitGate(): Promise<void> {
+    for (let g = this.gate; ; g = this.gate) {
+      await g;
+      if (g === this.gate) return;
+    }
   }
 
   /**
@@ -740,9 +786,13 @@ export class EngineClient implements EngineLike {
    */
   private respawn(reason: string, gpu: boolean, manual = false): void {
     if (this.disposed) return;
+    const epoch = ++this.replayEpoch;
+    // a newer init / loadSession (or a close) supersedes the replay: the status is theirs
+    const seq = this.setupSeq;
     const err = namedError(ENGINE_ERRORS.crashed, `Engine restarted: ${reason}`);
+    // (a frame in flight ends with this rejection; one still waiting for a replay goes on waiting
+    // for this restart's: processFrame clears frameBusy when its frame settles, not here)
     this.rejectAll(err);
-    this.frameBusy = false;
     this.killWorker();
     if (gpu) this.gpuFailures++;
     const now = Date.now();
@@ -768,16 +818,17 @@ export class EngineClient implements EngineLike {
           const options: EngineOptions = { ...setup.options, resume: !!setup.options.sessionId };
           if (cpu) options.preferGPU = false;
           const res = await this.call('init', options, { timeoutMs: this.opts.initTimeoutMs, bypassGate: true, fatalOnTimeout: true });
-          this.setState('ready', `recovered after: ${reason}`, res);
+          if (epoch === this.replayEpoch && seq === this.setupSeq) this.setState('ready', `recovered after: ${reason}`, res);
         } else {
           const options: Partial<EngineOptions> = { ...(setup.options ?? {}) };
           if (cpu) options.preferGPU = false;
           await this.call('loadSession', { id: setup.id, options }, { bypassGate: true });
-          this.setState('ready', `recovered after: ${reason}`);
+          if (epoch === this.replayEpoch && seq === this.setupSeq) this.setState('ready', `recovered after: ${reason}`);
         }
       } catch (e) {
-        // A failed replay leaves the engine usable for a fresh init (unless it is dead).
-        if (this.st.state === 'respawning') this.setState('idle', `re-initialisation failed: ${(e as Error)?.message ?? e}`);
+        // A failed replay leaves the engine usable for a fresh init (unless it is dead). One
+        // that failed because a later restart killed its worker leaves the state to that restart.
+        if (epoch === this.replayEpoch && seq === this.setupSeq && this.st.state === 'respawning') this.setState('idle', `re-initialisation failed: ${(e as Error)?.message ?? e}`);
       }
     };
     this.gate = replay();

@@ -556,6 +556,30 @@ describe('IncrementalMapper: determinism, forward motion', () => {
     stream(db, strict, graph2, db.frameIds().slice(0, 30));
     expect(strict.initialized).toBe(false);
   }, 300_000);
+
+  it('LiveMapper: after initialising from an older pair, the pending keyframes register outward from that pair', () => {
+    // walking away from the scene with 4 sequential pairs (CPU tier): the initial pair (50, 54) is
+    // found while adding keyframe 40, so the keyframes between them need the pair's side first
+    const { db, guess } = forwardData(60, 7);
+    const graph = new CorrespondenceGraph();
+    const live = new LiveMapper(db, graph, { intrinsics: guess });
+    const ids = db.frameIds().reverse();
+    let atInit: { id: number; registered: boolean; pending: number[] } | null = null;
+    for (let k = 0; k < ids.length; k++) {
+      const id = ids[k];
+      graph.addImage(id, db.features.get(id)!.count);
+      for (const j of ids.slice(Math.max(0, k - 4), k)) {
+        const g = db.getTwoView(j, id);
+        if (g && g.config !== 'degenerate' && g.inliers.length >= 30) graph.addTwoView(j, id, g.inliers);
+      }
+      const r = live.addKeyframe(id);
+      if (r.initialized && !atInit) atInit = { id, registered: r.registered, pending: live.pendingIds() };
+    }
+    expect(atInit).not.toBeNull();
+    expect(atInit!.registered).toBe(true);
+    expect(atInit!.pending).toEqual([]);
+    expect(live.reconstruction.numRegisteredImages).toBe(60);
+  }, 300_000);
 });
 
 const DEFAULT_FALLBACK_AFTER = 10;
@@ -599,6 +623,37 @@ describe('LiveMapper: invariants and extreme world transforms during capture', (
     expect(img.registered).toBe(false);
     expect(live.pendingIds()).toEqual([7]);
     expect(reconstructionInvariantErrors(rec, { graph })).toEqual([]);
+  }, 300_000);
+
+  it('a keyframe dropped by a refinement through incrementalMapper (engine refine) is pending again', async () => {
+    const { db, guess } = orbitData(24, 15);
+    const graph = new CorrespondenceGraph();
+    const live = new LiveMapper(db, graph, { intrinsics: guess });
+    const ids = db.frameIds();
+    stream(db, live, graph, ids.slice(0, 23));
+    const rec = live.reconstruction;
+    expect(rec.numRegisteredImages).toBe(23);
+    const img = rec.images.get(7)!;
+    const dropKeyframe7 = async () => {
+      const flip = rotvecToMat3([0, Math.PI, 0]);
+      const R = img.pose.R;
+      const Rn = new Float64Array(9);
+      for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) Rn[3 * r + c] = flip[3 * r] * R[c] + flip[3 * r + 1] * R[3 + c] + flip[3 * r + 2] * R[6 + c];
+      img.pose = poseAt(rec.imageCenter(7), Rn);
+      await live.incrementalMapper.iterativeGlobalRefinement(undefined, undefined, true);
+      expect(img.registered).toBe(false);
+    };
+    // the next registered keyframe retries it
+    await dropKeyframe7();
+    stream(db, live, graph, ids.slice(23));
+    expect(img.registered).toBe(true);
+    expect(rec.numRegisteredImages).toBe(24);
+    // the pending loop of a later engine refine retries it
+    await dropKeyframe7();
+    expect(live.pendingIds()).toEqual([7]);
+    for (const id of live.pendingIds()) live.addKeyframe(id);
+    expect(img.registered).toBe(true);
+    expect(live.pendingIds()).toEqual([]);
   }, 300_000);
 
   it('a similarity applied mid-capture (rotation ≈ π, s = 1e3, |t| = 1e5) does not disturb further mapping', () => {

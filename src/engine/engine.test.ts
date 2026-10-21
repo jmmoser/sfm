@@ -14,17 +14,22 @@ import { parseGLB } from '../io/glb';
 import { decodePLY } from '../io/ply';
 import { readZip } from '../io/zip';
 import { umeyama } from '../math/sim3';
-import { rotateImagePoint } from '../sensors/frame-orientation';
-import type { LiveUpdate } from '../workers/protocol';
+import { cameraFromDevice, rotateImagePoint, type ScreenAngle } from '../sensors/frame-orientation';
+import type { FrameInput, LiveUpdate } from '../workers/protocol';
 import { createCpuFeaturePipeline } from './cpu-pipeline';
 import { PhotogrammetryEngine, frameToBitmap } from './engine';
 import { OrientationTracker, gravityDown, overlayPoints, prepareFrame } from './frame-ingest';
-import { ImuLog, classifyScene, handEyeCheck } from './live';
+import { ImuLog, classifyScene, handEyeCheck, keyframeUpCam } from './live';
 import { MemoryEngineStore, packImu, packSparseModel, unpackImu, unpackSparseModel } from './persistence';
 import { centre, frameInputs, makeCapture, objectScene, type SynthCapture } from './testutil';
-import type { EngineConfig, SparseResultEx } from './types';
+import type { EngineConfig, KeyframeRecord, SparseResultEx } from './types';
 
 const DEG = Math.PI / 180;
+
+function angleDeg(a: ArrayLike<number>, b: ArrayLike<number>): number {
+  const d = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (Math.hypot(a[0], a[1], a[2]) * Math.hypot(b[0], b[1], b[2]));
+  return Math.acos(Math.min(1, Math.max(-1, d))) / DEG;
+}
 
 let pipeline: FeaturePipeline;
 beforeAll(() => {
@@ -163,6 +168,54 @@ describe('frame ingest', () => {
     expect(v).toMatchObject({ ok: true, k: 3 });
   });
 
+  it('dates a UI rotation by screenAngleSince when the producer knows it (FramePump: settled already)', () => {
+    const portrait = (o: OrientationTracker): void => {
+      o.classify({ width: 480, height: 640, screenAngle: 0, t: 0 });
+      o.classify({ width: 480, height: 640, screenAngle: 0, t: 90 });
+    };
+    const landscape = (t: number, screenAngleSince?: number) => ({ width: 640, height: 480, screenAngle: 90, t, screenAngleSince });
+    // rotated at 1000 ms, the pump skipped [1000, 1500) itself: its first frame at the new θ is kept
+    const o = new OrientationTracker(500);
+    portrait(o);
+    expect(o.classify(landscape(1500, 1000)).ok).toBe(true);
+    // a producer that does not settle itself: the window still starts at the rotation
+    const d = new OrientationTracker(500);
+    portrait(d);
+    expect(d.classify(landscape(1200, 1000)).ok).toBe(false);
+    expect(d.classify(landscape(1400, 1000)).ok).toBe(false);
+    expect(d.classify(landscape(1500, 1000)).ok).toBe(true);
+    // without it (or with a time after the frame, or none known) the first frame at the new θ dates the rotation
+    for (const since of [undefined, 1600, -Infinity, NaN]) {
+      const p = new OrientationTracker(500);
+      portrait(p);
+      expect(p.classify(landscape(1500, since)).ok).toBe(false);
+      expect(p.classify(landscape(1900)).ok).toBe(false);
+      expect(p.classify(landscape(2000)).ok).toBe(true);
+    }
+  });
+
+  it('the engine dates a UI rotation by FrameInput.screenAngleSince', async () => {
+    const frame = (w: number, h: number, screenAngle: ScreenAngle, t: number, screenAngleSince?: number): FrameInput => ({
+      bitmap: { width: w, height: h, data: new Uint8ClampedArray(w * h * 4) },
+      t,
+      screenAngle,
+      imu: [],
+      ...(screenAngleSince !== undefined ? { screenAngleSince } : {}),
+    });
+    const reason = async (since?: number): Promise<string> => {
+      const e = new PhotogrammetryEngine({ mode: 'object', quality: 'fast', persist: false }, testConfig());
+      await e.init();
+      await e.processFrame(frame(48, 64, 0, 0));
+      await e.processFrame(frame(48, 64, 0, 90));
+      // rotated at 1000 ms; the pump skipped [1000, 1500) itself
+      const u = await e.processFrame(frame(64, 48, 90, 1500, since));
+      e.dispose();
+      return u.debug!.reason;
+    };
+    expect(await reason()).toBe('dropped: within 500 ms of a UI rotation');
+    expect(await reason(1000)).not.toMatch(/^dropped/);
+  });
+
   it('rotates RGBA frames into the canonical orientation and maps the overlay back', () => {
     const W = 40,
       H = 30;
@@ -210,6 +263,35 @@ describe('frame ingest', () => {
     expect(back.length).toBe(3);
     expect(back[1].gyro[0]).toBeCloseTo(0.1);
     expect(back[1].accel).toBeNull();
+  });
+
+  it('IMU log coverage stops at a sample gap (as GyroReference)', () => {
+    const log = new ImuLog();
+    const run = (t0: number) => Array.from({ length: 51 }, (_, i) => ({ t: t0 + 10 * i, gyro: [0, 0, 0] as [number, number, number], accel: null, accelG: null }));
+    // samples over [0, 500] and [2000, 2500]: 1.5 s without any (page hidden)
+    log.append([...run(0), ...run(2000)]);
+    expect(log.covers(100, 400)).toBe(true);
+    expect(log.covers(2100, 2400)).toBe(true);
+    // within the slack of the gap's ends
+    expect(log.covers(100, 540)).toBe(true);
+    expect(log.covers(1960, 2400)).toBe(true);
+    expect(log.covers(100, 2400)).toBe(false);
+    expect(log.covers(2400, 100)).toBe(false);
+    expect(log.covers(450, 2050)).toBe(false);
+  });
+
+  it('keyframe up: −gravity, else up for the UI rotation in the canonical camera frame', () => {
+    const rec = (theta0: number, screenAngle: number, gravityCam: [number, number, number] | null): KeyframeRecord =>
+      ({ screenAngle, info: { R_cam_device: cameraFromDevice(theta0), gravityCam } }) as unknown as KeyframeRecord;
+    const g = keyframeUpCam(rec(90, 0, [0.3, 1.2, -1.6]))!;
+    expect(Math.hypot(g[0], g[1], g[2])).toBeCloseTo(1, 12);
+    expect(angleDeg(g, [-0.3, -1.2, 1.6])).toBeLessThan(1e-6);
+    // images upright for the UI rotation: image up (−y)
+    for (const th of [0, 90, 180, 270]) expect(keyframeUpCam(rec(th, th, null))).toEqual([0, -1, 0]);
+    // raw buffers (upright for θ₀ = 90) in a portrait UI: the image's left points up
+    expect(keyframeUpCam(rec(90, 0, null))).toEqual([-1, 0, 0]);
+    expect(keyframeUpCam(rec(90, 180, null))).toEqual([1, 0, 0]);
+    expect(keyframeUpCam(rec(0, Number.NaN, null))).toBeUndefined();
   });
 });
 
@@ -304,6 +386,11 @@ describe('engine: synthetic orbit, CPU path', () => {
       expect(c.frameIndex).toBeGreaterThanOrEqual(0);
       expect(c.t).toBe(cap.frames[c.frameIndex!].t);
     }
+    // the cameras carry their physical up (the viewer's 'auto' world up): world +Z here
+    for (const { pose: { R }, upCam: u } of res.cameras) {
+      expect(u).toBeDefined();
+      expect(angleDeg([0, 1, 2].map((k) => R[k] * u![0] + R[3 + k] * u![1] + R[6 + k] * u![2]), [0, 0, 1])).toBeLessThan(5);
+    }
     const fTrue = cap.cam.f;
     expect(Math.abs(res.cameras[0].intrinsics.f / fTrue - 1)).toBeLessThan(0.03);
     expect(res.metric.metric).toBe(true);
@@ -392,6 +479,7 @@ describe('engine: synthetic orbit, CPU path', () => {
     expect(sum.quality).toBe('fast');
     expect(sum.sparse!.cameras.length).toBe(res.cameras.length);
     expect((sum.sparse!.cameras[0] as { frameIndex?: number }).frameIndex).toBe(res.cameras[0].frameIndex);
+    expect(sum.sparse!.cameras.map((c) => c.upCam)).toEqual(res.cameras.map((c) => c.upCam));
     expect(sum.dense!.count).toBe(engine.denseCloudResult!.count);
     expect(sum.mesh!.triangleCount).toBe(engine.meshResult!.triangleCount);
     const b = await e2.exportModel('colmap-zip');
@@ -470,10 +558,22 @@ describe('engine: R_cam_device verification', () => {
     const cap = makeCapture({ frames: 40, arcDeg: 50, width: 320, height: 240, theta: 90 });
     const e = new PhotogrammetryEngine({ mode: 'object', quality: 'fast', hfovPriorDeg: 60 }, testConfig());
     await e.init();
-    for (const f of frameInputs(cap, { screenAngle: 0 })) await e.processFrame(f);
-    expect(e.liveSession!.state.thetaSession).toBe(90);
-    expect(e.liveSession!.state.cameraTheta).toBe(90);
-    expect(e.liveSession!.state.cameraThetaVerified).toBe(true);
+    const updates: LiveUpdate[] = [];
+    for (const f of frameInputs(cap, { screenAngle: 0 })) updates.push(await e.processFrame(f));
+    const st = e.liveSession!.state;
+    expect(st.thetaSession).toBe(90);
+    expect(st.cameraTheta).toBe(90);
+    expect(st.cameraThetaVerified).toBe(true);
+    // the live cameras carry their physical up (the viewer's 'auto' world up), here from gravity
+    // (≈ 2° off: the orbit's accelerations); image up is horizontal
+    for (const r of st.records.values()) {
+      const R = cap.frames[r.frameIndex].pose.R;
+      expect(angleDeg(keyframeUpCam(r)!, [R[2], R[5], R[8]])).toBeLessThan(5);
+    }
+    const cams = updates.filter((u) => u.cameras?.length).pop()!.cameras!;
+    expect(cams.length).toBeGreaterThan(5);
+    const world = cams.map(({ pose: { R }, upCam: u }) => [0, 1, 2].map((k) => R[k] * u![0] + R[3 + k] * u![1] + R[6 + k] * u![2]));
+    for (const w of world) expect(angleDeg(w, world[0])).toBeLessThan(5);
     e.dispose();
   }, 300_000);
 

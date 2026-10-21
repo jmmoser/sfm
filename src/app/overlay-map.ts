@@ -15,8 +15,8 @@ import { canonicalRotation, snapScreenAngle, type ScreenAngle } from '../sensors
  *  - raw delivery is a property of the capture path, fixed by the FIRST portrait-UI frame: with raw
  *    delivery the landscape bitmaps of a landscape UI are raw too (upright for 90 also at θ = 270);
  *  - a portrait bitmap in a landscape UI is a transient mis-rotation the engine drops: no overlay;
- *  - frames within `settleMs` of a UI rotation are ignored for the delivery decision (as the engine
- *    drops them before classifying);
+ *  - frames within `settleMs` of a UI rotation (dated by `screenAngleSince` when given, as in the
+ *    engine) are ignored for the delivery decision (as the engine drops them before classifying);
  *  - a frame declared raw (`raw`, FrameInput.rawBuffer) is upright for θ = 90 in every UI rotation,
  *    without changing `rawDelivery` (the engine's stateless rule).
  * The preview shown at θ_display needs `canonicalRotation(θ_display, θ_upright)` CLOCKWISE quarter
@@ -34,10 +34,11 @@ export class FrameOrientationTracker {
    * Observe a submitted frame (call for EVERY frame, in submission order) and return the θ its
    * pixels are upright for, or null when the engine drops such a frame (no overlay).
    */
-  observe(f: { width: number; height: number; screenAngle: number; t?: number; raw?: boolean }): ScreenAngle | null {
+  observe(f: { width: number; height: number; screenAngle: number; t?: number; raw?: boolean; screenAngleSince?: number }): ScreenAngle | null {
     const ui = snapScreenAngle(f.screenAngle);
     const t = f.t ?? NaN;
-    if (this.lastUI !== null && ui !== this.lastUI) this.changeT = t;
+    const since = f.screenAngleSince;
+    if (this.lastUI !== null && ui !== this.lastUI) this.changeT = since !== undefined && Number.isFinite(since) && since <= t ? since : t;
     this.lastUI = ui;
     const settling = Number.isFinite(t) && t - this.changeT < this.settleMs;
     // a frame declared raw (FrameInput.rawBuffer): upright for θ = 90; per frame, no state change

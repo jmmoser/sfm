@@ -270,11 +270,12 @@ export interface LiveSummary {
   keyframeIndices: number[];
   frameMs: NumStats;
   keyframeMs: NumStats;
-  /** Last live cameras (LiveUpdate.cameras). */
+  /** Last live cameras (LiveUpdate.cameras of the newest update carrying them). */
   cameras: { pose: PoseJSON; f: number }[];
   /**
-   * Last live cameras mapped to dataset frames by keyframe order (only when their number equals
-   * the number of keyframes; integrator must verify the ordering assumption).
+   * Last live cameras mapped to dataset frames by keyframe order (only when every keyframe of
+   * that update is registered and each one was announced by a 'keyframe' frame response;
+   * integrator must verify the ordering assumption).
    */
   images: { index: number; pose: PoseJSON }[] | null;
 }

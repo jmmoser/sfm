@@ -20,7 +20,8 @@ import { VocabularyIndex } from '../sfm/vocab';
 import { computeWorldAlignment, type WorldAlignment, type WorldKeyframe } from '../sfm/world';
 import { gyroConsistency, timedRotations, type GyroConsistency } from '../sfm/gyro';
 import { median } from '../math/stats';
-import { handEyeCheck, type LiveSession } from './live';
+import type { ScreenAngle } from '../sensors/frame-orientation';
+import { handEyeCheck, keyframeUpCam, type HandEyeResult, type LiveSession } from './live';
 import { refinePerImageFocal, refineRollingShutter, rsStats, sparseRollingShutter, type RefineRSResult } from './refine-camera';
 import { pairToStored, type EngineStore, type StoredPair, type StoredPairs } from './persistence';
 import type { CpuPool } from './cpu-pool';
@@ -252,6 +253,19 @@ export function explainedCorrespondenceRatio(rec: Reconstruction, db: FeatureDat
     }
   }
   return total > 0 ? explained / total : 0;
+}
+
+/**
+ * Final R_cam_device check on the refined poses, by the rule of the live check
+ * (`LiveSession.maybeVerifyCameraFromDevice`): only a hypothesis that explains the gyro clearly
+ * best (median < 4° and under half the runner-up's) is switched to and marked verified. An
+ * ambiguous result verifies nothing: the gyro gates of later refines trust a verified θ.
+ */
+export function handEyeDecision(r: HandEyeResult, current: ScreenAngle | null): { switchTo: ScreenAngle | null; verified: boolean } {
+  const sorted = [...r.medianErrDeg].sort((x, y) => x - y);
+  const eb = r.medianErrDeg[r.best / 90];
+  if (r.pairs < 4 || !(eb < 4 && eb < 0.5 * sorted[1])) return { switchTo: null, verified: false };
+  return { switchTo: r.best !== current ? r.best : null, verified: true };
 }
 
 /** Options of `splitPairs`. */
@@ -616,7 +630,10 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
         }
         if (inflight.length) await drain(maxInflight);
       } catch (e) {
+        // a failed GPU match job: not attempted, the next refine tries the pair again
         unrecorded.delete(key);
+        st.attempted.delete(key);
+        attempted.splice(attempted.lastIndexOf(key), 1);
         deps.log('warn', `pair ${a}-${b}: ${(e as Error)?.message ?? e}`);
       }
       if (now() - lastYield > 40) {
@@ -923,14 +940,13 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
       st.imu,
       { offsetMs: st.timeOffsetMs ?? 0 },
     );
-    if (r && r.pairs >= 4) {
-      const sorted = [...r.medianErrDeg].sort((x, y) => x - y);
-      const best = r.best;
-      if (best !== st.cameraTheta && r.medianErrDeg[best / 90] < 4 && r.medianErrDeg[best / 90] < 0.5 * sorted[1]) {
-        deps.log('warn', `R_cam_device check (refined poses): switching θ ${st.cameraTheta} → ${best}`, r);
-        live.setCameraTheta(best);
+    if (r) {
+      const d = handEyeDecision(r, st.cameraTheta);
+      if (d.switchTo !== null) {
+        deps.log('warn', `R_cam_device check (refined poses): switching θ ${st.cameraTheta} → ${d.switchTo}`, r);
+        live.setCameraTheta(d.switchTo);
       }
-      if (r.medianErrDeg[best / 90] < 4) st.cameraThetaVerified = true;
+      if (d.verified) st.cameraThetaVerified = true;
     }
   }
   let alignment: WorldAlignment | null = null;
@@ -994,12 +1010,14 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   if (srs) model.rollingShutter = srs;
   const cameras: SparseCameraEx[] = model.images.map((im) => {
     const r = st.records.get(im.id);
+    const upCam = r ? keyframeUpCam(r) : undefined;
     return {
       id: im.id,
       pose: { R: Float64Array.from(im.pose.R), t: Float64Array.from(im.pose.t) },
       intrinsics: { ...model.cameras.get(im.cameraId)! },
       t: r?.t ?? NaN,
       frameIndex: r?.frameIndex ?? -1,
+      ...(upCam ? { upCam } : {}),
     };
   });
   const cam0 = cameras[0]?.intrinsics;

@@ -4,7 +4,7 @@ import { pipelineCompileLimits } from '../features/gpu-common';
 import { renderCPU } from './cpu-reference';
 import { SplatRenderer } from './renderer';
 import { randomScene, testCamera } from './testutil';
-import type { SplatCamera, SplatModel } from './types';
+import { ALPHA_MIN, type SplatCamera, type SplatModel } from './types';
 
 let ctx: GPUContext;
 const renderers = new Map<string, SplatRenderer>();
@@ -106,18 +106,66 @@ describe('SplatRenderer (GPU) vs CPU reference', () => {
   });
 
   it('grows the intersection reservation when a frame needs more', async () => {
-    const m = randomScene({ count: 300, seed: 25, logScale: [-1.2, -0.8], opacity: [0.2, 0.4] }); // large splats
+    const m = randomScene({ count: 300, seed: 25, logScale: [-1.2, -0.8], opacity: [0.2, 0.4] }); // large splats (16618 intersections)
     const cam = testCamera(160, 128);
+    const px = cam.width * cam.height;
     const r = await SplatRenderer.create(ctx, { maxWidth: 160, maxHeight: 128, isectCapacity: 4096 });
-    r.setModel(m);
-    const g = await r.render(cam, { withStats: true });
-    r.destroy();
-    const c = renderCPU(m, cam);
-    let d = 0;
-    for (let i = 0; i < cam.width * cam.height; i++) for (let ch = 0; ch < 3; ch++) d = Math.max(d, Math.abs(g.data[4 * i + ch] - c.color[3 * i + ch]));
-    console.log(`[splat] intersections ${g.intersections} (reserved 4096 → grown), max diff ${d.toExponential(2)}`);
-    expect(g.intersections).toBeGreaterThan(4096);
-    expect(d).toBeLessThan(1e-4);
+    // the same kernels with a reservation this frame fits from the start (it never grows)
+    const fits = await SplatRenderer.create(ctx, { maxWidth: 160, maxHeight: 128, isectCapacity: 32768 });
+    try {
+      r.setModel(m);
+      fits.setModel(m);
+      const g = await r.render(cam, { withStats: true, withN: true });
+      const e = await fits.render(cam, { withStats: true, withN: true });
+      expect(g.intersections).toBeGreaterThan(4096);
+      expect(r.isectCapacity).toBeGreaterThanOrEqual(g.intersections!);
+      expect(e.intersections).toBe(g.intersections);
+      expect(fits.isectCapacity).toBe(32768);
+      // The forward pass is deterministic (stable scan-ranked radix sorts with count-driven dispatches,
+      // per-pixel compositing) and the reservation only caps the emitted intersections: the frame
+      // rendered after the growth must be, bit for bit, the frame that never overflowed. A stale or
+      // truncated intersection list, or the overflowing first frame returned, would differ (the
+      // 4096-capped frame is off the CPU by 0.25 max, 5.3e-2 mean, by > 1e-4 on 86.5 % of its pixels).
+      const bits = (a: Float32Array | Uint32Array): Uint32Array => new Uint32Array(a.buffer, a.byteOffset, a.length);
+      const gb = bits(g.data);
+      const eb = bits(e.data);
+      let wordsDiffer = 0;
+      for (let i = 0; i < gb.length; i++) if (gb[i] !== eb[i]) wordsDiffer++;
+      let nDiffer = 0;
+      for (let i = 0; i < px; i++) if (g.n![i] !== e.n![i]) nDiffer++;
+      expect(wordsDiffer).toBe(0);
+      expect(nDiffer).toBe(0);
+      // ... and that frame is complete (f32 GPU vs f64 CPU). Pixels agree to f32 rounding (≤ 6.9e-7
+      // on SwiftShader) except where a splat's σ lands within the f32 error of the α cut
+      // σ = ln(o / α_min): one side skips the splat, the other adds α_min·T·c ≤ 0.84·α_min = 3.3e-3
+      // (T ≤ 1; degree-0 colours ≤ 0.5 + 1.2·SH_C0 = 0.84). On SwiftShader that is 1 pixel of 20480:
+      // (0, 80), splat 19 at σ 4.1855038 (f64) / 4.1854987 (f32) against the cut 4.1855013 / 4.1855016,
+      // which differs by 1.25e-3. A `max < 1e-4` bound over all pixels holds only when no σ happens to
+      // land that close to a cut, i.e. by luck, on any f32 rasteriser.
+      const c = renderCPU(m, cam);
+      let maxDiff = 0;
+      let sum = 0;
+      let over = 0;
+      for (let i = 0; i < px; i++) {
+        let d = 0;
+        for (let ch = 0; ch < 3; ch++) d = Math.max(d, Math.abs(g.data[4 * i + ch] - c.color[3 * i + ch]));
+        maxDiff = Math.max(maxDiff, d); // NaN propagates and fails below
+        sum += d;
+        if (!(d <= 1e-4)) over++;
+      }
+      console.log(
+        `[splat] intersections ${g.intersections} (reserved 4096 → ${r.isectCapacity}); same bits as the unbounded frame; vs CPU: max ${maxDiff.toExponential(2)}, mean ${(sum / px).toExponential(2)}, ${over} of ${px} pixels > 1e-4`,
+      );
+      // α-cut flips only: 1 pixel here; 20 (1e-3) leaves room for a GPU whose exp / FMA rounding moves σ more
+      expect(over / px).toBeLessThan(1e-3);
+      // ≤ two flipped splats in one pixel (2 · 3.3e-3); at 1 flip per 20480 pixels, two in one pixel is ~2e-5 per run
+      expect(maxDiff).toBeLessThan(2 * ALPHA_MIN);
+      // rounding (1.5e-7 here) + 20 flipped pixels at 3.3e-3 each (3.2e-6): 4 orders below a truncated frame
+      expect(sum / px).toBeLessThan(5e-6);
+    } finally {
+      r.destroy();
+      fits.destroy();
+    }
   });
 
   it('a rejected reservation or model leaves the renderer intact (review)', async () => {

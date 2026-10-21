@@ -303,7 +303,8 @@ export type RSCostBatchFunction = (models: RollingShutterModel[]) => Promise<num
 /**
  * Search the readout (axis, signed time) minimising `cost`: 0; ±10 and ±25 ms (for the default
  * 40 ms range) on both axes choose the axis and direction — ±25 ms only along the direction that
- * is clearly best at ±10 ms, when one is (3 evaluations fewer, same result); along it, successive
+ * is clearly best at ±10 ms, when one is (3 evaluations fewer, same result); along it, the range
+ * end if the outer probe is best, bisection towards the end while it stays best, then successive
  * parabola fits (≤ 3 more evaluations). Accepted when the relative decrease against 0 reaches
  * `minImprovement` and |readout| ≥ `minReadoutMs`. ≈ 10–18 cost evaluations in total.
  */
@@ -418,13 +419,21 @@ function* rsSearchSteps(
       xs = [...known.keys()].sort((a, b) => a - b);
       bi = xs.reduce((k, x, i) => (known.get(x)! < known.get(xs[k])! ? i : k), 0);
     }
+    const tol = Math.max(0.5, 0.2 * o.stepMs);
+    // still best at the range end: bisect towards it until bracketed (or within tol of the end);
+    // not after an extension stopped short of the end (the minimum lies beyond, nothing to bracket)
+    for (let g = 0; g < 6 && bi === xs.length - 1 && bi > 0 && xs[bi] >= o.maxReadoutMs && xs[bi] - xs[bi - 1] > tol; g++) {
+      const mid = 0.5 * (xs[bi - 1] + xs[bi]);
+      known.set(mid, use(mid, (yield [hyp(mid)])[0]));
+      xs = [...known.keys()].sort((a, b) => a - b);
+      bi = xs.reduce((k, x, i) => (known.get(x)! < known.get(xs[k])! ? i : k), 0);
+    }
     let a = xs[Math.max(0, bi - 1)],
       b = xs[bi],
       c = xs[Math.min(xs.length - 1, bi + 1)];
     let fa = known.get(a)!,
       fb = known.get(b)!,
       fc = known.get(c)!;
-    const tol = Math.max(0.5, 0.2 * o.stepMs);
     for (let it = 0; it < 8 && c - a > tol && a < b && b < c; it++) {
       // vertex of the parabola through (a, fa), (b, fb), (c, fc)
       const num = (b - a) ** 2 * (fb - fc) - (b - c) ** 2 * (fb - fa);

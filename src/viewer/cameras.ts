@@ -18,6 +18,8 @@ import { cameraCenter } from './helpers';
 export interface ViewerCamera {
   pose: Pose;
   intrinsics: CameraIntrinsics;
+  /** Physical up in the camera frame (unit) when known; else image up (−y). For the 'auto' world up. */
+  upCam?: ArrayLike<number> | null;
 }
 
 /** Line segments per frustum: 4 rays, 4 rectangle edges, 2 for the "up" marker. */

@@ -11,7 +11,7 @@
  *   loaded     a scan is open in the engine → Run asks first ("Free memory and run" releases the
  *              engine, then runs; "Run anyway"); the scan opens again afterwards
  * Prints the text report of the run. Screenshots: e2e/out/ui/bench-*.png.
- * Usage: node e2e/ui/bench.mjs [run|cancel|no-webgpu|loaded ...] [--scale small|full] [--verbose]
+ * Usage: node e2e/ui/bench.mjs [run|cancel|no-webgpu|loaded|closed ...] [--scale small|full] [--verbose]
  */
 import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -19,8 +19,19 @@ import { OUT, launch, layoutAudit, shot, sleep } from './lib.mjs';
 
 const argv = process.argv.slice(2);
 const scaleIdx = argv.indexOf('--scale');
-const scale = scaleIdx >= 0 ? argv[scaleIdx + 1] : 'small';
+const scaleEq = argv.find((a) => a.startsWith('--scale='));
+const scale = scaleEq ? scaleEq.slice('--scale='.length) : scaleIdx >= 0 ? argv[scaleIdx + 1] : 'small';
 const args = argv.filter((a, i) => !a.startsWith('--') && argv[i - 1] !== '--scale');
+const SCENARIOS = ['run', 'cancel', 'no-webgpu', 'loaded', 'closed'];
+// A misspelled name or option (or `full` without --scale) would run nothing, or the wrong thing, and still pass.
+const unknown = args.filter((a) => !SCENARIOS.includes(a));
+const badFlags = argv.filter((a) => a.startsWith('--') && a !== '--scale' && a !== '--verbose' && a !== scaleEq);
+if (unknown.length || badFlags.length || !['small', 'full'].includes(scale)) {
+  if (unknown.length) console.error(`[bench] unknown scenario(s): ${unknown.join(', ')}\n[bench] known: ${SCENARIOS.join(', ')}`);
+  else if (badFlags.length) console.error(`[bench] unknown option(s): ${badFlags.join(', ')} (known: --scale small|full, --verbose)`);
+  else console.error(`[bench] --scale must be small | full, got ${scale}`);
+  process.exit(2);
+}
 const want = (n) => !args.length || args.includes(n);
 const { newPage, close, consoleErrors, base } = await launch({ verbose: argv.includes('--verbose') });
 const failures = [];
@@ -35,6 +46,7 @@ const url = (extra = '') => `${base}?mock=1&screen=diagnostics&benchScale=${scal
 const TIMEOUT = scale === 'full' ? 3_600_000 : 900_000;
 
 async function scenario(name, fn) {
+  if (!SCENARIOS.includes(name)) throw new Error(`scenario ${name} is missing from SCENARIOS`);
   if (!want(name)) return;
   console.log(`[bench] — ${name}`);
   try {
@@ -217,6 +229,36 @@ await scenario('loaded', async () => {
   await by(page, 'session-item').first().tap();
   await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
   check(/Loaded vase/.test((await page.locator('.viewer-title').textContent()) ?? ''), 'the scan opens again after the release');
+  await context.close();
+});
+
+await scenario('closed', async () => {
+  const { page, context } = await newPage();
+  await page.goto(`${base}?mock=1&benchScale=${scale}`);
+  await by(page, 'new-scan').waitFor();
+  await page.evaluate(async () => {
+    const { SessionStore } = await import('/src/io/storage.ts');
+    const s = await SessionStore.open();
+    await s.createSession({ id: 'seed-closed', name: 'Deleted vase', mode: 'object', status: 'meshed', stats: { quality: 'fast', keyframes: 20 } });
+  });
+  await page.reload();
+  // open the scan, then delete it: the engine lets go of it (closed) but its worker stays
+  await by(page, 'session-item').first().tap();
+  await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  await by(page, 'viewer-back').tap();
+  await page.evaluate(() => globalThis.__sfmApp.deleteSession('seed-closed'));
+  const before = await page.evaluate(() => ({ ...globalThis.__sfmApp.engine.status, loaded: globalThis.__sfmApp.loadedSessionId }));
+  check(before.state === 'idle' && before.reason === 'closed' && before.loaded === null, `deleting the open scan closes it (${JSON.stringify(before)})`);
+  await by(page, 'open-diagnostics').tap();
+  await by(page, 'bench-run').waitFor({ timeout: 30000 });
+  // nothing loaded: no question, but what the closed engine still parks is freed first
+  await by(page, 'bench-run').tap();
+  await by(page, 'bench-cancel').waitFor({ timeout: 10000 });
+  check((await page.locator('[data-testid="bench-run-anyway"]').count()) === 0, 'no question after a delete');
+  const st = await page.evaluate(() => globalThis.__sfmApp.engine.status);
+  check(st.state === 'idle' && st.reason === 'released', `the closed engine was released before the benchmark (${JSON.stringify(st)})`);
+  await by(page, 'bench-cancel').tap();
+  await waitReport(page);
   await context.close();
 });
 

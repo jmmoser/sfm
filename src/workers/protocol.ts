@@ -14,7 +14,8 @@
  * sender no longer needs (a transferred buffer is detached on the sending side).
  *
  * Extensions over ENGINE.md (superset, nothing removed): the `visibility` request (workers get
- * no `visibilitychange`; the engine must not submit GPU work while the page is hidden),
+ * no `visibilitychange`; the engine must not submit GPU work while the page is hidden), the
+ * `close` request (let go of a session before it is deleted),
  * `EngineOptions.resume` (re-open a persisted session after a worker respawn), optional
  * FramePump metadata on `FrameInput`, `SessionSummary` carries the stored models, the Gaussian
  * splatting stage (`splat`, `splatModel`, export 'ply-splat', `ProgressEvent.detail`).
@@ -104,6 +105,12 @@ export interface FrameInput {
   t: number;
   /** θ of ARCHITECTURE §2 when the frame was captured. */
   screenAngle: ScreenAngle;
+  /**
+   * performance.now() time θ took the value `screenAngle` (FramePump: when the UI rotated; −∞: no
+   * rotation seen). The engine's settle window after a rotation starts there, else at the first
+   * frame with the new θ.
+   */
+  screenAngleSince?: number;
   /** IMU samples since the previous frame. */
   imu: ImuSample[];
   geo?: GeoFix | null;
@@ -140,6 +147,12 @@ export interface LiveCamera {
   intrinsics: CameraIntrinsics;
   /** Capture time of the keyframe on the IMU clock (camera time + estimated camera–IMU offset), ms. */
   t?: number;
+  /**
+   * Physical up in the camera frame (unit): −gravity when known, else up for a phone held in the
+   * frame's UI rotation. The images are upright for the session's θ₀, not for how the phone was
+   * held (raw sensor buffers: θ₀ = 90 in a portrait UI), so image up (−y) need not be up.
+   */
+  upCam?: [number, number, number];
 }
 
 export interface LiveUpdate {
@@ -208,6 +221,8 @@ export interface SparseCamera {
   id: number;
   pose: Pose;
   intrinsics: CameraIntrinsics;
+  /** Physical up in the camera frame (unit), as LiveCamera.upCam; absent = unknown. */
+  upCam?: [number, number, number];
 }
 
 export interface SparseResult {
@@ -370,6 +385,12 @@ export interface EngineMethodMap {
   cancel: { params: { target?: number } | undefined; result: void };
   /** Extension: page visibility (pause GPU submissions while hidden). */
   visibility: { params: { hidden: boolean }; result: void };
+  /**
+   * Extension: let go of session `sessionId` before it is deleted — its engine is disposed (no
+   * more writes to it), the compiled feature pipeline is kept for the next init. Result: whether
+   * the engine held that session.
+   */
+  close: { params: { sessionId: string }; result: boolean };
   dispose: { params: undefined; result: void };
 }
 
@@ -390,6 +411,7 @@ export const ENGINE_METHODS: readonly EngineMethod[] = [
   'loadSession',
   'cancel',
   'visibility',
+  'close',
   'dispose',
 ];
 

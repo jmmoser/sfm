@@ -215,6 +215,29 @@ describe('runIncrementalSfM', () => {
     expect(ea.focalError).toBeLessThan(0.01);
     expect(eb.focalError).toBeLessThan(0.01);
   });
+
+  it('a given initial pair builds one model (not one per threshold level)', async () => {
+    const a = generateScene({ kind: 'orbit', numImages: 24, seed: 11, k1: 0.03, descriptors: false, numPoints: 3000 });
+    const b = generateScene({ kind: 'walk', numImages: 36, seed: 12, k1: 0.03, descriptors: false, idOffset: 1000 });
+    const s = combineScenes(a, b);
+    const guess = { ...s.camera, f: s.camera.f * 1.08, k1: 0 };
+    const { db } = buildSyntheticDatabase(s, { camera: guess });
+    const models = await runIncrementalSfM(db, { intrinsics: guess, initImagePair: [0, 3] });
+    expect(models.length).toBe(1);
+    expect(models[0].numRegisteredImages).toBe(24);
+    expect(models[0].registeredImageIds().every((id) => id < 1000)).toBe(true);
+    expect(models[0].images.get(0)!.registered && models[0].images.get(3)!.registered).toBe(true);
+  });
+
+  it('a given initial pair that fails at the strict level is retried at the relaxed ones', async () => {
+    // median angle ≈ 2°: the strict level's 4° minimum point angle leaves < 15 points, 2° hundreds
+    const s = generateScene({ kind: 'walk', numImages: 36, seed: 7, k1: 0.03, descriptors: false });
+    const guess = { ...s.camera, f: s.camera.f * 1.08, k1: 0 };
+    const { db } = buildSyntheticDatabase(s, { camera: guess });
+    const models = await runIncrementalSfM(db, { intrinsics: guess, initImagePair: [0, 1] });
+    expect(models.length).toBe(1);
+    expect(models[0].numRegisteredImages).toBe(36);
+  });
 });
 
 describe('rotationCheck (external rotation consistency, e.g. the gyro)', () => {

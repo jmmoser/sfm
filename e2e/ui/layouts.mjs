@@ -124,9 +124,12 @@ for (const device of devices) {
     await page.waitForFunction(() => Number(document.querySelector('[data-testid="kf-count"]')?.textContent) >= 5, null, { timeout: 90000 });
     await page.evaluate(() => globalThis.__sfmApp?.debug.holdFrames?.(true));
     await auditAndShot(page, device, 'capture');
+    // the thumbnail opens the cloud view (point cloud seen from the camera); its toggle closes it
     await by(page, 'mini-view').tap();
+    await page.waitForSelector('.capture.cloud-view');
     await auditAndShot(page, device, 'capture-3d');
-    await page.locator('.mini-collapse').tap();
+    await by(page, 'cloud-toggle').tap();
+    await page.waitForFunction(() => !document.querySelector('.capture.cloud-view'));
     await by(page, 'pause').tap();
     await auditAndShot(page, device, 'capture-paused');
     await page.evaluate(() => globalThis.__sfmApp?.debug.holdFrames?.(false));

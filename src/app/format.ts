@@ -73,7 +73,9 @@ export function formatCount(n: number | null | undefined): string {
   if (a < 1000) return String(Math.round(n));
   if (a < 1e6) {
     const k = n / 1000;
-    return `${Math.abs(k) < 10 ? trimZeros(k.toFixed(1)) : Math.round(k)}k`;
+    const s = Math.abs(k) < 10 ? trimZeros(k.toFixed(1)) : String(Math.round(k));
+    // Round first so 999.6k becomes "1M" instead of "1000k".
+    if (Math.abs(Number(s)) < 1000) return `${s}k`;
   }
   const m = n / 1e6;
   return `${Math.abs(m) < 10 ? trimZeros(m.toFixed(2)) : Math.abs(m) < 100 ? trimZeros(m.toFixed(1)) : Math.round(m)}M`;

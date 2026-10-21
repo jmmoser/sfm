@@ -82,7 +82,14 @@ export function parseArgs(argv) {
     else if (a === '--views') o.cfg.maxViews = int(2);
     else if (a === '--stride') o.cfg.stride = int(1);
     else if (a === '--first') o.cfg.first = int(0);
-    else if (a === '--frames') o.cfg.frames = next().split(',').map((s) => Number(s));
+    else if (a === '--frames') {
+      const parts = next().split(',').map((s) => s.trim());
+      const ids = parts.map(Number);
+      if (parts.some((s) => s === '') || !ids.every((v) => Number.isInteger(v) && v >= 0)) throw new Error('--frames needs comma-separated frame indices ≥ 0');
+      if (new Set(ids).size !== ids.length) throw new Error('--frames has duplicate indices');
+      if (ids.length < 2) throw new Error('--frames needs at least 2 frames');
+      o.cfg.frames = ids;
+    }
     else if (a === '--sources') o.cfg.numSources = int(1);
     else if (a === '--iterations') setPath(o.cfg, 'pm.iterations', int(1));
     else if (a === '--geom-iterations') setPath(o.cfg, 'geo.geometricIterations', int(1));
@@ -123,7 +130,8 @@ export function parseArgs(argv) {
     else if (a.startsWith('--')) throw new Error(`unknown option ${a}`);
     else o.scenes.push(a);
   }
-  if (o.scenes.length === 0 || o.scenes.includes('all')) o.scenes = ['object', 'yard'];
+  o.scenes = [...new Set(o.scenes.flatMap((s) => (s === 'all' ? ['object', 'yard'] : [s])))];
+  if (o.scenes.length === 0) o.scenes = ['object', 'yard'];
   if (o.tag !== null && !/^[\w.-]+$/.test(o.tag)) throw new Error('--tag must be a plain name');
   if (o.loadMaps !== undefined && !/^[\w.{}-]+$/.test(o.loadMaps)) throw new Error('--load-maps must be a run name (e.g. object or {scene}-base)');
   for (const s of o.scenes) if (!/^[\w.-]+$/.test(s)) throw new Error(`bad dataset name ${s}`);
@@ -398,6 +406,22 @@ function aggTable(agg) {
   return rows.map((r) => r.map((s, c) => (c === 0 ? s.padEnd(w[c]) : s.padStart(w[c]))).join('  ')).join('\n');
 }
 
+/**
+ * Subset visibility (<name>.compvis.u8: one byte per completeness-set GT sample), or null when
+ * this run wrote none (a file of that name is then left over from an earlier run) or its length
+ * does not match the GT set.
+ */
+export async function loadSubsetVisibility(file, produced, nSamples) {
+  if (!produced) return null;
+  const b = await readFile(file);
+  const v = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+  if (v.length !== nSamples) {
+    console.warn(`[dense-gt] ${file}: ${v.length} entries, expected ${nSamples}; ignoring it`);
+    return null;
+  }
+  return v;
+}
+
 // ---------------------------------------------------------------------------- main
 
 async function runScene(page, scene, opts, outDir) {
@@ -462,11 +486,7 @@ async function runScene(page, scene, opts, outDir) {
     out.metrics = m;
     console.log(`\nmetrics (identity alignment):\n${formatTable(m)}`);
     // completeness restricted to GT samples visible in the used views
-    let compVis = null;
-    try {
-      const b = await readFile(join(outDir, `${name}.compvis.u8`));
-      compVis = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
-    } catch {}
+    const compVis = await loadSubsetVisibility(join(outDir, `${name}.compvis.u8`), !!summary.completenessVisibility, (dataset.gtFocus ?? dataset.gt).points.length / 3);
     if (compVis) {
       // visible in the dataset (any frame) AND in at least one of the used views
       const set0 = dataset.gtFocus ?? dataset.gt;

@@ -18,7 +18,7 @@ import { loadViewerModule } from '../viewer-loader';
 import { formatDistance } from '../../viewer/helpers';
 import type { ProgressEvent } from '../../core/types';
 import { isCancelledError, type ExportFormat, type QualityPreset } from '../../workers/protocol';
-import type { App, Screen } from '../app';
+import type { App, Results, Screen } from '../app';
 import { button, chip, group, iconButton, kvRow, progressBar, section, segmented, setButtonLabel, spinner, switchRow } from '../components/controls';
 import { confirmDialog } from '../components/dialog';
 import { openSheet, type SheetHandle } from '../components/sheet';
@@ -72,6 +72,8 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   const d = new Disposer();
   let viewer: Viewer | null = null;
   let closed = false;
+  /** load() applied this scan: until then app.results may still describe the previous one. */
+  let ready = false;
   let measuring = false;
   const display: DisplayState = { layer: 'points', cameras: true, edl: true, grid: true, meshLighting: false };
   const exports = new Map<ExportFormat, ExportState>();
@@ -198,6 +200,8 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
 
   function applyContent(first: boolean): void {
     const r = app.results;
+    // (an empty dense cloud, from a fusion that kept nothing, shows the sparse one, as exports do)
+    const dense = r.dense && r.dense.count > 0 ? r.dense : null;
     titleEl.textContent = r.name;
     renderBadges();
     if (!viewer) {
@@ -207,11 +211,11 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     const metric = r.sparse?.metric;
     viewer.setWorldUp(metric?.gravityAligned ? 'z' : 'auto');
     viewer.setUnits(!!metric?.metric);
-    if (r.dense) viewer.setPointCloud(r.dense);
+    if (dense) viewer.setPointCloud(dense);
     else if (r.sparse) viewer.setPointCloud(r.sparse.points, { pointSizePx: 3, splats: false });
     else viewer.setPointCloud(null);
     viewer.setMesh(r.mesh);
-    viewer.setCameras(r.sparse ? r.sparse.cameras.map((c) => ({ pose: c.pose, intrinsics: c.intrinsics })) : [], false);
+    viewer.setCameras(r.sparse ? r.sparse.cameras.map((c) => ({ pose: c.pose, intrinsics: c.intrinsics, upCam: c.upCam })) : [], false);
     if (first) {
       // the photoreal model when there is one (points meanwhile, while it loads), else the mesh
       display.layer = r.splat ? 'splats' : r.mesh ? 'mesh' : 'points';
@@ -232,7 +236,8 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     const layer = display.layer === 'splats' && splatState !== 'ready' ? 'points' : display.layer;
     if (layer === 'splats' && r.splat) parts.push(`${formatCount(r.splat.count)} Gaussians`);
     else if (layer === 'mesh' && r.mesh) parts.push(`${formatCount(r.mesh.triangleCount)} triangles`);
-    else if (r.dense) parts.push(`${formatCount(r.dense.count)} points`);
+    // (an empty dense cloud shows the sparse one: applyContent)
+    else if (r.dense && r.dense.count > 0) parts.push(`${formatCount(r.dense.count)} points`);
     else if (r.sparse) parts.push(`${formatCount(r.sparse.points.count)} points`);
     if (r.sparse) parts.push(`${r.sparse.cameras.length} photos`);
     subEl.textContent = parts.join(' · ');
@@ -412,6 +417,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
 
   // ---- sheets ------------------------------------------------------------------------------------
   function openDisplay(): void {
+    if (!ready) return;
     const r = app.results;
     const av = availableLayers();
     const layers = segmented<LayerId>(
@@ -449,6 +455,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   }
 
   function openBuild(): void {
+    if (!ready) return;
     const r = app.results;
     const resumable = denseResumable(r);
     // the interrupted run's preset (null: unknown — older records)
@@ -599,28 +606,6 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     }
   }
 
-  function exportAvailability(f: ExportFormat): { ok: boolean; sub: string } {
-    const r = app.results;
-    switch (f) {
-      case 'ply-points':
-        if (r.dense) return { ok: true, sub: `Dense cloud · ${formatCount(r.dense.count)} points, normals, colours` };
-        if (r.sparse) return { ok: true, sub: `Sparse points · ${formatCount(r.sparse.points.count)}` };
-        return { ok: false, sub: 'No points yet' };
-      case 'ply-mesh':
-        return r.mesh ? { ok: true, sub: `${formatCount(r.mesh.triangleCount)} triangles with vertex colours` } : { ok: false, sub: 'Build the mesh first' };
-      case 'glb':
-        if (r.mesh) return { ok: true, sub: 'Coloured mesh — opens in most 3D apps and AR' };
-        if (r.dense || r.sparse) return { ok: true, sub: 'Coloured point cloud (glTF binary)' };
-        return { ok: false, sub: 'Nothing to export yet' };
-      case 'colmap-zip':
-        return r.sparse ? { ok: true, sub: `Cameras, sparse model and ${r.sparse.cameras.length} photos` } : { ok: false, sub: 'No sparse model yet' };
-      case 'ply-splat':
-        return r.splat
-          ? { ok: true, sub: `${formatCount(r.splat.count)} Gaussians · opens in SuperSplat, Spark and most splat viewers` }
-          : { ok: false, sub: 'Build the photoreal model first' };
-    }
-  }
-
   /** Re-renders the OPEN export sheet (null when closed): a build that finishes after the sheet
    *  was closed and opened again must update the new sheet, not the detached old list. */
   let renderExports: (() => void) | null = null;
@@ -630,6 +615,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   let sharingUntil = 0;
 
   function openExport(): void {
+    if (!ready) return;
     const list = h('div', { class: 'export-list' });
     const render = (): void => {
       replaceChildren(list, ...EXPORTS.map((e) => exportRow(e)));
@@ -649,7 +635,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   }
 
   function exportRow(e: (typeof EXPORTS)[number]): HTMLElement {
-    const av = exportAvailability(e.format);
+    const av = exportAvailability(app.results, e.format);
     const st = exports.get(e.format) ?? { status: 'idle' };
     const filename = exportFilename(app.results.name, e.ext, e.suffix);
     let action: HTMLElement;
@@ -720,6 +706,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   }
 
   function openInfo(): void {
+    if (!ready) return;
     const r = app.results;
     const sp = r.sparse;
     const m = sp?.metric;
@@ -882,6 +869,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       }
     }
     if (closed) return;
+    ready = true;
     loading.hidden = true;
     if (!app.env.webgl) {
       replaceChildren(canvasHost, h('div', { class: 'viewer-nogl' }, icon('warning', { size: 28 }), h('p', { text: 'WebGL is not available, so the model cannot be displayed. You can still export it.' })));
@@ -918,6 +906,30 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       d.dispose();
     },
   };
+}
+
+/** Whether an export format has something to export, and what (the Export sheet's sub line). */
+export function exportAvailability(r: Pick<Results, 'sparse' | 'dense' | 'mesh'> & Partial<Pick<Results, 'splat'>>, f: ExportFormat): { ok: boolean; sub: string } {
+  // an empty dense cloud (fusion kept no point) is skipped like the engine's export does
+  const dense = r.dense && r.dense.count > 0 ? r.dense : null;
+  switch (f) {
+    case 'ply-points':
+      if (dense) return { ok: true, sub: `Dense cloud · ${formatCount(dense.count)} points, normals, colours` };
+      if (r.sparse) return { ok: true, sub: `Sparse points · ${formatCount(r.sparse.points.count)}` };
+      return { ok: false, sub: 'No points yet' };
+    case 'ply-mesh':
+      return r.mesh ? { ok: true, sub: `${formatCount(r.mesh.triangleCount)} triangles with vertex colours` } : { ok: false, sub: 'Build the mesh first' };
+    case 'glb':
+      if (r.mesh) return { ok: true, sub: 'Coloured mesh — opens in most 3D apps and AR' };
+      if (dense || r.sparse) return { ok: true, sub: 'Coloured point cloud (glTF binary)' };
+      return { ok: false, sub: 'Nothing to export yet' };
+    case 'colmap-zip':
+      return r.sparse ? { ok: true, sub: `Cameras, sparse model and ${r.sparse.cameras.length} photos` } : { ok: false, sub: 'No sparse model yet' };
+    case 'ply-splat':
+      return r.splat
+        ? { ok: true, sub: `${formatCount(r.splat.count)} Gaussians · opens in SuperSplat, Spark and most splat viewers` }
+        : { ok: false, sub: 'Build the photoreal model first' };
+  }
 }
 
 /** Engine memory statistics (stats.memoryMB after the last step, the dense plan's peak, size caps). */

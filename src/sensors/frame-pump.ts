@@ -42,12 +42,15 @@ export interface PumpFrame {
   timeSource: FrameMeta['timeSource'];
   /** UI rotation θ (ARCHITECTURE §2) of the frame. */
   screenAngle: ScreenAngle;
+  /** performance.now() time θ took that value (ScreenAngleTracker.lastChangeTime; −∞: no rotation seen). */
+  screenAngleSince: number;
   /** cameraFromDevice(screenAngle). */
   R_cam_device: Mat3;
   /** Normalised IMU samples since the previous delivered frame (may extend slightly past t). */
   imu: ImuSample[];
   /** MotionSensor calibration version the samples were normalised with (-1 without motion). */
   imuCalibrationVersion: number;
+  /** The GPS fix nearest in time to t, with its own timestamp (null: none within `geoMaxAgeMs`). */
   geo: GeoFix | null;
   heading: HeadingReading | null;
   attitude: AttitudeReading | null;
@@ -76,7 +79,6 @@ export interface FramePumpMotion {
 }
 export interface FramePumpGeo {
   nearest(t: number): GeoFix | null;
-  interpolate?(t: number): GeoFix | null;
 }
 export interface FramePumpCompass {
   headingAt(t: number): HeadingReading | null;
@@ -242,6 +244,7 @@ export class FramePump {
       return;
     }
     const theta = this.tracker.angle;
+    const thetaSince = this.tracker.lastChangeTime;
     this.busyFlag = true;
     // Counted at the attempt so that failing grabs are retried at targetHz, not on every frame.
     this.lastDeliveredT = t;
@@ -258,7 +261,7 @@ export class FramePump {
     }
     const gms = performance.now() - g0;
     st.grabMs = st.grabMs === 0 ? gms : st.grabMs + 0.2 * (gms - st.grabMs);
-    void this.deliver(grab, t, meta.timeSource, meta.segment, theta, this.runGen, ms);
+    void this.deliver(grab, t, meta.timeSource, meta.segment, theta, thetaSince, this.runGen, ms);
   };
 
   private checkAspect(w: number, h: number, theta: number): boolean {
@@ -291,6 +294,7 @@ export class FramePump {
     timeSource: FrameMeta['timeSource'],
     segment: number,
     theta: ScreenAngle,
+    thetaSince: number,
     gen: number,
     maxSide: number | null,
   ): Promise<void> {
@@ -319,7 +323,9 @@ export class FramePump {
       const imu = m ? m.drain() : [];
       let geo: GeoFix | null = null;
       if (this.o.geo) {
-        geo = this.o.geo.interpolate?.(t) ?? this.o.geo.nearest(t);
+        // the raw fix with its own timestamp: in real time no fix after t exists yet, so an
+        // interpolation would restamp the last fix to t (a lag the GPS alignment cannot see)
+        geo = this.o.geo.nearest(t);
         if (geo && Math.abs(geo.t - t) > (this.o.geoMaxAgeMs ?? 30000)) geo = null;
       }
       const c = this.o.compass;
@@ -331,6 +337,7 @@ export class FramePump {
         t,
         timeSource,
         screenAngle: theta,
+        screenAngleSince: thetaSince,
         R_cam_device: cameraFromDevice(theta),
         imu,
         imuCalibrationVersion: m?.calibration?.version ?? -1,

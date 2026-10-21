@@ -119,16 +119,25 @@ function finite3(v: ArrayLike<number> | null | undefined): boolean {
 }
 
 /**
+ * Longest IMU sample gap (ms) a rotation is integrated across. Longer gaps (page hidden, worker
+ * respawn, ring-buffer overflow) have an unknown rotation: an interval spanning one is not covered.
+ */
+export const IMU_MAX_GAP_MS = 500;
+
+/**
  * Incremental gyro integrator: cumulative device attitude Q(t) = R_wd(t₀)ᵀ R_wd(t) at every sample
  * (2nd-order Magnus steps, linear ω within a sample interval), bias-corrected, grown by `sync` as
  * samples arrive (amortised O(new samples); a rebuild only when the bias changes or a sample was
- * inserted out of order). Queries take CAMERA times (IMU time = camera time + offsetMs).
+ * inserted out of order). Queries take CAMERA times (IMU time = camera time + offsetMs); an
+ * interval across a sample gap > IMU_MAX_GAP_MS is not covered (no rotation, so no gyro check).
  */
 export class GyroReference {
   private t = new Float64Array(256);
   private w = new Float64Array(3 * 256);
   private q = new Float64Array(4 * 256);
   private n = 0;
+  /** Indices i with t[i] − t[i−1] > IMU_MAX_GAP_MS (ascending). */
+  private gapEnd: number[] = [];
   private last: ImuSample | null = null;
   private srcLen = 0;
   private readonly tq = new Float64Array(8);
@@ -177,6 +186,7 @@ export class GyroReference {
     g.w = this.w.slice(0, Math.max(3, 3 * this.n));
     g.q = this.q.slice(0, Math.max(4, 4 * this.n));
     g.n = this.n;
+    g.gapEnd = this.gapEnd.slice();
     g.last = this.last;
     g.srcLen = this.srcLen;
     return g;
@@ -191,7 +201,10 @@ export class GyroReference {
     // prefix intact ⇔ the last source sample seen by the previous sync is still at its position
     let start = 0;
     if (this.srcLen > 0 && L >= this.srcLen && samples[this.srcLen - 1] === this.last) start = this.srcLen;
-    else this.n = 0;
+    else {
+      this.n = 0;
+      this.gapEnd = [];
+    }
     const bx = this.biasV ? this.biasV[0] : 0,
       by = this.biasV ? this.biasV[1] : 0,
       bz = this.biasV ? this.biasV[2] : 0;
@@ -209,6 +222,7 @@ export class GyroReference {
         this.q[0] = 1;
         this.q[1] = this.q[2] = this.q[3] = 0;
       } else {
+        if (this.t[i] - this.t[i - 1] > IMU_MAX_GAP_MS) this.gapEnd.push(i);
         const h = (this.t[i] - this.t[i - 1]) / 1000;
         this.step(i - 1, h, this.w[3 * i], this.w[3 * i + 1], this.w[3 * i + 2], this.q, 4 * i);
       }
@@ -250,15 +264,28 @@ export class GyroReference {
     return this.n >= 2 ? [this.t[0], this.t[this.n - 1]] : null;
   }
 
-  /** True when the samples cover the CAMERA times [ta, tb] (within slackMs). */
+  /** True when the samples cover the CAMERA times [ta, tb] (within slackMs) without a gap > IMU_MAX_GAP_MS. */
   covers(ta: number, tb: number, slackMs = 60): boolean {
     if (this.n < 2 || !Number.isFinite(ta) || !Number.isFinite(tb)) return false;
-    const lo = Math.min(ta, tb) + this.offsetMs,
-      hi = Math.max(ta, tb) + this.offsetMs;
-    return this.t[0] <= lo + slackMs && this.t[this.n - 1] >= hi - slackMs;
+    const lo = Math.min(ta, tb) + this.offsetMs + slackMs,
+      hi = Math.max(ta, tb) + this.offsetMs - slackMs;
+    if (!(this.t[0] <= lo && this.t[this.n - 1] >= hi)) return false;
+    // the first gap ending after lo is the only one that can start before hi
+    const ge = this.gapEnd;
+    let a = 0,
+      b = ge.length;
+    while (a < b) {
+      const mid = (a + b) >> 1;
+      if (this.t[ge[mid]] <= lo) a = mid + 1;
+      else b = mid;
+    }
+    return a === ge.length || this.t[ge[a] - 1] >= hi;
   }
 
-  /** Q(t) at IMU time t into out[o..o+3] (ω held constant outside the samples). */
+  /**
+   * Q(t) at IMU time t into out[o..o+3] (ω held constant outside the samples, and inside a gap
+   * > IMU_MAX_GAP_MS from its nearer end: `covers`' slack reaches that far into a gap).
+   */
   private quatAt(tm: number, out: Float64Array, o: number): void {
     const n = this.n;
     if (n === 0) {
@@ -267,10 +294,7 @@ export class GyroReference {
       return;
     }
     if (n === 1 || tm <= this.t[0] || tm >= this.t[n - 1]) {
-      const i = n === 1 || tm <= this.t[0] ? 0 : n - 1;
-      const h = (tm - this.t[i]) / 1000;
-      qexpInto(h * this.w[3 * i], h * this.w[3 * i + 1], h * this.w[3 * i + 2], this.tq, 4);
-      qmulInto(this.q, 4 * i, this.tq, 4, out, o);
+      this.holdAt(n === 1 || tm <= this.t[0] ? 0 : n - 1, tm, out, o);
       return;
     }
     let lo = 0,
@@ -282,11 +306,23 @@ export class GyroReference {
     }
     const i = lo;
     const span = this.t[i + 1] - this.t[i];
+    if (span > IMU_MAX_GAP_MS) {
+      // the step interpolated across a whole gap is no measurement
+      this.holdAt(tm - this.t[i] <= this.t[i + 1] - tm ? i : i + 1, tm, out, o);
+      return;
+    }
     const a = span > 0 ? (tm - this.t[i]) / span : 0;
     const ex = this.w[3 * i] + a * (this.w[3 * i + 3] - this.w[3 * i]);
     const ey = this.w[3 * i + 1] + a * (this.w[3 * i + 4] - this.w[3 * i + 1]);
     const ez = this.w[3 * i + 2] + a * (this.w[3 * i + 5] - this.w[3 * i + 2]);
     this.step(i, (tm - this.t[i]) / 1000, ex, ey, ez, out, o);
+  }
+
+  /** Q(t) = Q_i ⊗ exp((t − t_i) ω_i): ω of sample i held constant. */
+  private holdAt(i: number, tm: number, out: Float64Array, o: number): void {
+    const h = (tm - this.t[i]) / 1000;
+    qexpInto(h * this.w[3 * i], h * this.w[3 * i + 1], h * this.w[3 * i + 2], this.tq, 4);
+    qmulInto(this.q, 4 * i, this.tq, 4, out, o);
   }
 
   /**

@@ -364,9 +364,12 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
     const eng = engine;
     let liveEvents = 0;
     let lastLive: LiveUpdate | null = null;
+    // with background mapping only the model updates carry cameras, frame responses do not
+    let lastCams: LiveUpdate | null = null;
     eng.onLive((u) => {
       liveEvents++;
       lastLive = u;
+      if (u.cameras) lastCams = u;
       if (cfg.liveTrace && u.cameras)
         (result.liveTrace ??= []).push({
           ms: now(),
@@ -513,6 +516,7 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
           rec.wallMs = round(performance.now() - tf, 1);
           result.frames.push(rec);
           refs.push({ delivered: k, index: f.index, t, engineFrameIndex: null, keyframe: false });
+          result.live.delivered = k + 1;
           log(`[harness] aborting capture after ${consecutiveErrors} consecutive frame error(s)`);
           captureOk = false;
           break;
@@ -550,9 +554,6 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
             keyframes: upd.numKeyframes,
           };
         }
-        if (upd.cameras) {
-          result.live.cameras = upd.cameras.map((c) => ({ pose: poseToJSON(c.pose), f: c.intrinsics.f }));
-        }
       }
       refs.push({ delivered: k, index: f.index, t, engineFrameIndex: upd ? upd.frameIndex : null, keyframe: upd?.decision === 'keyframe' });
       result.frames.push(rec);
@@ -569,21 +570,25 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
     }
     mark('capture', tCapture);
     /**
-     * Live summary from the newest LiveUpdate of any kind. Called after the capture AND again
-     * after finishCapture: with background mapping the model updates of the keyframes still in the
-     * mapping queue arrive as `live` events while finishCapture drains it.
+     * Live summary: the counts from the newest LiveUpdate of any kind, the cameras from the newest
+     * one carrying them. Called after the capture AND again after finishCapture: with background
+     * mapping the model updates of the keyframes still in the mapping queue arrive as `live` events
+     * while finishCapture drains it.
      */
     const applyLive = (): void => {
       const ll = lastLive as LiveUpdate | null;
+      const lc = lastCams as LiveUpdate | null;
       result.live.unsolicitedUpdates = Math.max(0, liveEvents - frameMs.length);
       if (ll) {
         result.live.keyframes = ll.numKeyframes;
         result.live.registered = ll.numRegistered;
         result.live.points = ll.numPoints;
-        if (ll.cameras) result.live.cameras = ll.cameras.map((c) => ({ pose: poseToJSON(c.pose), f: c.intrinsics.f }));
       }
+      if (lc?.cameras) result.live.cameras = lc.cameras.map((c) => ({ pose: poseToJSON(c.pose), f: c.intrinsics.f }));
+      // cameras lists the registered keyframes only, and keyframeIndices misses a held frame
+      // committed by finishCapture: map by order only when both cover every keyframe of `lc`
       result.live.images = null;
-      if (result.live.cameras.length > 0 && result.live.cameras.length === result.live.keyframeIndices.length) {
+      if (lc?.cameras && lc.cameras.length > 0 && lc.cameras.length === lc.numKeyframes && lc.numKeyframes === result.live.keyframeIndices.length) {
         result.live.images = result.live.cameras.map((c, i) => ({ index: result.live.keyframeIndices[i], pose: c.pose }));
       }
     };

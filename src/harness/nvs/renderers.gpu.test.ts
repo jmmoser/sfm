@@ -71,7 +71,7 @@ describe('ViewerRenderers pinhole projection', () => {
     it(`mesh squares and point splats land on the pinhole projection (${W}×${H})`, () => {
       const R = rotation([0.3, -0.5, 0.8], 2.1);
       const cam: NvsCamera = { width: W, height: H, fx: 110, fy: 110, cx: W / 2 - 7.3, cy: H / 2 + 4.6, R, t: [0.2, -0.4, 1.1] };
-      // 4 × 4 squares over the image at depths 2–3 (≈ 7–11 px wide)
+      // 4 × 4 squares over the image at depths 2–3 (3.7–5.5 px wide)
       const centres: number[][] = [];
       for (let j = 0; j < 4; j++) for (let i = 0; i < 4; i++) {
         const z = 2 + ((i + 2 * j) % 5) / 4;
@@ -81,7 +81,8 @@ describe('ViewerRenderers pinhole projection', () => {
       made.push(r);
       r.setContent(null, squares(cam, centres, 0.05));
       const img = r.render('mesh-unlit', cam);
-      // MSAA quantises the edges (≈ ±0.1 px per square): no bias on average, small per square
+      // MSAA quantises the edges (≈ ±0.1 px per square, sd 0.059 px per axis): small per square, and
+      // no bias on average beyond the rasteriser's vertex snapping (see the mean check below)
       const err: number[][] = [];
       for (const c of centres) {
         const [u, v] = project(cam, c);
@@ -93,9 +94,24 @@ describe('ViewerRenderers pinhole projection', () => {
         const i = 4 * (Math.round(v) * W + Math.round(u));
         expect(Array.from(img.subarray(i, i + 4))).toEqual([255, 255, 255, 255]);
       }
+      // Mean error: 0.04 px is the quantisation noise of a 16-square mean (sd 0.015 px, ≈ 2.7 σ, at
+      // random phases for these five sizes; at 4.0 and 5.5 px wide both edges of a square err alike).
+      // On top comes the rasteriser's own offset: vertices snap to 1/2^SUBPIXEL_BITS px and the
+      // standard 4× sample locations (odd multiples of 1/8 px) lie on that grid, so an edge within
+      // half a step of a sample snaps ONTO it and the top-left fill rule decides; both edges of a
+      // square then move the same way, by half a step (2^-(bits+1) px) per axis on average.
+      // SwiftShader snaps to 1/16 px ⇒ 1/32 = 0.031 px (towards −u, +v): its frames here equal,
+      // alpha for alpha, the exact pinhole projection rasterised that way (mean −0.045, +0.038 px
+      // at 96×128 and −0.054, +0.044 at 160×120; the same squares snapped to 1/256 px: +0.022,
+      // −0.006 and −0.015, +0.010). 8-bit GPUs ⇒ 0.002 px. No sign is assumed: the fill rule's
+      // corner follows the back-end's framebuffer orientation. On SwiftShader the check then lets
+      // uniform projection shifts of about −0.03…+0.08 px in u and −0.085…+0.025 px in v through
+      // (measured); half-pixel convention errors fail per square (0.36–0.63 px).
+      const gl = r.viewer.renderer.getContext();
+      const snapBias = 2 ** -((gl.getParameter(gl.SUBPIXEL_BITS) as number) + 1);
       const mean = (k: number) => err.reduce((s, e) => s + e[k], 0) / err.length;
-      expect(Math.abs(mean(0))).toBeLessThan(0.04);
-      expect(Math.abs(mean(1))).toBeLessThan(0.04);
+      expect(Math.abs(mean(0))).toBeLessThan(0.04 + snapBias);
+      expect(Math.abs(mean(1))).toBeLessThan(0.04 + snapBias);
       // radius-sized point splats (as the app draws the dense cloud): disc of radius r·f/Z px
       const pts: PointCloud = {
         count: centres.length,

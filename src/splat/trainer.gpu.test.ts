@@ -263,7 +263,9 @@ describe('SplatTrainer geometry channels (GPU) vs CPU reference', () => {
     const target = packDepthTarget(map, pin, pin, { factor: 2 });
     expect(target.valid).toBeGreaterThan(200);
     const view = viewOf({ ...cam, fy: cam.fx });
-    const t = await trainer(m, [view], { geometry: { depth: [0.8, 0.8], normal: [0.3, 0.3], factor: 2 } });
+    // decaying weights (depth exponentially, normal linearly: one end is 0) so the schedule check
+    // below sees a decay; the kernel checks run at iteration 0, i.e. with the start weights 0.8 / 0.3
+    const t = await trainer(m, [view], { geometry: { depth: [0.8, 0.08], normal: [0.3, 0], until: 0.3, factor: 2 } });
     t.setViewDepth(0, target);
     expect(t.depthViews).toBe(1);
     for (const level of [1, 2, 4]) {
@@ -276,8 +278,27 @@ describe('SplatTrainer geometry channels (GPU) vs CPU reference', () => {
       expect(Math.abs(g.sums[1] - ref.normal)).toBeLessThan(1e-4 * Math.max(1, ref.normal));
       expect(e).toBeLessThan(1e-5);
     }
-    // weights decay and stop at `until`
-    expect(t.geometryWeightsAt(0)).toEqual([0.8, 0.3]);
+    // weights decay and stop at `until` (0.3 of the 300 iterations: iteration 90).
+    // At iteration 0 the kernel gets exactly the start weights the CPU reference above was given.
+    // They reach it as f32 uniforms, and the f64 log-space schedule exp(ln a·(1−f) + ln b·f) gives
+    // a only to 1 ulp at f = 0 (ln / exp round: a constant 0.3 gives 0.29999999999999993, 6e-17
+    // off, 2e-9 of an f32 ulp; the earlier exact f64 check failed on that. Here 0.8 happens to
+    // round-trip exactly and the normal schedule is linear), so compare the f32 values the GPU
+    // receives, not the f64 bits.
+    expect(t.geometryWeightsAt(0).map(Math.fround)).toEqual([Math.fround(0.8), Math.fround(0.3)]);
+    const end = 0.3 * 300;
+    for (let it = 0; it < end; it++) {
+      const f = it / end;
+      const [wd, wn] = t.geometryWeightsAt(it);
+      // independent closed forms of the documented schedule. Their f64 evaluations agree to
+      // < 1e-14 relative (measured max 4.4e-16 depth, 6.6e-15 normal: the linear form cancels at
+      // the end, ×90 at it = 89), so 1e-12 is pure rounding margin, far below the change of the
+      // weights from one iteration to the next (depth × 10^(-1/90): 2.5 %, normal ≥ 1/90: 1.1 %).
+      expect(Math.abs(wd - 0.8 * (0.08 / 0.8) ** f)).toBeLessThan(1e-12 * wd);
+      expect(Math.abs(wn - 0.3 * (1 - f))).toBeLessThan(1e-12 * wn);
+    }
+    expect(t.geometryWeightsAt(end)).toEqual([0, 0]);
+    expect(t.geometryWeightsAt(300)).toEqual([0, 0]);
   });
 
   it('depth supervision pulls the Gaussians onto the target depth while the photometric fit still improves', async () => {
