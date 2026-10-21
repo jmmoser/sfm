@@ -3,7 +3,7 @@
  *
  * While running it watches presented frames (CameraCapture.onFrame), and at most `targetHz`
  * times per second — and never while the consumer is still busy (back-pressure: the consumer
- * returns a promise) — grabs the CURRENT frame as an ImageBitmap (synchronously inside the
+ * returns a promise) — grabs the CURRENT frame as an ImageBitmap or VideoFrame (synchronously inside the
  * frame callback, so bitmap and timestamp belong together) and delivers it with the IMU
  * samples since the previous delivered frame, the GPS fix, compass heading and attitude.
  *
@@ -19,7 +19,8 @@
  * engine treats it as upright for θ = 90 and converts it, downscaled to `maxSide`). Its aspect
  * does not follow the UI, so the aspect check is replaced by "a raw frame must be landscape".
  * Elsewhere (`videoFrameOrientation: 'upright'`, e.g. Chromium) VideoFrames are upright like the
- * <video>: not raw, and checked like bitmaps.
+ * <video>: not raw, and checked like bitmaps. The pump's default is 'bitmap'; the app turns the
+ * setting on by default on iOS WebKit (src/app/config.ts `videoFrameGrab`) when VideoFrame exists.
  * `stats.grabMs` = main-thread time of the grab call, whichever path.
  */
 import type { GeoFix, ImuSample, Mat3, Vec3 } from '../core/types';
@@ -42,7 +43,11 @@ export interface PumpFrame {
   timeSource: FrameMeta['timeSource'];
   /** UI rotation θ (ARCHITECTURE §2) of the frame. */
   screenAngle: ScreenAngle;
-  /** performance.now() time θ took that value (ScreenAngleTracker.lastChangeTime; −∞: no rotation seen). */
+  /**
+   * performance.now() time θ took that value (ScreenAngleTracker.lastChangeTime; −∞: no rotation
+   * seen), so the engine's settle window starts at the rotation, not at the first frame delivered
+   * after the pump's own `settleMs`.
+   */
   screenAngleSince: number;
   /** cameraFromDevice(screenAngle). */
   R_cam_device: Mat3;

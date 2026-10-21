@@ -1,7 +1,8 @@
 /**
  * Camera timing probe (Diagnostics): measures, on the device, whether reading camera frames another
- * way would improve on the capture path in use (rVFC + createImageBitmap(<video>), ./camera.ts)
- * before building it (docs/research/ios-camera.md §7 ladder steps A/B).
+ * way would improve on the capture path in use (rVFC + createImageBitmap(<video>) or
+ * new VideoFrame(<video>), ./camera.ts, ./frame-pump.ts) before building it
+ * (docs/research/ios-camera.md §7 ladder steps A/B; step A, the MSTP worker path, is not built).
  *
  * After `warmupMs` (camera latency settles) it records for `durationMs`, on the same camera track:
  *  - every rVFC callback (captureTime / presentationTime, frame size, UI rotation θ);

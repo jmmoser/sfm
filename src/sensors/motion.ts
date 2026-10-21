@@ -615,7 +615,13 @@ export class MotionSensor {
     return out;
   }
 
-  /** Samples added since the previous drain (for streaming to the worker); oldest first. */
+  /**
+   * Samples added since the previous drain (for streaming to the worker); oldest first.
+   * The buffer keeps RAW values, so a calibration change (`calibration.version`++) re-signs every
+   * sample still buffered, but samples already drained keep the calibration they were drained
+   * with: consumers must expect a change mid-stream (PumpFrame.imuCalibrationVersion; the world
+   * alignment re-checks the accelerometer sign, src/sfm/world.ts `accelSignCorrected`).
+   */
   drain(): ImuSample[] {
     const b = this.buffer;
     const i0 = Math.max(this.drainCursor, b.first);
