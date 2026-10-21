@@ -22,8 +22,10 @@
  *     P.z + 1.5 d. No connectivity test: the parts of a multi-part object (or an object and its
  *     stand) connect only through the plane. The lowest points (2nd percentile) must lie within
  *     0.25 d of the plane, else the object does not rest on it (hand-held, hanging).
- *  4. Box: 0.5 / 99.5 percentiles per axis + a max(5 % of the extent, 0.02 d) margin. The bottom
- *     is the plane height under the box centre + clearance, which keeps the support out of the box.
+ *  4. Box: 0.2 / 99.8 percentiles per axis + a max(10 % of the extent, 0.03 d) margin (sparse
+ *     points cover the extremes thinly; see MARGIN). The bottom is the plane height under the box
+ *     centre + clearance, which keeps the support out of the box.
+ *     confidence = the plane's share of the annulus points × min(1, object points / 200).
  *
  * The result is null (`reason` says why) when the model is not gravity-aligned, the cameras do
  * not orbit a point (axes spread < 10°, orbit test failed, cameras look straight down), there is
@@ -33,7 +35,9 @@
  * Limits: the box is axis-aligned in the world frame, so its yaw is the world's (north when
  * known). Objects wider than ~0.6 × the camera ring are trimmed, and clutter within that radius
  * is kept. White, glossy or glass supports give few sparse points, hence no plane and no box.
- * Validated on synthetic scenes only (object-roi.test.ts, e2e object-real).
+ * Validated on synthetic data only: object-roi.test.ts, mesh-roi.test.ts and a 40-frame e2e
+ * 'object' run (worker engine, 240 px dense): no mesh vertex outside the GT object box ± 2 cm
+ * (61 % unbounded), its completeness within 0.004 of the unbounded mesh. object-real is pending.
  */
 import type { ObjectRoi, Pose } from '../core/types';
 import { opticalAxisConvergence } from '../geometry/convergence';
@@ -99,9 +103,16 @@ const OBJECT_ABOVE = 1.5;
 const MIN_OBJECT_POINTS = 20;
 /** The 2nd-percentile object point lies at most 0.25 d above the plane. */
 const MAX_GAP = 0.25;
-/** Box margin: max(5 % of the extent, 0.02 d) per axis. */
-const MARGIN = 0.05;
-const MIN_MARGIN = 0.02;
+/**
+ * Box: percentiles 0.2 / 99.8 per axis + max(10 % of the extent, 0.03 d). Sparse points cover an
+ * object's extremes thinly: on a 40-frame e2e object run (856 object points) 0.5 / 99.5 + max(5 %,
+ * 0.02 d) left the box 0.9–1.3 cm inside the GT object box (79 % of it covered); these values cover
+ * 94.5 % (the rest is the bottom cut) at IoU 0.78.
+ */
+const PCT_LO = 0.2;
+const PCT_HI = 99.8;
+const MARGIN = 0.1;
+const MIN_MARGIN = 0.03;
 /** Cameras closer than 0.25 d to the axis (horizontally) look straight down: no ring. */
 const MIN_RING = 0.25;
 /** Object points at which the confidence stops growing. */
@@ -253,8 +264,8 @@ export function proposeObjectRoi(model: ObjectRoiInput, opts: ObjectRoiOptions):
   if (gap > MAX_GAP * d) return fail(`object does not rest on the support plane (gap ${gap.toPrecision(3)})`);
 
   // ---- 4. box
-  const lo = [percentile(ox, 0.5), percentile(oy, 0.5), percentile(oz, 0.5)];
-  const hi = [percentile(ox, 99.5), percentile(oy, 99.5), percentile(oz, 99.5)];
+  const lo = [percentile(ox, PCT_LO), percentile(oy, PCT_LO), percentile(oz, PCT_LO)];
+  const hi = [percentile(ox, PCT_HI), percentile(oy, PCT_HI), percentile(oz, PCT_HI)];
   const min: [number, number, number] = [0, 0, 0];
   const max: [number, number, number] = [0, 0, 0];
   for (let k = 0; k < 3; k++) {
