@@ -201,7 +201,7 @@ applySim3(sim, p: Float64Array /*3n*/, out?): Float64Array
 ### 4.2 `src/geometry`  (depends on math)
 
 Files: `camera.ts`, `pose.ts`, `ransac.ts`, `essential.ts`, `fundamental.ts`,
-`homography.ts`, `pnp.ts`, `triangulation.ts`, `twoview.ts`, `align.ts`, `index.ts`.
+`homography.ts`, `pnp.ts`, `triangulation.ts`, `twoview.ts`, `align.ts`, `convergence.ts`, `index.ts`.
 
 ```ts
 // camera.ts
@@ -275,6 +275,10 @@ estimateTwoViewGeometry(kp1: Float32Array, kp2: Float32Array /*stride 4, px*/, m
 // align.ts
 alignSim3Ransac(src: Float64Array, dst: Float64Array, n, maxError: number, opts?: { weights?; rng?; minInliers? })
   : { s: number; R: Mat3; t: Vec3; inlierMask: Uint8Array; numInliers: number } | null
+
+// convergence.ts — where the cameras look (object centre for classification, coverage, crop, fly-through)
+opticalAxisConvergence(poses: Pose[]): { point: Vec3 | null; spreadRad: number; inFront: number;
+  distMedian: number; offAxisMedian: number; converging: boolean }   // least-squares point closest to all optical axes
 ```
 
 ### 4.3 `src/ba`  (depends on math)

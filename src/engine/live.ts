@@ -23,6 +23,7 @@
 import type { CameraIntrinsics, CancelToken, FeatureSet, FrameInfo, GeoFix, ImuSample, Mat3, MatchPairs, Pose, TwoViewGeometry } from '../core/types';
 import type { FeaturePipeline } from '../features/extractor';
 import { deserializeFeatureSet, serializeFeatureSet } from '../io/serialize';
+import { opticalAxisConvergence } from '../geometry/convergence';
 import { solvePnPRansac } from '../geometry/pnp';
 import { estimateTwoViewGeometry, type TwoViewOptions } from '../geometry/twoview';
 import { mat3Mul, mat3MulTranspose } from '../math/mat3';
@@ -332,66 +333,12 @@ export function keyframeUpCam(r: KeyframeRecord): [number, number, number] | und
 
 /** Decide 'object' vs 'scene' from the registered cameras (optical-axis convergence). */
 export function classifyScene(poses: readonly Pose[], medianDepth: number): 'object' | 'scene' | null {
-  const n = poses.length;
-  if (n < 6) return null;
-  // least-squares point closest to all optical axes
-  const A = new Float64Array(9);
-  const bv = new Float64Array(3);
-  const Cs: Float64Array[] = [];
-  const Ds: Float64Array[] = [];
-  for (const p of poses) {
-    const C = poseCentre(p);
-    const d = Float64Array.of(p.R[6], p.R[7], p.R[8]);
-    Cs.push(C);
-    Ds.push(d);
-    for (let r = 0; r < 3; r++)
-      for (let c = 0; c < 3; c++) {
-        const m = (r === c ? 1 : 0) - d[r] * d[c];
-        A[3 * r + c] += m;
-        bv[r] += m * C[c];
-      }
-  }
-  // solve A x = b (3×3)
-  const det =
-    A[0] * (A[4] * A[8] - A[5] * A[7]) - A[1] * (A[3] * A[8] - A[5] * A[6]) + A[2] * (A[3] * A[7] - A[4] * A[6]);
-  // angular spread of the viewing directions
-  const mean = new Float64Array(3);
-  for (const d of Ds) for (let k = 0; k < 3; k++) mean[k] += d[k] / n;
-  const spread = Math.acos(Math.min(1, Math.hypot(mean[0], mean[1], mean[2])));
-  if (!(Math.abs(det) > 1e-9) || spread < 10 * DEG) return 'scene';
-  const inv = (i: number, j: number): number => {
-    const m = (r: number, c: number): number => A[3 * r + c];
-    const cof = [
-      m(1, 1) * m(2, 2) - m(1, 2) * m(2, 1),
-      -(m(1, 0) * m(2, 2) - m(1, 2) * m(2, 0)),
-      m(1, 0) * m(2, 1) - m(1, 1) * m(2, 0),
-      -(m(0, 1) * m(2, 2) - m(0, 2) * m(2, 1)),
-      m(0, 0) * m(2, 2) - m(0, 2) * m(2, 0),
-      -(m(0, 0) * m(2, 1) - m(0, 1) * m(2, 0)),
-      m(0, 1) * m(1, 2) - m(0, 2) * m(1, 1),
-      -(m(0, 0) * m(1, 2) - m(0, 2) * m(1, 0)),
-      m(0, 0) * m(1, 1) - m(0, 1) * m(1, 0),
-    ];
-    return cof[3 * j + i] / det;
-  };
-  const P = new Float64Array(3);
-  for (let i = 0; i < 3; i++) P[i] = inv(i, 0) * bv[0] + inv(i, 1) * bv[1] + inv(i, 2) * bv[2];
-  let inFront = 0;
-  const dist: number[] = [];
-  const off: number[] = [];
-  for (let i = 0; i < n; i++) {
-    const v = [P[0] - Cs[i][0], P[1] - Cs[i][1], P[2] - Cs[i][2]];
-    const along = v[0] * Ds[i][0] + v[1] * Ds[i][1] + v[2] * Ds[i][2];
-    const len = Math.hypot(v[0], v[1], v[2]);
-    if (along > 0) inFront++;
-    dist.push(len);
-    off.push(Math.sqrt(Math.max(0, len * len - along * along)));
-  }
-  const dMed = median(dist);
-  const offMed = median(off);
-  const converging = inFront >= 0.9 * n && offMed < 0.35 * dMed;
+  if (poses.length < 6) return null;
+  const c = opticalAxisConvergence(poses);
+  if (!c.point) return 'scene';
+  const dMed = c.distMedian;
   const depthOk = !(medianDepth > 0) || (dMed < 2.5 * medianDepth && dMed > 0.3 * medianDepth);
-  return converging && depthOk ? 'object' : 'scene';
+  return c.converging && depthOk ? 'object' : 'scene';
 }
 
 /** Live capture session. */
