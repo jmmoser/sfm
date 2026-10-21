@@ -571,8 +571,9 @@ retrieval for loop closure, spatial neighbours) → verify (pairs and vocabulary
 workers) → refined live model → only when it is unhealthy, a full incremental SfM from scratch
 on the enriched graph (keep the better of live/offline model) → global
 BA with self-calibration → retriangulate → final BA → inertial alignment (time
-offset, gravity, metric scale), GPS Sim3 alignment, compass yaw → world frame per §2
-(timings: docs/research/refine-performance.md).
+offset, gravity, metric scale: band-pass regression, or keyframe-interval preintegration when
+that lacks excitation, docs/research/imu-scale.md), GPS Sim3 alignment, compass yaw → world
+frame per §2 (timings: docs/research/refine-performance.md).
 
 **Dense**: undistort keyframes (≤ 1600 px by preset) → source-view selection →
 PatchMatch at ½ resolution (multi-scale) → PatchMatch (photometric) for all views →
