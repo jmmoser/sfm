@@ -536,6 +536,10 @@ export async function refinePerImageFocal(
     // The per-image focal lengths are only partly observable (focal ↔ dolly), so one round leaves part
     // of the breathing in the shared camera; the alternation converges linearly (principal point
     // 0.4–1 px per round on the e2e captures) — up to `rounds` (6) until it moves < 0.25 px.
+    // The cap stops before convergence on purpose: c_y still moves at round 6 and walks past the
+    // truth with more rounds (object-real, 12 rounds: 1.46 px vs 0.87 px at 6), so it acts as an
+    // early-stopping regulariser; a joint BA with intrinsics shared across cameras would be the
+    // principled fix (docs/research/real-capture-robustness.md).
     const shared = new Map<number, CameraIntrinsics>(); // shared camera id → its current values
     for (const sid of new Set(sharedOf.values())) shared.set(sid, { ...rec.cameras.get(sid)! });
     const rounds = Math.max(1, o.rounds ?? 6);

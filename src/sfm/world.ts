@@ -311,7 +311,9 @@ export function computeWorldAlignment(input: WorldAlignmentInput, options: Parti
   let gravity: GravityResult | null = n > 0 ? estimateGravity(ikf, imu, { gyroBias, ...o.gravity, offsetMs }) : null;
   // An accelerometer with the wrong sign yields gravity pointing UP (a model upside down) that
   // still looks reliable; the orientation-based gravityCam is independent of that sign and goes
-  // through the same R_cam_device, so a disagreement beyond 90° can only be the sign.
+  // through the same R_cam_device, so a disagreement beyond 90° can only be the sign. Re-checked
+  // here because samples streamed before MotionSensor's runtime sign check decided keep the prior
+  // sign (its ring buffer re-signs only what it still holds).
   let accelSignCorrected = false;
   if (gravity && gravity.source === 'accelG') {
     const gc = estimateGravity(ikf, [], o.gravity);

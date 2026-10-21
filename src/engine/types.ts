@@ -119,6 +119,8 @@ export interface EngineConfig {
   /**
    * Estimate the gyro bias / camera–IMU offset from the live keyframes every 10 registrations
    * during capture (default false; refine always calibrates once before the rolling-shutter estimation).
+   * Off because it changes the keyframe selection and measured equal or worse (yard-real ATE 7.0e-4
+   * vs 3.3e-4; docs/research/real-capture-robustness.md).
    */
   liveGyroCalibration?: boolean;
   /**
