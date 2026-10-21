@@ -36,7 +36,8 @@ interface EngineOptions {
 }
 
 interface FrameInput {
-  bitmap: ImageBitmap | RGBAImage;  // full resolution, any UI orientation
+  bitmap: ImageBitmap | RGBAImage | VideoFrame;  // full resolution, any UI orientation; a VideoFrame
+                                    //   (default on iOS) is converted + downscaled in the worker, then closed
   t: number;                        // capture time, ms (performance.now domain)
   screenAngle: 0 | 90 | 180 | 270;  // θ of ARCHITECTURE §2 when the frame was captured
   screenAngleSince?: number;        // performance.now() time θ took that value (FramePump); the 500 ms
