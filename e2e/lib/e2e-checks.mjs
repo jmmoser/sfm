@@ -3,9 +3,10 @@
 
 /**
  * The e2e/metrics.mjs result format from a harness result (window.runPipeline):
- * { intrinsics, images: [{index, pose}], metric, numInputImages, pointsFile? }.
+ * { intrinsics, images: [{index, pose}], metric, numInputImages, pointsFile?, objectRoi? }.
  * `numInputImages` = images the engine tried to register: `stats.images` when the engine
- * reports it, else the live keyframe count, else the number of cameras.
+ * reports it, else the live keyframe count, else the number of cameras. `objectRoi`: the
+ * mesh's object box (null = none proposed), absent without a mesh.
  */
 export function metricsInput(r, { pointsFile = null } = {}) {
   const sp = r.sparse;
@@ -20,6 +21,7 @@ export function metricsInput(r, { pointsFile = null } = {}) {
     numInputImages: numInput || null,
   };
   if (pointsFile) out.pointsFile = pointsFile;
+  if (r.mesh) out.objectRoi = r.mesh.objectRoi ?? null;
   return out;
 }
 
@@ -36,7 +38,10 @@ const abs = (v) => (typeof v === 'number' ? Math.abs(v) : v);
 
 /**
  * Named check values from computeMetrics output. `when` decides whether a check applies:
- *   'always', 'dense' (dense cloud requested), 'metric' / 'gravity' / 'north' (claimed by the result).
+ *   'always', 'dense' (dense cloud requested), 'mesh' (mesh requested), 'metric' / 'gravity' /
+ *   'north' (claimed by the result). The mesh / object-box checks score object isolation against
+ *   meta.focus (metrics `focus` / `objectRoi`); objectRoiContainsFocus is 1 when the box contains
+ *   meta.focus shrunk by 1 cm, else 0.
  */
 export const CHECKS = {
   registrationRate: { label: 'registration rate (of input)', when: 'always', value: (m) => m.registration?.rateOfInput ?? m.registration?.rate ?? null },
@@ -51,11 +56,16 @@ export const CHECKS = {
   densePrecision: { label: 'dense precision', when: 'dense', value: (m) => m.dense?.precision ?? null },
   denseCompleteness: { label: 'dense completeness', when: 'dense', value: (m) => m.dense?.completeness ?? null },
   denseFscore: { label: 'dense F-score', when: 'dense', value: (m) => m.dense?.fscore ?? null },
+  meshFocusOutside: { label: 'mesh vertices outside focus ± 2 cm', when: 'mesh', value: (m) => m.focus?.outsideFraction ?? null },
+  meshFocusCompleteness: { label: 'mesh completeness in focus box', when: 'mesh', value: (m) => m.focus?.completeness ?? null },
+  objectRoiIoU: { label: 'object box IoU with focus', when: 'mesh', value: (m) => m.objectRoi?.iou ?? null },
+  objectRoiContainsFocus: { label: 'object box ⊇ focus − 1 cm', when: 'mesh', value: (m) => (m.objectRoi ? (m.objectRoi.containsFocusShrunk ? 1 : 0) : null) },
 };
 
 /**
- * Evaluate thresholds. ctx = { dense: bool (dense requested), claims: {metric, gravityAligned,
- * northAligned} (from the result), sensors: {imu, gps, heading} (streams that were passed) }.
+ * Evaluate thresholds. ctx = { dense: bool (dense requested), mesh: bool (mesh requested), claims:
+ * {metric, gravityAligned, northAligned} (from the result), sensors: {imu, gps, heading} (streams
+ * that were passed) }.
  * Returns [{ name, label, value, limit, status: 'pass' | 'fail' | 'skip', reason? }].
  * A check that applies but has no value (e.g. no trajectory) FAILS. `claims` thresholds
  * (e.g. { metric: true }) require the result to claim that property when the sensors needed
@@ -76,11 +86,13 @@ export function runChecks(metrics, thresholds, ctx) {
     const applies =
       def.when === 'always' ||
       (def.when === 'dense' && !!ctx.dense) ||
+      (def.when === 'mesh' && !!ctx.mesh) ||
       (def.when === 'metric' && claimed.metric) ||
       (def.when === 'gravity' && claimed.gravity) ||
       (def.when === 'north' && claimed.north);
     if (!applies) {
-      out.push({ name, label: def.label, value: null, limit, status: 'skip', reason: def.when === 'dense' ? 'no dense run' : `not claimed (${def.when})` });
+      const reason = def.when === 'dense' ? 'no dense run' : def.when === 'mesh' ? 'no mesh run' : `not claimed (${def.when})`;
+      out.push({ name, label: def.label, value: null, limit, status: 'skip', reason });
       continue;
     }
     const v = def.value(metrics);
