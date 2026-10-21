@@ -19,6 +19,13 @@
  *      distributed selection.
  * Work is split into several submissions by a cost budget (iOS GPU watchdog), the
  * pyramids of the most recent processed sizes stay allocated between calls.
+ *
+ * GPU memory per cached processed size: (S + 3) planes x Σ octave pixels x 4 B + one temp
+ * plane (1600x1200 ≈ 69 MB), plus the input texture / buffer and ≈ 3 MB of fixed buffers.
+ * Limits: tile sizes, submitBudget and the tiled-vs-direct blur choice are not tuned on an
+ * A-series GPU yet (cfg.profile records per-kernel times for that); descriptors of slots
+ * dropped by the final selection are still read back (<= 128 B x maxFeatures x
+ * maxOrientations). Measurements: docs/research/features-gpu.md.
  */
 
 import type { FeatureSet, GrayImage } from '../core/types';

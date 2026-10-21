@@ -1,7 +1,6 @@
 /**
  * Adversarial regression tests for the sfm "extras" (keyframes, pairs, vocab, inertial, geo,
- * world). Each test names the defect it guards against (see docs/ARCHITECTURE.md, "src/sfm
- * extras — review notes").
+ * world). Each test names the defect it guards against.
  */
 import { describe, expect, it } from 'vitest';
 import type { CameraIntrinsics, GeoFix, ImuSample } from '../core/types';

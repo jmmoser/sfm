@@ -12,7 +12,11 @@
  * (R: 9 row-major, t: 3, X: 3, K: [f, cx, cy, k1, k2]).
  */
 
-/** |Zc| is clamped to at least this value (keeps residuals finite at the camera centre). */
+/**
+ * |Zc| is clamped to at least this value (keeps residuals finite at the camera centre).
+ * Points behind a camera are not rejected: they give finite mirrored residuals, which the
+ * robust loss down-weights.
+ */
 export const BA_MIN_DEPTH = 1e-12;
 
 /** Offsets into the output of `radialResidualJacobian`. */

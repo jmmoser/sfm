@@ -13,7 +13,8 @@
  *    = pass), best <= maxDistance.
  *  - Mutual: the matched b feature's best a (over the same candidate structure) must
  *    be the query a feature. No ratio test is applied in the reverse direction.
- *  - Ties: the smaller index wins in both directions.
+ *  - Ties: the smaller index wins in both directions (guided matching: candidates are
+ *    visited in grid-walk order, so exactly equal similarities resolve in that order).
  *  - Output: flat [i, j, ...] pairs sorted by ascending index in a.
  */
 

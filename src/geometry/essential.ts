@@ -26,7 +26,9 @@ import { denormalizeHartley, det3, hartleyNormalize, smallestEigenvector } from 
 // the solutions and (x, y, z) are read from the eigenvectors (inverse iteration).
 // The eigen-approach is used instead of Nistér's degree-10 polynomial because the
 // latter suffers catastrophic cancellation for small baselines (measured: true E
-// lost in 26 % of noise-free samples at baseline/depth ≈ 1e-3…1e-2, vs. ≪ 1 % here).
+// lost in 26 % of noise-free samples at baseline/depth ≈ 1e-3…1e-2, vs. ~2–10 % here;
+// below 1e-3 the true root often becomes a complex eigenvalue pair and is lost too —
+// such parallax is below the noise. Numbers: docs/research/solvers.md).
 // Each solution is polished by Gauss–Newton on the 10 original constraints.
 // ---------------------------------------------------------------------------
 

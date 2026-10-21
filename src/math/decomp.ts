@@ -302,7 +302,8 @@ export function solveLeastSquares(A: Matrix, b: ArrayLike<number>): Float64Array
 // Module-level scratch buffers (grown on demand, reused across calls). All
 // routines below are synchronous and never call user code, so sharing is safe.
 // Avoiding per-call allocation matters: off-heap typed-array allocation
-// dominated the run time of small SVDs (e.g. 8 x 9 in RANSAC loops).
+// dominated the run time of small SVDs (e.g. 8 x 9 in RANSAC loops). Not reentrant:
+// each worker has its own module instance. Timings: docs/research/solvers.md.
 let scrW: Float64Array = new Float64Array(256);
 let scrWt: Float64Array = new Float64Array(256);
 let scrVt: Float64Array = new Float64Array(256);

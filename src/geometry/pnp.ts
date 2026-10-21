@@ -1011,7 +1011,8 @@ class PnPEstimator implements RansacEstimator<Pose> {
 /**
  * Robust absolute pose: observed pixels are undistorted once to normalised
  * coordinates; LO-MSAC with Lambda Twist P3P minimal samples (local optimisation =
- * a few robust LM steps) at threshold maxErrorPx / f; final robust LM refinement on
+ * a few robust LM steps) at threshold maxErrorPx / f (normalised coordinates; the
+ * distortion Jacobian is ignored); final robust LM refinement (Huber at half the threshold) on
  * all inliers, inlier recount and a second refinement. Returns null if fewer than
  * minInliers (default 12) inliers remain.
  */

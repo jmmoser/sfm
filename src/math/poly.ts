@@ -21,7 +21,8 @@
  *    floating-point Sturm chains and of the Cardano/Ferrari closed forms (both
  *    measured to miss or invent roots on badly scaled inputs).
  *  - `polyRealRootsSturm`: classical Sturm-sequence isolation + bisection + Newton
- *    (kept as an independent cross-check; see module notes in ARCHITECTURE.md).
+ *    (kept as an independent cross-check, single scaling only; stress-test results in
+ *    docs/research/solvers.md).
  */
 
 const EPS = 2.220446049250313e-16;

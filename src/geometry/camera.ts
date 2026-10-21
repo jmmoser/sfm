@@ -128,7 +128,11 @@ export function undistortNormalized(cam: CameraIntrinsics, xd: number, yd: numbe
   out[1] = yd * s;
 }
 
-/** Camera-frame point → pixel. Returns false (out untouched) if Z ≤ 1e-12. */
+/**
+ * Camera-frame point → pixel. Returns false (out untouched) if Z ≤ 1e-12. Points beyond
+ * the monotone radius of a strongly barrel-distorted lens are NOT rejected (they fold
+ * back into the image).
+ */
 export function projectCam(cam: CameraIntrinsics, X: ArrayLike<number>, out: Float64Array): boolean {
   const Z = X[2];
   if (!(Z > 1e-12)) return false;

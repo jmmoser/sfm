@@ -5,6 +5,11 @@
  * We request the largest adapter limits that matter for compute-heavy image
  * processing, plus optional features when available. Callers must always be
  * prepared for `getGPU()` resolving to null (no WebGPU) and fall back to CPU.
+ *
+ * Portability (Safari 26 / Apple GPUs): optional features are enabled only when the
+ * adapter has them and no kernel requires one — no `enable f16`, subgroups or storage
+ * textures; no pointers, `vec3` in buffers or struct-by-value; `r32float` textures are
+ * only `textureLoad`ed (unfilterable-float), linear filtering only on r8unorm / rgba8unorm.
  */
 
 export interface GPUContext {
