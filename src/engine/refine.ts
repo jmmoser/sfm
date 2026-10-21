@@ -134,9 +134,13 @@ export function modelPointCloud(m: SparseModel): PointCloud {
 }
 
 /**
- * When the only reason the IMU scale was rejected is low excitation, but the fit itself is
- * excellent, return the relaxed threshold to retry with: relative σ ≤ 3 % and either R² ≥ 0.9 with
- * excitation ≥ 0.03 m/s², or R² ≥ 0.95 with excitation ≥ 0.015 m/s².
+ * When the only reason the band-pass IMU scale was rejected is low excitation, but the fit itself
+ * is excellent, return the relaxed threshold to retry with: relative σ ≤ 3 % and either R² ≥ 0.9
+ * with excitation ≥ 0.03 m/s², or R² ≥ 0.95 with excitation ≥ 0.015 m/s². Only reached when the
+ * alignment found no metric scale at all, i.e. the keyframe-interval estimate that
+ * `computeWorldAlignment` tries first (`estimateMetricScaleFromIntervals`, not limited by the
+ * keyframe rate) was unreliable as well and no GPS scale exists — e.g. a gentle orbit, whose slow
+ * centripetal acceleration is degenerate with a device-frame accelerometer bias.
  *
  * The excitation the inertial module measures is the band-limited IMU acceleration AS SAMPLED AT
  * THE KEYFRAMES: it falls with the keyframe rate, not only with the hand motion (e2e `object`, GT
@@ -990,6 +994,8 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     stats.timeOffsetMs = Math.round(alignment.details.offsetMs * 10) / 10;
     stats.timeOffsetSource = alignment.details.offsetSource;
     stats.scaleSource = alignment.metric.source;
+    if (alignment.metric.source === 'imu' || alignment.metric.source === 'imu+gps')
+      stats.scaleMethod = alignment.details.imuScale?.reliable ? 'bandpass' : 'intervals';
     stats.yawSource = alignment.details.yawSource;
     Object.assign(stats, alignment.details.headingStats); // north reference, declination, yaw σ / fusion
     if (alignment.metric.relativeUncertainty !== null) stats.scaleUncertainty = alignment.metric.relativeUncertainty;

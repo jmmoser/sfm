@@ -24,8 +24,10 @@
  *    compass σ from the reported accuracies, the sample count and a systematic floor); when they
  *    disagree by > 3 combined σ the compass is dropped against a confident GPS yaw (σ ≤ 10°),
  *    otherwise the less certain one (`details.yawFusion`, `yawSource`, warning);
- *  - scale: IMU and GPS combined by inverse-variance weighting in log-scale when both are
- *    reliable and consistent (else the more certain one);
+ *  - scale: IMU (`estimateMetricScale`; when that is unreliable — e.g. too little band-limited
+ *    excitation at phone keyframe rates of 1–2 /s — the keyframe-interval preintegration estimate
+ *    `estimateMetricScaleFromIntervals`) and GPS, combined by inverse-variance weighting in
+ *    log-scale when both are reliable and consistent (else the more certain one);
  *  - translation: GPS ⇒ local ENU at `originLatLonAlt`; otherwise the first camera (or the
  *    centroid) is put at the origin.
  */
@@ -47,12 +49,14 @@ import {
   composeGravityAlignment,
   estimateGravity,
   estimateMetricScale,
+  estimateMetricScaleFromIntervals,
   estimateTimeOffset,
   estimateTimeOffsetFromAcceleration,
   type AccelTimeOffsetResult,
   type GravityOptions,
   type GravityResult,
   type InertialKeyframe,
+  type IntervalScaleOptions,
   type MetricScaleOptions,
   type MetricScaleResult,
   type TimeOffsetOptions,
@@ -117,6 +121,8 @@ export interface WorldAlignmentOptions {
   timeOffset: Partial<TimeOffsetOptions>;
   gravity: Partial<GravityOptions>;
   scale: Partial<MetricScaleOptions>;
+  /** Options of the keyframe-interval scale estimate (used when the band-pass one is unreliable). */
+  intervalScale: Partial<IntervalScaleOptions>;
   gps: Partial<GpsAlignOptions>;
   /**
    * Axis the compass heading refers to: 'device-top' (+y of the device), 'optical-axis', or
@@ -160,6 +166,7 @@ const DEFAULT_WORLD: WorldAlignmentOptions = {
   timeOffset: {},
   gravity: {},
   scale: {},
+  intervalScale: {},
   gps: {},
   compassReference: 'auto',
   minCompassObservations: 3,
@@ -194,7 +201,10 @@ export interface WorldAlignment {
     gravity: GravityResult | null;
     /** The accelerometer samples were negated: their gravity contradicted the keyframes' `gravityCam`. */
     accelSignCorrected: boolean;
+    /** Band-pass IMU scale (`estimateMetricScale`). */
     imuScale: MetricScaleResult | null;
+    /** Keyframe-interval IMU scale, computed only when `imuScale` is unreliable (else null). */
+    imuScaleIntervals: MetricScaleResult | null;
     gps: GpsAlignment | null;
     /** Compass yaw (true north when `north` is 'true' or a GPS yaw exists, else magnetic). */
     compass: CompassYaw | null;
@@ -363,6 +373,18 @@ export function computeWorldAlignment(input: WorldAlignmentInput, options: Parti
     });
     if (imuScale && !imuScale.reliable) warnings.push(`IMU scale unreliable: ${imuScale.reason}`);
   }
+  // The band-pass estimate collapses at low keyframe rates (its excitation is the 0.3–3 Hz
+  // acceleration as sampled at the keyframes); the interval estimate integrates the full-rate IMU.
+  let imuScaleIntervals: MetricScaleResult | null = null;
+  if (imu.length >= 2 && n >= 6 && !(imuScale && imuScale.reliable)) {
+    imuScaleIntervals = estimateMetricScaleFromIntervals(ikf, imu, { gyroBias, gravity: scaleGravity(), ...o.intervalScale, offsetMs });
+    if (imuScaleIntervals && imuScaleIntervals.reliable)
+      warnings.push(
+        `IMU scale from keyframe intervals (σ ${(100 * imuScaleIntervals.relUncertainty).toFixed(1)} %, span ${imuScaleIntervals.spanS!.toFixed(2)} s, R² ${imuScaleIntervals.r2.toFixed(3)})`,
+      );
+    else if (imuScaleIntervals) warnings.push(`IMU interval scale unreliable: ${imuScaleIntervals.reason}`);
+  }
+  const imuUsed = imuScale && imuScale.reliable ? imuScale : imuScaleIntervals && imuScaleIntervals.reliable ? imuScaleIntervals : null;
   const Rg = gravityOk ? composeGravityAlignment(gravity!.down) : Float64Array.of(1, 0, 0, 0, 1, 0, 0, 0, 1);
 
   // ---- GPS
@@ -480,7 +502,7 @@ export function computeWorldAlignment(input: WorldAlignmentInput, options: Parti
 
   // ---- scale
   const cands: { source: 'imu' | 'gps'; scale: number; relUncertainty: number }[] = [];
-  if (imuScale && imuScale.reliable) cands.push({ source: 'imu', scale: imuScale.scale, relUncertainty: imuScale.relUncertainty });
+  if (imuUsed) cands.push({ source: 'imu', scale: imuUsed.scale, relUncertainty: imuUsed.relUncertainty });
   if (gps && gps.scaleRelUncertainty <= o.maxGpsScaleRelUncertainty && gps.s > 0)
     cands.push({ source: 'gps', scale: gps.s, relUncertainty: gps.scaleRelUncertainty });
   else if (gps) warnings.push(`GPS scale too uncertain (${(100 * gps.scaleRelUncertainty).toFixed(0)} %)`);
@@ -589,6 +611,7 @@ export function computeWorldAlignment(input: WorldAlignmentInput, options: Parti
       gravity,
       accelSignCorrected,
       imuScale,
+      imuScaleIntervals,
       gps,
       compass,
       yawSource,
