@@ -139,7 +139,8 @@ export interface FrameInput {
 export type DecodedFrameInput = FrameInput & { bitmap: ImageBitmap | RGBAImage };
 
 export type KeyframeDecision = 'keyframe' | 'skip' | 'reject_blur' | 'reject_motion';
-export type Guidance = 'good' | 'move_slower' | 'more_texture' | 'translate_more' | 'tracking_lost' | 'initializing';
+/** 'too_dark': the recent frames are too dark to track (median luma, or blur in dim light; src/engine/frame-ingest.ts LowLightMonitor). */
+export type Guidance = 'good' | 'move_slower' | 'more_texture' | 'translate_more' | 'tracking_lost' | 'initializing' | 'too_dark';
 export type TrackingState = 'initializing' | 'tracking' | 'lost';
 
 export interface LiveCamera {
@@ -160,6 +161,12 @@ export interface LiveUpdate {
   decision: KeyframeDecision;
   guidance: Guidance;
   tracking: TrackingState;
+  /**
+   * Capture mode in effect: the session's mode, or for 'auto' the engine's decision once made
+   * ('auto' until then — LiveSession resolves it from ≥ 8 registered keyframes). Absent from
+   * older engines: treat as the configured mode.
+   */
+  resolvedMode?: CaptureMode;
   numKeyframes: number;
   numRegistered: number;
   numPoints: number;

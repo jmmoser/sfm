@@ -23,6 +23,17 @@
  * image at the working size for the CPU SIFT) and — for keyframes only — the full-resolution
  * canonical image as JPEG (OffscreenCanvas.convertToBlob, quality 0.92) or raw RGBA when no
  * JPEG encoder exists (Node tests). The source bitmap is closed by `release()`.
+ *
+ * Low light (`LowLightMonitor`, guidance 'too_dark'): the luma of the ≤ 640 px copy over the
+ * last 5 analysed frames. iOS auto-exposure cannot expose longer than 1/fps (fixed frame rate,
+ * docs/research/ios-camera.md §1.2), so in a dark room it runs out of ISO and the frames darken
+ * and blur: 'too_dark' when the window's median luma is < 40 (of 255; auto-exposure keeps lit
+ * scenes far brighter — the synthetic e2e captures sit at 130–157 (object-real) and 91–122
+ * (yard-real)), or < 70 with ≥ 3 of the 5 frames blur-rejected. Hysteresis: it clears once the
+ * median is ≥ 50 and the dim-blur rule (< 80, ≥ 2 blur rejects) no longer holds. The first 8
+ * frames after a reset (start, new camera segment) are ignored while auto-exposure settles.
+ * Exposure is not settable on iOS, the torch is (ARCHITECTURE §2.2). The thresholds are not yet
+ * measured on device.
  */
 import type { FeatureSet, GrayImage, ImuSample, RGBAImage, Vec3 } from '../core/types';
 import { areaResampleRGBA } from '../dense/undistort';
@@ -213,6 +224,75 @@ export function lumaStats(img: RGBAImage): { mean: number; std: number } {
   }
   const mean = s / n;
   return { mean, std: Math.sqrt(Math.max(0, s2 / n - mean * mean)) };
+}
+
+export interface LowLightOptions {
+  /** Analysed frames in the window (default 5). */
+  window: number;
+  /** Too dark below this median luma (0–255, default 40)… */
+  darkLuma: number;
+  /** …until the median is above this (default 50). */
+  clearLuma: number;
+  /** Dim (below this median luma, default 70) AND blurry (`dimBlurFrames` blur rejects in the window, default 3). */
+  dimLuma: number;
+  dimBlurFrames: number;
+  /** Frames ignored after a reset while auto-exposure settles (default 8). */
+  warmupFrames: number;
+}
+
+const LOW_LIGHT_DEFAULTS: LowLightOptions = { window: 5, darkLuma: 40, clearLuma: 50, dimLuma: 70, dimBlurFrames: 3, warmupFrames: 8 };
+
+/** Too-dark state from the recent frames' luma and blur rejects (see the header). */
+export class LowLightMonitor {
+  readonly options: LowLightOptions;
+  private readonly luma: number[] = [];
+  private readonly blur: boolean[] = [];
+  private isDark = false;
+  private warmup: number;
+
+  constructor(opts: Partial<LowLightOptions> = {}) {
+    this.options = { ...LOW_LIGHT_DEFAULTS, ...opts };
+    this.warmup = this.options.warmupFrames;
+  }
+
+  /** The recent frames are too dark. */
+  get dark(): boolean {
+    return this.isDark;
+  }
+
+  /** One analysed frame: its mean luma (NaN = unknown: ignored) and whether the blur gate rejected it. */
+  push(lumaMean: number, blurRejected: boolean): boolean {
+    if (!Number.isFinite(lumaMean)) return this.isDark;
+    if (this.warmup > 0) {
+      this.warmup--;
+      return this.isDark;
+    }
+    const o = this.options;
+    this.luma.push(lumaMean);
+    this.blur.push(blurRejected);
+    if (this.luma.length > o.window) {
+      this.luma.shift();
+      this.blur.shift();
+    }
+    // at least 3 frames: one dark frame (a hand over the lens) is not a dark room
+    if (this.luma.length < Math.min(3, o.window)) return this.isDark;
+    const sorted = [...this.luma].sort((a, b) => a - b);
+    const med = sorted[sorted.length >> 1];
+    const blurs = this.blur.reduce((n, b) => n + (b ? 1 : 0), 0);
+    const dimBlurry = (limit: number, frames: number): boolean => med < limit && blurs >= frames;
+    this.isDark = this.isDark
+      ? med < o.clearLuma || dimBlurry(o.dimLuma + (o.clearLuma - o.darkLuma), o.dimBlurFrames - 1)
+      : med < o.darkLuma || dimBlurry(o.dimLuma, o.dimBlurFrames);
+    return this.isDark;
+  }
+
+  /** Forget the window (a new camera segment: auto-exposure settles again). */
+  reset(): void {
+    this.luma.length = 0;
+    this.blur.length = 0;
+    this.isDark = false;
+    this.warmup = this.options.warmupFrames;
+  }
 }
 
 /** JPEG of an RGBA image (null without OffscreenCanvas). */
