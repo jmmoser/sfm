@@ -236,3 +236,29 @@ describe('EngineClient: closeSession of a scan being loaded', () => {
     expect(c.status).toMatchObject({ state: 'idle', reason: 'compile failed' });
   });
 });
+
+describe('EngineClient: a continued capture (init with extend)', () => {
+  it('is reopened by a replay until finishCapture resolved, then replayed as stored (resume only)', async () => {
+    const { c, workers } = client();
+    const ready = c.init({ mode: 'object', quality: 'fast', sessionId: 's1', resume: true, extend: true });
+    await flush();
+    workers[0].reply('init', initResult('w1'));
+    await ready;
+    const initOf = (w: FakeWorker) => w.posted.find((r) => r.method === 'init')!.params as { resume?: boolean; extend?: boolean };
+
+    workers[0].gpuLost(); // during the capture: the replay reopens it
+    await flush();
+    expect(initOf(workers[1])).toMatchObject({ resume: true, extend: true });
+    workers[1].reply('init', initResult('w2'));
+    await flush();
+
+    const done = c.finishCapture();
+    await flush();
+    workers[1].reply('finishCapture', undefined);
+    await done;
+    workers[1].gpuLost(); // after it: restored as stored
+    await flush();
+    expect(initOf(workers[2]).resume).toBe(true);
+    expect(initOf(workers[2]).extend).toBeUndefined();
+  });
+});

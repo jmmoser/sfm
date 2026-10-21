@@ -11,6 +11,9 @@
  * gives MAGNETIC north —, counts, reprojection error, engine memory, timings). A densify that
  * was interrupted (stats.denseResumablePass from loadSession, or cancelled / failed here) offers
  * "Resume dense reconstruction" (HUD + Build sheet): the engine continues from its stored maps.
+ * "Add more views" (Build sheet; src/app/extend-scan.ts) continues the scan's capture — processing
+ * then runs again —, also offered by a card when refine could not connect some photos
+ * (stats.unconnectedImages; dismissed per refine: stats.unconnectedNoticeRefineMs).
  */
 import { saveFile } from '../../io/download';
 import type { SplatDisplayState, Viewer } from '../../viewer';
@@ -24,7 +27,9 @@ import { confirmDialog } from '../components/dialog';
 import { openSheet, type SheetHandle } from '../components/sheet';
 import { toast } from '../components/toast';
 import { Disposer, h, replaceChildren } from '../dom';
-import { exportFilename, formatBytes, formatCount, formatDuration, modeLabel, qualityLabel } from '../format';
+import { exportFilename, formatBytes, formatCount, formatDuration, modeLabel, plural, qualityLabel } from '../format';
+import { canScan } from '../env';
+import { openExtendSheet } from '../extend-scan';
 import { icon, type IconName } from '../icons';
 import type { ProcessingStep, Route } from '../router';
 import {
@@ -146,6 +151,17 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     button({ label: 'Resume', variant: 'primary', size: 'sm', testId: 'splat-resume-button', onClick: () => void buildSplats(splatResumeQuality(app.results) ?? builtQuality(app.results, 'splat')) }),
   );
 
+  // Photos refine could not connect to the model: add views that overlap them (lowest priority card).
+  const unconnectedTitle = h('span', { class: 'viewer-resume-title' });
+  const unconnectedHud = h(
+    'div',
+    { class: 'viewer-resume', hidden: true, role: 'status', 'data-testid': 'unconnected-photos' },
+    h('span', { class: 'viewer-resume-icon' }, icon('camera', { size: 20 })),
+    h('div', { class: 'viewer-resume-text' }, unconnectedTitle, h('span', { class: 'viewer-resume-sub', text: 'Add views that overlap them to complete the model.' })),
+    button({ label: 'Add views', variant: 'primary', size: 'sm', testId: 'unconnected-extend', onClick: () => openExtend() }),
+    iconButton('close', 'Dismiss', () => dismissUnconnected(), { testId: 'unconnected-dismiss' }),
+  );
+
   // Photoreal build progress (engine.splat runs while the model stays explorable).
   const jobBar = progressBar('Photoreal model');
   const jobSub = h('span', { class: 'viewer-job-sub', 'data-testid': 'splat-progress-text' });
@@ -161,7 +177,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   // Layer pill above the toolbar (Splats / Points / Mesh), shown when there is a choice.
   const layerHost = h('div', { class: 'layer-switch', hidden: true, 'data-testid': 'layer-switch' });
 
-  const el = h('div', { class: 'viewer-screen' }, canvasHost, loading, top, resumeHud, splatResumeHud, jobHud, measureHud, layerHost, toolbar);
+  const el = h('div', { class: 'viewer-screen' }, canvasHost, loading, top, resumeHud, splatResumeHud, unconnectedHud, jobHud, measureHud, layerHost, toolbar);
 
   /**
    * Resume (re-run) the interrupted densify with the quality of the INTERRUPTED run (the engine skips
@@ -256,7 +272,36 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     const it = r.stats.splatResumableIteration;
     splatResumeSub.textContent = `Continues from the saved training${typeof it === 'number' && it > 0 ? ` (iteration ${it.toLocaleString('en-US')})` : ''}${sq ? ` · ${qualityLabel(sq)}` : ''}.`;
     jobHud.hidden = !building;
+    const unconnected = unconnectedPhotos();
+    unconnectedHud.hidden = !unconnected || building || !resumeHud.hidden || !splatResumeHud.hidden || !canScan(app.env);
+    unconnectedTitle.textContent = `${plural(unconnected, 'photo')} could not be connected`;
     el.classList.toggle('building', building);
+  }
+
+  // ---- add more views ----------------------------------------------------------------------------
+  /** Keyframes the model leaves out (refine stats.unconnectedImages), 0 when none or dismissed for this refine. */
+  function unconnectedPhotos(): number {
+    const r = app.results;
+    const st = { ...(r.sparse?.stats ?? {}), ...r.stats };
+    const n = st.unconnectedImages;
+    if (typeof n !== 'number' || !(n > 0) || !r.sparse || !route.sessionId) return 0;
+    return typeof st.unconnectedNoticeRefineMs === 'number' && st.unconnectedNoticeRefineMs === st.refineMs ? 0 : n;
+  }
+
+  function dismissUnconnected(): void {
+    const r = app.results;
+    const ms = r.stats.refineMs ?? r.sparse?.stats.refineMs;
+    const key = typeof ms === 'number' ? ms : 0;
+    r.stats = { ...r.stats, unconnectedNoticeRefineMs: key };
+    void app.updateSession(route.sessionId, { stats: { unconnectedNoticeRefineMs: key } });
+    renderBadges();
+  }
+
+  /** The "Add more views" sheet for this scan (not while the photoreal model trains: leaving would stop it). */
+  function openExtend(): void {
+    if (!ready || !route.sessionId || building || closed) return;
+    const r = app.results;
+    openExtendSheet(app, { id: route.sessionId, status: r.mesh ? 'meshed' : r.dense ? 'dense' : 'sparse', built: { dense: !!r.dense, mesh: !!r.mesh, splat: !!r.splat } });
   }
 
   function applyDisplay(): void {
@@ -571,6 +616,37 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
         ),
       ),
     ];
+    content.push(
+      section(
+        'More views',
+        h(
+          'div',
+          { class: 'build-list' },
+          h(
+            'div',
+            { class: 'build-item', 'data-testid': 'build-extend-item' },
+            h('span', { class: 'build-icon' }, icon('camera', { size: 22 })),
+            h(
+              'div',
+              { class: 'build-text' },
+              h('span', { class: 'build-title', text: 'Add more views' }),
+              h('span', { class: 'build-sub', text: 'Scan the parts that are missing. The scan is then processed again.' }),
+            ),
+            button({
+              label: 'Add',
+              variant: 'secondary',
+              size: 'sm',
+              testId: 'build-extend',
+              disabled: building || !route.sessionId || !canScan(app.env),
+              onClick: () => {
+                sheet.close();
+                openExtend();
+              },
+            }),
+          ),
+        ),
+      ),
+    );
     const sheet = openSheet({ title: 'Build', subtitle: 'Higher quality takes longer and needs more memory.', content, testId: 'sheet-build' });
 
     function resumeItem(): HTMLElement {

@@ -346,6 +346,27 @@ export class App {
     this.navigate({ type: 'START_CAPTURE', sessionId: id });
   }
 
+  /**
+   * Continue the capture of the stored scan `sessionId` ("Add more views" / "Continue scanning";
+   * from the tap that called requestCapturePermissions). The page lets go of the scan's dense
+   * cloud, mesh and splat info (the capture needs the memory and the next refine replaces them; a
+   * capture stopped without new views loads the scan again); its sparse model stays for the
+   * capture's preview.
+   */
+  startExtendScan(sessionId: string): boolean {
+    if (!nextRoute(this.route, { type: 'EXTEND_CAPTURE', sessionId })) return false;
+    this.loadSeq++; // a load still running is superseded by the capture's engine init
+    if (this.results.sessionId === sessionId) {
+      this.results.dense = null;
+      this.results.mesh = null;
+      this.results.splat = null;
+    } else {
+      this.results = { ...App.emptyResults(this.config), sessionId };
+      this.loadedSessionId = null;
+    }
+    return this.navigate({ type: 'EXTEND_CAPTURE', sessionId });
+  }
+
   // ---- sessions -----------------------------------------------------------------------------------
 
   sessions(): Promise<SessionStore | null> {

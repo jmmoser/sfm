@@ -17,6 +17,16 @@
  *    UI, upright for θ = 90 — the engine's rule) is turned onto the upright preview;
  *  - finishing can be cancelled (a stuck finishCapture is aborted, the worker restarted);
  *  - the engine's capture memory limit ('out-of-memory' event) asks "finish scan now?".
+ *
+ * Continued capture (`route.extendFrom`: "Add more views" / "Continue scanning", src/app/extend-scan.ts):
+ * the engine init has `resume` + `extend` with the STORED session's mode and quality (the session
+ * record is not created again, its thumbnail kept); the stored sparse model is shown until the
+ * rebuilt live model arrives; counters start at the restored keyframes and Finish needs a new one
+ * (then it re-runs refine, + densify with auto-dense, like a new scan). The first new keyframe sets
+ * the session status back to 'capturing' (a kill leaves a scan Home offers to process, not new
+ * photos behind a 'meshed' status). Stopping without new views returns where it came from with the
+ * scan as it was (the engine lets go of the reopened capture); with new views they are kept and
+ * the scan is processed from Home. A continued capture never deletes the session.
  */
 import type { PumpFrame } from '../../sensors/frame-pump';
 import { CameraCapture, type CameraStartResult, type CameraState } from '../../sensors/camera';
@@ -26,16 +36,17 @@ import { GeoSensor } from '../../sensors/geolocation';
 import { integrateGyro, MotionSensor } from '../../sensors/motion';
 import { screenAngle, type ScreenAngle } from '../../sensors/frame-orientation';
 import type { CapturePermissionStatus } from '../../sensors/permissions';
+import type { SessionMeta } from '../../io/storage';
 import type { Viewer } from '../../viewer';
 import { loadViewerModule } from '../viewer-loader';
-import { ENGINE_ERRORS, isCancelledError, type FrameInput, type LiveCamera, type LiveUpdate } from '../../workers/protocol';
+import { ENGINE_ERRORS, isCancelledError, type FrameInput, type InitResult, type LiveCamera, type LiveUpdate } from '../../workers/protocol';
 import type { App, Screen } from '../app';
 import type { AbortOutcome, EngineErrorInfo } from '../engine-client';
 import { button, iconButton, setButtonLabel, spinner } from '../components/controls';
 import { confirmDialog } from '../components/dialog';
 import { toast } from '../components/toast';
 import { Disposer, h, replaceChildren } from '../dom';
-import { defaultSessionName, formatAccuracy, formatBytes, formatClock, formatCount, guidanceInfo, trackingLabel } from '../format';
+import { defaultSessionName, formatAccuracy, formatBytes, formatClock, formatCount, guidanceInfo, plural, trackingLabel } from '../format';
 import { icon, type IconName } from '../icons';
 import { frameErrorAction, isQuotaError, overlayMatchesView } from '../capture-policy';
 import { FrameOrientationTracker, mapOverlay } from '../overlay-map';
@@ -65,10 +76,18 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   const d = new Disposer();
   const cfg = { ...app.config };
   const sessionId = route.sessionId;
-  const sessionName = defaultSessionName(cfg.mode);
-  app.results.name = sessionName;
-  app.results.mode = cfg.mode;
-  app.results.quality = cfg.quality;
+  /** Continue the stored session `sessionId` (its mode / quality / name come from its record). */
+  const extend = !!route.extendFrom && !!sessionId;
+  let sessionName = defaultSessionName(cfg.mode);
+  if (!extend) {
+    app.results.name = sessionName;
+    app.results.mode = cfg.mode;
+    app.results.quality = cfg.quality;
+  }
+  /** Continued capture: the stored session record, the keyframes restored by the engine, the status change. */
+  let stored: SessionMeta | null = null;
+  let baseKeyframes = 0;
+  let markedCapturing = false;
 
   const camera = new CameraCapture();
   /** The "VideoFrame grab" setting (where VideoFrame exists): no main-thread copy per grab. */
@@ -88,7 +107,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   let numKeyframes = 0;
   let elapsedMs = 0;
   let runningSince: number | null = null;
-  let thumbDone = false;
+  let thumbDone = extend; // a continued scan keeps its thumbnail
   let latestSparse: { positions: Float32Array; colors: Uint8Array } | null = null;
   let latestCameras: LiveCamera[] | null = null;
   /** R_cam_device of the poses in latestCameras (engine camera frame) and the engine's gyro bias. */
@@ -121,7 +140,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     h('span', { class: 'stat' }, regCount, h('span', { text: 'registered' })),
     h('span', { class: 'stat' }, ptCount, h('span', { text: 'points' })),
   );
-  const closeBtn = iconButton('close', 'Cancel scan', () => void cancel(), { variant: 'glass', testId: 'capture-cancel' });
+  const closeBtn = iconButton('close', extend ? 'Stop adding views' : 'Cancel scan', () => void cancel(), { variant: 'glass', testId: 'capture-cancel' });
   const viewBtn = iconButton('cube', 'Point cloud view', () => setCloudView(!cloudView), { variant: 'glass', testId: 'cloud-toggle' });
   viewBtn.setAttribute('aria-pressed', 'false');
   // no WebGL: no live 3D view to show instead of the camera
@@ -214,8 +233,16 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   }
 
   function updateFinish(): void {
-    const enough = numKeyframes >= MIN_KEYFRAMES;
+    const added = numKeyframes - baseKeyframes;
+    // a continued capture finishes (and is processed again) only with new views
+    const enough = numKeyframes >= MIN_KEYFRAMES && (!extend || added > 0);
     finishBtn.disabled = !enough || !(phase === 'running' || phase === 'paused');
+    if (extend) {
+      finishHint.hidden = phase === 'starting' || phase === 'error';
+      finishHint.textContent =
+        numKeyframes < MIN_KEYFRAMES ? `${numKeyframes} / ${MIN_KEYFRAMES} keyframes — keep moving` : added > 0 ? `+${plural(added, 'new view')}` : 'Start where you already scanned, then add the missing views';
+      return;
+    }
     finishHint.hidden = enough || phase === 'starting' || phase === 'error';
     if (!enough) finishHint.textContent = `${numKeyframes} / ${MIN_KEYFRAMES} keyframes — keep moving`;
   }
@@ -425,8 +452,11 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       v.setSparsePoints(positions, colors);
     }
     if (latestCameras?.length) v.setCameras(decimateCameras(latestCameras, MAX_CAMERAS), true);
-    if (cloudView) startFollow();
-    else v.fitToContent(false);
+    if (cloudView) {
+      // (the stored model of a continued scan has no posed frame to follow yet)
+      if (!follow.hasAnchor) v.fitToContent(false);
+      startFollow();
+    } else v.fitToContent(false);
     miniEmpty.hidden = true;
   }
 
@@ -552,6 +582,11 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     if (pump) debugOverlay?.setGrabMs(pump.stats.grabMs);
     const prevKf = numKeyframes;
     numKeyframes = u.numKeyframes;
+    if (extend && !markedCapturing && baseKeyframes > 0 && numKeyframes > baseKeyframes) {
+      // the stored model no longer covers every photo: a kill now leaves a capture to process
+      markedCapturing = true;
+      void app.updateSession(sessionId, { status: 'capturing' });
+    }
     kfCount.textContent = String(u.numKeyframes);
     regCount.textContent = String(u.numRegistered);
     ptCount.textContent = formatCount(u.numPoints);
@@ -751,6 +786,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   async function start(): Promise<void> {
     setPhase('starting');
     showCard(infoCard({ spinner: true, title: 'Starting camera…', text: 'Allow camera and motion access when asked.' }));
+    if (extend && !(await loadStoredSession())) return;
     const perms = app.takePermissions();
     if (!perms) {
       // No Start tap (e.g. reload / retry): ask from a tap now.
@@ -760,6 +796,25 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     const st = await perms;
     if (closed) return;
     await afterPermissions(st);
+  }
+
+  /** Continued capture: the stored scan's name, mode and quality (false + an error card when it is gone). */
+  async function loadStoredSession(): Promise<boolean> {
+    const s = await app.sessions();
+    stored = s ? await s.getSession(sessionId!).catch(() => null) : null;
+    if (closed) return false;
+    if (!stored) {
+      errorCard('Scan not found', 'This scan is no longer stored on this device.', null);
+      return false;
+    }
+    cfg.mode = stored.mode;
+    const q = stored.stats?.quality;
+    if (q === 'fast' || q === 'balanced' || q === 'max') cfg.quality = q;
+    sessionName = stored.name;
+    app.results.name = stored.name;
+    app.results.mode = cfg.mode;
+    app.results.quality = cfg.quality;
+    return true;
   }
 
   function showPermissionTap(): void {
@@ -854,7 +909,16 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       d.interval(updateGps, 2000);
       gpsChip.hidden = false;
     }
-    if (sessionId) {
+    if (extend) {
+      const available = await app.storageAvailable();
+      if (closed) return;
+      if (available !== null && available < LOW_STORAGE_BYTES) toast(`Only ${formatBytes(available)} of storage left — a long scan may not fit.`, { tone: 'warn', durationMs: 6000 });
+      // another camera format gets intrinsics of its own: the new views fit less well
+      const res0 = stored?.stats?.resolution;
+      if (typeof res0 === 'string' && res0 !== `${camRes.width}×${camRes.height}`) {
+        toast(`The camera delivers ${camRes.width}×${camRes.height}, this scan was captured at ${res0} — the new views may fit less well.`, { tone: 'warn', durationMs: 7000 });
+      }
+    } else if (sessionId) {
       const created = app.createSession(sessionId, { name: sessionName, mode: cfg.mode, quality: cfg.quality });
       sessionCreated = created;
       const [res, available] = await Promise.all([created, app.storageAvailable()]);
@@ -875,15 +939,17 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   async function initEngine(): Promise<void> {
     showCard(infoCard({ spinner: true, title: 'Preparing 3D engine…', text: 'Compiling GPU programs. This takes a moment the first time.' }));
     try {
-      await app.engine.init({
+      const res = await app.engine.init({
         mode: cfg.mode,
         quality: cfg.quality,
         sessionId: sessionId ?? undefined,
         persist: !!sessionId,
         preferGPU: true,
         hfovPriorDeg: camRes?.hfovPriorDeg,
+        ...(extend ? { resume: true, extend: true } : {}),
       });
       app.loadedSessionId = sessionId;
+      if (extend && !closed && !onExtendInit(res)) return;
     } catch (e) {
       if (closed) return;
       const msg = (e as Error)?.message ?? String(e);
@@ -919,10 +985,37 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     pump.start();
     setPhase('running');
     guidance.hidden = false;
-    guidanceTitle.textContent = guidanceInfo('initializing', cfg.mode).title;
-    guidanceDetail.textContent = guidanceInfo('initializing', cfg.mode).detail;
+    guidanceTitle.textContent = extend ? 'Start where you already scanned' : guidanceInfo('initializing', cfg.mode).title;
+    guidanceDetail.textContent = extend ? 'Point at a part of the scan first, then move on to the missing views.' : guidanceInfo('initializing', cfg.mode).detail;
     guidance.dataset.tone = 'info';
     guidance.querySelector('.guidance-icon')!.replaceChildren(icon('info', { size: 18 }));
+  }
+
+  /**
+   * Continued capture after the engine restored it: counters start at the restored keyframes, the
+   * stored model is shown until the rebuilt live model arrives, little memory left is said up front.
+   * False (an error card) when nothing was restored: a capture from scratch would replace the
+   * scan's model with the new photos alone.
+   */
+  function onExtendInit(res: InitResult): boolean {
+    baseKeyframes = res.resumedKeyframes ?? 0;
+    if (baseKeyframes <= 0) {
+      errorCard('This scan cannot be continued', 'Its stored capture could not be read on this device.', null);
+      return false;
+    }
+    numKeyframes = Math.max(numKeyframes, baseKeyframes);
+    kfCount.textContent = String(numKeyframes);
+    const m = res.captureMemory;
+    if (m && m.capMB > 0 && m.usedMB > 0.85 * m.capMB) toast('This scan is close to the memory limit of this device — only a few more views fit.', { tone: 'warn', durationMs: 7000 });
+    const sp = app.results.sessionId === sessionId ? app.results.sparse : null;
+    if (sp && !latestSparse && sp.points.count > 0) {
+      latestSparse = { positions: sp.points.positions, colors: sp.points.colors };
+      latestCameras = sp.cameras.map((c) => ({ pose: c.pose, intrinsics: c.intrinsics, ...(c.upCam ? { upCam: c.upCam } : {}) }));
+      viewerDirty = true;
+      scheduleViewer(true);
+    }
+    updateFinish();
+    return true;
   }
 
   function onCameraState(s: CameraState, detail?: string): void {
@@ -1087,6 +1180,9 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   async function completeFinish(durationMs: number): Promise<void> {
     app.results.liveSparse = latestSparse;
     app.results.liveCameras = latestCameras;
+    // a continued scan is processed again: its preview is the live model with the new views (and
+    // the stored model is no longer the scan's until the refine replaces it)
+    if (extend) app.results.sparse = null;
     await saveCaptured(durationMs);
     if (closed) return;
     closed = true;
@@ -1095,6 +1191,8 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
 
   async function saveCaptured(durationMs: number): Promise<void> {
     await sessionCreated;
+    const prevMs = stored?.stats?.durationMs;
+    if (typeof prevMs === 'number' && Number.isFinite(prevMs)) durationMs += prevMs;
     // awaited: a later stats merge (abandon) must read these stats, not the ones before them
     await app.updateSession(sessionId, {
       status: 'captured',
@@ -1144,6 +1242,24 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   async function cancel(): Promise<void> {
     const wasRunning = phase === 'running';
     if (wasRunning) pause('user');
+    if (extend) {
+      const added = numKeyframes - baseKeyframes;
+      const stop = await confirmDialog({
+        title: added > 0 ? 'Stop adding views?' : 'Stop without adding views?',
+        message:
+          added > 0
+            ? `The ${plural(added, 'new photo')} ${added === 1 ? 'is' : 'are'} kept: process the scan with them from the home screen. Tap Finish instead to process it now.`
+            : 'Nothing was added — the scan stays as it is.',
+        confirmLabel: 'Stop',
+        cancelLabel: 'Keep scanning',
+      });
+      if (!stop) {
+        if (wasRunning) resume();
+        return;
+      }
+      await abandon();
+      return;
+    }
     const ok = await confirmDialog({
       title: 'Discard this scan?',
       message: numKeyframes > 0 ? 'The photos captured so far will be deleted.' : undefined,
@@ -1159,6 +1275,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   }
 
   async function abandon(deleteSession = numKeyframes < MIN_KEYFRAMES): Promise<void> {
+    if (extend) return leaveExtended();
     closed = true;
     stopSensors();
     void app.wakeLock.release();
@@ -1181,6 +1298,26 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     }
     app.loadedSessionId = null;
     app.navigate({ type: 'CANCEL' });
+  }
+
+  /**
+   * Leave a continued capture (never deleting the scan). Without new views the scan is as it was:
+   * the engine lets go of the reopened capture (the scan is loaded again where it is shown) and the
+   * route goes back. With new views they are kept: the scan is a capture to process (Home).
+   */
+  async function leaveExtended(): Promise<void> {
+    closed = true;
+    stopSensors();
+    void app.wakeLock.release();
+    await app.engine.abortLongOperation({ graceMs: FINISH_ABORT_GRACE_MS }).catch(() => 'none' as const);
+    app.loadedSessionId = null;
+    if (markedCapturing || numKeyframes > baseKeyframes) {
+      await app.updateSession(sessionId, { stats: { keyframes: numKeyframes, points: last?.numPoints ?? 0 } });
+      app.navigate({ type: 'CANCEL' });
+      return;
+    }
+    await app.engine.closeSession(sessionId!).catch(() => undefined);
+    app.navigate({ type: 'BACK' });
   }
 
   return {

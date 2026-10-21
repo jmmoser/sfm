@@ -1,7 +1,8 @@
 /**
  * Home: hero + "New scan", saved sessions (thumbnail, name, date, status, frames) with
- * open / rename / delete, storage usage + "Install to Home Screen" hint, environment banners
- * (Lockdown Mode, HTTPS, camera / storage blocking, WebGPU → CPU mode), Diagnostics link.
+ * open / add more views (continue scanning: src/app/extend-scan.ts) / rename / delete, storage
+ * usage + "Install to Home Screen" hint, environment banners (Lockdown Mode, HTTPS, camera /
+ * storage blocking, WebGPU → CPU mode), Diagnostics link.
  */
 import type { SessionMeta, StorageEstimateInfo } from '../../io/storage';
 import type { App, Screen } from '../app';
@@ -14,6 +15,7 @@ import { canScan, environmentIssues, type EnvInfo } from '../env';
 import { formatBytes, formatRelativeDate, modeLabel, plural, statusInfo } from '../format';
 import { icon } from '../icons';
 import { MIN_KEYFRAMES, routeForSession } from '../router';
+import { isProcessed, openExtendSheet } from '../extend-scan';
 
 const INSTALL_HINT_KEY = 'sfm.hideInstallHint';
 
@@ -125,10 +127,21 @@ export function createHomeScreen(app: App): Screen {
 
   function more(s: SessionMeta): void {
     const canOpen = !!routeForSession(s.id, s.status, photoCount(s));
+    const processed = isProcessed(s.status);
+    const sg = s.stats?.splatGaussians;
+    const built = { dense: s.status === 'dense' || s.status === 'meshed', mesh: s.status === 'meshed', splat: typeof sg === 'number' && sg > 0 };
     actionSheet(
       s.name,
       [
         { label: canOpen ? (s.status === 'captured' || s.status === 'capturing' ? 'Process' : 'Open') : 'Open', icon: 'cube', disabled: !canOpen, onSelect: () => openSession(s), testId: 'session-open' },
+        {
+          // continue the capture: new views for a processed scan, the rest of an interrupted one
+          label: processed ? 'Add more views' : 'Continue scanning',
+          icon: 'camera',
+          disabled: !canScan(app.env) || (!processed && photoCount(s) < 1),
+          onSelect: () => void openExtendSheet(app, { id: s.id, status: s.status, built }),
+          testId: 'session-extend',
+        },
         { label: 'Rename', icon: 'pencil', onSelect: () => void rename(s), testId: 'session-rename' },
         { label: 'Delete', icon: 'trash', destructive: true, onSelect: () => void remove(s), testId: 'session-delete' },
       ],
