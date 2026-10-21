@@ -1,6 +1,7 @@
 /**
  * Pure helpers for the Viewer / Processing screens (unit-tested in model-info.test.ts):
- * dense / splat resume detection, north reference of the model, engine memory statistics.
+ * dense / splat resume detection, the photoreal build card (progress line, preview caption,
+ * "Use it now"), north reference of the model, engine memory statistics.
  */
 import { SPLAT_STAGES, type QualityPreset } from '../workers/protocol';
 import type { Results } from './app';
@@ -62,6 +63,24 @@ export function splatResumeQuality(r: Pick<Results, 'stats'>): QualityPreset | n
   return null;
 }
 
+/**
+ * The stored splat model was ended early ("Use it now") and its training can continue from the
+ * checkpoint the engine kept at the model's iteration: `stats.splatResumableIteration` (set by the
+ * viewer from the result's splatContinueFrom, by loadSession after a reload) equals
+ * `splat.iterations`, and no build of the app was interrupted since. Not an interruption: no
+ * "interrupted" card; the Build sheet offers to continue the training.
+ */
+export function splatContinuable(r: Pick<Results, 'sparse' | 'splat' | 'stats'>): boolean {
+  if (!r.sparse || !r.splat || r.stats.splatInterrupted) return false;
+  return r.stats.splatResumableIteration === r.splat.iterations;
+}
+
+/** "1,250 of 3,000 iterations" (`of` part only when the schedule is known and longer). */
+export function splatIterationsText(iteration: number, iterations?: unknown): string {
+  const it = iteration.toLocaleString('en-US');
+  return typeof iterations === 'number' && iterations > iteration ? `${it} of ${iterations.toLocaleString('en-US')} iterations` : `${it} iterations`;
+}
+
 /** Drop the splat-resume markers (a training finished, or refine invalidated the checkpoints). */
 export function clearSplatResume(stats: Stats): void {
   delete stats.splatResumableIteration;
@@ -100,6 +119,35 @@ export function splatProgressView(e: { stage: string; progress: number; message?
   }
   if (e.stage === SPLAT_STAGES.finishing) return { progress: 0.97 + 0.03 * Math.max(0, p), text: 'Saving the model' };
   return { progress: p < 0 ? -1 : 0.08 * p, text: 'Preparing the photos' };
+}
+
+/** Caption of a 'splat_preview' snapshot (its SplatPreviewDetail): "Iteration 1,250 of 3,000". */
+export function splatPreviewCaption(detail?: Record<string, number>): string {
+  const it = detail?.iteration;
+  if (typeof it !== 'number') return 'Preview';
+  if (it <= 0) return 'Initial Gaussians, before training';
+  const n = detail?.iterations;
+  return `Iteration ${it.toLocaleString('en-US')}${typeof n === 'number' && n > it ? ` of ${n.toLocaleString('en-US')}` : ''}`;
+}
+
+export interface SplatUseNow {
+  /** "Use it now" can end the training (the engine's finishFrom is reached). */
+  ready: boolean;
+  /** Why not yet (empty when ready or unknown). */
+  note: string;
+}
+
+/**
+ * "Use it now" on the photoreal build card from the latest 'splat_training' detail: enabled from
+ * `finishFrom` (the end of the trainer's coarse-to-fine schedule) on; before the first report
+ * (preparation) disabled without a note.
+ */
+export function splatUseNow(detail?: Record<string, number>): SplatUseNow {
+  const it = detail?.iteration;
+  const from = detail?.finishFrom;
+  if (typeof it !== 'number' || typeof from !== 'number') return { ready: false, note: '' };
+  if (it >= from) return { ready: true, note: '' };
+  return { ready: false, note: `Usable from iteration ${from.toLocaleString('en-US')}` };
 }
 
 /** Drop the dense-resume markers (a densify finished, or refine invalidated the stored depth maps). */

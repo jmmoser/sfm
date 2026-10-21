@@ -1,6 +1,21 @@
 import { describe, expect, it } from 'vitest';
-import type { SparseResult } from '../workers/protocol';
-import { builtQuality, clearDenseResume, clearSplatResume, denseResumable, denseResumeQuality, memoryStatRows, northInfo, splatProgressView, splatResumable, splatResumeQuality } from './model-info';
+import type { SparseResult, SplatResult } from '../workers/protocol';
+import {
+  builtQuality,
+  clearDenseResume,
+  clearSplatResume,
+  denseResumable,
+  denseResumeQuality,
+  memoryStatRows,
+  northInfo,
+  splatContinuable,
+  splatIterationsText,
+  splatPreviewCaption,
+  splatProgressView,
+  splatResumable,
+  splatResumeQuality,
+  splatUseNow,
+} from './model-info';
 
 const sparse = { points: { count: 0, positions: new Float32Array(0), colors: new Uint8Array(0) }, cameras: [], stats: {} } as unknown as SparseResult;
 const cloud = { count: 1, positions: new Float32Array(3), colors: new Uint8Array(3) };
@@ -115,5 +130,28 @@ describe('splat resume / progress', () => {
       '2,900 / 3,000 iterations · < 1 min left',
     );
     expect(splatProgressView({ stage: 'splat_finishing', progress: 1 })).toEqual({ progress: 1, text: 'Saving the model' });
+  });
+  it('preview caption and "Use it now" (from finishFrom; disabled without a note while preparing)', () => {
+    expect(splatPreviewCaption({ iteration: 0, iterations: 3000, viewId: 4, psnr: 19 })).toBe('Initial Gaussians, before training');
+    expect(splatPreviewCaption({ iteration: 1250, iterations: 3000, viewId: 4, psnr: 27 })).toBe('Iteration 1,250 of 3,000');
+    expect(splatPreviewCaption({ iteration: 3000, iterations: 3000 })).toBe('Iteration 3,000');
+    expect(splatPreviewCaption()).toBe('Preview');
+    expect(splatUseNow()).toEqual({ ready: false, note: '' });
+    expect(splatUseNow({ iteration: 400, iterations: 3000, finishFrom: 900 })).toEqual({ ready: false, note: 'Usable from iteration 900' });
+    expect(splatUseNow({ iteration: 900, iterations: 3000, finishFrom: 900 })).toEqual({ ready: true, note: '' });
+    // an older engine without finishFrom: never offered
+    expect(splatUseNow({ iteration: 2000, iterations: 3000 }).ready).toBe(false);
+  });
+  it('a model ended early stays continuable (not "interrupted") until a build of it is interrupted', () => {
+    const splat = { count: 10, iterations: 1250, stats: { splatIterations: 3000 } } as unknown as SplatResult;
+    expect(splatContinuable({ sparse, splat, stats: { splatResumableIteration: 1250 } })).toBe(true);
+    // a continuation cancelled later (checkpoint further on) or here (app marker): interrupted
+    expect(splatContinuable({ sparse, splat, stats: { splatResumableIteration: 1600 } })).toBe(false);
+    expect(splatContinuable({ sparse, splat, stats: { splatResumableIteration: 1250, splatInterrupted: 1 } })).toBe(false);
+    expect(splatContinuable({ sparse, splat: null, stats: { splatResumableIteration: 1250 } })).toBe(false);
+    expect(splatContinuable({ sparse, splat, stats: {} })).toBe(false);
+    expect(splatIterationsText(1250, 3000)).toBe('1,250 of 3,000 iterations');
+    expect(splatIterationsText(3000, 3000)).toBe('3,000 iterations');
+    expect(splatIterationsText(1250, undefined)).toBe('1,250 iterations');
   });
 });
