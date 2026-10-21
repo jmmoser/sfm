@@ -35,9 +35,24 @@ function allFinite(dm: DepthMap): boolean {
   return true;
 }
 
+/**
+ * Per-component tolerance between a GPU normal (as `compute()` returns it) and the CPU normal of
+ * the same hypothesis. Two independent terms:
+ * - 1e-4: the GPU's f32 sampling of the normal (sin / cos / sqrt). SwiftShader's sin / cos are off
+ *   by up to 1.9e-4 (abs, near |value| = 0.985; within WGSL's 2^-11 bound), which leaves its
+ *   normalised init normals within 7.3e-5 of the CPU's (64×48 'far' set, read back unquantised).
+ * - 6.5e-5: the output codec (octahedral snorm16 since the 12 B/px readback). Each coordinate
+ *   rounds by <= 0.5 / 32767 and the decode is 3-Lipschitz (sigma_max of its Jacobian <= sqrt 3,
+ *   1 / |P| <= sqrt 3), so |dn| <= 3 * sqrt(2) * 0.5 / 32767 = 6.474e-5; 2e7 sampled normals reach
+ *   6.4726e-5 (max single component 5.67e-5).
+ * A wrong PCG stream or sampling formula moves normals by O(0.1-1), far outside either term.
+ */
+const NORMAL_TOL = 1e-4 + 6.5e-5;
+
 interface Parity {
   depthSame: number;
   normalSame: number;
+  maxNormalDiff: number;
   costClose: number;
   meanCostDiff: number;
 }
@@ -47,21 +62,19 @@ function parity(a: DepthMap, b: DepthMap, depthTol: number, normalTol: number, c
   const n = a.depth.length;
   let ds = 0;
   let ns = 0;
+  let nd = 0;
   let cc = 0;
   let cd = 0;
   for (let i = 0; i < n; i++) {
     if (Math.abs(a.depth[i] - b.depth[i]) <= depthTol * Math.max(b.depth[i], 1e-9)) ds++;
-    if (
-      Math.abs(a.normal[3 * i] - b.normal[3 * i]) <= normalTol &&
-      Math.abs(a.normal[3 * i + 1] - b.normal[3 * i + 1]) <= normalTol &&
-      Math.abs(a.normal[3 * i + 2] - b.normal[3 * i + 2]) <= normalTol
-    )
-      ns++;
+    const e = Math.max(Math.abs(a.normal[3 * i] - b.normal[3 * i]), Math.abs(a.normal[3 * i + 1] - b.normal[3 * i + 1]), Math.abs(a.normal[3 * i + 2] - b.normal[3 * i + 2]));
+    if (e <= normalTol) ns++;
+    nd = Math.max(nd, e); // NaN propagates
     const d = Math.abs(a.cost[i] - b.cost[i]);
     if (d <= costTol) cc++;
     cd += d;
   }
-  return { depthSame: ds / n, normalSame: ns / n, costClose: cc / n, meanCostDiff: cd / n };
+  return { depthSame: ds / n, normalSame: ns / n, maxNormalDiff: nd, costClose: cc / n, meanCostDiff: cd / n };
 }
 
 function signedMedianRelError(dm: DepthMap, gt: Float32Array, mask: Uint8Array): number {
@@ -72,7 +85,7 @@ function signedMedianRelError(dm: DepthMap, gt: Float32Array, mask: Uint8Array):
 }
 
 const fmtP = (p: Parity): string =>
-  `depth same ${(100 * p.depthSame).toFixed(2)}% | normal same ${(100 * p.normalSame).toFixed(2)}% | cost close ${(100 * p.costClose).toFixed(2)}% | mean |Δcost| ${p.meanCostDiff.toExponential(2)}`;
+  `depth same ${(100 * p.depthSame).toFixed(2)}% | normal same ${(100 * p.normalSame).toFixed(2)}% (max |Δn| ${p.maxNormalDiff.toExponential(2)}) | cost close ${(100 * p.costClose).toFixed(2)}% | mean |Δcost| ${p.meanCostDiff.toExponential(2)}`;
 
 describe('PatchMatchGPU adversarial', () => {
   it('random initialisation is identical to the CPU (PCG streams, inverse-depth sampling, normals)', async () => {
@@ -80,7 +93,7 @@ describe('PatchMatchGPU adversarial', () => {
     const opts = { iterations: 0, maxCost: 2 };
     const g = await pm.compute(ds.views[0], ds.views.slice(1), ds.range, opts);
     const c = patchMatchCPU(ds.views[0], ds.views.slice(1), ds.range, opts);
-    const p = parity(g, c, 1e-5, 1e-4, 0.02);
+    const p = parity(g, c, 1e-5, NORMAL_TOL, 0.02);
     log(`init-only parity: ${fmtP(p)}`);
     expect(allFinite(g)).toBe(true);
     expect(p.depthSame).toBeGreaterThan(0.999);
@@ -125,7 +138,7 @@ describe('PatchMatchGPU adversarial', () => {
       console.warn = warn;
     }
     const c0 = patchMatchCPU(ds.views[0], ds.views.slice(1), ds.range, opts0);
-    const p0 = parity(g0, c0, 1e-5, 1e-4, 0.02);
+    const p0 = parity(g0, c0, 1e-5, NORMAL_TOL, 0.02);
     log(`loop path, init-only parity: ${fmtP(p0)}`);
     expect(p0.depthSame).toBeGreaterThan(0.999);
     expect(p0.costClose).toBeGreaterThan(0.97);
@@ -190,7 +203,7 @@ describe('PatchMatchGPU adversarial', () => {
     const opts0 = { iterations: 0, maxCost: 2 };
     const g0 = await pm.compute(mixed[0], mixed.slice(1), base.range, opts0);
     const c0 = patchMatchCPU(mixed[0], mixed.slice(1), base.range, opts0);
-    const p0 = parity(g0, c0, 1e-5, 1e-4, 0.02);
+    const p0 = parity(g0, c0, 1e-5, NORMAL_TOL, 0.02);
     log(`mixed source sizes, init-only parity: ${fmtP(p0)}`);
     expect(p0.costClose).toBeGreaterThan(0.97);
     const g = await pm.compute(mixed[0], mixed.slice(1), base.range, { iterations: 3 });
@@ -252,7 +265,7 @@ describe('PatchMatchGPU adversarial', () => {
     const opts = { iterations: 0, maxCost: 2, geometric: false };
     const g0 = await pm.compute(full.views[0], full.views.slice(1), full.range, opts, { prior: coarse, sourceDepths: [] });
     const c0 = patchMatchCPU(full.views[0], full.views.slice(1), full.range, opts, { prior: coarse, sourceDepths: [] });
-    const p0 = parity(g0, c0, 1e-5, 1e-4, 0.02);
+    const p0 = parity(g0, c0, 1e-5, NORMAL_TOL, 0.02);
     log(`prior-initialised, init-only parity: ${fmtP(p0)}`);
     expect(p0.depthSame).toBeGreaterThan(0.999);
     const g = await pm.compute(full.views[0], full.views.slice(1), full.range, { iterations: 2, geometric: false }, { prior: coarse, sourceDepths: [] });
