@@ -227,7 +227,7 @@ MockEngine implements the same calls (a fast fake run whose model is one Gaussia
 
 ## 4. UI flow (`src/app`)
 
-Home (sessions, new scan, diagnostics) → Setup (mode, quality) → Permissions
+Home (sessions, new scan, diagnostics, the "run interrupted" card below) → Setup (mode, quality) → Permissions
 (one tap: motion → camera → location) → Capture (video, guidance, live sparse
 view, counters, finish) → Processing (stages + progress + cancel) → Viewer
 (splats / points / mesh layer pill, cameras, EDL, measure, export, run dense / mesh / photoreal). The splat
@@ -235,3 +235,30 @@ stage runs from the viewer itself ("Photoreal model" in the Build sheet → `spl
 `SplatTrainingDetail`, Cancel, Resume after an interruption), the model is fetched with `splatModel` into the
 viewer's WebGPU splat layer and shown by default, and the export sheet offers 'ply-splat' (src/viewer/splat-layer.ts,
 research/viewer-rendering.md).
+
+### Interrupted runs (run journal, `src/app/run-journal.ts`)
+
+iOS kills a tab that exceeds its memory limit and evicts one in the background without any event, so the
+app keeps a crash-safe marker of the long run in progress in localStorage `sfm.run.v1` = {v, sessionId,
+name, step: refine | densify | mesh | splat, stage, quality, visible, startedAt, lastBeat, kills{step: n},
+interrupted?}:
+
+* written when a step of a stored scan starts (Processing's refine / densify / mesh; the viewer's photoreal
+  build), on each stage change (at most every 5 s otherwise) and on visibilitychange while the run is open;
+  the page's own unload (`pagehide`, not persisted) is not recorded as going to the background;
+* closed on success (that step's kill count resets), on cancel, on any error the engine reported, and when
+  the screen is left (kill counts kept). A kill runs nothing, so the open entry survives.
+
+At App start an open entry becomes an interruption: **killed** when the page was visible at the last write
+(likely memory or a crash — a closed tab looks the same, so the copy says "stopped"), **evicted** when it
+was hidden; `kills[step]` is incremented. Home shows a "run interrupted" card (testId `run-interrupted`)
+naming the scan and the step until it is resumed or dismissed (or the next run starts). Resume opens the scan
+through the normal OPEN_SESSION route: Processing for a captured scan (refine), otherwise the viewer, whose
+dense / photoreal resume card continues from the stored depth maps / splat checkpoint (`loadSession` stats).
+
+While `kills[step] ≥ 1` for the scan, its next densify / mesh / photoreal build runs in **light mode**: the
+3D view shows at most 1.5 M points of the dense cloud (the existing `decimate`), no mesh, and the viewer's
+prepared export files are dropped; the full view returns when the build stops. The engine's memory plan is
+unchanged, so splat checkpoints stay valid (lowering `memoryBudgetMB` after a second kill is a later step).
+The MockEngine mirrors the engine's stored progress in the session record's stats, so e2e/ui/states.mjs
+kills runs with a page reload (`killed-dense`, `killed-splat`, `evicted-refine`).
