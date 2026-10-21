@@ -82,6 +82,33 @@ function limitsToPlain(l: GPUSupportedLimits | undefined): Record<string, number
   return out;
 }
 
+/** Which of `names` exist in a dedicated worker; null when no worker could answer (2 s timeout). */
+async function workerGlobals(names: string[], errors: string[]): Promise<Record<string, boolean> | null> {
+  if (typeof Worker === 'undefined') return null;
+  let w: Worker | null = null;
+  try {
+    w = new Worker(new URL('../workers/feature-probe.worker.ts', import.meta.url), { type: 'module', name: 'feature-probe' });
+    const worker = w;
+    return await new Promise<Record<string, boolean> | null>((resolve) => {
+      const timer = setTimeout(() => resolve(null), 2000);
+      worker.onmessage = (ev: MessageEvent<Record<string, boolean>>) => {
+        clearTimeout(timer);
+        resolve(ev.data);
+      };
+      worker.onerror = () => {
+        clearTimeout(timer);
+        resolve(null);
+      };
+      worker.postMessage(names);
+    });
+  } catch (e) {
+    errors.push(`feature worker: ${(e as Error)?.message ?? e}`);
+    return null;
+  } finally {
+    w?.terminate();
+  }
+}
+
 export async function collectDiagnostics(opts: DiagnosticsOptions = {}): Promise<SensorDiagnostics> {
   const errors: string[] = [];
   const g = globalThis as unknown as Record<string, unknown> & {
@@ -109,9 +136,9 @@ export async function collectDiagnostics(opts: DiagnosticsOptions = {}): Promise
     webgpu: !!nav?.gpu,
     getUserMedia: !!nav?.mediaDevices?.getUserMedia,
     requestVideoFrameCallback: typeof HTMLVideoElement !== 'undefined' && has(HTMLVideoElement.prototype, 'requestVideoFrameCallback'),
-    // Safari exposes MSTP in dedicated workers only: false on this (main) thread is expected on
-    // iOS. The capture path does not use it (rVFC + createImageBitmap).
-    mediaStreamTrackProcessor: has(g, 'MediaStreamTrackProcessor'),
+    // checked in a dedicated worker: Safari exposes MSTP there only (Chromium also on the main
+    // thread). Only the camera timing probe uses it; the capture path is rVFC + createImageBitmap.
+    mediaStreamTrackProcessor: (await workerGlobals(['MediaStreamTrackProcessor'], errors))?.MediaStreamTrackProcessor ?? has(g, 'MediaStreamTrackProcessor'),
     videoFrame: has(g, 'VideoFrame'),
     imageCapture: has(g, 'ImageCapture'),
     offscreenCanvas: has(g, 'OffscreenCanvas'),

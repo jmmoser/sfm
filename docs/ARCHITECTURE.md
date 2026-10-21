@@ -3115,8 +3115,8 @@ Every web platform API, JS built-in, CSS feature, WGSL construct and WebAssembly
   adapter makes one device; WebKit returns a lost device on the second request). (3) `compilePipeline` (SIFT / matcher)
   races `createComputePipelineAsync` against a 30 s timeout and then compiles synchronously, as PatchMatchGPU already did.
   (4) `SiftGPU.extractFromBitmap(ImageData)` uploads with `writeTexture` (ImageData is not a Safari
-  `copyExternalImageToTexture` source per BCD). MSTP is worker-only in Safari: `features.mediaStreamTrackProcessor` is
-  false on the main thread there (unused by the capture path).
+  `copyExternalImageToTexture` source per BCD). MSTP is worker-only in Safari: `features.mediaStreamTrackProcessor` is probed in a
+  dedicated worker (src/workers/feature-probe.worker.ts), main-thread fallback (unused by the capture path).
 
 ### Security & privacy review (2026-10; amends the `src/app`, `src/io`, `src/engine` notes and `public/sw.js`)
 
