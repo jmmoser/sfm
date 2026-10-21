@@ -246,14 +246,23 @@ fn tileTouched(m: vec2f, c: vec3f, tau: f32, tx: u32, ty: u32) -> bool {
 }
 `;
 
-/** f32 add on a u32 atomic (compare-exchange loop; WGSL has no float atomics). */
+/**
+ * f32 add on a u32 atomic (WGSL has no float atomics). Exchange-only on purpose: Safari's
+ * WGSL→MSL lowering of atomicCompareExchangeWeak emits a result struct with a
+ * `thread`-qualified field, which Metal rejects, so the whole pipeline fails to compile.
+ * Take the slot's value out (leaving 0.0 = 0u), add it to what we hold, put the sum back; if
+ * another thread deposited into the emptied slot meanwhile, we took its value with the
+ * second exchange and go round again carrying it. Every exchange moves ownership of a value,
+ * so nothing is lost or counted twice.
+ */
 export const ATOMIC_ADD_F32_WGSL = (buffer: string): string => /* wgsl */ `
 fn atomicAddF32(idx: u32, v: f32) {
-  var old = atomicLoad(&${buffer}[idx]);
+  var carry = v;
   loop {
-    let r = atomicCompareExchangeWeak(&${buffer}[idx], old, bitcast<u32>(bitcast<f32>(old) + v));
-    if (r.exchanged) { break; }
-    old = r.old_value;
+    carry += bitcast<f32>(atomicExchange(&${buffer}[idx], 0u));
+    let stray = atomicExchange(&${buffer}[idx], bitcast<u32>(carry));
+    if (stray == 0u) { break; }
+    carry = bitcast<f32>(stray);
   }
 }
 `;
