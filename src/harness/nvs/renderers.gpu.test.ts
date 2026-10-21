@@ -81,7 +81,8 @@ describe('ViewerRenderers pinhole projection', () => {
       made.push(r);
       r.setContent(null, squares(cam, centres, 0.05));
       const img = r.render('mesh-unlit', cam);
-      // MSAA quantises the edges (≈ ±0.1 px per square): no bias on average, small per square
+      // MSAA quantises the edges (≈ ±0.1 px per square, sd 0.056 px per axis): small per square, and
+      // no bias on average beyond the rasteriser's vertex snapping (see the mean check below)
       const err: number[][] = [];
       for (const c of centres) {
         const [u, v] = project(cam, c);
@@ -93,9 +94,21 @@ describe('ViewerRenderers pinhole projection', () => {
         const i = 4 * (Math.round(v) * W + Math.round(u));
         expect(Array.from(img.subarray(i, i + 4))).toEqual([255, 255, 255, 255]);
       }
+      // Mean error: 0.04 px is the quantisation noise of a 16-square mean (sd 0.014 px, ≈ 2.9 σ).
+      // On top comes the rasteriser's own offset: vertices snap to 1/2^SUBPIXEL_BITS px and the
+      // standard 4× sample locations (odd multiples of 1/8 px) lie on that grid, so an edge within
+      // half a step of a sample snaps ONTO it and the top-left fill rule decides; both edges of a
+      // square then move the same way, by half a step (2^-(bits+1) px) per axis on average.
+      // SwiftShader snaps to 1/16 px ⇒ 1/32 = 0.031 px (towards −u, +v): its frames here equal,
+      // alpha for alpha, the exact pinhole projection rasterised that way (mean −0.045, +0.038 px
+      // at 96×128 and −0.054, +0.044 at 160×120; the same squares snapped to 1/256 px: +0.022,
+      // −0.006 and −0.015, +0.010). 8-bit GPUs ⇒ 0.002 px. No sign is assumed: the fill rule's
+      // corner follows the back-end's framebuffer orientation.
+      const gl = r.viewer.renderer.getContext();
+      const snapBias = 2 ** -((gl.getParameter(gl.SUBPIXEL_BITS) as number) + 1);
       const mean = (k: number) => err.reduce((s, e) => s + e[k], 0) / err.length;
-      expect(Math.abs(mean(0))).toBeLessThan(0.04);
-      expect(Math.abs(mean(1))).toBeLessThan(0.04);
+      expect(Math.abs(mean(0))).toBeLessThan(0.04 + snapBias);
+      expect(Math.abs(mean(1))).toBeLessThan(0.04 + snapBias);
       // radius-sized point splats (as the app draws the dense cloud): disc of radius r·f/Z px
       const pts: PointCloud = {
         count: centres.length,
