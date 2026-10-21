@@ -8,6 +8,11 @@
  *   [depth/NNNNNN.f32], gt_points.bin (Float32 xyz), gt_normals.i8 (int8 xyz ×127),
  *   [gt_visibility.u8] (frames seeing each sample, saturating at 255), and the same
  *   three files with the gt_focus_ prefix for the dense object-of-interest samples.
+ *
+ * Not modelled: specular materials, lighting changes beyond the exposure drift, a camera–IMU
+ * lever arm. Global shutter, fixed focal and a smooth path unless a `*-real` preset (or the
+ * realism options) adds rolling shutter, focus breathing, shake / fast pans and white-balance
+ * drift. SwiftShader renders ≈ 0.75–0.9 s per frame (a 240-frame yard dataset ≈ 4 min).
  */
 import type { CameraIntrinsics, Pose } from '../../core/types';
 import {

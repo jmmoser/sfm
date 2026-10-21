@@ -14,8 +14,13 @@
  *    the page was hidden), or a readback chunk lacks its fresh stamp (a dropped copy
  *    leaves the staging buffer's previous contents), the whole computation is retried
  *    (max 2×, every source uploaded again: uploads may have been dropped too) and then fails;
- *  - all pipelines are compiled in `create()` (compilation blocks the GPU process
- *    on Safari 26), raced against device loss and a timeout.
+ *  - pipelines (init / propagate / finalize / priorPlanes per source-count bucket and kernel
+ *    shape) are compiled in `create()` / `precompile()` (compilation blocks the GPU process
+ *    on Safari 26), raced against device loss and a timeout: create the matcher after
+ *    capture, not while the camera preview runs;
+ *  - error scopes are pushed / popped synchronously around each encode + submit (`scoped`),
+ *    and `onSubmittedWorkDone` is raced against `device.lost`, so a lost device cannot hang
+ *    compute().
  * Textures and buffers are reused across compute() calls. Source grey images and source depth
  * maps live in LRU texture-array caches keyed by the uploaded object (`LayerCache`): a view that
  * is a source of several references is converted and uploaded once while it stays resident (the
@@ -23,6 +28,14 @@
  * uploaded as is (its grey is derived in the shader). A `finalize` pass converts the hypotheses to
  * depth / octahedral normal / cost on the GPU, and the result is read back at 12 B/px together
  * with the dropped-work sentinel in one mapping when it fits the staging buffer.
+ *
+ * GPU memory: 32 B per reference pixel (+ ≤ 8 MB staging), 1 B per cached source-image pixel,
+ * + 4 B per cached source-depth pixel in geometric mode (+ ≤ 4 slack layers per cache). JS
+ * output 20 B/px (+ 4 B/px transient during readback). Results do not depend on the band
+ * tiling: the PCG streams are per pass and pixel.
+ * Known limits: no mip selection for sources that see the surface at a different scale (a source
+ * at 2× resolution drops within-1 % from 81 to 70 %); hardware bilinear weights have only ~8-bit
+ * sub-texel precision on some GPUs (≈ 1/256 px).
  */
 import type { GPUContext } from '../gpu/device';
 import { createBuffer } from '../gpu/device';

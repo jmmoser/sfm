@@ -2,6 +2,9 @@
  * Exports (ENGINE.md §2 `exportModel`): PLY points (dense if available, else sparse), PLY
  * mesh, GLB (mesh if available, else points), COLMAP text model + images in a ZIP, Gaussian
  * splats as an INRIA 3DGS PLY (appearance-normalised model of the splat stage).
+ *
+ * Privacy: no export carries a location — there is no geo input here, coordinates are local
+ * (ENU metres when aligned) and the keyframe JPEGs are canvas re-encodes (no EXIF). Keep it so.
  */
 import type { FeatureSet, PointCloud, RGBAImage, TriangleMesh } from '../core/types';
 import { createColmapZipBlob, type ColmapArchiveImage, type ColmapModelInput } from '../io/colmap';

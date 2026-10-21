@@ -227,7 +227,8 @@ class FeaturePipelineImpl implements FeaturePipeline {
 /**
  * Creates the feature pipeline: WebGPU (SiftGPU + MatcherGPU, pipelines compiled up
  * front) when `preferGPU` (default) and a device is available, the CPU reference
- * otherwise. Never rejects because of the GPU.
+ * otherwise. Never rejects because of the GPU. Create it once at start-up: its 19
+ * compute pipelines compile synchronously in Safari's GPU process and block the queue.
  */
 export async function createFeaturePipeline(opts: FeaturePipelineOptions = {}): Promise<FeaturePipeline> {
   const siftOpts = opts.sift ?? {};

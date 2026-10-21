@@ -11,6 +11,12 @@
  *
  * The caller (engine) adds each keyframe to the FeatureDatabase and its verified
  * pairs to the CorrespondenceGraph BEFORE calling `addKeyframe`.
+ *
+ * Global BA runs whenever the model grew by 30 % up to 30 images (3, 4, 6, 8, 11, …), then every
+ * `globalBAEvery` registrations. Pending keyframes are retried nearest-first when their visible-
+ * point count grew. The BAs are time-bounded, so live results depend on the machine's load (by
+ * design; the batch `runIncrementalSfM` is deterministic). Limit: a single model — no second
+ * model is started while tracking is lost (the offline `runIncrementalSfM` handles that).
  */
 import type { Pose } from '../core/types';
 import type { CorrespondenceGraph } from './correspondence-graph';

@@ -19,6 +19,13 @@
  *    checkpoints) and the degradation (fewer views, Gaussians, smaller images) that fits it.
  *
  * All sizes are bytes unless a name ends in `MB`.
+ *
+ * Limits: every number here is an estimate — iOS exposes no `performance.memory`, so there is no
+ * on-device memory profile, the JSC heap slack on top of live data is covered only by the 250 MB
+ * page reserve, and the `maxBufferSize` budget classes are unverified on devices. Per-stage budget
+ * estimates and the measured per-keyframe cost: docs/research/on-device-benchmark.md. Descriptors
+ * are ≈ 86 % of the feature bytes and only needed for matching: paging them to the store would
+ * roughly double the keyframe cap.
  */
 import type { FeatureSet } from '../core/types';
 import type { CorrespondenceGraph } from '../sfm/correspondence-graph';
@@ -49,7 +56,7 @@ export const MEM = Object.freeze({
   depthOnlyPx: 4,
   rgbaPx: 4,
   /**
-   * PatchMatchGPU (ARCHITECTURE §6 dense notes): 32 B per reference px, 1 B per source px, +4 B
+   * PatchMatchGPU (src/dense/patchmatch-gpu.ts): 32 B per reference px, 1 B per source px, +4 B
    * per source px geometric; fixed: uniforms, ≤ 8 MB staging and the upload caches' slack layers
    * (≤ 8 MB each, `PatchMatchGPU.cacheSlackBytes`).
    */

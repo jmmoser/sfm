@@ -1,7 +1,7 @@
 /**
  * Recommended dense-reconstruction settings per quality preset (`fast` / `balanced` / `max`),
- * tuned on the GT-pose dense harness (e2e/run-dense-gt.mjs; ARCHITECTURE §6 "Dense tuning
- * results"). Flat fields use the engine's names (src/engine/presets.ts merges them over its base
+ * tuned on the GT-pose dense harness (e2e/run-dense-gt.mjs; docs/research/dense-tuning.md
+ * "Dense tuning results"). Flat fields use the engine's names (src/engine/presets.ts merges them over its base
  * table); the nested blocks hold the full option sets for direct users of src/dense:
  *
  *   selectSourceViews(views, sparse, { numSources, ...viewSelection })
@@ -18,25 +18,26 @@
  * The defaults of the individual functions (`DEFAULT_FUSION_OPTIONS`, …) are unchanged for
  * compatibility (existing tests pin them); these presets are the tuned combination.
  *
- * Multi-scale (2026-10, real GPU): ½-resolution photometric (`iterations`) → full-resolution
+ * Multi-scale: ½-resolution photometric (`iterations`) → full-resolution
  * prior-initialised photometric (`fullResIterations` 2) → geometric, run by the engine
  * (src/engine/dense.ts). GT-pose harness at 800 px / 40 views (fast), M4: quality-neutral
- * (object F 0.9992 → 0.9990, yard 0.6184 → 0.6190) at 1.2–1.5× less GPU time; ARCHITECTURE §6
- * "Dense on a real GPU". The cheaper kernel (`patchRadius` 6 / `patchStep` 3, `affineWindow`,
+ * (object F 0.9992 → 0.9990, yard 0.6184 → 0.6190) at 1.2–1.5× less GPU time (docs/research/dense-tuning.md
+ * "Dense on a real GPU"). The cheaper kernel (`patchRadius` 6 / `patchStep` 3, `affineWindow`,
  * 3 proposals) halves the GPU time again but costs yard completeness (e2e yard-real F −0.75 pt),
  * so the presets keep the 11 px / 36-sample window.
  *
  * Evidence (480 px, GT poses; P / C at τ): fusion `minViews` 2 + halo filter + normal 15°
  * took object 0.9991 / 0.960 → 0.9996 / 0.988 and yard 0.9885 / 0.231 → 0.979 / 0.347;
  * `depthMarginMin` 0.5 (yard near ground) → yard 0.981 / 0.352; the sky test of the halo filter
- * (untextured top-connected regions without coherent depth, ARCHITECTURE §6 "Sky / low-texture
- * halo removal") → yard 0.985 / 0.352, object unchanged. SOR lowers completeness more
+ * (untextured top-connected regions without coherent depth, docs/research/dense-tuning.md
+ * "Sky / low-texture halo removal") → yard 0.985 / 0.352, object unchanged. SOR lowers completeness more
  * than it raises precision (off). 4 instead of 6 photometric iterations and 5 instead of 8
  * sources cost 0.2–0.8 pt of completeness (`fast` only); 2 instead of 3 geometric iterations
  * and a second geometric pass stay within ±0.2 pt with this fusion (`fast` uses 2 iterations,
  * `max` keeps one pass and spends its budget on image size and views). Image size and view
  * count are the main levers for large scenes (GT depth into fusion, yard: 480 → 960 px
- * C 0.461 → 0.526, 30 → 60 views C 0.461 → 0.570); a 480 px object is already saturated.
+ * C 0.461 → 0.526, 30 → 60 views C 0.461 → 0.570); a 480 px object is already saturated. `fusionMaxNeighbours` 8 instead of 10 loses nothing
+ * measurable and bounds fusion's resident maps (≈ 370 MB at 1600 px).
  */
 import type { FusionOptions } from './fusion';
 import type { PatchMatchOptions } from './types';

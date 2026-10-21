@@ -89,7 +89,11 @@ class Arena {
 
 const arena = new Arena();
 
-/** Frees the scratch memory kept between extractSiftCPU calls. */
+/**
+ * Frees the scratch memory kept between extractSiftCPU calls: ≈ 110 MB for a 1600x1200
+ * image (or a < 800 px image upsampled to octave -1). Extract from a worker and call this
+ * when done.
+ */
 export function releaseSiftCPUMemory(): void {
   arena.release();
 }

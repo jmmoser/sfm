@@ -21,6 +21,9 @@
  *  - training: seeding s·k·D (s = seedPerWord·k) + iterations · M·k·D (M = trainingPerWord·k):
  *    k = 512 ⇒ ≈ 1 s with SIMD, ≈ 3.5 s in JS.
  *  - query: O(total non-zeros) = O(images · min(k, features)) — 500 images × 512 words ≈ 0.5 ms.
+ *
+ * Limit: with very few indexed images TF-IDF is degenerate (N = 2 ⇒ every word both images
+ * share has idf 0): retrieval scores mean little until more than a handful of images are indexed.
  */
 import { DESCRIPTOR_SIZE, type FeatureSet } from '../core/types';
 import { createSimdKernels, type SimdKernels } from '../features/simd';

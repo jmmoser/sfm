@@ -28,6 +28,10 @@
  * (`readState` / `readModel` / `readMoments` / `normaliseAppearance` can then simply be called
  * again). Checkpoints: `readState` + `readMoments` + `readModel`, restored by
  * `init(params, views)` + `restore(state, moments)`.
+ *
+ * An iteration is one command buffer of ≈ 20 ms GPU time on an M4 (600×800, 300 k Gaussians; half
+ * of it the rasteriser backward). Not measured on an iPhone: if it exceeds ~30 ms there, split
+ * forward and backward into separate command buffers.
  */
 import type { CameraIntrinsics, Pose, RGBAImage } from '../core/types';
 import type { GPUContext } from '../gpu/device';
@@ -149,9 +153,14 @@ export interface SplatColourCorrection {
  * alpha-blended inverse depth / normal (smallest-scale axis) divided by the accumulated alpha,
  * z_t / n_t / w the target depth, normal and weight (depth-target.ts). Weights decay exponentially
  * from `[0]` to `[1]` over the first `until` of the run (linearly when one end is 0), then 0 and
- * the trainer switches to the plain kernels. Defaults (measured, ARCHITECTURE "Geometry
- * supervision …"): inverse depth only, 0.5 → 0.05 over the first 30 %; the normal term
- * (e.g. 0.1 → 0.01) did not add anything on the test scenes and costs more.
+ * the trainer switches to the plain kernels. Defaults (measured on held-out and off-trajectory
+ * views, docs/research/splat-tuning.md): inverse depth only, 0.5 → 0.05 over the first 30 %;
+ * the normal term (e.g. 0.1 → 0.01) did not add anything on the test scenes and needs the
+ * 13-accumulator kernels. Supervising the whole run pins ground seen only at grazing angles onto a
+ * thin layer whose gaps show from new viewpoints; stopping early lets the photometric phase close
+ * them. Dividing by the accumulated alpha is necessary: on the raw blended inverse depth the loss
+ * can only be met where the render is already opaque. The relative inverse-depth error is
+ * scale-free (object 0.3–2.5 m and yard 3–25 m share the weights).
  */
 export interface SplatGeometryOptions {
   depth: [number, number];
@@ -196,13 +205,19 @@ export interface SplatTrainerOptions {
   /** Resolution levels: downscale factor (1, 2, 4, …) until a fraction of the iterations. */
   resolution?: { factor: number; until: number }[];
   mcmc?: Partial<SplatMcmcOptions> | false;
-  /** Per-view affine colour correction (default on). */
+  /**
+   * Per-view affine colour correction (default on) for exposure / white-balance drift. Off raises
+   * raw held-out PSNR only because test frames near the path share the capture's exposure clock
+   * (an uncorrected model bakes the drift into region-wise colours); on drift-free views it wins
+   * 0.4–1.8 dB.
+   */
   colourCorrection?: Partial<SplatColourCorrection> | false;
   /** Depth / normal supervision (default off; targets through `setViewDepth`). */
   geometry?: Partial<SplatGeometryOptions> | false;
   /**
    * Flatten regulariser: weight of the smallest scale's L1 (÷ scene extent, mean over the
-   * Gaussians) — surfel-like discs. Default 0.
+   * Gaussians) — surfel-like discs. Default 0: it (and `anisotropy`) shapes the Gaussians as
+   * intended but moved no novel-view PSNR on the test scenes.
    */
   flatten?: number;
   /** Anisotropy cap: penalise ln s_max − ln s_mid above ln(maxRatio) (mean over the Gaussians). Default off. */
@@ -263,7 +278,11 @@ interface TrainPipelines {
 
 /** Ring of per-iteration loss / stamp slots; slot STAT_SLOTS holds the last relocation's stamp. */
 const STAT_SLOTS = 64;
-/** Rasteriser backward: pixel groups (32 pixels each) per workgroup, splats per thread step (wgsl/raster.ts). */
+/**
+ * Rasteriser backward: pixel groups (32 pixels each) per workgroup, splats per thread step
+ * (wgsl/raster.ts). Measured fastest on an M4 (600×800, 300 k Gaussians): 64-thread workgroups
+ * 10.0 ms vs 12.0 (256), 10.9 (128), 13.8 (32); two splats per step 15.7 ms.
+ */
 export const BWD_GROUPS = 2;
 export const BWD_PER_STEP = 1;
 

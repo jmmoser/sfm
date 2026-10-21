@@ -50,7 +50,7 @@ export interface EngineConfig {
   /**
    * Feature backend: 'auto' (default: WebGPU SIFT / matcher when available, else CPU) or 'cpu'
    * (CPU SIFT / matching even when WebGPU exists; PatchMatch still uses the GPU). The GPU and CPU
-   * SIFT produce the same features (ARCHITECTURE §6 features GPU notes); 'cpu' is for test runs on
+   * SIFT produce the same features (docs/research/features-gpu.md); 'cpu' is for test runs on
    * software adapters (SwiftShader), where GPU SIFT is ~20× slower than the CPU code.
    */
   featureBackend?: 'auto' | 'cpu';
@@ -119,6 +119,8 @@ export interface EngineConfig {
   /**
    * Estimate the gyro bias / camera–IMU offset from the live keyframes every 10 registrations
    * during capture (default false; refine always calibrates once before the rolling-shutter estimation).
+   * Off because it changes the keyframe selection and measured equal or worse (yard-real ATE 7.0e-4
+   * vs 3.3e-4; docs/research/real-capture-robustness.md).
    */
   liveGyroCalibration?: boolean;
   /**

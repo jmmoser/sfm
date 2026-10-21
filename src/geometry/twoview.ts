@@ -39,7 +39,11 @@ export interface TwoViewOptions {
   minInlierRatio?: number;
   /** RANSAC confidence (default 0.999, as COLMAP's two-view verification). */
   confidence?: number;
-  /** RANSAC iteration cap per model (default 10000). */
+  /**
+   * RANSAC iteration cap per model (default 10000). A pair with no valid model runs the
+   * full budget (≈ 0.6–1.2 s in Node), so pass ≈ 1000–2000 when verifying speculative
+   * (retrieval) pairs, or pre-filter by match count.
+   */
   maxIterations?: number;
   rng?: Rng;
   /**
@@ -406,6 +410,9 @@ function extractInliers(matches: MatchPairs, mask: Uint8Array): MatchPairs {
  *    rotation (a rotation-only fit would absorb the small translation); t = (0, 0, 0),
  *    inliers = H inliers, and triAngle the median rotation-compensated ray angle.
  *    'uncalibrated' pairs get no R, t.
+ *
+ * Known limit: planar pairs with t ∥ n (walking toward a wall) are ill-conditioned for
+ * both H and E (a few degrees of translation error from two views).
  */
 export function estimateTwoViewGeometry(
   kp1: Float32Array,

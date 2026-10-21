@@ -8,6 +8,8 @@
  * paper). The GPU applies the plan (wgsl/backward.ts `relocateWGSL`): copy entries
  * (dst ← src, new opacity, log-scale delta), then the sources' own updates; Adam moments of
  * both are reset. Implemented from the paper (the reference code has a non-commercial licence).
+ * Chosen over 3DGS clone / split / prune for its fixed memory budget (the cap is planned up front)
+ * and its robustness to the MVS initialisation.
  */
 import { Rng } from '../math/random';
 import { logit, sigmoid } from './types';

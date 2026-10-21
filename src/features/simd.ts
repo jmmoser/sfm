@@ -23,6 +23,9 @@
  *                                     (trilinear accumulation, see descBody).
  * Rows are processed in 4-float blocks: planes need >= 16 bytes of slack after
  * their end (reads/writes past the row end only touch lanes that are discarded).
+ *
+ * The module is compiled synchronously (new WebAssembly.Module): keep it < 4 KB, the
+ * size Chrome allows for synchronous compilation on the main thread (≈ 3.4 KB now).
  */
 
 // ---------------------------------------------------------------------------

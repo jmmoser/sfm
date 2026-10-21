@@ -21,7 +21,8 @@ export const CANDIDATE_WORDS = 8;
  * the largest power of two such that one padded bin cannot overflow 2^32 for 0..1
  * images. A bin collects samples from a 2x2-bin area (<= 4 (SBP + 1)^2 pixels, SBP =
  * 3 sigma_max) with gradient magnitude <= sqrt(2) (one-sided borders) and weights <= 1.
- * Default options (S = 3, sigma 1.6): 2^22 (resolution 2.4e-7).
+ * Default options (S = 3, sigma 1.6): 2^22 (resolution 2.4e-7), ≈ 25 % headroom.
+ * Float32 input outside 0..1 is not checked: 0..255 floats overflow the bins silently.
  */
 export function descriptorFixedPoint(sigma: number, S: number): number {
   const sbp = 3 * sigma * 2 ** ((S + 0.6) / S);

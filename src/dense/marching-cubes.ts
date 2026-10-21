@@ -8,13 +8,18 @@
  * a rule that depends only on the face's four corner signs, so the two cubes sharing a
  * face always agree → the surface is watertight (no cracks, unlike the classic Lorensen
  * table whose complementary cases disagree on ambiguous faces). The face segments link
- * into closed loops which are fan-triangulated. Orientation: "inside" (SDF < 0) on the
+ * into closed loops, triangulated with diagonals only between edges that share no cube face
+ * (`triangulateLoop`; such a diagonal occurs in no other cube ⇒ edge-manifold, which plain
+ * fans are not on noisy SDFs; a centre-vertex fallback exists for loops where that is
+ * impossible). At most 5 triangles per cube. Orientation: "inside" (SDF < 0) on the
  * right of each segment seen from outside ⇒ triangles are counter-clockwise when seen from
  * the positive (free-space) side, i.e. face normals point along +∇SDF (towards the cameras).
  *
  * Vertices live on voxel edges and are welded across block borders through a hash keyed
  * by (owner voxel, axis); normals come from the TSDF gradient (central differences,
- * interpolated along the edge), colours are interpolated from the voxel colours.
+ * interpolated along the edge), colours are interpolated from the voxel colours (an end that
+ * was never coloured takes the other end's colour). Edges between two saturated values are
+ * skipped (ghost surfaces). Synchronous: not cancellable mid-run, so run it in a worker.
  *
  * Voxel (gx, gy, gz) has its centre at world (gx, gy, gz) · voxelSize; block (bx, by, bz)
  * holds voxels 8b … 8b+7 per axis; local voxel index = lx + 8 (ly + 8 lz).

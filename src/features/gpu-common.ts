@@ -404,7 +404,10 @@ export class BudgetEncoder {
     this.cost = 0;
   }
 
-  /** Submits what has been recorded (if anything) and waits for the GPU. */
+  /**
+   * Submits what has been recorded (if anything) and waits for the GPU. No timeout: if iOS
+   * stalls the queue while the page is hidden, this waits until it is visible again.
+   */
   async flush(): Promise<void> {
     if (!this.enc) return;
     this.submitCurrent();
@@ -418,7 +421,12 @@ export class BudgetEncoder {
   }
 }
 
-/** Pushes validation + OOM error scopes; the returned function pops them and throws GPUFeatureError. */
+/**
+ * Pushes validation + OOM error scopes; the returned function pops them and throws GPUFeatureError.
+ * Known limit: SiftGPU / MatcherGPU hold these scopes across awaits, so an error of another
+ * module that uses no scopes of its own is attributed to features (CPU fallback). The reverse
+ * cannot give wrong results: an invalid command buffer also fails the WorkStamp check.
+ */
 export function errorScope(device: GPUDevice, label: string): () => Promise<void> {
   device.pushErrorScope('out-of-memory');
   device.pushErrorScope('validation');

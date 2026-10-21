@@ -37,7 +37,10 @@ export interface SynthConfig {
   frames: number;
   /** performance.now()-like timestamp (ms) of trajectory time τ = 0 (IMU clock). */
   startTimeMs: number;
-  /** Camera–IMU time offset: reported frame t = true t + timeOffsetMs. */
+  /**
+   * Camera–IMU time offset: reported frame t = true t + timeOffsetMs (default +25 ms). IMU, GPS
+   * and compass stay on the true clock (`tTrue`).
+   */
   timeOffsetMs: number;
   seed: number;
   /** Horizontal field of view of the LONG image side (deg); sets f. */

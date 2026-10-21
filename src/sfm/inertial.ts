@@ -15,6 +15,19 @@
  * device attitude R_wd = R_wc · R_cam_device, gyro dR_wd/dt = R_wd [ω]×, accel = R_wdᵀ a,
  * accelG = R_wdᵀ (a − g_world) with g_world = 9.81 · down. Time offset: an image stamped
  * t_cam was exposed at IMU time t_cam + offsetMs.
+ *
+ * Assumptions / limits: one constant gyro bias and constant accelerometer biases per capture;
+ * the scale needs band-limited (0.3–3 Hz) acceleration ≥ 0.08 m/s² RMS (`excitationRms`), so
+ * tripod-smooth motion comes out `reliable: false` (as does the gyro time offset of a smooth
+ * constant-rate pan); segments are
+ * split at keyframe gaps > 3 s and IMU gaps > 250 ms. `estimateTimeOffset` costs ∝ keyframes ×
+ * grid points (±250 ms at 2 ms, evaluated twice: 2000 keyframes ≈ 1 s per grid pass). When the
+ * device hardly rotates, an uncompensated horizontal accelerometer bias b tilts gravity by ≈ b/g.
+ *
+ * Synthetic accuracy (extras-testutil: gyro noise 0.005 rad/s, bias ≈ 0.01; accel noise / bias
+ * ≈ 0.05 m/s²; 2–4 Hz keyframes; 30 seeds): hand-held 0.4 m orbit scale rms 0.5 % (max 1.0 %),
+ * 40 m walk rms 1.0 % (max 2.4 %); time offset max error < 1 ms; gravity rms 0.2° (orbit) /
+ * 0.4° (walk); scale z-scores rms 0.8–0.95. `estimateInertialAlignment` ≈ 20–30 ms (Node).
  */
 import type { ImuSample, Mat3, Vec3 } from '../core/types';
 import { solveSPD } from '../math/decomp';
@@ -850,7 +863,8 @@ export function estimateGravity(
       }
     }
   }
-  // Fallback: per-keyframe gravity in the camera frame.
+  // Fallback: per-keyframe gravity in the camera frame. Its σ treats the keyframes as independent
+  // (the DeviceOrientation attitude errors are time-correlated), so it is optimistic.
   let gx = 0,
     gy = 0,
     gz = 0,
@@ -1221,7 +1235,9 @@ function doubleIntegrateAt(s: Float64Array, a: Float64Array, dim: number, q: Flo
  * holds exactly up to noise — aliasing of fast motion by the keyframe sampling affects both
  * sides identically, and drift from unknown initial velocity vanishes under F. Vision is the
  * regressand (its noise is larger after differentiation; IMU noise in the band is small, so
- * the errors-in-variables bias is negligible). IRLS (Huber) least squares; scale = 1/s₀.
+ * the errors-in-variables attenuation ≈ σ²_noise / var(F[P]) is small — ≈ 2 % only at the
+ * `minExcitation` floor with 0.05 m/s² noise — and is not corrected). IRLS (Huber) least
+ * squares; scale = 1/s₀.
  * The uncertainty is a Newey–West (HAC) sandwich estimate, since the band-limited, oversampled
  * residuals are strongly autocorrelated.
  * Unknowns c_w absorb a constant world-frame acceleration bias (e.g. gravity leakage when

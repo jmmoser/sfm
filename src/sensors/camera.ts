@@ -19,7 +19,9 @@
  *  - rVFC `captureTime` = when the frame reached WebKit's capture source (after ISP, ~10–40 ms
  *    after exposure; same performance.now() timeline); `mediaTime` is 0 for camera streams.
  *  - Hidden page ⇒ the track is muted (not ended) and unmuted on return. If it is still muted
- *    ~1 s after becoming visible, or ended, we re-open the same device (new `segment`).
+ *    ~1.2 s after becoming visible, or ended, we re-open the same device (new `segment`).
+ *  - Keep the <video> attached to the document and visible while capturing: rVFC (and iOS
+ *    decoding) stall for a detached or hidden element.
  */
 export type LensClass = 'wide' | 'ultrawide' | 'tele' | 'virtual' | 'front' | 'unknown';
 export type CameraFacing = 'back' | 'front' | 'unknown';

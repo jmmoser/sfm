@@ -10,8 +10,9 @@
  * recomputes those few similarities exactly in f64 like the CPU matcher and applies
  * the final decision with the same code, so results coincide with matchCPU except for
  * candidates whose f32 similarities tie within rounding (third-best swaps), which is
- * vanishingly rare. Both directions run on the GPU for the mutual check (skipped when
- * `mutual: false`). Guided matching evaluates the constraint in the kernel and culls
+ * vanishingly rare (never observed), and exact f64 ties in guided mode, which resolve
+ * to the smaller index here and in grid-walk order on the CPU (matchGuidedCPU). Both
+ * directions run on the GPU for the mutual check (skipped when `mutual: false`). Guided matching evaluates the constraint in the kernel and culls
  * whole tiles using spatially sorted features ('positions', 'H' -> predicted
  * positions, 'F' -> epipolar band).
  *

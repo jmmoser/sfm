@@ -19,6 +19,8 @@
  * the new device from the host copy of the model (twice), then reports 'unavailable' (the next
  * `setModel` starts over on a new device). Software adapters (SwiftShader) are refused:
  * compiling and drawing would block for minutes.
+ *
+ * Frame times and GPU memory: docs/research/viewer-rendering.md.
  */
 import { getGPU, type GPUContext } from '../gpu/device';
 import { SplatPresenter } from '../splat/present';
@@ -78,6 +80,7 @@ export interface SplatLayerStats {
   /** Tile intersections of the last frame and the reservation. */
   intersections: number;
   isectCapacity: number;
+  /** SplatRenderer.gpuBytes: per-Gaussian parameters + projection / sort (~80 B), 16 B per reserved intersection, 20 B per canvas pixel. */
   gpuMB: number;
 }
 

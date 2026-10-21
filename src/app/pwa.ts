@@ -1,6 +1,10 @@
 /**
  * Service worker registration (production builds only, never on localhost) and persistent storage
  * at launch. See public/sw.js for the caching strategy.
+ *
+ * Deployment: the service worker's caches are kept per scope, but IndexedDB (scans, photos, GPS
+ * fixes) is per ORIGIN — on a shared origin (`<user>.github.io/<repo>/`) every other project there
+ * can read it. Deploy on a dedicated origin for real use.
  */
 
 /**

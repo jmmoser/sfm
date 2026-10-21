@@ -9,7 +9,8 @@
  *    the caller (FramePump) sends the next frame only after that. A second concurrent call
  *    rejects with EngineBusyError (its bitmap is closed).
  *  - Timeouts: `init` (pipeline compilation can take a while on iOS), frames, short calls;
- *    long operations (refine/densify/mesh/export) use an INACTIVITY timeout reset by progress.
+ *    long operations (LONG_RUNNING_METHODS: finishCapture / refine / densify / mesh / splat /
+ *    export / loadSession) use an INACTIVITY timeout reset by progress.
  *  - Fatal worker death (script failed to load, a `fatal` error event — e.g. the GPU process
  *    connection died, so `requestAdapter()` returns null in that realm —, a stuck init or
  *    repeated frame timeouts): pending requests reject with EngineCrashedError, the worker is

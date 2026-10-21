@@ -1,5 +1,5 @@
 /**
- * Gaussian-splatting stage (docs/ENGINE.md "Splat", ARCHITECTURE §6 "src/splat"): trains
+ * Gaussian-splatting stage (docs/ENGINE.md "Splat", src/splat/index.ts): trains
  * `SplatTrainer` on the registered keyframes after densify (or after refine without a dense cloud).
  *
  *   prepare   training views = registered keyframes with a stored photo, evenly spread, as the
@@ -20,6 +20,20 @@
  *             'gpu-lost'), trains again from there and finishes.
  *   finishing appearance normalisation (mean training-view colour matrix folded into the colours),
  *             read-back; the engine persists the model (`packSplatModel`) and clears the checkpoints.
+ *
+ * Choices: every registered keyframe trains, not just the dense subset (40 at fast): novel views
+ * need the viewpoints, and a 600×800 view is only 1.9 MB of GPU memory. The dense cloud is seeded
+ * through the footprint LOD (keeps the MVS cloud's screen-space density, unlike a random subset);
+ * the sparse points add the walls / far structure MVS misses. The shell radius
+ * max(20 × camera extent, 3 × p98 sparse-point distance) is a heuristic, and an unresolved 'auto'
+ * mode gets no shell. ≤ `chunk` (25) iterations per GPU-lock hold: cancel / page-hidden latency
+ * ≈ 0.5 s on an M4. Measurements: docs/research/splat-tuning.md.
+ *
+ * Known limits: view preparation (JPEG decode, undistortion, rolling-shutter remap, ≈ 128 ms per
+ * 600×800 view on an M4, ~19 % of the fast stage) and the depth-target packing (1–1.5 s for 40
+ * views) run on the engine thread; only the views that are dense views get depth targets, and the
+ * targets stay allocated after `until` (a rollback may need them). Not yet measured on an iPhone
+ * (iteration time, IndexedDB checkpoint writes of 22–56 MB every 500 iterations, `max` headroom).
  */
 import type { CameraIntrinsics, CancelToken, PointCloud, ProgressCallback } from '../core/types';
 import type { DepthMap } from '../dense/types';

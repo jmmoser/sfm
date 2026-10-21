@@ -649,6 +649,8 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     throw e;
   }
   const rec: StoredPairs = { pairs: stored, attempted };
+  // (not read back yet: a refine on a live session restored from the store — e.g. after densify
+  // released it — matches these pairs again)
   await deps.store.putValue('refine/pairs', rec).catch((e: unknown) => deps.log('warn', `could not persist refine pairs: ${(e as Error)?.message ?? e}`));
   stats.newPairs = verified;
   stats.pairs = st.db.numPairs;
@@ -737,7 +739,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
       // model is biased by where the features sit in the frame (e2e yard-real −30.5 / abl-yard-rs
       // −27.9 ms, truth −25; re-calibrating on the corrected model gives −25.1 / −24.9 ms and the
       // true bias): measured neutral on abl-*-rs / object-real and worse on yard-real (principal
-      // point 0.4 → 1.3 px, rotation 0.10 → 0.13°) — ARCHITECTURE "Real-capture robustness"
+      // point 0.4 → 1.3 px, rotation 0.10 → 0.13°) — docs/research/real-capture-robustness.md
       const before = r.applied;
       r = await estimate({ ...rsOpts, around: before }, before);
       passes = p;

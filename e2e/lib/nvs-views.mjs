@@ -18,7 +18,8 @@
 //  - the rolling-shutter motion of the ground-truth image: camera angular velocity (gyro at the true
 //    frame time, camera frame: ω_cam = R_cam_device·ω_dev) and, with a GT focus distance (-real
 //    sets), the translational term ν = camera-frame velocity of the centre (central difference of the
-//    neighbouring GT frames) / focus distance — the engine corrects its dense views with both.
+//    neighbouring GT frames) / focus distance — the engine corrects its dense views with both (on the
+//    object orbit a rotation-only correction scores no better than none).
 //
 // Test dataset (opts.test, e2e/nvs.mjs --test-dataset): the frames of ANOTHER dataset of the same
 // seeded scene (e.g. an off-trajectory walk) are scored instead of the held-out frames. Its GT poses

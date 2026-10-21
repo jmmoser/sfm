@@ -18,6 +18,9 @@
  *                   scaled by this device's CPU SIFT speed relative to it;
  *  - mesh:          TSDF ≈ 0.3 µs per pixel per view + 1.5 s marching cubes / simplification
  *                   (same CPU scaling).
+ *
+ * The coefficients are unverified on Apple devices (headless reference timings:
+ * docs/research/on-device-benchmark.md).
  */
 import { QUALITY_PRESETS, resolveDensePreset } from '../../engine/presets';
 import type { BenchEstimate, BenchRates } from './types';

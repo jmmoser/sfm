@@ -17,7 +17,16 @@
  *    its orientation / descriptor use Gaussian level clamp(round(s), 1, S).
  *  - Descriptor layout: index = (by * 4 + bx) * 8 + bo where bx (by) is the spatial bin
  *    along the keypoint's rotated x (y) axis — x' = (cos θ, sin θ), y' = (-sin θ, cos θ)
- *    in image coordinates (y down) — and bo the bin of (gradient angle - θ) in [0, 2π).
+ *    in image coordinates (y down) — and bo the bin of (gradient angle - θ) in [0, 2π),
+ *    bin bo centred at bo * 45°. θ follows the image rotation: warping an image by +α
+ *    (clockwise as displayed) increases θ by α; an exact 90° turn gives θ + π/2 and the
+ *    same descriptors up to ±1 per byte (pinned by tests).
+ *  - Reported keypoint scale follows Lowe / VLFeat: ≈ σ_blob * 2^(-1/(2S)) for an ideal
+ *    Gaussian blob of sigma σ_blob (≈ 0.89 σ_blob for S = 3); score = |DoG| at the refined
+ *    extremum.
+ *  - maxFeatures counts ORIENTED features. The distributed selection (distribute.ts) runs
+ *    twice: on keypoints before orientation (descriptors are only computed for survivors)
+ *    and on the oriented features at the end.
  */
 
 import { DESCRIPTOR_SIZE } from '../core/types';

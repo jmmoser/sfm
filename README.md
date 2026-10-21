@@ -189,11 +189,11 @@ UI ◀──────── progress / results ──────────
                                               └ exports: PLY · splat PLY · GLB · COLMAP ZIP
 ```
 
-* [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): conventions, module contracts, and per-module
-  design notes and review findings.
+* [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): goals, conventions, module contracts and
+  the pipeline. How each module works is in its source file headers.
 * [`docs/ENGINE.md`](docs/ENGINE.md): engine API, worker protocol and UI flow.
 * [`docs/research/`](docs/research): verified iOS Safari facts on WebGPU, camera, sensors, memory
-  and storage.
+  and storage, and dated measurement reports (tuning, benchmarks) behind the defaults.
 
 | Directory | Contents |
 |---|---|

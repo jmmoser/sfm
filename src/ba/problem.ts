@@ -90,6 +90,7 @@ export interface BAProblem {
   obsUV: Float64Array;
   /** Optional per-observation weight (1/σ); multiplies the residual. */
   obsWeight?: Float32Array;
+  /** Not robustified: gate outlying GPS centres (multipath) before passing them, or use a large σ. */
   centerPriors?: BACenterPrior[];
   relRotationPriors?: BARelRotationPrior[];
   focalPriors?: BAFocalPrior[];
@@ -113,7 +114,8 @@ export interface BAOptions {
   /**
    * Stop when ‖δ‖ ≤ parameterTolerance · (‖x‖ + parameterTolerance) (that last small step is
    * still taken if it decreases the cost). ‖x‖ is over ALL free parameters incl. points, so on
-   * large scenes this can stop early; pass 0 to disable. Default 1e-8.
+   * large scenes this can stop early, and it depends on the world origin; pass 0 to disable
+   * (preferred for the final global BA, bounded by `maxIterations`, as COLMAP). Default 1e-8.
    */
   parameterTolerance?: number;
   /** Initial LM damping λ (= 1 / trust-region radius). Default 1e-4. */

@@ -1379,9 +1379,20 @@ const now = (): number => (typeof performance !== 'undefined' ? performance.now(
  * points, intrinsics per `cameraRefine`). See the module header for the method.
  *
  * Observations whose residual is not finite at the input (or with a non-finite /
- * negative weight) are ignored for the whole run. Parameters in the problem always
- * end at the best accepted state, also on cancellation, time-out or exceptions
- * thrown by `onIteration`.
+ * negative weight, or whose weighted squared residual overflows) are ignored for the
+ * whole run. Parameters in the problem always end at the best accepted state, also on
+ * cancellation, time-out or exceptions thrown by `onIteration`.
+ *
+ * For callers: pass poses roughly in capture order — the skyline envelope, and so the
+ * direct solver's cost, depends on it (a random order just falls back to PCG). Explicit
+ * Schur cost and pair memory grow with Σ m² (m = views per point). Synchronous and
+ * single-threaded: run it in the engine worker; for live BA use `timeLimitMs` / `cancel`
+ * or `BundleAdjuster` to yield between iterations.
+ *
+ * Known limits: IRLS only (no Triggs second-order correction, like Ceres for concave ρ);
+ * no inverse-depth parameterisation, so points far beyond the baseline converge slowly
+ * along their ray (harmless for reprojection); PCG has only the block-Jacobi
+ * preconditioner (no visibility-based one). Measurements: docs/research/solvers.md.
  */
 export function bundleAdjust(problem: BAProblem, options?: BAOptions): BAResult {
   const ba = new BundleAdjuster(problem, options);

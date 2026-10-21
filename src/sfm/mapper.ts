@@ -17,6 +17,32 @@
  *     re-triangulation, completion / merging and filtering, iterated while > 0.5 %
  *     of the observations change;
  *  7. multiple models when the graph is disconnected (or registration stalls).
+ *
+ * Choices beyond COLMAP (rationale):
+ *  - initial pair: the second image is ordered by "stored two-view angle ≥ threshold" first,
+ *    then by correspondences, so video pairs further apart are tried first; pairs stored as
+ *    'panoramic' or with an angle < ½ threshold are skipped without re-estimation (each costs
+ *    ≈ 10–30 ms; at most `initMaxPairEvaluations` per search, cached). Initial points need
+ *    ≥ max(filterMinTriAngleDeg, ¼ of the level's angle). The relaxation levels apply to later
+ *    models too; `initFallback` adds a last-resort level for forward motion.
+ *  - registration: `absPoseMinNumInliers` AND `absPoseMinInlierRatio` gate acceptance (not only
+ *    the RANSAC loop); degenerate poses are rejected (`poseIsUsable`).
+ *  - local BA: `localBANumImages` neighbours BESIDES the new image (COLMAP's count includes it);
+ *    observations of constant points subsampled to `localBAMaxConstantObsPerImage` per image
+ *    (≈ 2.5× faster, accuracy unchanged in the tests); afterwards only the observations in the
+ *    bundle images and the modified points are filtered (COLMAP re-checks every observation of
+ *    every point of the bundle images — with 60-view tracks, the whole model).
+ *  - `runIncrementalSfM` yields every `yieldIntervalMs`, runs global BA resumably in
+ *    `globalBASliceMs` slices (bit-identical to one solve) and the initial-pair search in chunks
+ *    of INIT_CHUNK re-estimations; longest synchronous step ≈ 0.6–0.8 s (Node, 100 images).
+ *    Models with fewer than min(minModelSize, 0.8·N) images are dropped unless it is the only one.
+ *
+ * Limits: no intrinsics prior in the regular BAs (early self-calibration relies on
+ * `minImagesForIntrinsics`); the `planarAlternative` of a planar initial pair is not
+ * disambiguated; the principal point is not refined by default; loop closure only through the
+ * correspondence graph (retrieval pairs must be in it). Global BA dominates long captures with
+ * long tracks (synthetic walk, 250 keyframes, 58-view mean tracks, 358 k observations: ≈ 150 s,
+ * 1–3 s per LM iteration at the end) — the keyframe selector should keep tracks moderate.
  */
 import type {
   CameraIntrinsics,
@@ -1435,7 +1461,7 @@ export class IncrementalMapper {
   /**
    * Global BA over all registered images (gauge: first image fixed, one translation
    * component of the second). Observations behind their camera are removed first
-   * unless `filterNegativeDepth` is false (continuation slices of one BA).
+   * unless `filterNegativeDepth` is false.
    */
   adjustGlobalBundle(
     timeLimitMs?: number,

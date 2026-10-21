@@ -35,6 +35,11 @@
  * direction but only ≈ 15–20 % of the readout time (e2e: 3–5 ms of 22 ms). Search: 0, then
  * ±10 / ±25 ms on both axes pick the axis and direction, then parabola fits along it. RS is only accepted when it lowers the cost significantly (default ≥ 3 %) —
  * otherwise 0 (global shutter) is kept.
+ *
+ * Limits: the translational term is first order with keyframe-rate velocities (hand shake between
+ * keyframes is not in it); the estimate can stay short of the true readout (e2e abl-object-rs:
+ * 19.1 of 22 ms, poses nevertheless as accurate as the global-shutter dataset's). Measurements:
+ * docs/research/real-capture-robustness.md.
  */
 import type { BACameraRefine, BAProblem } from '../ba/problem';
 import { bundleAdjust } from '../ba/solver';
