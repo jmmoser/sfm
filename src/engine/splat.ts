@@ -17,9 +17,21 @@
  *             model is read again once visible (stale data is never stored); a lost device (in a
  *             step, a checkpoint or the finishing readbacks) rebuilds the trainer on the new one
  *             from it (from the initial Gaussians before the first one; twice at most, then
- *             'gpu-lost'), trains again from there and finishes.
+ *             'gpu-lost'), trains again from there and finishes. Finish early (`CancelToken.finishEarly`,
+ *             the app's "Use it now"): from `finishFrom` (the trainer's `fullResolutionFrom`, the end
+ *             of the coarse-to-fine schedule; an earlier request waits for it) the loop stops between
+ *             chunks, writes a checkpoint at that iteration and finishes like a complete run.
  *   finishing appearance normalisation (mean training-view colour matrix folded into the colours),
- *             read-back; the engine persists the model (`packSplatModel`) and clears the checkpoints.
+ *             read-back; the engine persists the model (`packSplatModel`) and clears the checkpoints
+ *             — except after a finish early with a stored checkpoint at the model's iteration
+ *             (`stats.splatContinueFrom`): a later run of the same settings continues from it.
+ *   previews  (`SplatOptions.preview`) 'splat_preview' events: `trainer.render` of the training view
+ *             nearest the middle photo (the viewer's default view), box-downscaled by an integer to
+ *             ≤ 400 px, as RGBA8 with its PSNR against that photo; once right after the first upload
+ *             (that view goes first: the initial Gaussians, ~12 s before the first iteration on an M4)
+ *             and then between chunks every ≥ 2 s. Forward only, no new pipeline, under the GPU lock
+ *             (so never while hidden), one ≤ 1.9 MB readback through the trainer's staging buffer; a
+ *             failed one is skipped.
  *
  * Choices: every registered keyframe trains, not just the dense subset (40 at fast): novel views
  * need the viewpoints, and a 600×800 view is only 1.9 MB of GPU memory. The dense cloud is seeded
@@ -33,9 +45,13 @@
  * 600×800 view on an M4, ~19 % of the fast stage) and the depth-target packing (1–1.5 s for 40
  * views) run on the engine thread; only the views that are dense views get depth targets, and the
  * targets stay allocated after `until` (a rollback may need them). Not yet measured on an iPhone
- * (iteration time, IndexedDB checkpoint writes of 22–56 MB every 500 iterations, `max` headroom).
+ * (iteration time, IndexedDB checkpoint writes of 22–56 MB every 500 iterations, `max` headroom,
+ * the preview readbacks next to the viewer). A finish early skips the end of the learning-rate
+ * decay (~2 dB below the full schedule at 1 000 of 3 000 iterations in the GT-pose snapshots of
+ * e2e/README.md "Splat results"; not measured through this path). Previews are raw trainer
+ * colours from a training viewpoint (flattering), outside the memory plan (≈ 4 MB transient).
  */
-import type { CameraIntrinsics, CancelToken, PointCloud, ProgressCallback } from '../core/types';
+import type { CameraIntrinsics, CancelToken, PointCloud, ProgressCallback, RGBAImage } from '../core/types';
 import type { DepthMap } from '../dense/types';
 import { footprintDownsample } from '../dense/pointcloud';
 import { undistortedCamera } from '../dense/undistort';
@@ -43,8 +59,10 @@ import type { GPUContext } from '../gpu/device';
 import { SplatTrainer, SplatWorkDroppedError, DEFAULT_SPLAT_GEOMETRY, geometryMode, type SplatTrainerOptions, type SplatTrainerState, type SplatTrainingView } from '../splat/trainer';
 import { packDepthTarget } from '../splat/depth-target';
 import { backgroundShell, concatModels, initFromPointCloud, type ColourSource } from '../splat/init';
-import { splatCamera, type SplatModel } from '../splat/types';
-import { ENGINE_ERRORS, SPLAT_STAGES, namedError, type QualityPreset, type SplatOptions, type SplatTrainingDetail } from '../workers/protocol';
+import { boxDownscale, previewFactor, previewViewIndex, rgbPsnr } from '../splat/preview';
+import { splatImageToRGBA8 } from '../splat/renderer';
+import { downscaleSplatCamera, splatCamera, type SplatCamera, type SplatModel } from '../splat/types';
+import { ENGINE_ERRORS, SPLAT_STAGES, namedError, type QualityPreset, type SplatOptions, type SplatPreviewDetail, type SplatTrainingDetail } from '../workers/protocol';
 import { loadDenseViewImage, spreadSubset } from './dense';
 import { MB, fitSplatPlan, formatBreakdown, planSplat, type SplatPlan } from './memory';
 import {
@@ -69,6 +87,28 @@ const ckptKey = (slot: number, part: 'params' | 'm' | 'v' | 'colour'): string =>
 const THUMB_SIZE = 160;
 /** Attempts of a trainer readback whose copy was dropped (SplatWorkDroppedError) before the stage fails. */
 const MAX_READ_ATTEMPTS = 5;
+/** Long side of the 'splat_preview' snapshots (px; never above the training size). */
+const PREVIEW_SIZE = 400;
+/**
+ * Training wall time between two previews (ms): ≤ 0.5 Hz keeps their forward pass and readback
+ * (≈ 5 ms on an M4) far below 1 % of the training and the readback stalls off the viewer's frames.
+ */
+const PREVIEW_EVERY_MS = 2000;
+
+/** The previews of a run (`SplatOptions.preview`). */
+interface PreviewState {
+  /** Training view index and keyframe id. */
+  index: number;
+  id: number;
+  /** Downscale factor of the training camera and the camera rendered. */
+  factor: number;
+  cam: SplatCamera;
+  /** That view's photo at the preview size (set when it is uploaded). */
+  target: RGBAImage | null;
+  /** now() of the last preview, previews posted. */
+  last: number;
+  count: number;
+}
 
 export interface SplatDeps {
   /** Keyframe images. */
@@ -226,8 +266,8 @@ export async function runSplat(deps: SplatDeps, opts: SplatOptions = {}, progres
   const iterations = Math.max(1, Math.round(preset.iterations));
   const shDegree = trainerOverrides.shDegree ?? preset.shDegree;
   const stats: Record<string, number | string> = {};
-  const report = (stage: string, p: number, message?: string, detail?: Record<string, number>): void => {
-    const e = { stage, progress: Math.max(0, Math.min(1, p)), ...(message !== undefined ? { message } : {}), ...(detail ? { detail } : {}) };
+  const report = (stage: string, p: number, message?: string, detail?: Record<string, number>, image?: RGBAImage): void => {
+    const e = { stage, progress: Math.max(0, Math.min(1, p)), ...(message !== undefined ? { message } : {}), ...(detail ? { detail } : {}), ...(image ? { image } : {}) };
     progress?.(e);
   };
   const check = (stage: string): void => {
@@ -322,6 +362,18 @@ export async function runSplat(deps: SplatDeps, opts: SplatOptions = {}, progres
   stats.splatIterations = iterations;
   stats.splatMemPeakMB = Math.round(plan.peakBytes / MB);
   stats.splatGpuMB = Math.round(plan.gpuBytes / MB);
+  // previews: the training view nearest the viewer's default photo, at ≤ PREVIEW_SIZE
+  let preview: PreviewState | null = null;
+  if (opts.preview && progress) {
+    const index = previewViewIndex(
+      views.map((v) => v.id),
+      model.images.map((im) => im.id),
+    );
+    const im = views[index];
+    const full = splatCamera(undistortedCamera(camOf(im.id), size), im.pose);
+    const factor = previewFactor(full.width, full.height, PREVIEW_SIZE);
+    preview = { index, id: im.id, factor, cam: downscaleSplatCamera(full, factor), target: null, last: -Infinity, count: 0 };
+  }
   deps.log(
     plan.fits ? 'info' : 'warn',
     `splat memory plan (${views.length} views ${vd.width}×${vd.height}, ≤ ${maxGaussians} Gaussians, SH ${shDegree}, budget ${deps.memoryBudgetMB} MB, peak ≈ ${Math.round(plan.peakBytes / MB)} MB, GPU ≈ ${Math.round(plan.gpuBytes / MB)} MB): ` +
@@ -401,23 +453,52 @@ export async function runSplat(deps: SplatDeps, opts: SplatOptions = {}, progres
     deps.log('info', `splat: geometry targets for ${n} of ${views.length} views (1/${geoOpt!.factor} size) in ${Math.round(now() - td)} ms`);
   };
   const viewMeta = (): SplatTrainingView[] => views.map((im) => ({ id: im.id, cam: undistortedCamera(camOf(im.id), size), pose: im.pose, image: null }));
+  /**
+   * One 'splat_preview' snapshot of trainer `t`: a forward pass and a ≤ 1.9 MB readback under the
+   * GPU lock (which waits while the page is hidden). A failure (e.g. a device loss, which the next
+   * step then recovers from) only skips it.
+   */
+  const renderPreview = async (t: SplatTrainer): Promise<void> => {
+    const p = preview;
+    if (!p?.target) return;
+    const target = p.target;
+    try {
+      const out = await deps.gpuLock(() => t.render(p.cam));
+      const image: RGBAImage = { width: out.width, height: out.height, data: splatImageToRGBA8(out) };
+      const detail: SplatPreviewDetail = { iteration: t.iteration, iterations, viewId: p.id, psnr: Math.round(100 * rgbPsnr(image, target)) / 100 };
+      report(SPLAT_STAGES.preview, t.iteration / iterations, `iteration ${t.iteration}`, detail, image);
+      p.count++;
+    } catch (e) {
+      deps.log('warn', `splat: preview at iteration ${t.iteration} skipped (${(e as Error)?.message ?? e})`);
+    }
+    p.last = now();
+  };
   const uploadViews = async (t: SplatTrainer, from: number, to: number): Promise<void> => {
-    for (let i = 0; i < views.length; i++) {
+    // the preview's view first: the first snapshot (the initial Gaussians) follows its upload
+    const order = preview ? [preview.index, ...views.keys()].filter((i, k) => k === 0 || i !== preview!.index) : [...views.keys()];
+    for (let k = 0; k < order.length; k++) {
       check(SPLAT_STAGES.prepare);
+      const i = order[k];
       const im = views[i];
       const v = await loadDenseViewImage(deps.store, model, im.id, camOf(im.id), size);
       await deps.waitVisible();
       t.setViewImage(i, v.image);
-      report(SPLAT_STAGES.prepare, from + ((to - from) * (i + 1)) / views.length, `uploading views ${i + 1}/${views.length}`);
-      if (i % 4 === 3) await tick();
+      if (preview && i === preview.index) {
+        preview.target ??= boxDownscale(v.image, preview.factor);
+        if (!preview.count) await renderPreview(t);
+      }
+      report(SPLAT_STAGES.prepare, from + ((to - from) * (k + 1)) / views.length, `uploading views ${k + 1}/${views.length}`);
+      if (k % 4 === 3) await tick();
     }
   };
-  const createTrainer = async (params: SplatModel, from: number, to: number): Promise<SplatTrainer> => {
+  /** A trainer on `params` (+ a checkpoint's state, restored before the uploads: the first preview's iteration). */
+  const createTrainer = async (params: SplatModel, from: number, to: number, ck?: Pick<CheckpointData, 'state' | 'moments'>): Promise<SplatTrainer> => {
     report(SPLAT_STAGES.prepare, from, 'compiling GPU pipelines');
     const c = ctx!;
     const t = await deps.gpuLock(() => SplatTrainer.create(c, trainerOpts));
     try {
       t.init(params, viewMeta());
+      if (ck) t.restore(ck.state, ck.moments);
       await uploadViews(t, from + 0.1 * (to - from), to);
       await uploadDepth(t);
       deps.config.splatDebug?.onTrainer?.(t);
@@ -428,9 +509,8 @@ export async function runSplat(deps: SplatDeps, opts: SplatOptions = {}, progres
     return t;
   };
   const tPrep = now();
-  let trainer = await createTrainer(init, 0.2, 1);
+  let trainer = await createTrainer(init, 0.2, 1, resume ?? undefined);
   try {
-    if (resume) trainer.restore(resume.state, resume.moments);
     stats.splatPrepareMs = Math.round(now() - t0);
     deps.log('info', `splat: prepared in ${((now() - t0) / 1000).toFixed(1)} s (trainer + ${views.length} view uploads ${((now() - tPrep) / 1000).toFixed(1)} s)`);
 
@@ -519,8 +599,7 @@ export async function runSplat(deps: SplatDeps, opts: SplatOptions = {}, progres
         return;
       }
       const ck = await loadLast();
-      trainer = await createTrainer(ck.params, 0, 1);
-      trainer.restore(ck.state, ck.moments);
+      trainer = await createTrainer(ck.params, 0, 1, ck);
     };
     // iteration 0: the initial Gaussians (rollback target)
     while (!resume) {
@@ -539,6 +618,9 @@ export async function runSplat(deps: SplatDeps, opts: SplatOptions = {}, progres
     let drops = 0;
     let last = { loss: NaN, count: trainer.gaussians, itPerSec: 0 };
     const every = Math.max(1, Math.round(preset.checkpointEvery));
+    // finish early (CancelToken.finishEarly) from the end of the coarse-to-fine schedule on
+    const finishFrom = Math.min(iterations, trainer.fullResolutionFrom);
+    let finishedEarly = false;
     let mean: Float64Array | null = null;
     let out: SplatModel | null = null;
     let tf = 0;
@@ -548,6 +630,22 @@ export async function runSplat(deps: SplatDeps, opts: SplatOptions = {}, progres
           // keep the progress since the last checkpoint for the resume (cheap next to the training)
           if (lastCkpt && trainer.iteration - lastCkpt.iteration >= 100) await writeCheckpoint().catch((e: unknown) => deps.log('warn', `splat: checkpoint on cancel failed: ${(e as Error)?.message ?? e}`));
           throw cancelledError(SPLAT_STAGES.training);
+        }
+        if (cancel?.finishEarly && trainer.iteration >= finishFrom) {
+          // the checkpoint a later run continues from, before the finishing changes the trainer
+          if (lastCkpt?.iteration !== trainer.iteration) {
+            try {
+              await writeCheckpoint();
+            } catch (e) {
+              if (isDeviceLost(e)) {
+                await recoverLoss(e);
+                continue;
+              }
+              deps.log('warn', `splat: checkpoint at iteration ${trainer.iteration} failed (${(e as Error)?.message ?? e}); finishing without one to continue from`);
+            }
+          }
+          finishedEarly = true;
+          break;
         }
         await deps.waitVisible();
         const it = trainer.iteration;
@@ -572,9 +670,12 @@ export async function runSplat(deps: SplatDeps, opts: SplatOptions = {}, progres
           continue;
         }
         const cur = trainer.iteration;
-        const detail: SplatTrainingDetail = { iteration: cur, iterations, loss: last.loss, itPerSec: last.itPerSec, gaussians: last.count };
+        const detail: SplatTrainingDetail = { iteration: cur, iterations, loss: last.loss, itPerSec: last.itPerSec, gaussians: last.count, finishFrom };
         report(SPLAT_STAGES.training, cur / iterations, `iteration ${cur}/${iterations} · ${last.count} Gaussians · ${last.itPerSec.toFixed(1)} it/s`, detail);
         if (cur % every === 0 && cur < iterations) await writeCheckpoint().catch((e: unknown) => recoverLoss(e));
+        // (none right before the loop stops: the model itself comes next)
+        const stopping = !!cancel?.cancelled || (!!cancel?.finishEarly && cur >= finishFrom);
+        if (preview && cur < iterations && !stopping && now() - preview.last >= PREVIEW_EVERY_MS) await renderPreview(trainer);
       }
       stats.splatTrainMs = Math.round(now() - tTrain);
       stats.splatItPerSec = trainMsThisRun > 0 ? Math.round((10_000 * trainItersThisRun) / trainMsThisRun) / 10 : 0;
@@ -583,9 +684,11 @@ export async function runSplat(deps: SplatDeps, opts: SplatOptions = {}, progres
       stats.splatCheckpointMs = Math.round(ckptMs);
       if (drops) stats.splatDroppedWork = drops;
       if (losses) stats.splatDeviceLosses = losses;
+      if (preview) stats.splatPreviews = preview.count;
       deps.log(
         'info',
-        `splat: trained ${trainItersThisRun} iterations in ${(stats.splatTrainMs / 1000).toFixed(1)} s (${stats.splatItPerSec} it/s in step, checkpoints ${ckpts} × ≈ ${ckpts ? Math.round(ckptMs / ckpts) : 0} ms), ${last.count} Gaussians, loss ${last.loss.toFixed(4)}`,
+        `splat: trained ${trainItersThisRun} iterations in ${(stats.splatTrainMs / 1000).toFixed(1)} s (${stats.splatItPerSec} it/s in step, checkpoints ${ckpts} × ≈ ${ckpts ? Math.round(ckptMs / ckpts) : 0} ms), ${last.count} Gaussians, loss ${last.loss.toFixed(4)}` +
+          `${finishedEarly ? `; finished early at iteration ${trainer.iteration} of ${iterations}` : ''}${preview ? `; ${preview.count} previews` : ''}`,
       );
 
       // ---- finishing (a cancel arriving now is ignored: the training is complete)
@@ -602,6 +705,11 @@ export async function runSplat(deps: SplatDeps, opts: SplatOptions = {}, progres
     }
     if (mean) stats.splatMeanColourGain = Math.round(((mean[0] + mean[5] + mean[10]) / 3) * 1000) / 1000;
     if (readRetries) stats.splatReadRetries = readRetries;
+    if (finishedEarly) {
+      stats.splatFinishedEarly = 1;
+      // a stored checkpoint at the model's iteration: the engine keeps it for a later run to continue from
+      if (deps.checkpoints && lastCkpt?.iteration === trainer.iteration) stats.splatContinueFrom = trainer.iteration;
+    }
     stats.splatCount = out.count;
     stats.splatFinishMs = Math.round(now() - tf);
     stats.splatMs = Math.round(now() - t0);

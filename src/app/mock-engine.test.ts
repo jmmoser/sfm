@@ -272,6 +272,48 @@ describe('MockEngine', () => {
     await expect(e.splatModel()).resolves.toBeNull();
   });
 
+  it('splat previews; finishEarly keeps that model and a later run continues from it', async () => {
+    // (slow enough for a preview before iteration 900: one every 400 ms of a 1.6 s training)
+    const e = new MockEngine({ speed: 1, sessions: async () => null });
+    await e.init({ mode: 'object', quality: 'fast', sessionId: 's3' });
+    for (let i = 0; i < 40; i++) await e.processFrame(frame(100 + i * 400));
+    await e.refine();
+    const previews: { iteration: number; sum: number; w: number; h: number }[] = [];
+    let requested = 0;
+    let firstTraining = -1;
+    const info = await e.splat({ preview: true }, (p) => {
+      if (p.stage === 'splat_preview' && p.image && p.detail) {
+        previews.push({ iteration: p.detail.iteration, sum: Array.from(p.image.data).reduce((s, v) => s + v, 0), w: p.image.width, h: p.image.height });
+      }
+      if (p.stage === 'splat_training' && p.detail) {
+        if (firstTraining < 0) firstTraining = previews.length;
+        expect(p.detail.finishFrom).toBe(900);
+        // a request before finishFrom waits for it
+        if (!requested) {
+          requested = p.detail.iteration;
+          e.finishEarly('splat');
+        }
+      }
+    });
+    expect(requested).toBeLessThan(900);
+    expect(firstTraining).toBe(1); // the first preview comes before the training
+    expect(previews[0]).toMatchObject({ iteration: 0, w: 288, h: 384 });
+    expect(previews.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(previews.map((p) => p.sum)).size).toBe(previews.length); // they change
+    expect(info.iterations).toBeGreaterThanOrEqual(900);
+    expect(info.iterations).toBeLessThan(3000);
+    expect(info.stats).toMatchObject({ splatFinishedEarly: 1, splatContinueFrom: info.iterations, splatIterations: 3000 });
+    const sum = await e.loadSession('s3');
+    expect(sum.splat?.iterations).toBe(info.iterations);
+    expect(sum.stats).toMatchObject({ splatResumableIteration: info.iterations, splatResumableQuality: 'fast' });
+    // continue: from there to the end, no longer resumable
+    const done = await e.splat();
+    expect(done.iterations).toBe(3000);
+    expect(done.stats.splatResumedFrom).toBe(info.iterations);
+    expect(done.stats.splatFinishedEarly).toBeUndefined();
+    expect((await e.loadSession('s3')).stats.splatResumableIteration).toBeUndefined();
+  });
+
   it('failOn makes a method fail (error UI)', async () => {
     const e = new MockEngine({ speed: 50, failOn: { refine: 'out of memory' }, sessions: async () => null });
     await e.init({ mode: 'object', quality: 'fast' });

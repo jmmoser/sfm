@@ -580,4 +580,6 @@ PatchMatch (geometric consistency) → halo / sky filter → fusion → filtered
 point cloud → optional TSDF mesh.
 
 **Splat**: dense (else sparse) cloud → 3D Gaussians → WebGPU training against all keyframes
-(MCMC densification, depth supervision from the dense maps, per-view colour correction).
+(MCMC densification, depth supervision from the dense maps, per-view colour correction; optional
+snapshot previews between chunks; "finish early" from the end of the coarse-to-fine schedule keeps
+the model and a checkpoint to continue from).

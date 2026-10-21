@@ -202,6 +202,11 @@ export interface ProgressEvent {
    * iteration, loss, it/s). Plain numbers only, so it survives the worker message as is.
    */
   detail?: Record<string, number>;
+  /**
+   * A picture of the stage's state (e.g. the splat stage's 'splat_preview' snapshot of the model
+   * being trained, RGBA8). The engine worker transfers its buffer, never copies it.
+   */
+  image?: RGBAImage;
 }
 
 export type ProgressCallback = (e: ProgressEvent) => void;
@@ -209,4 +214,10 @@ export type ProgressCallback = (e: ProgressEvent) => void;
 /** Cooperative cancellation token passed through long-running work. */
 export interface CancelToken {
   readonly cancelled: boolean;
+  /**
+   * Optional: end the work early and keep its result so far. Only the splat training honours it
+   * (src/engine/splat.ts: it stops at the current iteration and finishes like a complete run);
+   * other work ignores it.
+   */
+  readonly finishEarly?: boolean;
 }

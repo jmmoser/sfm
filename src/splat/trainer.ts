@@ -17,7 +17,8 @@
  * and the views (images now or one by one with `setViewImage`, so the host never holds them all),
  * then `step(n)` runs n iterations — one command buffer each, awaited before the next (one heavy
  * command buffer in flight, iOS rule) — and can be called repeatedly in time slices from a worker.
- * `render`, `readModel` / `exportPLY` (ply.ts), `memory()`.
+ * `render` (forward only, between steps: the engine's training previews), `readModel` /
+ * `exportPLY` (ply.ts), `memory()`; `fullResolutionFrom` (end of the coarse-to-fine schedule).
  *
  * Dropped work (iOS may silently drop command buffers submitted while the page is hidden): every
  * iteration stamps its stats slot with a submission counter and every MCMC relocation copies its
@@ -737,6 +738,19 @@ export class SplatTrainer {
     const frac = it / Math.max(1, this.opts.iterations);
     for (const l of this.levels) if (frac < l.until) return l.factor;
     return 1;
+  }
+
+  /**
+   * First iteration of the full-resolution phase, i.e. the end of the coarse-to-fine schedule
+   * (default 30 % of `iterations`; 0 without levels): the earliest point where stopping early
+   * (the engine's `finishEarly`) leaves a model trained at the size it is shown at.
+   */
+  get fullResolutionFrom(): number {
+    const T = Math.max(1, this.opts.iterations);
+    const until = Math.max(0, ...this.levels.filter((l) => l.factor > 1).map((l) => l.until));
+    let it = Math.min(T, Math.max(0, Math.ceil(until * T - 1e-6)));
+    while (it < T && this.levelAt(it) !== 1) it++;
+    return it;
   }
 
   /** Mean learning rate (world units) at iteration `it`. */

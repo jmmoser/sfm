@@ -3,8 +3,9 @@
  * (src/workers/engine.worker.ts) with the typed RPC protocol of src/workers/protocol.ts.
  *
  *  - Request ids, transfer lists (ImageBitmaps / large typed arrays are transferred).
- *  - Progress events are routed to the request that caused them; `live` / `log` / `error`
- *    events go to subscribers.
+ *  - Progress events are routed to the request that caused them (with their `image`, e.g. the
+ *    splat previews); `live` / `log` / `error` events go to subscribers. `finishEarly` is sent like
+ *    `cancel` (fire and forget, to the newest long operation or the newest of a method).
  *  - Back-pressure: at most ONE frame in flight. `processFrame` resolves with the LiveUpdate;
  *    the caller (FramePump) sends the next frame only after that. A second concurrent call
  *    rejects with EngineBusyError (its bitmap is closed).
@@ -91,7 +92,8 @@ export interface EngineLike {
   mesh(options?: MeshOptions, onProgress?: ProgressCallback): Promise<TriangleMesh>;
   /**
    * Train Gaussian splats (long; progress stages SPLAT_STAGES, 'splat_training' events carry a
-   * SplatTrainingDetail in `detail`; cancel keeps a checkpoint: the next call resumes it).
+   * SplatTrainingDetail in `detail`, `preview: true` adds 'splat_preview' snapshots in `image`;
+   * cancel keeps a checkpoint: the next call resumes it).
    */
   splat(options?: SplatOptions, onProgress?: ProgressCallback): Promise<SplatResult>;
   /** The stored splat model for the viewer (null when none). */
@@ -103,6 +105,12 @@ export interface EngineLike {
    * newest one of `method` (several can run at once, e.g. an export during a splat build).
    */
   cancel(method?: EngineMethod): void;
+  /**
+   * End the running long operation early and keep its result (targeted like `cancel`): the splat
+   * training stops at its current iteration — from `SplatTrainingDetail.finishFrom` on — and
+   * `splat` resolves with that model (stats.splatFinishedEarly). Other operations ignore it.
+   */
+  finishEarly(method?: EngineMethod): void;
   /**
    * Cancel the running long operation (finishCapture / refine / densify / mesh / splat / export /
    * loadSession; the newest one, or the newest one of `method`) and make sure it ENDS: when the
@@ -215,7 +223,7 @@ type Setup = { kind: 'init'; options: EngineOptions } | { kind: 'load'; id: stri
  * finishCapture is one (it drains the keyframe mapping queue; the worker gives it a cancel token).
  */
 const LONG: ReadonlySet<EngineMethod> = new Set<EngineMethod>(LONG_RUNNING_METHODS);
-const FIRE_AND_FORGET: ReadonlySet<EngineMethod> = new Set<EngineMethod>(['cancel', 'visibility', 'dispose']);
+const FIRE_AND_FORGET: ReadonlySet<EngineMethod> = new Set<EngineMethod>(['cancel', 'finishEarly', 'visibility', 'dispose']);
 
 function defaultWorker(): Worker {
   return new Worker(new URL('../workers/engine.worker.ts', import.meta.url), { type: 'module', name: 'engine' });
@@ -402,6 +410,12 @@ export class EngineClient implements EngineLike {
   cancel(method?: EngineMethod): void {
     const target = this.longTarget(method);
     if (target !== null) this.sendCancel(target);
+  }
+
+  finishEarly(method?: EngineMethod): void {
+    const target = this.longTarget(method);
+    if (target === null || !this.worker) return;
+    void this.call('finishEarly', { target }, { timeoutMs: this.opts.callTimeoutMs }).catch(() => undefined);
   }
 
   /** The newest pending long operation (of `method` when given); null when none. */
@@ -718,6 +732,7 @@ export class EngineClient implements EngineLike {
         const pe: ProgressEvent = { stage: ev.stage, progress: ev.progress };
         if (ev.message !== undefined) pe.message = ev.message;
         if (ev.detail) pe.detail = ev.detail;
+        if (ev.image) pe.image = ev.image;
         const targetId = ev.requestId ?? this.longTarget();
         const p = targetId !== null && targetId !== undefined ? this.pending.get(targetId) : undefined;
         if (p) {

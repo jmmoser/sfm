@@ -18,7 +18,8 @@
  * `close` request (let go of a session before it is deleted),
  * `EngineOptions.resume` (re-open a persisted session after a worker respawn), optional
  * FramePump metadata on `FrameInput`, `SessionSummary` carries the stored models, the Gaussian
- * splatting stage (`splat`, `splatModel`, export 'ply-splat', `ProgressEvent.detail`).
+ * splatting stage (`splat`, `splatModel`, export 'ply-splat', `ProgressEvent.detail`, the
+ * 'splat_preview' snapshots in `ProgressEvent.image`, the `finishEarly` request).
  */
 import type {
   CameraIntrinsics,
@@ -281,6 +282,11 @@ export interface SplatOptions {
   backgroundShell?: boolean;
   /** Ignore a resumable checkpoint of the same run and train from the start. */
   restart?: boolean;
+  /**
+   * Post 'splat_preview' events while training: snapshots of the model from one training view
+   * (default off: the harness and tests opt in like the app).
+   */
+  preview?: boolean;
 }
 
 /** Progress stage names of `splat` (ProgressEvent.stage). */
@@ -289,6 +295,12 @@ export const SPLAT_STAGES = {
   prepare: 'splat_prepare',
   /** Training; `ProgressEvent.detail` is a `SplatTrainingDetail`. */
   training: 'splat_training',
+  /**
+   * With `SplatOptions.preview`: a snapshot of the model being trained (`ProgressEvent.image`,
+   * RGBA8 ≤ 400 px; `detail`: `SplatPreviewDetail`), once before the training and then every ≥ 2 s
+   * of it. Interleaved with the other stages and never throttled.
+   */
+  preview: 'splat_preview',
   /** Appearance normalisation, read-back, persisting the model. */
   finishing: 'splat_finishing',
 } as const;
@@ -303,6 +315,26 @@ export interface SplatTrainingDetail {
   /** Iterations per second of the last chunk. */
   itPerSec: number;
   gaussians: number;
+  /**
+   * First iteration at which `finishEarly` ends the training (the end of the coarse-to-fine
+   * resolution schedule: 30 % of the iterations by default); a request before it takes effect there.
+   */
+  finishFrom: number;
+}
+
+/** `ProgressEvent.detail` of the 'splat_preview' stage. */
+export interface SplatPreviewDetail {
+  [key: string]: number;
+  /** Iterations trained when the snapshot was rendered (0: the initial Gaussians). */
+  iteration: number;
+  iterations: number;
+  /** Keyframe id of the training view it is rendered from (the one nearest the middle photo). */
+  viewId: number;
+  /**
+   * PSNR (dB) against that view's training photo at the snapshot size, raw colours (no per-view
+   * colour correction or appearance normalisation). A training view: it flatters the model.
+   */
+  psnr: number;
 }
 
 /** What `splat` resolves with (the model itself: `splatModel`). */
@@ -321,7 +353,10 @@ export interface SplatResult {
   /**
    * Well-known keys: splatViews, splatWidth / splatHeight, splatMaxGaussians, splatInitGaussians,
    * splatShell, splatItPerSec, splatLoss, splatResumedFrom, splatMemPeakMB, splatGpuMB,
-   * splatDegraded, splatTrainMs, splatPrepareMs, splatStoredBytes.
+   * splatDegraded, splatTrainMs, splatPrepareMs, splatStoredBytes, splatIterations (the
+   * schedule), splatPreviews. Ended by `finishEarly`: splatFinishedEarly = 1 and, when the
+   * checkpoint at that iteration was kept for a later `splat` to continue from, splatContinueFrom
+   * (that iteration; loadSession then reports it as splatResumableIteration).
    */
   stats: Record<string, number | string>;
 }
@@ -383,6 +418,12 @@ export interface EngineMethodMap {
   loadSession: { params: { id: string; options?: Partial<EngineOptions> }; result: SessionSummary };
   /** Cancel the request `target` (default: the running long operation). Resolves at once. */
   cancel: { params: { target?: number } | undefined; result: void };
+  /**
+   * Extension: end the request `target` (default: the running long operation) early and keep its
+   * result — the splat training stops at its current iteration (from `SplatTrainingDetail.finishFrom`
+   * on) and finishes like a complete run. Others ignore it. Resolves at once.
+   */
+  finishEarly: { params: { target?: number } | undefined; result: void };
   /** Extension: page visibility (pause GPU submissions while hidden). */
   visibility: { params: { hidden: boolean }; result: void };
   /**
@@ -410,6 +451,7 @@ export const ENGINE_METHODS: readonly EngineMethod[] = [
   'export',
   'loadSession',
   'cancel',
+  'finishEarly',
   'visibility',
   'close',
   'dispose',
