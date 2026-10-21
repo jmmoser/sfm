@@ -47,7 +47,7 @@
  * the sky estimates, 68 % of the > 5 % outliers, 0.9 % of the ≤ 1 % pixels. The sky test
  * then removes 80–90 % of the sky-coloured points farther than τ that survive fusion on the
  * yard (precision 0.981 → 0.985, completeness −0.03 pt) and changes nothing on the object
- * (ARCHITECTURE §6 "Sky / low-texture halo removal"). ≈ 40 ms per 480×360 map for step 1 on
+ * (docs/research/dense-tuning.md "Sky / low-texture halo removal"). ≈ 40 ms per 480×360 map for step 1 on
  * one x86 core, + 5–30 ms for the sky test (proportional to the top-connected untextured
  * area). Apply it ONCE per map: a second pass sees the removed pixels as invalid and erodes
  * further (`removeDepthHalos` on the final maps, or `FusionOptions.haloFilter`, not both).

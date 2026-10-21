@@ -8,6 +8,11 @@
  *
  * GPU scheduling (one command buffer in flight, retries of dropped work) is done inside
  * PatchMatchGPU; between views the engine waits while the page is hidden.
+ *
+ * Limits: cancel is seen between views, so its latency is one PatchMatch view (estimated 4–15 s
+ * per 1600 px view on an iPhone). Stored depth maps peak at ≈ 2.2 × views × px × 12 B of
+ * IndexedDB (≈ 6 GB at `max`); iOS does not expose free disk, so a quota error mid-dense is not
+ * predicted — it rejects densify, which then resumes from `dense/progress`.
  */
 import type { CameraIntrinsics, CancelToken, PointCloud, Pose, ProgressCallback, RGBAImage, TriangleMesh } from '../core/types';
 import { removeDepthHalos, worldUpInCamera } from '../dense/depth-filter';

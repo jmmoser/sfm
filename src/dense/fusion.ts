@@ -29,8 +29,8 @@ import type { DenseView, DepthMap, DepthMapStore } from './types';
 export interface FusionOptions {
   /**
    * Minimum number of consistent views per point, reference included. Default 3 (kept for
-   * compatibility; the tuned presets use 2 — `DENSE_PRESETS`, ARCHITECTURE §6 "Dense tuning
-   * results").
+   * compatibility; the tuned presets use 2 — `DENSE_PRESETS`, docs/research/dense-tuning.md "Dense
+   * tuning results").
    */
   minViews: number;
   /** Maximum relative depth difference. Default 0.01. */

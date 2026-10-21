@@ -649,6 +649,8 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     throw e;
   }
   const rec: StoredPairs = { pairs: stored, attempted };
+  // (not read back yet: a refine on a live session restored from the store — e.g. after densify
+  // released it — matches these pairs again)
   await deps.store.putValue('refine/pairs', rec).catch((e: unknown) => deps.log('warn', `could not persist refine pairs: ${(e as Error)?.message ?? e}`));
   stats.newPairs = verified;
   stats.pairs = st.db.numPairs;

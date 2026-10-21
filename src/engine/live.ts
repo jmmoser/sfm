@@ -14,6 +14,11 @@
  * neighbours (bounded per preset), verification, FeatureDatabase / CorrespondenceGraph update,
  * `LiveMapper.addKeyframe`, vocabulary training / indexing, the R_cam_device hand-eye check,
  * 'auto' mode resolution, persistence and a `live` event with the decimated model.
+ *
+ * Limits: there is one live model — when tracking is lost for good, later keyframes stay pending
+ * (refine's offline SfM handles disconnected captures); the 'auto' decision is a heuristic. The
+ * worker is single-threaded, so synchronous steps (LiveMapper global BA, vocabulary training at
+ * `vocabularyTrainAfter` keyframes) delay frames and cancel by up to ≈ 1 s.
  */
 import type { CameraIntrinsics, CancelToken, FeatureSet, FrameInfo, GeoFix, ImuSample, Mat3, MatchPairs, Pose, TwoViewGeometry } from '../core/types';
 import type { FeaturePipeline } from '../features/extractor';

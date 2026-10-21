@@ -90,7 +90,9 @@ export interface PatchMatchOptions {
    * Warp the window into a source with the homography's affine approximation at the window
    * centre (its Jacobian) instead of a projective divide per sample: two multiply-adds per
    * sample. The error is second order in the window offset (well below 0.1 px for a 13 px window
-   * except on grazing planes). Default false (the tuned `DENSE_PRESETS` enable it).
+   * except on grazing planes). Default false; `DENSE_PRESETS` keep it off too: with the cheaper
+   * 13 px / 25-sample window and 3 proposals it halves GPU time but costs ≈ 1 pt of yard
+   * completeness (docs/research/dense-tuning.md "Dense on a real GPU").
    */
   affineWindow: boolean;
   /**
