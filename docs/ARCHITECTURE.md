@@ -3405,9 +3405,12 @@ without a dense cloud); protocol and UI contract in ENGINE.md §2 "Splat" / §3 
   centroid error ≤ 0.004 px against the pinhole projection.
 * **Tests**: `src/engine/splat-plan.test.ts` (presets, plan = trainer estimate, degradation, encodings incl. bf16
   range, run key, 'ply-splat' export), `mock-engine.test.ts` (stages, detail, resumable cancel, export),
-  `src/engine/splat-engine.gpu.test.ts` (E2E_GPU=host: persistent session densify → splat cancelled at 160 → engine
-  dropped → new engine reports `splatResumableIteration` 100, resumes at 120, persists, clears checkpoints, exports;
-  in-memory session without dense cloud + sky shell: a simulated drop rolls back, `device.destroy()` at 140 rebuilds),
+  `src/engine/splat-engine.gpu.test.ts` (SwiftShader or E2E_GPU=host; 200 iterations at 120×160, checkpoints every
+  50, MCMC refinement at 100 / 150: persistent session densify → splat cancelled at 120 → engine dropped → new engine
+  reports `splatResumableIteration` 100, resumes at 110, persists, clears checkpoints, exports; in-memory session
+  without dense cloud + sky shell: a simulated drop rolls back, `device.destroy()` at 120 rebuilds; device losses in
+  the first checkpoint, the finishing readbacks and the checkpoint at 150 rebuild and train on; each run asserts the
+  iteration it resumes at),
   `src/splat/trainer.gpu.test.ts` (restore round trip, drop detection), `src/splat/nvs.gpu.test.ts`.
 * **Measured** (`E2E_GPU=host node e2e/run-e2e.mjs object-real --engine worker --splat --nvs --tag int-object`,
   fast, M4 / Metal, headless Chrome, host load 4–6 from other apps): every enforced check passes (ATE 2.89e-4 of the
