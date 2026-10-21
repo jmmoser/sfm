@@ -19,7 +19,13 @@
  *
  * Depth maps stream through an LRU cache (only the reference and its neighbours must be
  * resident). Optionally the consistency-filtered depth maps (only fused pixels kept) are
- * written to `filteredStore`, e.g. as clean input for `tsdfMesh`.
+ * written to `filteredStore` — use them as the input of `tsdfMesh`.
+ *
+ * Deliberate differences to COLMAP: the plane-based depth test above, and traversal depth 1
+ * (only the reference's own neighbours are checked, no BFS through neighbours of neighbours),
+ * which keeps the resident set to the reference + its neighbours: (maxNeighbours + 2) depth
+ * maps at 20 B/px, + 1 bit/px/view of fused masks. NaN / ±∞ depths and non-finite normals are
+ * invalid (they would pass the relative tests).
  */
 import type { CancelToken, PointCloud, ProgressCallback } from '../core/types';
 import { DepthMapCache, Yielder, growF32, growU8, relativeTransform, scaleCamera } from './dense-util';

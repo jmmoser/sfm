@@ -24,7 +24,9 @@
  * Depth range: robust percentiles (default 1st / 99th) of the z-depths of the sparse
  * points visible in the reference, widened ×0.8 / ×1.25. With fewer than
  * `minPointsForRange` visible points, all sparse points projecting into the reference
- * image in front of it are used; without any, a range is derived from the baselines.
+ * image in front of it are used (in addition to the observed ones: with a distorted camera an
+ * observed point's pinhole projection can fall outside the frame); without any, a range is
+ * derived from the baselines (0.5–200 × the median baseline).
  */
 import type { CameraIntrinsics, Pose } from '../core/types';
 import { poseCentre, quantile } from './dense-util';
@@ -60,7 +62,11 @@ export interface ViewSelectionOptions {
   /** Depth range percentiles (0..100). Defaults 1 and 99. */
   depthPercentileLow: number;
   depthPercentileHigh: number;
-  /** Margins applied to the percentiles. Defaults 0.8 and 1.25. */
+  /**
+   * Margins applied to the percentiles. Defaults 0.8 and 1.25 (`DENSE_PRESETS` use
+   * `depthMarginMin` 0.5: SfM tracks on near ground are short, so the 1st-percentile sparse depth
+   * misses it — on the GT-pose yard the wider bound removed a third of the > 5 % depth outliers).
+   */
   depthMarginMin: number;
   depthMarginMax: number;
   /** Below this many visible points the range falls back to all points in the frustum. Default 10. */

@@ -21,6 +21,14 @@
  *      geometric mode); the best of the 9 is kept.
  *   5. Refinement: up to 6 proposals (perturbed / random depth & normal, depth
  *      perturbation shrinking each iteration, random depths uniform in inverse depth).
+ *
+ * Cost details: grey = Rec.709 rounded to 8 bit (identical to the GPU's r8unorm upload); the
+ * bilateral colour term uses mean |ΔR|,|ΔG|,|ΔB| instead of ACMM's grey difference, to separate
+ * surfaces of equal luminance. A reference window with weighted variance < `minVariance` is
+ * textureless: cost 2, the pixel is never updated. A window centre outside / behind a source
+ * costs 2 for that source. Window fattening at occlusion boundaries is left to fusion's
+ * consistency checks. A zero-baseline source is photo-consistent at every depth: harmless with
+ * ≥ 2 informative sources, but it lowers the reported cost (view selection filters it).
  */
 import type { DenseView, DepthMap, DepthRange, GeometricInput, PatchMatchOptions } from './types';
 import {

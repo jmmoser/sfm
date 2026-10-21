@@ -20,7 +20,7 @@
  * the constant covers integration / time-offset / R_cam_device errors and the vision rotation's
  * own error, the drift an uncompensated (or residual) gyro bias, the last the gyro scale error and
  * time-offset errors during fast rotation. Wrong pairs measured on the e2e datasets are 50–140°
- * off; correct ones ≤ 2–3°.
+ * off; correct ones ≤ 2–3° (docs/research/real-capture-robustness.md).
  *
  * Conventions (ARCHITECTURE §2): gyro ω_dev with dR_wd/dt = R_wd [ω]×; R_cam_device maps device
  * to camera vectors; "camera(ta) → camera(tb)" = R with x_b = R x_a for a static direction

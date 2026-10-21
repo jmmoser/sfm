@@ -36,7 +36,20 @@
  *     (bounding-box diagonal) are removed.
  *
  * Memory: 11 B per voxel (Int16 TSDF, Uint16 weight, 3 × Uint16 colour, Uint8 colour
- * weight) = 5.6 KB per block; default maxBlocks 50 000 ≈ 280 MB worst case.
+ * weight) = 5.6 KB per block; default maxBlocks 50 000 ≈ 280 MB worst case (lower it on
+ * iPhone, e.g. 25–30 k). With a user-given `voxelSize` there is no coarsening: allocation stops
+ * at `maxBlocks` (`blockCapHit`).
+ *
+ * Tile culling uses the projected half-extent of a block's bounding sphere per axis,
+ * f·r·√(1 + (X/Z)²)/(Z − r): the on-axis f·r/(Z − r) under-estimates off-axis blocks by up to 2×
+ * at 120° FOV and culled visible blocks.
+ *
+ * Limits: one voxel size per volume, from the median depth (for an object in front of a room the
+ * room decides — pass `maxDepth`, e.g. 2 × the object distance, in object mode); structures thinner
+ * than ≈ τ (fences, poles) are lost and sharp edges round by ≈ 1 voxel; grazing ground with
+ * cos θ < 0.1 (beyond ≈ 10× the camera height) falls back to the ray distance and can still
+ * fragment where few views overlap. Integration of one view and marching cubes are synchronous:
+ * cancel latency is one view's integration (≤ ~1 s at 50 k blocks) — run it in a worker.
  */
 import type { CameraIntrinsics, CancelToken, Pose, ProgressCallback, TriangleMesh } from '../core/types';
 import { DepthMapCache, Int3HashMap, Yielder, poseCentre, quantile, rgbAtResolution, scaleCamera } from './dense-util';
