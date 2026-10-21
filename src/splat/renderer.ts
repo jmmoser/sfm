@@ -167,11 +167,12 @@ export class SplatRenderer {
    * reservation grows and the frame is rendered again.
    */
   async render(cam: SplatCamera, o: RenderCallOptions = {}): Promise<SplatImage> {
-    const r = await this.renderOnce(cam, o);
+    let r = await this.renderOnce(cam, o);
     const f = this.fwd!;
-    if (r.intersections! > f.isectCapacity && r.intersections! * 4 <= this.device.limits.maxStorageBufferBindingSize) {
-      f.resizeIntersections(Math.ceil(r.intersections! * 1.25));
-      return this.renderOnce(cam, o);
+    const grown = grownIntersectionCapacity(r.intersections!, f.isectCapacity, this.device.limits.maxStorageBufferBindingSize);
+    if (grown !== null) {
+      f.resizeIntersections(grown);
+      r = await this.renderOnce(cam, o);
     }
     if (!o.withStats) delete r.intersections;
     return r;
@@ -232,4 +233,15 @@ export function splatImageToRGBA8(img: SplatImage): Uint8ClampedArray {
     out[4 * i + 3] = 255;
   }
   return out;
+}
+
+/**
+ * The intersection reservation a frame that needed `intersections` regrows to (25 % headroom), or
+ * null when it fits or cannot be honoured: each sort buffer holds 4 B per intersection and must stay
+ * within `maxBindingBytes` (maxStorageBufferBindingSize), headroom included.
+ */
+export function grownIntersectionCapacity(intersections: number, capacity: number, maxBindingBytes: number): number | null {
+  const max = Math.floor(maxBindingBytes / 4);
+  if (!(intersections > capacity) || intersections > max) return null;
+  return Math.min(Math.ceil(intersections * 1.25), max);
 }
