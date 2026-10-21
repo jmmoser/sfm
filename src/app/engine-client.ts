@@ -21,7 +21,7 @@
  *  - Page visibility is forwarded (`visibility` request): the worker cannot see
  *    `visibilitychange`, and iOS silently drops GPU work submitted while hidden.
  */
-import type { PointCloud, ProgressCallback, ProgressEvent, TriangleMesh } from '../core/types';
+import type { PointCloud, ProgressCallback, ProgressEvent } from '../core/types';
 import {
   ENGINE_ERRORS,
   LONG_RUNNING_METHODS,
@@ -43,6 +43,7 @@ import {
   type LiveUpdate,
   type LogMessage,
   type MeshOptions,
+  type MeshResult,
   type SessionSummary,
   type SparseResult,
   type SplatModelPayload,
@@ -88,7 +89,7 @@ export interface EngineLike {
   finishCapture(): Promise<void>;
   refine(onProgress?: ProgressCallback): Promise<SparseResult>;
   densify(options?: DenseOptions, onProgress?: ProgressCallback): Promise<PointCloud>;
-  mesh(options?: MeshOptions, onProgress?: ProgressCallback): Promise<TriangleMesh>;
+  mesh(options?: MeshOptions, onProgress?: ProgressCallback): Promise<MeshResult>;
   /**
    * Train Gaussian splats (long; progress stages SPLAT_STAGES, 'splat_training' events carry a
    * SplatTrainingDetail in `detail`; cancel keeps a checkpoint: the next call resumes it).
@@ -366,7 +367,7 @@ export class EngineClient implements EngineLike {
     return this.call('densify', options, { onProgress });
   }
 
-  mesh(options?: MeshOptions, onProgress?: ProgressCallback): Promise<TriangleMesh> {
+  mesh(options?: MeshOptions, onProgress?: ProgressCallback): Promise<MeshResult> {
     return this.call('mesh', options, { onProgress });
   }
 

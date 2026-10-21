@@ -20,13 +20,14 @@
  *   value  dense/meta         undistorted dense views (for meshing after a reload)
  *   bin    depth/<id>         fusion-filtered depth maps (float16 normals / cost)
  *   bin    mesh               serializeTriangleMesh
+ *   value  mesh/meta          MeshMetaRecord (object box of the mesh, meshing stats; null = none)
  *   bin    splat/model        trained Gaussian splats, compact (packSplatModel: f32 means, f16 rest)
  *   value  splat/meta         SplatMetaRecord (count, SH degree, background, stats)
  *   value  splat/progress     SplatProgressRecord: the last complete training checkpoint
  *   bin    splat/ckpt<s>/params | m | v | colour   checkpoint slot s ∈ {0, 1} (f32 parameters,
  *                             bf16 Adam moments, f32 colour-correction state)
  */
-import type { CameraIntrinsics, GeoFix, ImuSample, Mat3, MetricInfo, RGBAImage, TwoViewConfig, TwoViewGeometry, Vec3 } from '../core/types';
+import type { CameraIntrinsics, GeoFix, ImuSample, Mat3, MetricInfo, ObjectRoi, RGBAImage, TwoViewConfig, TwoViewGeometry, Vec3 } from '../core/types';
 import { SessionStore, type SessionMeta } from '../io/storage';
 import { packFloat16, unpackFloat16 } from '../io/serialize';
 import { allocSplatModel, shCoeffCount, type ShDegree, type SplatModel } from '../splat/types';
@@ -355,6 +356,25 @@ export interface SparseMetaRecord {
 export interface DenseMetaRecord {
   views: { id: number; cam: CameraIntrinsics; pose: { R: number[]; t: number[] }; depthWidth: number; depthHeight: number }[];
   maxImageSize: number;
+}
+
+/**
+ * Persisted meta of the stored mesh (`mesh/meta`; written after `mesh`, cleared with it and by
+ * refine): the object box the TSDF was bounded to, in the world frame of the sparse model it was
+ * built from (exports place its bottom centre at the origin), and the meshing stats.
+ */
+export interface MeshMetaRecord {
+  version: 1;
+  objectRoi: ObjectRoi | null;
+  stats: Record<string, number | string>;
+}
+
+/** A well-formed ObjectRoi (a damaged / foreign stored record reads as no box). */
+export function isObjectRoi(x: unknown): x is ObjectRoi {
+  if (!x || typeof x !== 'object') return false;
+  const r = x as Partial<ObjectRoi>;
+  const vec = (v: unknown): boolean => Array.isArray(v) && v.length === 3 && v.every((c) => typeof c === 'number' && Number.isFinite(c));
+  return vec(r.min) && vec(r.max) && vec(r.centre) && Number.isFinite(r.planeZ) && Number.isFinite(r.confidence);
 }
 
 // ---------------------------------------------------------------------------------------------

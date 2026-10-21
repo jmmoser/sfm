@@ -4,7 +4,8 @@
  * LRU image cache sized to the memory budget) → source-view selection from the sparse model →
  * PatchMatch (photometric, then geometric-consistency passes; WebGPU with a CPU fallback at low
  * resolution) into DepthMapStores (memory, or IndexedDB + LRU when persisting) → fusion →
- * point-cloud filtering. Meshing: TSDF over the fusion-filtered depth maps (+ simplification).
+ * point-cloud filtering. Meshing: TSDF over the fusion-filtered depth maps, bounded to the
+ * automatic object box in object mode (`runMesh`), + simplification.
  *
  * GPU scheduling (one command buffer in flight, retries of dropped work) is done inside
  * PatchMatchGPU; between views the engine waits while the page is hidden.
@@ -14,9 +15,10 @@
  * IndexedDB (≈ 6 GB at `max`); iOS does not expose free disk, so a quota error mid-dense is not
  * predicted — it rejects densify, which then resumes from `dense/progress`.
  */
-import type { CameraIntrinsics, CancelToken, PointCloud, Pose, ProgressCallback, RGBAImage, TriangleMesh } from '../core/types';
+import type { CameraIntrinsics, CancelToken, ObjectRoi, PointCloud, Pose, ProgressCallback, RGBAImage, TriangleMesh } from '../core/types';
 import { removeDepthHalos, worldUpInCamera } from '../dense/depth-filter';
 import { fuseDepthMaps } from '../dense/fusion';
+import { proposeObjectRoi } from '../dense/object-roi';
 import { patchMatchCPU } from '../dense/patchmatch-cpu';
 import { PatchMatchGPU } from '../dense/patchmatch-gpu';
 import { filterPointCloud, footprintDownsample } from '../dense/pointcloud';
@@ -748,9 +750,27 @@ export interface MeshDeps {
   config: EngineConfig;
   model: SparseModel | null;
   memoryBudgetMB: number;
+  /** World +Z is up (`MetricInfo.gravityAligned`): needed for the object box. */
+  gravityAligned?: boolean;
+  log?(level: 'debug' | 'info' | 'warn' | 'error', message: string, data?: unknown): void;
 }
 
-/** TSDF mesh of the fusion-filtered depth maps (+ optional simplification). */
+/** Compact text of an object box for the stats / log. */
+function formatObjectRoi(r: ObjectRoi): string {
+  const v = (a: readonly number[]): string => `(${a.map((x) => x.toFixed(3)).join(', ')})`;
+  return `min ${v(r.min)} max ${v(r.max)}, plane ${r.planeZ.toFixed(4)}`;
+}
+
+/**
+ * TSDF mesh of the fusion-filtered depth maps (+ optional simplification). Object mode (with a
+ * gravity-aligned model, `MeshOptions.objectRoi` not false): the TSDF is bounded to the automatic
+ * object box (`proposeObjectRoi` on the sparse model), which keeps the table and room out of the
+ * mesh, gives the block budget to the object and takes the auto voxel from the depths inside the
+ * box; the box bottom clears the support plane by ≥ 2 such voxels. Without a box the 2 × median
+ * depth cut alone applies. The dense cloud and splats are never cropped. Stats: voxelSize,
+ * tsdfAutoVoxelSize, tsdfCoarsenLevels, tsdfBlocks, tsdfMaxBlocks, objectRoi (the box,
+ * 'none: <reason>' or 'off'), objectRoiConfidence.
+ */
 export async function runMesh(
   deps: MeshDeps,
   views: DenseView[],
@@ -758,29 +778,53 @@ export async function runMesh(
   opts: MeshOptions = {},
   progress?: ProgressCallback,
   cancel?: CancelToken,
-): Promise<{ mesh: TriangleMesh; stats: Record<string, number | string> }> {
+): Promise<{ mesh: TriangleMesh; stats: Record<string, number | string>; objectRoi: ObjectRoi | null }> {
   const t0 = now();
   const preset = resolveDensePreset(opts.quality ?? deps.quality, deps.config.dense ?? {});
   const mc = modeConfig(deps.mode === 'auto' ? 'auto' : deps.mode);
   const stats: Record<string, number | string> = {};
+  const sparseDepth = deps.model ? medianSparseDepth(deps.model) : NaN;
   let maxDepth = Infinity;
-  if (Number.isFinite(mc.tsdfMaxDepthFactor) && deps.model) {
-    const d = medianSparseDepth(deps.model);
-    if (d > 0) maxDepth = mc.tsdfMaxDepthFactor * d;
+  if (Number.isFinite(mc.tsdfMaxDepthFactor) && sparseDepth > 0) maxDepth = mc.tsdfMaxDepthFactor * sparseDepth;
+  const userVoxel = opts.voxelSize && opts.voxelSize > 0 ? opts.voxelSize : undefined;
+  // ---- object box (object mode)
+  let objectRoi: ObjectRoi | null = null;
+  stats.objectRoi = 'off';
+  stats.objectRoiConfidence = 0;
+  if (mc.objectRoi && opts.objectRoi !== false && deps.model) {
+    // clearance of the box bottom: 2 voxels. The bounded TSDF's auto voxel is 2 px footprints at the
+    // depth of what is inside the box ≈ the orbit distance d: per unit of d, autoVoxelPixels / f.
+    const fMed = median(views.map((v) => v.cam.f));
+    const minClearance = userVoxel ? 2 * userVoxel : fMed > 0 ? { perDistance: (2 * mc.tsdfAutoVoxelPixels) / fMed } : undefined;
+    const p = proposeObjectRoi(deps.model, { gravityAligned: !!deps.gravityAligned, minClearance });
+    objectRoi = p.roi;
+    stats.objectRoi = objectRoi ? formatObjectRoi(objectRoi) : `none: ${p.reason}`;
+    stats.objectRoiConfidence = objectRoi ? Math.round(objectRoi.confidence * 1000) / 1000 : 0;
+    deps.log?.(
+      'info',
+      `mesh object box: ${stats.objectRoi}` +
+        ` (ring ${p.ringRadius.toPrecision(3)}, camera distance ${p.distMedian.toPrecision(3)}, plane ${p.planePoints}/${p.annulusPoints} points, ` +
+        `tilt ${((p.planeTiltRad * 180) / Math.PI).toFixed(2)}°, σ ${p.planeSigma.toPrecision(2)}, clearance ${p.clearance.toPrecision(2)}, object ${p.objectPoints} points, confidence ${stats.objectRoiConfidence})`,
+    );
   }
   // block budget scaled to the memory budget (≈ 5.6 KB per block)
   const maxBlocks = Math.min(preset.tsdfMaxBlocks, Math.floor((0.25 * deps.memoryBudgetMB * 1024 * 1024) / 5632));
+  stats.tsdfMaxBlocks = maxBlocks;
   progress?.({ stage: 'meshing', progress: 0, message: 'TSDF' });
   let mesh = await tsdfMesh(
     views,
     filtered,
     {
-      voxelSize: opts.voxelSize && opts.voxelSize > 0 ? opts.voxelSize : undefined,
+      voxelSize: userVoxel,
       maxDepth,
       maxBlocks,
       autoVoxelPixels: mc.tsdfAutoVoxelPixels,
+      bounds: objectRoi,
       onStats: (s) => {
         stats.voxelSize = s.voxelSize;
+        stats.tsdfAutoVoxelSize = s.autoVoxelSize;
+        stats.tsdfCoarsenLevels = s.coarsenLevels;
+        stats.tsdfBlocks = s.blocks;
       },
     },
     (e) => progress?.({ stage: 'meshing', progress: 0.85 * Math.max(0, e.progress), message: e.message }),
@@ -796,5 +840,5 @@ export async function runMesh(
   stats.vertices = mesh.vertexCount;
   stats.meshingMs = Math.round(now() - t0);
   progress?.({ stage: 'meshing', progress: 1, message: `${mesh.triangleCount} triangles` });
-  return { mesh, stats };
+  return { mesh, stats, objectRoi };
 }

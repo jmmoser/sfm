@@ -18,7 +18,8 @@
  * `close` request (let go of a session before it is deleted),
  * `EngineOptions.resume` (re-open a persisted session after a worker respawn), optional
  * FramePump metadata on `FrameInput`, `SessionSummary` carries the stored models, the Gaussian
- * splatting stage (`splat`, `splatModel`, export 'ply-splat', `ProgressEvent.detail`).
+ * splatting stage (`splat`, `splatModel`, export 'ply-splat', `ProgressEvent.detail`), the object
+ * box of object-mode meshes (`MeshOptions.objectRoi`, `MeshResult`, `SessionSummary.objectRoi`).
  */
 import type {
   CameraIntrinsics,
@@ -26,6 +27,7 @@ import type {
   ImuSample,
   Mat3,
   MetricInfo,
+  ObjectRoi,
   PointCloud,
   Pose,
   ProgressEvent,
@@ -252,6 +254,21 @@ export interface MeshOptions {
   voxelSize?: number;
   /** Simplify to about this many triangles (default: no simplification). */
   targetTriangles?: number;
+  /**
+   * Object mode: mesh only inside the automatic object box (default true; false = the whole scene
+   * within the depth cut, "re-mesh full scene"). Ignored in scene mode.
+   */
+  objectRoi?: boolean;
+}
+
+/**
+ * Result of `mesh` (extension over ENGINE.md's TriangleMesh): the mesh plus the object box it was
+ * bounded to (object mode, gravity-aligned model, box found; else null) and the meshing stats
+ * (also merged into the session stats).
+ */
+export interface MeshResult extends TriangleMesh {
+  objectRoi?: ObjectRoi | null;
+  stats?: Record<string, number | string>;
 }
 
 /**
@@ -358,6 +375,8 @@ export interface SessionSummary {
   sparse: SparseResult | null;
   dense: PointCloud | null;
   mesh: TriangleMesh | null;
+  /** Extension: the object box the stored mesh was bounded to (null = none / unknown). */
+  objectRoi?: ObjectRoi | null;
   /** Extension: the stored splat model's info (fetch the model with `splatModel`). */
   splat?: SplatResult | null;
   stats: Record<string, number | string>;
@@ -373,7 +392,7 @@ export interface EngineMethodMap {
   finishCapture: { params: undefined; result: void };
   refine: { params: undefined; result: SparseResult };
   densify: { params: DenseOptions | undefined; result: PointCloud };
-  mesh: { params: MeshOptions | undefined; result: TriangleMesh };
+  mesh: { params: MeshOptions | undefined; result: MeshResult };
   /** Extension: train Gaussian splats (after densify, or after refine without a dense cloud). */
   splat: { params: SplatOptions | undefined; result: SplatResult };
   /** Extension: the stored splat model (packed, transferred), null when none was trained. */

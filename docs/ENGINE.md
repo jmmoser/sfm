@@ -74,7 +74,7 @@ class PhotogrammetryEngine {
   finishCapture(progress?, cancel?): Promise<void>
   refine(progress?, cancel?): Promise<SparseResult>
   densify(opts?, progress?, cancel?): Promise<PointCloud>
-  mesh(opts?, progress?, cancel?): Promise<TriangleMesh>
+  mesh(opts?, progress?, cancel?): Promise<MeshResult>   // TriangleMesh + objectRoi (object box or null) + stats
   splat(opts?: SplatOptions, progress?, cancel?): Promise<SplatResult>   // Gaussian splats (§2 "Splat")
   splatModel(): Promise<SplatModelPayload | null>                        // the stored splat model
   exportModel(format: 'ply-points' | 'ply-mesh' | 'glb' | 'colmap-zip' | 'ply-splat'): Promise<Blob>
@@ -151,6 +151,19 @@ alternate direction so the image LRU (sized up to every view when the plan allow
 PatchMatchGPU's upload caches stay warm. A fused cloud above the preset's `maxPoints` is merged
 with a footprint-adaptive LOD (cells ∝ each point's radius). Details: research/dense-tuning.md "Dense on a
 real GPU".
+
+Mesh: TSDF over the fusion-filtered depth maps (2 × median sparse depth cut in object mode). In object mode
+with a gravity-aligned model (`MeshOptions.objectRoi` not false) the TSDF is bounded to the automatic object
+box (`proposeObjectRoi`, src/dense/object-roi.ts: optical-axis convergence centre, support plane from a
+z-histogram of the sparse points in an annulus around the orbit axis, object = points above the plane within
+0.6 × the camera ring), so the table and room stay out of the mesh, the block budget goes to the object and the
+auto voxel follows the object's depth. No box (not gravity-aligned, no orbit, no plane, hand-held): the whole
+scene within the depth cut, as before. The dense cloud and splats are never cropped. The box is returned as
+`MeshResult.objectRoi`, persisted in `mesh/meta` (cleared with the mesh and by refine: it is in the refined
+world frame), reported as `SessionSummary.objectRoi` and handed to exports as `ExportSources.objectRoi` (USDZ /
+GLB put its bottom centre `objectRoiPivot` at the origin). Stats: `objectRoi` (the box, `none: <reason>` or
+`off`), `objectRoiConfidence`, `voxelSize`, `tsdfAutoVoxelSize`, `tsdfCoarsenLevels`, `tsdfBlocks`,
+`tsdfMaxBlocks`.
 
 ### Splat
 Gaussian splatting (`src/engine/splat.ts` over `src/splat`, research/splat-tuning.md "Engine splat stage"), after
