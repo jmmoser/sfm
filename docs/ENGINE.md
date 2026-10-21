@@ -33,6 +33,7 @@ interface EngineOptions {
   preferGPU?: boolean;         // default true
   hfovPriorDeg?: number;       // from CameraCapture (lens + aspect)
   resume?: boolean;            // re-open sessionId's persisted state (EngineClient after a worker respawn)
+  extend?: boolean;            // with resume: continue the stored capture, also a finished one ("Add more views")
 }
 
 interface FrameInput {
@@ -69,7 +70,7 @@ interface LiveUpdate {
 
 class PhotogrammetryEngine {
   constructor(opts: EngineOptions, config?: EngineConfig)   // EngineConfig: tuning knobs (harness / tests)
-  init(): Promise<{ gpu: boolean; adapter?: string; fallbackReason?: string }>
+  init(): Promise<InitResult>   // { gpu, adapter?, fallbackReason?, resumedKeyframes?, captureMemory?: { usedMB, capMB } }
   processFrame(f: FrameInput): Promise<LiveUpdate>
   finishCapture(progress?, cancel?): Promise<void>
   refine(progress?, cancel?): Promise<SparseResult>
@@ -124,6 +125,25 @@ picks object vs scene after initialisation from the scene depth / baseline.
    pose of the last registered keyframe), verify, reject pairs whose rotation disagrees
    with the gyro, update the graph, `LiveMapper.addKeyframe` (registrations checked
    against the gyro too).
+
+### Extend (continue a stored capture)
+`init` with `{ sessionId, persist: true, resume: true, extend: true }` restores the capture (keyframes,
+features, pairs, vocabulary, IMU, GPS, θ₀ / R_cam_device, time offset, gyro bias; the live model is
+rebuilt in the mapping queue) and reopens it (`LiveSession.reopenCapture`), also after finishCapture /
+refine: tracking restarts, so the first sharp frame becomes a keyframe that relocalises through the
+mapping queue's sequential, retrieval and spatial candidates. The stored mode and quality are kept; only
+the sparse model is loaded (the dense cloud / mesh stay in the store, outside the capture's memory cap,
+which applies from the first frame: `InitResult.captureMemory`). Times: performance.now() restarts with
+every page load, so the engine keeps a capture on its SESSION time base — FrameInput time + the capture
+segment's shift (`EngineStateRecord.timeSegments`). The first frame of a continued capture starts a
+segment ≥ 10 s (`EXTEND_TIME_GAP_MS`) after everything stored (frame, IMU, GPS and attitude times shifted
+alike; lower frame indices offset): the gyro never integrates across the gap and the inertial alignment
+splits the segments. LiveUpdate times stay on the page's base. The first new keyframe marks the stored
+results stale (`resultsStale`: `loadSession` then opens the scan with its sparse model only, status
+'capturing' / 'captured') until the next `refine`, which covers every keyframe and invalidates the dense
+cloud, mesh and splats as always (a cancelled or failed refine keeps the previous model). No multi-map
+merging: refine keeps the largest offline model and reports the keyframes outside it (`unconnectedImages`,
+`offlineModels`, `offlineDroppedImages`).
 
 ### Refine
 Train/extend the vocabulary → candidate pairs (sequential 10, retrieval 15,
@@ -230,7 +250,13 @@ MockEngine implements the same calls (a fast fake run whose model is one Gaussia
 Home (sessions, new scan, diagnostics) → Setup (mode, quality) → Permissions
 (one tap: motion → camera → location) → Capture (video, guidance, live sparse
 view, counters, finish) → Processing (stages + progress + cancel) → Viewer
-(splats / points / mesh layer pill, cameras, EDL, measure, export, run dense / mesh / photoreal). The splat
+(splats / points / mesh layer pill, cameras, EDL, measure, export, run dense / mesh / photoreal).
+"Add more views" (viewer Build sheet, the viewer's "N photos could not be connected" card, Home's
+session actions; "Continue scanning" for an interrupted capture) confirms that processing runs again
+and the later stages are rebuilt, then opens Capture on the stored session (`EXTEND_CAPTURE`: init with
+`resume` + `extend`, the stored mode / quality, the existing sparse model shown until the live model is
+rebuilt); the first new keyframe sets the session status back to 'capturing'. Finish re-runs refine
+(+ densify with auto-dense); stopping without new views returns to the stored model unchanged. The splat
 stage runs from the viewer itself ("Photoreal model" in the Build sheet → `splat` with a progress card fed by
 `SplatTrainingDetail`, Cancel, Resume after an interruption), the model is fetched with `splatModel` into the
 viewer's WebGPU splat layer and shown by default, and the export sheet offers 'ply-splat' (src/viewer/splat-layer.ts,

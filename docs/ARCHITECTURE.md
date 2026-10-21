@@ -42,7 +42,7 @@ source file headers. Measurements behind the defaults are dated reports in `docs
 | Quaternion | `[w, x, y, z]`, Hamilton, unit. |
 | Rotation update in optimisers | Left-multiplicative: `R ← exp([δω]×) R`, `t ← t + δt`. |
 | Angles | Radians unless the identifier ends in `Deg`. |
-| Time | Milliseconds, `performance.now()` domain. |
+| Time | Milliseconds, `performance.now()` domain. A stored capture is on its session time base: FrameInput time + the shift of its capture segment (`EngineStateRecord.timeSegments`), so a capture continued after a page reload stays in time order (src/engine/live.ts). |
 | Device frame (W3C DeviceMotion) | +x right edge, +y top edge, +z out of screen (portrait natural orientation). |
 | Camera ← device rotation | Rear camera, processed image upright for the UI rotated by screen angle θ (device turned θ counter-clockwise from natural portrait as seen by the user; θ ∈ {0, 90, 180, 270}): `R_cam_device(θ) = diag(1, −1, −1) · Rz(θ)` where `Rz(θ) = [[cosθ, −sinθ, 0], [sinθ, cosθ, 0], [0, 0, 1]]`. θ=0: `diag(1,−1,−1)`; θ=90: rows `(0,−1,0), (−1,0,0), (0,0,−1)`. `v_cam = R_cam_device · v_device`. (iOS mapping of `screen.orientation.angle` / `window.orientation` to θ is verified in `src/sensors/frame-orientation.ts`.) |
 | Device attitude | `R_wd` = device-to-world rotation; camera pose rotation `R = R_cam_device · R_wdᵀ`. Gyro `ω_dev`: `dR_wd/dt = R_wd [ω_dev]×`. `accel_dev = R_wdᵀ a_world`, `accelG_dev = R_wdᵀ (a_world − g_world)`, `g_world = (0, 0, −9.81)` in the Z-up world. |

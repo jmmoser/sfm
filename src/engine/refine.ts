@@ -7,6 +7,10 @@
  * self-calibration (f, k1, k2), re-triangulation and filtering → world alignment (IMU gravity /
  * time offset / metric scale, GPS, compass; verified R_cam_device) → SparseModel.
  *
+ * The offline SfM can return several models: only the largest is kept (no merging); stats
+ * `offlineModels` / `offlineDroppedImages` report the others, and `unconnectedImages` the
+ * keyframes missing from the final model (the viewer offers "Add more views" for them).
+ *
  * Progress stages: 'matching', 'reconstruction', 'alignment' (src/app/stages.ts).
  */
 import type { CancelToken, MatchPairs, PointCloud, ProgressCallback, TwoViewGeometry } from '../core/types';
@@ -795,6 +799,15 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
         cancel,
       );
       offline = models[0] ?? null;
+      // only the largest model is kept: report what the others held (split frequency on real captures)
+      stats.offlineModels = models.length;
+      if (models.length > 1) {
+        const kept = new Set(models[0].registeredImageIds());
+        const dropped = new Set<number>();
+        for (const m of models.slice(1)) for (const id of m.registeredImageIds()) if (!kept.has(id)) dropped.add(id);
+        stats.offlineDroppedImages = dropped.size;
+        deps.log('warn', `refine: offline SfM found ${models.length} models; ${dropped.size} keyframes only in the ${models.length - 1} smaller one(s) were dropped`);
+      }
     } catch (e) {
       if ((e as Error)?.name === 'CancelledError') throw e;
       deps.log('warn', `offline SfM failed: ${(e as Error)?.message ?? e}`);
@@ -1025,9 +1038,13 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   const cam0 = cameras[0]?.intrinsics;
   const trackLens: number[] = [];
   for (let i = 0; i < model.numPoints; i++) trackLens.push(model.trackOffsets[i + 1] - model.trackOffsets[i]);
+  // keyframes the final model could not connect (the viewer says so and offers to add views)
+  const unconnected = order.length - model.images.length;
+  if (unconnected > 0) deps.log('warn', `refine: ${unconnected} of ${order.length} keyframes could not be connected to the model`);
   Object.assign(stats, {
     images: order.length,
     registeredImages: model.images.length,
+    unconnectedImages: unconnected,
     points: model.numPoints,
     meanReprojErrorPx: Math.round(chosen.meanReprojectionError() * 1000) / 1000,
     meanTrackLength: Math.round(chosen.meanTrackLength() * 100) / 100,

@@ -15,6 +15,11 @@
  *   const blob = await engine.exportModel('ply-points');
  *
  * Model updates produced by background keyframe mapping arrive through `on('live', …)`.
+ *
+ * A stored capture is continued — also after it was processed, after a page reload — with
+ * `{ sessionId, persist: true, resume: true, extend: true }` (LiveSession.reopenCapture: new frames
+ * go onto the session time base after the stored ones); the next finishCapture / refine covers
+ * every keyframe, and refine invalidates the dense cloud, mesh and splats as always.
  */
 import type { CancelToken, FeatureSet, PointCloud, ProgressCallback, TriangleMesh } from '../core/types';
 import type { FeaturePipeline } from '../features/extractor';
@@ -478,7 +483,8 @@ export class PhotogrammetryEngine {
   /**
    * Create the feature pipeline (WebGPU preferred: pipelines compiled up front + self-test, CPU
    * fallback), open the session store when persisting, and restore the persisted capture when
-   * `resume` is set.
+   * `resume` is set — reopened for new frames with `extend` (stored mode / quality, sparse model
+   * only: the dense cloud and mesh stay in the store, out of the capture's memory).
    */
   async init(): Promise<InitResult> {
     if (this.disposed) throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');
@@ -490,6 +496,9 @@ export class PhotogrammetryEngine {
     const deleted = !!o.resume && this.store!.persistent && (await this.store!.getSessionMeta().catch(() => undefined)) === null;
     this.stopIfDisposed();
     if (deleted) throw namedError('SessionNotFoundError', `Session not found: ${o.sessionId}`);
+    const st = o.resume ? await this.store!.getValue<EngineStateRecord>('engine/state').catch(() => null) : null;
+    this.stopIfDisposed();
+    if (st && o.extend) this.adoptStoredSettings(st);
     try {
       await this.store!.ensureSession({ mode: o.mode, quality: o.quality });
     } catch (e) {
@@ -502,17 +511,26 @@ export class PhotogrammetryEngine {
     this.live = this.createLive();
     let resumed = 0;
     if (o.resume) {
-      const st = await this.store!.getValue<EngineStateRecord>('engine/state').catch(() => null);
+      if (!st && o.extend) this.log('warn', `session ${o.sessionId} has no stored capture to extend: starting empty`);
       if (st) {
         try {
           resumed = await this.live.restore(st);
-          await this.loadResults(st);
-          this.log('info', `resumed session ${o.sessionId}: ${resumed} keyframes`);
+          if (o.extend) this.live.reopenCapture();
+          // (results older than the capture's keyframes are only known to be stored)
+          await this.loadResults(st, !o.extend && st.resultsStale !== true);
+          this.log('info', `resumed session ${o.sessionId}: ${resumed} keyframes${o.extend ? ', capture reopened' : ''}`);
         } catch (e) {
-          // unreadable state: continue the capture from scratch (new keyframe ids never clash)
-          this.log('error', `could not resume session ${o.sessionId}: ${(e as Error)?.message ?? e}`);
-          this.emitError(e instanceof Error ? e : new Error(String(e)), false, 'storage');
+          const msg = (e as Error)?.message ?? String(e);
+          this.log('error', `could not resume session ${o.sessionId}: ${msg}`);
           this.live.dispose();
+          // a scan to extend is not started over: its next refine would replace the stored model
+          // with one of the new frames alone
+          if (o.extend) {
+            this.live = null;
+            throw new Error(`The stored capture could not be reopened: ${msg}`);
+          }
+          // unreadable state: continue the capture from scratch (new keyframe ids never clash)
+          this.emitError(e instanceof Error ? e : new Error(String(e)), false, 'storage');
           this.live = this.createLive();
           this.live.state.nextKeyframeId = Math.max(0, st.nextKeyframeId ?? 0);
           this.live.state.imuChunks = Math.max(0, st.imuChunks ?? 0);
@@ -536,7 +554,42 @@ export class PhotogrammetryEngine {
     const res: InitResult = { gpu: pipeline.gpu };
     if (adapter) res.adapter = adapter;
     if (!pipeline.gpu && pipeline.fallbackReason) res.fallbackReason = pipeline.fallbackReason;
+    if (resumed > 0 && this.live) {
+      res.resumedKeyframes = resumed;
+      // (the cap follows the device budget known by now)
+      const m = this.live.captureMemoryStatus();
+      res.captureMemory = { usedMB: Math.round(m.bytes / MB), capMB: Math.round(m.capBytes / MB) };
+    }
     return res;
+  }
+
+  /**
+   * `extend`: the continued capture keeps the stored mode and quality (keyframe thresholds, feature
+   * density and working size must match the stored keyframes); a pipeline taken over for the
+   * requested quality is dropped when its SIFT settings differ.
+   */
+  private adoptStoredSettings(st: EngineStateRecord): void {
+    const o = this.options;
+    const mode = st.mode === 'object' || st.mode === 'scene' || st.mode === 'auto' ? st.mode : null;
+    const quality = st.quality === 'fast' || st.quality === 'balanced' || st.quality === 'max' ? st.quality : null;
+    if (mode && mode !== o.mode) {
+      this.log('warn', `extend: continuing in the stored mode '${mode}' (not '${o.mode}')`);
+      o.mode = mode;
+    }
+    if (!quality || quality === o.quality) return;
+    this.log('warn', `extend: continuing at the stored quality '${quality}' (not '${o.quality}')`);
+    o.quality = quality;
+    if (this.pipeline && this.pipelineCfgKey !== pipelineKey(quality, o.preferGPU !== false, this.config)) {
+      if (this.ownsPipeline) {
+        try {
+          this.pipeline.destroy();
+        } catch {
+          /* ignore */
+        }
+      }
+      this.pipeline = null;
+      this.ownsPipeline = false;
+    }
   }
 
   /**
@@ -749,6 +802,8 @@ export class PhotogrammetryEngine {
         pool?.dispose();
       }
       releaseSiftCPUMemory();
+      // every keyframe is in the new results (persistSparse writes the state)
+      live.state.resultsStale = false;
       this.model = out.model;
       this.sparse = out.result;
       out.result.stats.refineMs = Math.round(now() - t0);
@@ -1234,12 +1289,17 @@ export class PhotogrammetryEngine {
   // ------------------------------------------------------------------------------------------
   // sessions
 
-  /** Load stored results (sparse / dense / mesh) of the current store. */
-  private async loadResults(st: EngineStateRecord | null): Promise<void> {
+  /**
+   * Load stored results (sparse / dense / mesh / splat info) of the current store. `decode: false`
+   * (a capture is continued or still to be processed): the dense cloud and mesh are not read into
+   * memory, only known to be stored — like results released after a transfer, reloaded when
+   * needed (loadSession, export); the next refine replaces them anyway.
+   */
+  private async loadResults(st: EngineStateRecord | null, decode = true): Promise<void> {
     const store = this.store!;
     // A damaged / unreadable stored result is treated as missing (logged): the scan still opens
     // and can be processed again from its photos, instead of becoming unopenable.
-    const decode = <T>(what: string, f: () => T): T | null => {
+    const tryDecode = <T>(what: string, f: () => T): T | null => {
       try {
         return f();
       } catch (e) {
@@ -1251,7 +1311,7 @@ export class PhotogrammetryEngine {
     const meta = await store.getValue<SparseMetaRecord>('sparse/meta').catch(() => null);
     const loaded =
       mb && meta
-        ? decode('sparse model', () => {
+        ? tryDecode('sparse model', () => {
             const model = unpackSparseModel(mb);
             model.rollingShutter = meta.rollingShutter ?? null;
             const sparse: SparseResultEx = {
@@ -1275,20 +1335,29 @@ export class PhotogrammetryEngine {
       this.sparse = loaded.sparse;
       this.stats = { ...meta!.stats };
     }
-    const db = await store.getBinary('dense/points').catch(() => null);
-    const dense = db && this.model ? decode('dense point cloud', () => deserializePointCloud(db)) : null;
-    if (dense) {
-      this.denseCloud = dense;
-      this.denseMeta = await store.getValue<DenseMetaRecord>('dense/meta').catch(() => null);
-      this.hasDense = true;
-      this.densePersisted = true;
-    }
-    const mb2 = await store.getBinary('mesh').catch(() => null);
-    const mesh = mb2 && this.model ? decode('mesh', () => deserializeTriangleMesh(mb2)) : null;
-    if (mesh) {
-      this.meshModel = mesh;
-      this.hasMesh = true;
-      this.meshPersisted = true;
+    if (!decode) {
+      const keys = this.model ? new Set(await store.listBinaryKeys().catch(() => [] as string[])) : new Set<string>();
+      if (keys.has('dense/points')) {
+        this.denseMeta = await store.getValue<DenseMetaRecord>('dense/meta').catch(() => null);
+        this.hasDense = this.densePersisted = true;
+      }
+      if (keys.has('mesh')) this.hasMesh = this.meshPersisted = true;
+    } else {
+      const db = await store.getBinary('dense/points').catch(() => null);
+      const dense = db && this.model ? tryDecode('dense point cloud', () => deserializePointCloud(db)) : null;
+      if (dense) {
+        this.denseCloud = dense;
+        this.denseMeta = await store.getValue<DenseMetaRecord>('dense/meta').catch(() => null);
+        this.hasDense = true;
+        this.densePersisted = true;
+      }
+      const mb2 = await store.getBinary('mesh').catch(() => null);
+      const mesh = mb2 && this.model ? tryDecode('mesh', () => deserializeTriangleMesh(mb2)) : null;
+      if (mesh) {
+        this.meshModel = mesh;
+        this.hasMesh = true;
+        this.meshPersisted = true;
+      }
     }
     // splats: only the info (the model is read on demand: splatModel / export)
     const sm = this.model ? await store.getValue<SplatMetaRecord>('splat/meta').catch(() => null) : null;
@@ -1359,11 +1428,27 @@ export class PhotogrammetryEngine {
       if (!options.quality && (q === 'fast' || q === 'balanced' || q === 'max')) this.options.quality = q;
     }
     this.sessionName = meta.name;
-    if (!this.model) await this.loadResults(st);
-    else await this.reloadResults();
+    // A capture continued after it was processed ("Add more views") and not refined since: its
+    // stored dense cloud / mesh belong to the model the next refine replaces — it opens with its
+    // sparse model only.
+    const pending = st?.resultsStale === true;
+    if (!this.model) await this.loadResults(st, !pending);
+    else if (!pending) await this.reloadResults();
     // (a superseded load reads nothing more: its reads fail once the store is closed, and are caught)
     this.stopIfDisposed();
-    const status = this.hasMesh ? 'meshed' : this.hasDense ? 'dense' : this.sparse ? 'sparse' : st?.captureFinished ? 'captured' : meta.status;
+    const status = pending
+      ? st?.captureFinished
+        ? 'captured'
+        : meta.status
+      : this.hasMesh
+        ? 'meshed'
+        : this.hasDense
+          ? 'dense'
+          : this.sparse
+            ? 'sparse'
+            : st?.captureFinished
+              ? 'captured'
+              : meta.status;
     // a densify interrupted by a kill / cancel can resume from its stored depth maps
     const prog = this.store!.persistent ? await this.store!.getValue<{ pass?: number; quality?: string }>('dense/progress').catch(() => null) : null;
     this.stopIfDisposed();
