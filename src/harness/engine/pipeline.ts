@@ -7,12 +7,16 @@
  *   engine.processFrame (one frame in flight = FramePump back-pressure) → record the LiveUpdate
  *   → finishCapture → refine (progress) → [densify] → [mesh] → [splat] → [exports, sizes only].
  *
+ * The live summary carries the object coverage of the last live cameras (`live.coverage`, the
+ * capture screen's ring: src/app/coverage.ts) and, with `liveTrace`, of every model update.
+ *
  * Every step is guarded: a failure is recorded in `errors` and the steps that depend on it are
  * skipped, so a partial result is always returned. Big outputs (PLY files) are streamed to
  * Node through `window.__e2eWrite` when the runner installed it (e2e/run-e2e.mjs).
  */
 import type { GeoFix, ImuSample, PointCloud, ProgressEvent, TriangleMesh } from '../../core/types';
 import { encodeMeshPLY, encodePLY } from '../../io/ply';
+import { computeCoverage } from '../../app/coverage';
 import { stageIdFor } from '../../app/stages';
 import {
   ENGINE_ERRORS,
@@ -44,7 +48,7 @@ import {
   type HeadingRow,
 } from './feed';
 import { bbox, keyframeSourceIndex, mapCamerasToFrames, medianIntrinsics, normalizeIntrinsics, poseToJSON, stageTimings, type CameraLike, type DeliveredRef } from './result';
-import type { CloudSummary, FrameRecord, HarnessConfig, HarnessError, HarnessResult, LiveSummary, ProgressRecord, ResolvedHarnessConfig } from './types';
+import type { CloudSummary, FrameRecord, HarnessConfig, HarnessError, HarnessResult, LiveCoverage, LiveSummary, ProgressRecord, ResolvedHarnessConfig } from './types';
 
 // ------------------------------------------------------------------ dataset
 
@@ -237,7 +241,23 @@ function emptyLive(): LiveSummary {
     frameMs: s,
     keyframeMs: s,
     cameras: [],
+    coverage: null,
     images: null,
+  };
+}
+
+/** The capture screen's coverage of live cameras (elevation bands only when gravity reaches the engine). */
+function liveCoverage(cams: NonNullable<LiveUpdate['cameras']>, elevation: boolean): LiveCoverage {
+  const c = computeCoverage(cams, { elevation });
+  return {
+    stable: c.stable,
+    elevation: c.elevation,
+    completeness: round(c.completeness, 4),
+    covered: c.covered,
+    coveredSectors: c.coveredSectors,
+    prompt: c.prompt,
+    counts: c.counts,
+    cameras: cams.length,
   };
 }
 
@@ -362,6 +382,7 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
       return finalize();
     }
     const eng = engine;
+    const coverageElevation = cfg.useImu && cfg.useGravity;
     let liveEvents = 0;
     let lastLive: LiveUpdate | null = null;
     // with background mapping only the model updates carry cameras, frame responses do not
@@ -370,7 +391,8 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
       liveEvents++;
       lastLive = u;
       if (u.cameras) lastCams = u;
-      if (cfg.liveTrace && u.cameras)
+      if (cfg.liveTrace && u.cameras) {
+        const { counts: _counts, ...coverage } = liveCoverage(u.cameras, coverageElevation);
         (result.liveTrace ??= []).push({
           ms: now(),
           frameIndex: u.frameIndex,
@@ -378,7 +400,9 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
           registered: u.numRegistered,
           points: u.numPoints,
           poses: u.cameras.map((c) => poseToJSON(c.pose)),
+          coverage,
         });
+      }
     });
     eng.onLog((l) => {
       if (result.logs.length < 1000 || l.level === 'error' || l.level === 'warn') result.logs.push({ ms: now(), level: l.level, message: l.message });
@@ -584,7 +608,10 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
         result.live.registered = ll.numRegistered;
         result.live.points = ll.numPoints;
       }
-      if (lc?.cameras) result.live.cameras = lc.cameras.map((c) => ({ pose: poseToJSON(c.pose), f: c.intrinsics.f }));
+      if (lc?.cameras) {
+        result.live.cameras = lc.cameras.map((c) => ({ pose: poseToJSON(c.pose), f: c.intrinsics.f }));
+        result.live.coverage = liveCoverage(lc.cameras, coverageElevation);
+      }
       // cameras lists the registered keyframes only, and keyframeIndices misses a held frame
       // committed by finishCapture: map by order only when both cover every keyframe of `lc`
       result.live.images = null;

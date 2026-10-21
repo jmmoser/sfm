@@ -524,8 +524,12 @@ The harness fields of `result.json` are:
 * `frames`: one record per delivered frame, with the decision, guidance, tracking, counters,
   overlay count, engine `timings`, wall and decode ms, and any error.
 * `decisions`, `guidance` and `tracking`: counts.
-* `live`: keyframes, registered images, points, `timeToInit`, frame and keyframe ms stats, and the
-  last live cameras.
+* `live`: keyframes, registered images, points, `timeToInit`, frame and keyframe ms stats, the
+  last live cameras, and their `coverage`: the capture screen's object-mode ring
+  (`src/app/coverage.ts`) — `stable`, `completeness`, covered sectors per elevation band
+  (`covered`: low < 10°, mid 10–40°, high > 40°, of 12 each), the `prompt` and the per-cell
+  keyframe `counts`. Elevation bands need gravity (`useImu` + `useGravity`), else `elevation: false`
+  (azimuth only). A scene capture usually stays `stable: false`.
 * `progress`: decimated progress events.
 * `sparse`: intrinsics normalised to the dataset size, mapped `images`, `metric`, `stats`,
   `pointsCount`, and the `unmapped` / `duplicates` camera ids.
@@ -547,9 +551,9 @@ flagged in `sparse.intrinsicsNote`.
 **Diagnostics** (off by default; large results):
 
 * `--set liveTrace=true` (any engine): `result.liveTrace` keeps the camera poses of every
-  `LiveUpdate` that carries the model (frame index, keyframe / registered / point counts). Poses
-  are the registered keyframes sorted by id, so they map to `live.keyframeIndices` only while every
-  keyframe is registered.
+  `LiveUpdate` that carries the model (frame index, keyframe / registered / point counts, and the
+  coverage ring of that update without the counts). Poses are the registered keyframes sorted by
+  id, so they map to `live.keyframeIndices` only while every keyframe is registered.
 * `--engine inline --set debugDump=true --set 'engineConfig={"mapping":"inline",…}'`:
   `result.debug` (`src/harness/engine/debug-dump.ts`, reads engine internals) has, after every
   keyframe frame, each keyframe's live registration state, 3D-point count and pose
