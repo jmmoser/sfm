@@ -8,6 +8,8 @@
  *    w ≥ 0) and translation — identical to our `Pose` convention.
  *  - POINTS2D x/y get +0.5. POINT3D_ID −1 marks an unmatched keypoint (also
  *    written for ids that are not among the exported points).
+ * Ids are written as given (0 included; COLMAP accepts 0-based ids). Image names
+ * must not contain whitespace: COLMAP's text reader splits lines on spaces.
  * Numbers are written with JavaScript's shortest round-trip representation, so
  * export → import is exact up to the ±0.5 shift (≤ 1 ulp).
  *

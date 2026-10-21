@@ -136,7 +136,8 @@ export interface DisplayOptions {
   grid?: boolean;
   /**
    * Draw the mesh with its vertex colours only (default true: they are photo colours, which
-   * already contain the shading; the lit mesh scored 5.1 dB lower in held-out views).
+   * already contain the shading; the lit mesh scored 3.8–5.1 dB lower in held-out views,
+   * docs/research/viewer-rendering.md).
    */
   unlit?: boolean;
   /** EDL strength (default 1, Potree scale). */
@@ -1106,6 +1107,11 @@ export class Viewer {
     return this.viewAnim !== null;
   }
 
+  /**
+   * near/far hug the clip sphere (outlier-clamped content ∪ cameras ∪ grid) every frame, with
+   * far/near ≤ 2000 unless zoomed very close to the orbit target: EDL (log2 of linearised depth)
+   * and the depth-readback picking both depend on that depth precision.
+   */
   private updateClipPlanes(): void {
     const s = this.clipSphere;
     let near = 0.01;
