@@ -1068,7 +1068,8 @@ fusion → filtered coloured point cloud → optional TSDF mesh.
   options on Safari (falls back to native size — always use bitmap.width/height); whether
   `<video>`-derived bitmaps are rotated exactly as the UI on every iOS version (aspect check +
   hand-eye check in the engine recommended); rVFC `captureTime` latency; MSTP worker path
-  (research ladder A) is not implemented here — the FramePump uses `createImageBitmap(video)`.
+  (research ladder A) is not implemented here — the FramePump grabs from the `<video>` on rVFC
+  (`new VideoFrame(video)` by default on iOS WebKit, else `createImageBitmap(video)`).
 
 ### `src/ba` (bundle adjustment)
 

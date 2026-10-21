@@ -137,7 +137,8 @@ export async function collectDiagnostics(opts: DiagnosticsOptions = {}): Promise
     getUserMedia: !!nav?.mediaDevices?.getUserMedia,
     requestVideoFrameCallback: typeof HTMLVideoElement !== 'undefined' && has(HTMLVideoElement.prototype, 'requestVideoFrameCallback'),
     // checked in a dedicated worker: Safari exposes MSTP there only (Chromium also on the main
-    // thread). Only the camera timing probe uses it; the capture path is rVFC + createImageBitmap.
+    // thread). Only the camera timing probe uses it; the capture path grabs from the <video> on rVFC
+    // (new VideoFrame on iOS by default, else createImageBitmap — src/sensors/frame-pump.ts).
     mediaStreamTrackProcessor: (await workerGlobals(['MediaStreamTrackProcessor'], errors))?.MediaStreamTrackProcessor ?? has(g, 'MediaStreamTrackProcessor'),
     videoFrame: has(g, 'VideoFrame'),
     imageCapture: has(g, 'ImageCapture'),
