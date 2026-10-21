@@ -11,13 +11,20 @@
  * gives MAGNETIC north —, counts, reprojection error, engine memory, timings). A densify that
  * was interrupted (stats.denseResumablePass from loadSession, or cancelled / failed here) offers
  * "Resume dense reconstruction" (HUD + Build sheet): the engine continues from its stored maps.
+ *
+ * The photoreal build is a run in the run journal (src/app/run-journal.ts), so a kill during it
+ * shows Home's "run interrupted" card on the next launch. After such a kill the next build runs in
+ * light mode (`data-light` on the screen): the 3D view shows at most LIGHT_MODE_MAX_POINTS of the
+ * dense cloud and no mesh (the mesh layer is not offered), and the prepared export files are
+ * dropped; the full cloud and the mesh come back when the build stops. The engine's memory plan is
+ * unchanged, so the splat checkpoints stay valid.
  */
 import { saveFile } from '../../io/download';
 import type { SplatDisplayState, Viewer } from '../../viewer';
 import { loadViewerModule } from '../viewer-loader';
 import { formatDistance } from '../../viewer/helpers';
 import type { ProgressEvent } from '../../core/types';
-import { isCancelledError, type ExportFormat, type QualityPreset } from '../../workers/protocol';
+import { SPLAT_STAGES, isCancelledError, type ExportFormat, type QualityPreset } from '../../workers/protocol';
 import type { App, Results, Screen } from '../app';
 import { button, chip, group, iconButton, kvRow, progressBar, section, segmented, setButtonLabel, spinner, switchRow } from '../components/controls';
 import { confirmDialog } from '../components/dialog';
@@ -27,6 +34,8 @@ import { Disposer, h, replaceChildren } from '../dom';
 import { exportFilename, formatBytes, formatCount, formatDuration, modeLabel, qualityLabel } from '../format';
 import { icon, type IconName } from '../icons';
 import type { ProcessingStep, Route } from '../router';
+import { LIGHT_MODE_MAX_POINTS, type RunHandle } from '../run-journal';
+import { decimate } from './capture';
 import {
   builtQuality,
   clearDenseResume,
@@ -90,6 +99,13 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   /** A photoreal build (engine.splat) runs from this screen. */
   let building = false;
   let cancelling = false;
+  /** The running build is in light mode (a build of this scan was killed before): see the header. */
+  let light = false;
+  /** Light mode replaced the shown cloud by a subset / left the mesh layer: undone by exitLight. */
+  let lightSubset = false;
+  let lightFromMesh = false;
+  /** The run journal's entry of the running photoreal build. */
+  let splatRun: RunHandle | null = null;
   /** Splats cannot be built here (no WebGPU in this browser; the engine would reject). */
   const webgpuMissing = (): boolean => app.env.webgpu === 'unsupported' || app.env.webgpu === 'no-adapter';
 
@@ -187,7 +203,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     const out: LayerId[] = [];
     if (splatsAvailable()) out.push('splats');
     if (r.dense || r.sparse) out.push('points');
-    if (r.mesh) out.push('mesh');
+    if (r.mesh && !light) out.push('mesh');
     return out;
   }
 
@@ -370,6 +386,42 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     if (splatState !== 'none' && splatState !== 'unavailable') void viewer.setSplats(null);
     if (display.layer === 'splats') display.layer = fallbackLayer();
     applyDisplay();
+  }
+
+  /**
+   * Light mode for a build after a kill (see the header): a subset of a large dense cloud, no mesh,
+   * no prepared export files. Undone by exitLight.
+   */
+  function enterLight(): void {
+    light = true;
+    el.dataset.light = '1';
+    exports.clear();
+    renderExports?.();
+    if (!viewer) return;
+    const dense = app.results.dense;
+    if (dense && dense.count > 0) {
+      const dec = decimate(dense.positions, dense.colors, LIGHT_MODE_MAX_POINTS);
+      lightSubset = dec.positions !== dense.positions;
+      if (lightSubset) viewer.setPointCloud({ count: dec.positions.length / 3, positions: dec.positions, colors: dec.colors }, { splats: false });
+    }
+    viewer.setMesh(null);
+    lightFromMesh = display.layer === 'mesh';
+    if (lightFromMesh) display.layer = 'points';
+    applyDisplay();
+  }
+
+  /** The build stopped: the full cloud and the mesh are shown again (as applyContent shows them). */
+  function exitLight(): void {
+    if (!light) return;
+    light = false;
+    delete el.dataset.light;
+    if (!viewer) return;
+    const r = app.results;
+    if (lightSubset && r.dense) viewer.setPointCloud(r.dense);
+    viewer.setMesh(r.mesh);
+    if (lightFromMesh && display.layer === 'points' && r.mesh) display.layer = 'mesh';
+    lightSubset = false;
+    lightFromMesh = false;
   }
 
   let splatUnavailableToast = false;
@@ -776,13 +828,19 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     jobCancel.disabled = false;
     renderBadges();
     const sessionId = route.sessionId;
+    // the run journal: a kill during the build is reported at the next launch; after one, light mode
+    if (sessionId && app.journal.lightMode(sessionId, 'splat')) enterLight();
+    const run = sessionId ? app.journal.begin({ sessionId, name: app.results.name, step: 'splat', stage: SPLAT_STAGES.prepare, quality: q }) : null;
+    splatRun = run;
     try {
       const res = await app.engine.splat({ quality: q }, (e: ProgressEvent) => {
+        run?.stage(e.stage);
         if (closed || cancelling) return;
         const v = splatProgressView(e);
         jobBar.set(v.progress);
         jobSub.textContent = v.text;
       });
+      run?.end('done');
       const r = app.results;
       r.splat = res;
       built = true;
@@ -800,6 +858,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       // a new model: show it (also replaces an older one in the viewer)
       void loadSplats(true);
     } catch (e) {
+      run?.end('stopped');
       const r = app.results;
       r.stats = { ...r.stats, splatInterrupted: 1, splatInterruptedQuality: q };
       if (closed) return;
@@ -812,6 +871,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       if (!closed) {
         app.busy = false;
         void app.wakeLock.release();
+        exitLight();
         renderBadges();
         // stopped / failed: the previous model (still the stored one) is shown again
         if (!built && app.results.splat && viewer && splatState === 'none' && !splatFetching) void loadSplats(wasSplats);
@@ -895,7 +955,9 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     leave() {
       closed = true;
       if (building) {
-        // the training must not outlive its screen (it keeps its checkpoints)
+        // the training must not outlive its screen (it keeps its checkpoints); leaving stops it
+        // like a cancel, not an interruption to report
+        splatRun?.end('stopped');
         if (!cancelling) void app.engine.abortLongOperation({ graceMs: 8000, method: 'splat' });
         app.busy = false;
         void app.wakeLock.release();

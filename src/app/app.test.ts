@@ -8,6 +8,7 @@ import type { SessionSummary } from '../workers/protocol';
 import { App } from './app';
 import { toast } from './components/toast';
 import type { EngineLike } from './engine-client';
+import { RunJournal } from './run-journal';
 
 vi.mock('./components/toast', () => ({ toast: vi.fn() }));
 
@@ -38,7 +39,7 @@ function fakeEngine(): { engine: EngineLike; loads: Deferred[] } {
 function fakeApp(engine: EngineLike): App {
   const config = { mode: 'object', quality: 'balanced' } as const;
   const sessionsP = Promise.resolve({ deleteSession: () => Promise.resolve() });
-  return Object.assign(Object.create(App.prototype), { engine, config, results: App.emptyResults(config), loadedSessionId: null, loadSeq: 0, sessionsP }) as App;
+  return Object.assign(Object.create(App.prototype), { engine, config, results: App.emptyResults(config), loadedSessionId: null, loadSeq: 0, sessionsP, journal: new RunJournal(null) }) as App;
 }
 
 const summary = (id: string): SessionSummary =>

@@ -4,7 +4,9 @@
  * hardware adapter, E2E_GPU=host — the WebGPU splat layer): a rebuild drops the Gaussian-splat
  * PLY prepared from the previous model; the previous model's splat layer is freed while the
  * trainer runs and shown again when the build stops; a build settling after the screen was left
- * does not take the wake lock / busy flag of the next screen.
+ * does not take the wake lock / busy flag of the next screen; after a killed build (run journal)
+ * the next one runs in light mode — no mesh, at most LIGHT_MODE_MAX_POINTS shown, no prepared
+ * exports — and everything comes back when it stops.
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import { getGPU } from '../../gpu/device';
@@ -12,8 +14,10 @@ import { lookAt } from '../../splat/testutil';
 import { SH_C0, allocSplatModel, logit } from '../../splat/types';
 import type { Viewer } from '../../viewer';
 import { ENGINE_ERRORS, namedError, type ExportFormat, type SparseResult, type SplatModelPayload, type SplatOptions, type SplatResult } from '../../workers/protocol';
+import type { PointCloud, TriangleMesh } from '../../core/types';
 import type { App, Results } from '../app';
 import { closeAllModals } from '../components/layers';
+import { LIGHT_MODE_MAX_POINTS, RUN_JOURNAL_KEY, RunJournal, parseRunRecord, type JournalStorage } from '../run-journal';
 import { createViewerScreen } from './viewer';
 
 class FakeEngine {
@@ -77,6 +81,29 @@ function info(count: number): SplatResult {
   return { count, iterations: 100, ms: 1, shDegree: 0, bytes: 56 * count, antialiased: true, stats: {} };
 }
 
+function cloud(n: number): PointCloud {
+  const positions = new Float32Array(3 * n);
+  for (let i = 0; i < 3 * n; i++) positions[i] = Math.sin(1.3 * i + 0.7) * 0.5;
+  return { count: n, positions, colors: new Uint8Array(3 * n).fill(200), radii: new Float32Array(n).fill(0.004) };
+}
+
+/** Two triangles (a quad in the z = 0 plane). */
+function quad(): TriangleMesh {
+  return {
+    vertexCount: 4,
+    triangleCount: 2,
+    positions: new Float32Array([-0.3, -0.3, 0, 0.3, -0.3, 0, 0.3, 0.3, 0, -0.3, 0.3, 0]),
+    normals: new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1]),
+    colors: new Uint8Array(12).fill(150),
+    indices: new Uint32Array([0, 1, 2, 0, 2, 3]),
+  };
+}
+
+function memStorage(): JournalStorage & { map: Map<string, string> } {
+  const map = new Map<string, string>();
+  return { map, getItem: (k) => map.get(k) ?? null, setItem: (k, v) => void map.set(k, v), removeItem: (k) => void map.delete(k) };
+}
+
 function fakeApp(engine: FakeEngine, splat: SplatResult | null) {
   const wakeLock = {
     active: false,
@@ -96,6 +123,7 @@ function fakeApp(engine: FakeEngine, splat: SplatResult | null) {
     loadedSessionId: 's1' as string | null,
     env: { webgpu: 'available', webgl: true, share: false },
     debug: {} as { viewer?: unknown },
+    journal: new RunJournal(null),
     navigate: (): void => undefined,
     updateSession: async (): Promise<void> => undefined,
     ensureSessionLoaded: async (): Promise<boolean> => true,
@@ -164,6 +192,65 @@ async function startBuild(quality: 'fast' | 'balanced' | 'max'): Promise<void> {
 }
 
 describe('viewer screen: photoreal build', () => {
+  it('after a killed build the next one runs in light mode, and the full view comes back when it stops (run journal)', async () => {
+    const engine = new FakeEngine();
+    const app = fakeApp(engine, null);
+    app.results.dense = cloud(LIGHT_MODE_MAX_POINTS + 100_000);
+    app.results.mesh = quad();
+    const storage = memStorage();
+    // the photoreal build of this scan was killed: the next launch counted it
+    new RunJournal(storage).begin({ sessionId: 's1', name: 'Bench', step: 'splat', stage: 'splat_training', quality: 'fast' });
+    app.journal = new RunJournal(storage);
+    app.journal.recover();
+    app.journal.acknowledge();
+    const screen = mount(app);
+    await loaded(app, screen);
+    const viewer = app.debug.viewer as Viewer;
+    expect(viewer.getStats()).toMatchObject({ densePoints: LIGHT_MODE_MAX_POINTS + 100_000, triangles: 2 });
+    // an export prepared before the build
+    await tap('tool-export');
+    await tap('export-prepare-ply-points');
+    await waitFor(() => !!q('export-save-ply-points'));
+    await closeSheets();
+
+    await startBuild('fast');
+    expect(engine.builds.length).toBe(1);
+    expect(screen.el.dataset.light).toBe('1');
+    expect(viewer.getStats().densePoints).toBe(LIGHT_MODE_MAX_POINTS);
+    expect(viewer.getStats().triangles).toBe(0);
+    expect(document.querySelector('[data-testid="layer-switch"] .segment[data-value="mesh"]')).toBeNull();
+    expect(parseRunRecord(storage.map.get(RUN_JOURNAL_KEY) ?? null)).toMatchObject({ step: 'splat', kills: { splat: 1 } });
+    await tap('tool-export');
+    await waitFor(() => !!q('export-ply-points'));
+    expect(q('export-save-ply-points')).toBeNull(); // the prepared file was dropped
+    await closeSheets();
+
+    // cancelled: everything back, the kill count kept (the next build is light again)
+    engine.builds[0].reject(namedError(ENGINE_ERRORS.cancelled, 'Cancelled'));
+    await waitFor(() => q('splat-progress')!.hidden === true);
+    expect(screen.el.dataset.light).toBeUndefined();
+    expect(viewer.getStats()).toMatchObject({ densePoints: LIGHT_MODE_MAX_POINTS + 100_000, triangles: 2 });
+    expect(document.querySelector('[data-testid="layer-switch"] .segment[data-value="mesh"]')).not.toBeNull();
+    expect(parseRunRecord(storage.map.get(RUN_JOURNAL_KEY) ?? null)).toMatchObject({ step: null, kills: { splat: 1 } });
+
+    // the resumed build in light mode completes: full view back, the count reset
+    await startBuild('fast');
+    expect(viewer.getStats().triangles).toBe(0);
+    engine.model = payload(30);
+    engine.builds[1].resolve(info(30));
+    await waitFor(() => q('splat-progress')!.hidden === true);
+    expect(viewer.getStats()).toMatchObject({ densePoints: LIGHT_MODE_MAX_POINTS + 100_000, triangles: 2 });
+    expect(app.journal.lightMode('s1', 'splat')).toBe(false);
+    expect(parseRunRecord(storage.map.get(RUN_JOURNAL_KEY) ?? null)).toMatchObject({ step: null, kills: {} });
+
+    // no kill: the next build keeps the mesh
+    await startBuild('balanced');
+    expect(screen.el.dataset.light).toBeUndefined();
+    expect(viewer.getStats().triangles).toBe(2);
+    engine.builds[2].reject(namedError(ENGINE_ERRORS.cancelled, 'Cancelled'));
+    await waitFor(() => q('splat-progress')!.hidden === true);
+  });
+
   it('a rebuild drops the Gaussian-splat PLY prepared from the previous model (review)', async () => {
     const engine = new FakeEngine();
     engine.model = payload(40);
