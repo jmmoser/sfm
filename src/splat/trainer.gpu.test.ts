@@ -279,10 +279,12 @@ describe('SplatTrainer geometry channels (GPU) vs CPU reference', () => {
       expect(e).toBeLessThan(1e-5);
     }
     // weights decay and stop at `until` (0.3 of the 300 iterations: iteration 90).
-    // At iteration 0 the kernel gets exactly the start weights the CPU reference above was given:
-    // the weights reach it as f32 uniforms, and the f64 schedule exp(ln w) is w only to 1 ulp
-    // (ln / exp round: 0.3 → 0.29999999999999993, 6e-17 off, 2e-9 of an f32 ulp), so compare the
-    // f32 values the GPU receives, not the f64 bits.
+    // At iteration 0 the kernel gets exactly the start weights the CPU reference above was given.
+    // They reach it as f32 uniforms, and the f64 log-space schedule exp(ln a·(1−f) + ln b·f) gives
+    // a only to 1 ulp at f = 0 (ln / exp round: a constant 0.3 gives 0.29999999999999993, 6e-17
+    // off, 2e-9 of an f32 ulp; the earlier exact f64 check failed on that. Here 0.8 happens to
+    // round-trip exactly and the normal schedule is linear), so compare the f32 values the GPU
+    // receives, not the f64 bits.
     expect(t.geometryWeightsAt(0).map(Math.fround)).toEqual([Math.fround(0.8), Math.fround(0.3)]);
     const end = 0.3 * 300;
     for (let it = 0; it < end; it++) {
