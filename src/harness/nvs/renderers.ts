@@ -6,7 +6,8 @@
  *  - 'points' / 'points-edl': the app's Viewer (src/viewer) drawing dense.ply as the viewer screen
  *    does (splats sized by the per-point radius; Eye-Dome Lighting off / on).
  *  - 'mesh-lit' / 'mesh-unlit': the Viewer drawing mesh.ply (vertex colours with the viewer's
- *    hemisphere + headlight lighting — the app default — or unlit).
+ *    hemisphere + headlight lighting, or unlit — the app default: the vertex colours are photo
+ *    colours that already contain the shading).
  *  - 'splat': a 3D Gaussian Splatting model (splats.ply, INRIA 3DGS PLY layout), rendered by the
  *    splat module when it exists — see `loadSplatRenderer` for the contract.
  */

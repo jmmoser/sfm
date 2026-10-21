@@ -9,6 +9,16 @@
  *  - track completion (transitively through the graph) and track merging (all
  *    observations must reproject within a threshold);
  *  - re-triangulation of under-reconstructed image pairs after global BA.
+ *
+ * Deviations from COLMAP: continue / complete never add a second observation of an image
+ * to a track (they skip images already in it); `merge`, as COLMAP, can still join two tracks
+ * that both observe an image (e.g. co-located SIFT orientations) — skipping such merges was
+ * measured worse on the sparse e2e (yard ATE +15 %), so it stays. `completeImage` scans only
+ * the image's own correspondences (COLMAP re-scans every element of its tracks, ≈ 5× slower;
+ * `completeAllTracks` after global BA covers the rest), `completeAllTracks` iterates
+ * untriangulated features (fewer than tracks), `mergeAllTracks` scans each graph edge once.
+ * `RayTriangulator` uses angular residuals, cheirality via the camera z-axis and a weighted LS
+ * ray intersection as local optimisation (no DLT / SVD, no allocation).
  */
 import type { CameraIntrinsics, Pose } from '../core/types';
 import { undistortNormalized } from '../geometry/camera';

@@ -266,7 +266,7 @@ export interface SplatPresetConfig {
   /**
    * Trainer defaults of the stage (`SplatTrainerOptions` fields; `EngineConfig.splat.trainer`
    * overrides them field by field), e.g. the geometry supervision from the dense depth maps and
-   * the per-view colour correction (ARCHITECTURE "Geometry supervision … off-trajectory").
+   * the per-view colour correction (docs/research/splat-tuning.md).
    */
   trainer: Partial<SplatTrainerOptions>;
 }

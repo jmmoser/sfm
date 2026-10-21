@@ -390,7 +390,9 @@ export class Reconstruction {
 
   /**
    * Recomputes the visibility statistics of one image from scratch (use after the
-   * graph gained correspondences of an image that was already added).
+   * graph gained correspondences of an image that was already added). Counts of images
+   * whose graph edges change after `addImage` (pair replacement, late pairs) go stale
+   * until then; only next-best-view ranking reads them, and registration resyncs first.
    */
   syncVisibility(id: number): void {
     const img = this.images.get(id);

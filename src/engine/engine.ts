@@ -680,7 +680,11 @@ export class PhotogrammetryEngine {
     }
   }
 
-  /** End the capture: finish the keyframe mapping queue, persist, release capture-time memory. */
+  /**
+   * End the capture: finish the keyframe mapping queue, persist, release capture-time memory.
+   * `cancel` is only checked after the queue drained: a slow (or hung) drain is stopped by the
+   * app's `abortLongOperation`, which restarts the worker (resume re-maps unfinished keyframes).
+   */
   finishCapture(progress?: ProgressCallback, cancel?: CancelToken): Promise<void> {
     return this.longRun('finishCapture', async () => {
       const live = this.assertLive();

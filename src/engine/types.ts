@@ -50,7 +50,7 @@ export interface EngineConfig {
   /**
    * Feature backend: 'auto' (default: WebGPU SIFT / matcher when available, else CPU) or 'cpu'
    * (CPU SIFT / matching even when WebGPU exists; PatchMatch still uses the GPU). The GPU and CPU
-   * SIFT produce the same features (ARCHITECTURE §6 features GPU notes); 'cpu' is for test runs on
+   * SIFT produce the same features (parity: src/features/sift-gpu.gpu.test.ts); 'cpu' is for test runs on
    * software adapters (SwiftShader), where GPU SIFT is ~20× slower than the CPU code.
    */
   featureBackend?: 'auto' | 'cpu';
