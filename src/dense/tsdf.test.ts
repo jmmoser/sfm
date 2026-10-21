@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Pose, TriangleMesh } from '../core/types';
+import { KdTree3 } from './kdtree';
 import { meshComponents, meshEdgeStats } from './marching-cubes';
 import { lookAt, makeFarScene, makeNearScene, orbitPoses, pinholeIntrinsics, type SynthScene } from './synthetic';
 import { distanceToScene, renderGtViews } from './testutil-scene';
@@ -179,6 +180,109 @@ describe('tsdfMesh', () => {
     log(`yard 16 × 320×240 (render ${(t1 - t0).toFixed(0)} ms): ${fmtStats(s)}; error mean ${(err.mean / s.voxelSize).toFixed(3)} vox, p95 ${(err.p95 / s.voxelSize).toFixed(3)} vox`);
     expect(mesh.triangleCount).toBeGreaterThan(10000);
     expect(err.p95).toBeLessThan(0.75 * s.voxelSize);
+  });
+
+  describe('bounds (object box)', () => {
+    // a sphere resting on the ground with a box beside it; cameras look down from 20–70°
+    const scene: SynthScene = {
+      primitives: [
+        { kind: 'quad', center: [0, 0, 0], axisU: [1, 0, 0], axisV: [0, 1, 0], halfU: 3, halfV: 3, material: { scale: 0.5, octaves: 7, color: [0.6, 0.55, 0.45], seed: 1 } },
+        { kind: 'sphere', center: [0, 0, 0.3], radius: 0.3, material: { scale: 0.2, octaves: 7, color: [0.4, 0.7, 0.4], seed: 2 } },
+        { kind: 'box', center: [0.9, 0.6, 0.2], halfSize: [0.2, 0.2, 0.2], yaw: 0.3, material: { scale: 0.2, octaves: 7, color: [0.8, 0.4, 0.3], seed: 3 } },
+      ],
+    };
+    const bounds = { min: [-0.36, -0.36, 0.02], max: [0.36, 0.36, 0.66] };
+    const cam = pinholeIntrinsics(160, 120, (60 * Math.PI) / 180);
+    const gt = renderGtViews(scene, cam, shellPoses([0, 0, 0.3], 1.8, [20, 45, 70], 10));
+    const run = async (opts: Parameters<typeof tsdfMesh>[2]): Promise<{ mesh: TriangleMesh; stats: TsdfStats }> => {
+      let stats: TsdfStats | null = null;
+      const mesh = await tsdfMesh(gt.views, gt.store, { ...opts, onStats: (s) => (stats = s) });
+      return { mesh, stats: stats! };
+    };
+    const outside = (m: TriangleMesh, pad: number): number => {
+      let n = 0;
+      for (let i = 0; i < m.vertexCount; i++) {
+        for (let a = 0; a < 3; a++) {
+          const v = m.positions[3 * i + a];
+          if (v < bounds.min[a] - pad || v > bounds.max[a] + pad) {
+            n++;
+            break;
+          }
+        }
+      }
+      return n;
+    };
+    /** Distance from each vertex of `a` to the nearest vertex of `b`. */
+    const nearest = (a: TriangleMesh, b: TriangleMesh, keep: (x: number, y: number, z: number) => boolean): number[] => {
+      const tree = new KdTree3(b.positions, b.vertexCount);
+      const d = new Float64Array(1);
+      const idx = new Int32Array(1);
+      const out: number[] = [];
+      for (let i = 0; i < a.vertexCount; i++) {
+        const [x, y, z] = [a.positions[3 * i], a.positions[3 * i + 1], a.positions[3 * i + 2]];
+        if (!keep(x, y, z)) continue;
+        tree.knn(x, y, z, 1, d, idx);
+        out.push(Math.sqrt(d[0]));
+      }
+      return out;
+    };
+
+    it('no vertex outside the bounds; inside, the unbounded surface within 1 voxel, with far fewer blocks', async () => {
+      const auto = await run({});
+      const autoBox = await run({ bounds });
+      log(`unbounded: ${fmtStats(auto.stats)}`);
+      log(`bounded:   ${fmtStats(autoBox.stats)}`);
+      // the bounded scene scale: 2 px at the sphere (≈ 1.5–1.8 m), not at the median of ground + sphere + box
+      expect(autoBox.stats.medianDepth).toBeLessThan(auto.stats.medianDepth);
+      expect(autoBox.stats.voxelSize).toBeLessThan(auto.stats.voxelSize);
+      expect(outside(autoBox.mesh, 0)).toBe(0);
+      // same voxel: the bounded volume is the unbounded one inside the bounds
+      const voxelSize = auto.stats.voxelSize;
+      const full = await run({ voxelSize });
+      const box = await run({ voxelSize, bounds });
+      const v = voxelSize;
+      expect(full.stats.blockCapHit).toBe(false);
+      expect(outside(full.mesh, v)).toBeGreaterThan(1000); // ground + box
+      expect(outside(box.mesh, 0)).toBe(0);
+      expect(box.mesh.triangleCount).toBeGreaterThan(2000);
+      expect(box.stats.blocks).toBeLessThan(0.5 * full.stats.blocks);
+      // bounded vertices lie on the unbounded mesh …
+      const dIn = nearest(box.mesh, full.mesh, () => true);
+      expect(Math.max(...dIn)).toBeLessThan(v);
+      // … which is complete inside the bounds (shrunk by 2 voxels: the cut faces end on cube corners)
+      const inner = (x: number, y: number, z: number): boolean => [x, y, z].every((c, a) => c > bounds.min[a] + 2 * v && c < bounds.max[a] - 2 * v);
+      const dOut = nearest(full.mesh, box.mesh, inner);
+      expect(dOut.length).toBeGreaterThan(1000);
+      expect(Math.max(...dOut)).toBeLessThan(v);
+      // the sphere, not the ground: every vertex within half a voxel of the scene, none on the ground
+      const err = vertexErrors(box.mesh, (x, y, z) => distanceToScene(scene, x, y, z));
+      expect(err.p95).toBeLessThan(0.5 * v);
+      let low = 0;
+      for (let i = 0; i < box.mesh.vertexCount; i++) if (box.mesh.positions[3 * i + 2] < 0.02 + v) low++;
+      expect(low / box.mesh.vertexCount).toBeLessThan(0.02);
+    });
+
+    it('a block budget that coarsens the whole scene fits the bounded volume at a finer voxel', async () => {
+      const full = await run({ maxBlocks: 600 });
+      const box = await run({ maxBlocks: 600, bounds });
+      log(`budget 600, unbounded: ${fmtStats(full.stats)}`);
+      log(`budget 600, bounded:   ${fmtStats(box.stats)}`);
+      expect(full.stats.coarsenLevels).toBeGreaterThan(0);
+      expect(box.stats.coarsenLevels).toBeLessThan(full.stats.coarsenLevels);
+      expect(box.stats.voxelSize).toBeLessThan(full.stats.voxelSize);
+      expect(outside(box.mesh, 0)).toBe(0);
+    });
+
+    it('an empty or non-finite box gives an empty mesh', async () => {
+      for (const b of [
+        { min: [0.2, 0, 0], max: [0.1, 1, 1] },
+        { min: [NaN, 0, 0], max: [1, 1, 1] },
+      ]) {
+        const { mesh, stats } = await run({ bounds: b });
+        expect(mesh.vertexCount).toBe(0);
+        expect(stats.blocks).toBe(0);
+      }
+    });
   });
 
   it('no valid depth: empty mesh', async () => {
