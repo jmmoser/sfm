@@ -61,6 +61,8 @@ async function captureAndRefine(e: PhotogrammetryEngine): Promise<void> {
 }
 
 const training = (p: ProgressEvent): SplatTrainingDetail | null => (p.stage === 'splat_training' && p.detail ? (p.detail as SplatTrainingDetail) : null);
+/** The training reports of a run from iteration `from` to `to` (one per `SPLAT.chunk`; no chunk crosses a checkpoint). */
+const reports = (from: number, to: number): number[] => Array.from({ length: (to - from) / SPLAT.chunk + 1 }, (_, i) => from + i * SPLAT.chunk);
 
 describe('engine splat stage', () => {
   it('cancel → kill → a new engine resumes from the checkpoint, persists and exports', async () => {
@@ -167,12 +169,15 @@ describe('engine splat stage', () => {
     );
     await captureAndRefine(e);
     let lost = false;
+    const iters: number[] = [];
     const info = await e.splat({ backgroundShell: true }, (p) => {
       // the colour-state readbacks of the appearance normalisation are dropped twice
       if (p.stage === 'splat_finishing' && p.progress === 0) current!.simulateDroppedWork({ readbacks: 2 });
       const d = training(p);
+      if (d) iters.push(d.iteration);
       if (d && d.iteration >= 120 && !lost) {
         lost = true;
+        // (destroyed in a microtask: before the next step's GPU work completes)
         void getGPU().then((ctx) => ctx?.device.destroy());
       }
     });
@@ -180,6 +185,9 @@ describe('engine splat stage', () => {
     expect(info.iterations).toBe(200);
     expect(info.stats.splatDroppedWork).toBe(1);
     expect(info.stats.splatDeviceLosses).toBe(1);
+    // the dropped first chunk is trained again from the checkpoint at 0 (first report 10, not 20);
+    // the device lost in the step after 120 is rebuilt from the checkpoint at 100 (next report 110)
+    expect(iters).toEqual([...reports(10, 120), ...reports(110, 200)]);
     expect(info.stats.splatReadRetries).toBe(2);
     // the mean colour matrix of the training views (stale staging data: loss sums, stamps)
     expect(Math.abs(Number(info.stats.splatMeanColourGain) - 1)).toBeLessThan(0.5);
@@ -214,7 +222,10 @@ describe('engine splat stage', () => {
     // normalisation (rebuilt from the checkpoint at iteration 150, trained again to 200)
     loseOnTrainer = true;
     let finishLost = false;
+    const itersA: number[] = [];
     const a = await e.splat(undefined, (p) => {
+      const d = training(p);
+      if (d) itersA.push(d.iteration);
       if (p.stage === 'splat_finishing' && p.progress === 0 && !finishLost) {
         finishLost = true;
         deviceOf(trainers[trainers.length - 1]).destroy();
@@ -224,6 +235,8 @@ describe('engine splat stage', () => {
     expect(a.iterations).toBe(200);
     expect(a.stats.splatDeviceLosses).toBe(2);
     expect(trainers.length).toBe(3);
+    // nothing trained before the first loss; the finishing loss trains again from the checkpoint at 150
+    expect(itersA).toEqual([...reports(10, 200), ...reports(160, 200)]);
     expect(Math.abs(Number(a.stats.splatMeanColourGain) - 1)).toBeLessThan(0.5);
     expect((await e.splatModel())?.model.count).toBe(a.count);
     // run 2: the checkpoint at iteration 150 (written right after its report): back to 100
@@ -243,6 +256,7 @@ describe('engine splat stage', () => {
     expect(b.stats.splatDeviceLosses).toBe(1);
     expect(trainers.length).toBe(5);
     expect(iters.filter((i) => i === 150).length).toBe(2); // trained again from 100
+    expect(iters).toEqual([...reports(10, 150), ...reports(110, 200)]);
     expect((await e.splatModel())?.model.count).toBe(b.count);
     e.dispose();
   }, 600_000);
