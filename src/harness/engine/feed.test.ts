@@ -1,10 +1,34 @@
 import { describe, expect, it } from 'vitest';
 import type { ImuSample } from '../../core/types';
 import { declination } from '../../sensors/wmm';
-import { HeadingNorthEmulator, cleanGeoFix, compassHeading, gravityDownAt, hfovLongSideDeg, latestAtOrBefore, numStats, planFrames, samplesBetween, upperBound } from './feed';
+import { frameMeta, type RecordedFrame } from '../../io/recording';
+import { pumpFrame } from '../../io/recording-testdata';
+import { CompassSensor } from '../../sensors/orientation';
+import { HeadingNorthEmulator, appliedDeclinationDeg, cleanGeoFix, compassHeading, extensionSplit, gravityDownAt, hfovLongSideDeg, latestAtOrBefore, numStats, planFrames, samplesBetween, upperBound, verbatimInput } from './feed';
 
 const frames = (n: number, fps: number, t0 = 10_000): { index: number; t: number }[] =>
   Array.from({ length: n }, (_, i) => ({ index: i, t: t0 + (1000 * i) / fps }));
+
+describe('extensionSplit (harness extendAt)', () => {
+  it('splits at the fraction, skips the given seconds and rebases the second segment to start near 0', () => {
+    const plan = frames(80, 10); // t = 10 000 … 17 900
+    const s = extensionSplit(plan, 0.6, 2)!;
+    expect(s.splitK).toBe(48);
+    // frames 48 … 67, within 2 s of frame 48 (t 14 800 … 16 799), are skipped
+    expect(s.skipped).toBe(20);
+    expect(s.feed.map((f) => f.index)).toEqual([...Array.from({ length: 48 }, (_, i) => i), ...Array.from({ length: 12 }, (_, i) => 68 + i)]);
+    expect(s.rebaseMs).toBe(16_300);
+    expect(s.feed[s.splitK].t - s.rebaseMs).toBe(500);
+    expect(extensionSplit(plan, 0.5)!.skipped).toBe(0);
+  });
+
+  it('refuses splits that leave fewer than 2 frames on a side', () => {
+    expect(extensionSplit(frames(40, 10), 0)).toBeNull();
+    expect(extensionSplit(frames(40, 10), 1)).toBeNull();
+    expect(extensionSplit(frames(3, 10), 0.5)).toBeNull();
+    expect(extensionSplit(frames(40, 10), 0.6, 30)).toBeNull();
+  });
+});
 
 describe('planFrames', () => {
   it('keeps everything by default, in time order', () => {
@@ -16,6 +40,12 @@ describe('planFrames', () => {
     const f = frames(40, 8);
     expect(planFrames(f, { startFrame: 2, frameStride: 4 }).map((x) => x.index)).toEqual([2, 6, 10, 14, 18, 22, 26, 30, 34, 38]);
     expect(planFrames(f, { frameStride: 4, maxFrames: 3 }).map((x) => x.index)).toEqual([0, 4, 8]);
+  });
+
+  it('keepOrder keeps the given order (a recording: the order the frames were sent in)', () => {
+    const f = [{ index: 0, t: 10 }, { index: 1, t: 5 }, { index: 2, t: 20 }];
+    expect(planFrames(f, { keepOrder: true }).map((x) => x.index)).toEqual([0, 1, 2]);
+    expect(planFrames(f).map((x) => x.index)).toEqual([1, 0, 2]);
   });
 
   it('rate-limits like a pump with half a frame of tolerance', () => {
@@ -155,5 +185,79 @@ describe('HeadingNorthEmulator (dataset true-north headings → what the phone r
     const none = new HeadingNorthEmulator('magnetic', null, date);
     expect(none.mode).toBe('true');
     expect(none.convert({ heading: 33, accuracy: 4 }, null)!.north).toBe('true');
+  });
+});
+
+describe('verbatimInput', () => {
+  const rows: RecordedFrame[] = Array.from({ length: 5 }, (_, i) => ({ seq: i, sentAt: 0, input: frameMeta(pumpFrame(i)), image: null }));
+  const all = { imu: true, gps: true, heading: true, gravity: true };
+
+  it('is the recorded FrameInput, unchanged, when every row is replayed', () => {
+    for (let i = 0; i < rows.length; i++) {
+      const v = verbatimInput(rows, i, i - 1, all);
+      expect(v).toStrictEqual(rows[i].input);
+      expect(v.imu).toBe(rows[i].input.imu);
+    }
+  });
+
+  it('prepends the IMU samples of the rows skipped since the previous replayed one', () => {
+    expect(verbatimInput(rows, 3, 0, all).imu).toEqual([...rows[1].input.imu, ...rows[2].input.imu, ...rows[3].input.imu]);
+    expect(verbatimInput(rows, 2, -1, all).imu).toHaveLength(6);
+    expect(rows[3].input.imu).toHaveLength(2); // the rows themselves are untouched
+  });
+
+  it('withholds the streams turned off', () => {
+    const v = verbatimInput(rows, 0, -1, { imu: false, gps: false, heading: false, gravity: true });
+    expect(v).toMatchObject({ imu: [], imuCalibrationVersion: -1, geo: null, heading: null, attitude: null, gravityDevice: null });
+    expect(v.t).toBe(rows[0].input.t);
+    expect(verbatimInput(rows, 0, -1, { ...all, gravity: false }).gravityDevice).toBeNull();
+    // a field the frame never had stays absent
+    const bare: RecordedFrame[] = [{ seq: 0, sentAt: 0, input: { t: 1, screenAngle: 0, imu: [] }, image: null }];
+    expect(Object.keys(verbatimInput(bare, 0, -1, { imu: false, gps: false, heading: false, gravity: false })).sort()).toEqual(['imu', 'screenAngle', 't']);
+  });
+
+  it('without GPS the compass goes back to magnetic north: what a CompassSensor that never got a fix reports', () => {
+    // one compass, two recordings of the same readings: before and after it learned the declination from a fix
+    const ev = { alpha: 30, beta: 80, gamma: 0, webkitCompassHeading: 200, webkitCompassAccuracy: 10 };
+    const magnetic = new CompassSensor({ target: null });
+    const corrected = new CompassSensor({ target: null });
+    for (const c of [magnetic, corrected]) {
+      c.handleOrientation({ ...ev, timeStamp: 100 });
+      c.handleOrientation({ alpha: 40, beta: 80, gamma: 0, timeStamp: 100 }, true); // the absolute attitude
+    }
+    expect(corrected.setLocationFromFix({ lat: 47.6, lon: -122.3, alt: 50, accuracy: 10 }, Date.UTC(2026, 9, 1))).toBe(true);
+    const d = corrected.declinationDeg;
+    expect(Math.abs(d)).toBeGreaterThan(5); // Seattle ≈ 15° E
+    const input = (c: CompassSensor): RecordedFrame['input'] => {
+      const h = c.headingAt(100)!;
+      const a = c.attitudeAt(100)!;
+      return { t: 100, screenAngle: 0, imu: [], geo: { t: 90, lat: 47.6, lon: -122.3, alt: 50, accuracy: 10, altitudeAccuracy: null }, heading: { heading: h.heading, accuracy: h.accuracy, north: h.north ?? 'magnetic', declinationDeg: h.declinationDeg ?? null }, attitude: { t: a.t, R_world_device: a.R_world_device, absolute: a.absolute, yawAccuracyDeg: a.yawAccuracyDeg } };
+    };
+    const rows: RecordedFrame[] = [
+      { seq: 0, sentAt: 0, input: input(corrected), image: null },
+      { seq: 1, sentAt: 0, input: { ...input(corrected), heading: null }, image: null }, // attitude only
+    ];
+    expect(rows[0].input.heading).toMatchObject({ north: 'true', declinationDeg: d });
+    expect(rows[0].input.attitude!.absolute).toBe(true);
+    expect(Math.abs(rows[0].input.attitude!.R_world_device[0] - input(magnetic).attitude!.R_world_device[0])).toBeGreaterThan(0.01);
+    const noGps = { imu: true, gps: false, heading: true, gravity: true };
+    const v = verbatimInput(rows, 0, -1, noGps);
+    const want = input(magnetic);
+    expect(v.geo).toBeNull();
+    expect(v.heading).toMatchObject({ north: 'magnetic', declinationDeg: 0 });
+    expect(v.heading!.heading).toBeCloseTo(want.heading!.heading, 9);
+    expect(want.heading).toMatchObject({ north: 'magnetic', declinationDeg: 0 });
+    for (let k = 0; k < 9; k++) expect(v.attitude!.R_world_device[k]).toBeCloseTo(want.attitude!.R_world_device[k], 12);
+    // a frame without a heading: the declination of the newest earlier one
+    expect(appliedDeclinationDeg(rows, 1)).toBe(d);
+    const v1 = verbatimInput(rows, 1, 0, noGps);
+    for (let k = 0; k < 9; k++) expect(v1.attitude!.R_world_device[k]).toBeCloseTo(want.attitude!.R_world_device[k], 12);
+    // the recorded rows are untouched, and with GPS everything stays verbatim
+    expect(rows[0].input.heading).toMatchObject({ north: 'true' });
+    expect(verbatimInput(rows, 0, -1, { ...noGps, gps: true })).toStrictEqual(rows[0].input);
+    // already magnetic (no fix on the device): unchanged
+    const mag: RecordedFrame[] = [{ seq: 0, sentAt: 0, input: input(magnetic), image: null }];
+    expect(verbatimInput(mag, 0, -1, noGps).heading).toStrictEqual(mag[0].input.heading);
+    expect(appliedDeclinationDeg(mag, 0)).toBe(0);
   });
 });

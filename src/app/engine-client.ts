@@ -3,11 +3,14 @@
  * (src/workers/engine.worker.ts) with the typed RPC protocol of src/workers/protocol.ts.
  *
  *  - Request ids, transfer lists (ImageBitmaps / large typed arrays are transferred).
- *  - Progress events are routed to the request that caused them; `live` / `log` / `error`
- *    events go to subscribers.
+ *  - Progress events are routed to the request that caused them (with their `image`, e.g. the
+ *    splat previews); `live` / `log` / `error` events go to subscribers. `finishEarly` is sent like
+ *    `cancel` (fire and forget, to the newest long operation or the newest of a method).
  *  - Back-pressure: at most ONE frame in flight. `processFrame` resolves with the LiveUpdate;
  *    the caller (FramePump) sends the next frame only after that. A second concurrent call
- *    rejects with EngineBusyError (its bitmap is closed).
+ *    rejects with EngineBusyError (its bitmap is closed). A FrameTap (`setFrameTap`, the raw
+ *    capture recorder) sees each frame accepted, may hold back its resolution, and is told
+ *    whether it was posted to the worker (./frame-tap.ts).
  *  - Timeouts: `init` (pipeline compilation can take a while on iOS), frames, short calls;
  *    long operations (LONG_RUNNING_METHODS: finishCapture / refine / densify / mesh / splat /
  *    export / loadSession) use an INACTIVITY timeout reset by progress.
@@ -15,13 +18,14 @@
  *    connection died, so `requestAdapter()` returns null in that realm —, a stuck init or
  *    repeated frame timeouts): pending requests reject with EngineCrashedError, the worker is
  *    terminated and RESPAWNED, and the last `init` / `loadSession` is replayed with
- *    `resume: true` (docs/research/ios-webgpu.md §5 recovery state machine). Respawns are
+ *    `resume: true` (an init with `extend` keeps it until finishCapture / refine resolved: the
+ *    continued capture is reopened again) (docs/research/ios-webgpu.md §5 recovery state machine). Respawns are
  *    capped (3 per 60 s); after repeated GPU failures the engine is re-initialised with
  *    `preferGPU: false` (CPU tier).
  *  - Page visibility is forwarded (`visibility` request): the worker cannot see
  *    `visibilitychange`, and iOS silently drops GPU work submitted while hidden.
  */
-import type { PointCloud, ProgressCallback, ProgressEvent, TriangleMesh } from '../core/types';
+import type { PointCloud, ProgressCallback, ProgressEvent } from '../core/types';
 import {
   ENGINE_ERRORS,
   LONG_RUNNING_METHODS,
@@ -43,12 +47,14 @@ import {
   type LiveUpdate,
   type LogMessage,
   type MeshOptions,
+  type MeshResult,
   type SessionSummary,
   type SparseResult,
   type SplatModelPayload,
   type SplatOptions,
   type SplatResult,
 } from '../workers/protocol';
+import { tapFrame, type FrameTap } from './frame-tap';
 
 // ---------------------------------------------------------------------------------------------
 // EngineLike: what the UI needs (implemented by EngineClient and MockEngine)
@@ -85,13 +91,19 @@ export interface EngineLike {
   /** Start (or restart) an engine session. */
   init(options: EngineOptions): Promise<InitResult>;
   processFrame(frame: FrameInput): Promise<LiveUpdate>;
+  /**
+   * Observe the frames sent to the engine (null removes it): the raw capture recorder
+   * (./frame-tap.ts, ./recorder.ts). Frames rejected as busy never reach the tap.
+   */
+  setFrameTap(tap: FrameTap | null): void;
   finishCapture(): Promise<void>;
   refine(onProgress?: ProgressCallback): Promise<SparseResult>;
   densify(options?: DenseOptions, onProgress?: ProgressCallback): Promise<PointCloud>;
-  mesh(options?: MeshOptions, onProgress?: ProgressCallback): Promise<TriangleMesh>;
+  mesh(options?: MeshOptions, onProgress?: ProgressCallback): Promise<MeshResult>;
   /**
    * Train Gaussian splats (long; progress stages SPLAT_STAGES, 'splat_training' events carry a
-   * SplatTrainingDetail in `detail`; cancel keeps a checkpoint: the next call resumes it).
+   * SplatTrainingDetail in `detail`, `preview: true` adds 'splat_preview' snapshots in `image`;
+   * cancel keeps a checkpoint: the next call resumes it).
    */
   splat(options?: SplatOptions, onProgress?: ProgressCallback): Promise<SplatResult>;
   /** The stored splat model for the viewer (null when none). */
@@ -103,6 +115,12 @@ export interface EngineLike {
    * newest one of `method` (several can run at once, e.g. an export during a splat build).
    */
   cancel(method?: EngineMethod): void;
+  /**
+   * End the running long operation early and keep its result (targeted like `cancel`): the splat
+   * training stops at its current iteration — from `SplatTrainingDetail.finishFrom` on — and
+   * `splat` resolves with that model (stats.splatFinishedEarly). Other operations ignore it.
+   */
+  finishEarly(method?: EngineMethod): void;
   /**
    * Cancel the running long operation (finishCapture / refine / densify / mesh / splat / export /
    * loadSession; the newest one, or the newest one of `method`) and make sure it ENDS: when the
@@ -215,7 +233,7 @@ type Setup = { kind: 'init'; options: EngineOptions } | { kind: 'load'; id: stri
  * finishCapture is one (it drains the keyframe mapping queue; the worker gives it a cancel token).
  */
 const LONG: ReadonlySet<EngineMethod> = new Set<EngineMethod>(LONG_RUNNING_METHODS);
-const FIRE_AND_FORGET: ReadonlySet<EngineMethod> = new Set<EngineMethod>(['cancel', 'visibility', 'dispose']);
+const FIRE_AND_FORGET: ReadonlySet<EngineMethod> = new Set<EngineMethod>(['cancel', 'finishEarly', 'visibility', 'dispose']);
 
 function defaultWorker(): Worker {
   return new Worker(new URL('../workers/engine.worker.ts', import.meta.url), { type: 'module', name: 'engine' });
@@ -250,6 +268,7 @@ export class EngineClient implements EngineLike {
   private gpuFailures = 0;
   private frameBusy = false;
   private frameTimeouts = 0;
+  private frameTap: FrameTap | null = null;
   /**
    * Pending long operations, oldest first. Several can run at once (an export started during a
    * splat build): one finishing must not hide the others from `cancel` / `abortLongOperation`.
@@ -345,28 +364,48 @@ export class EngineClient implements EngineLike {
     }
     this.frameBusy = true;
     try {
-      const upd = await this.call('frame', frame, { timeoutMs: this.opts.frameTimeoutMs, frame: true });
-      this.frameTimeouts = 0;
-      this.live.emit(upd);
-      return upd;
+      return await tapFrame(this.frameTap, frame, async (f, posted) => {
+        const upd = await this.call('frame', f, { timeoutMs: this.opts.frameTimeoutMs, frame: true, onPosted: posted });
+        this.frameTimeouts = 0;
+        this.live.emit(upd);
+        return upd;
+      });
     } finally {
       this.frameBusy = false;
     }
   }
 
-  async finishCapture(): Promise<void> {
-    await this.call('finishCapture', undefined, { timeoutMs: this.opts.inactivityTimeoutMs, inactivity: true });
+  setFrameTap(tap: FrameTap | null): void {
+    this.frameTap = tap;
   }
 
-  refine(onProgress?: ProgressCallback): Promise<SparseResult> {
-    return this.call('refine', undefined, { onProgress });
+  async finishCapture(): Promise<void> {
+    const s = this.setup;
+    await this.call('finishCapture', undefined, { timeoutMs: this.opts.inactivityTimeoutMs, inactivity: true });
+    this.captureEnded(s);
+  }
+
+  async refine(onProgress?: ProgressCallback): Promise<SparseResult> {
+    const s = this.setup;
+    const res = await this.call('refine', undefined, { onProgress });
+    this.captureEnded(s);
+    return res;
+  }
+
+  /**
+   * A continued capture (init with `extend`) ended: a later replay restores the session as stored
+   * (`resume` only) instead of reopening its capture again (which would keep the capture state
+   * from being released before the dense stage).
+   */
+  private captureEnded(s: Setup | null): void {
+    if (s && s === this.setup && s.kind === 'init' && s.options.extend) delete s.options.extend;
   }
 
   densify(options?: DenseOptions, onProgress?: ProgressCallback): Promise<PointCloud> {
     return this.call('densify', options, { onProgress });
   }
 
-  mesh(options?: MeshOptions, onProgress?: ProgressCallback): Promise<TriangleMesh> {
+  mesh(options?: MeshOptions, onProgress?: ProgressCallback): Promise<MeshResult> {
     return this.call('mesh', options, { onProgress });
   }
 
@@ -402,6 +441,12 @@ export class EngineClient implements EngineLike {
   cancel(method?: EngineMethod): void {
     const target = this.longTarget(method);
     if (target !== null) this.sendCancel(target);
+  }
+
+  finishEarly(method?: EngineMethod): void {
+    const target = this.longTarget(method);
+    if (target === null || !this.worker) return;
+    void this.call('finishEarly', { target }, { timeoutMs: this.opts.callTimeoutMs }).catch(() => undefined);
   }
 
   /** The newest pending long operation (of `method` when given); null when none. */
@@ -593,6 +638,8 @@ export class EngineClient implements EngineLike {
       bypassGate?: boolean;
       fatalOnTimeout?: boolean;
       frame?: boolean;
+      /** The request was posted to the worker (not rejected before: disposed / dead / no worker). */
+      onPosted?: () => void;
     } = {},
   ): Promise<EngineResult<M>> {
     if (this.disposed) {
@@ -644,7 +691,9 @@ export class EngineClient implements EngineLike {
           this.settle(id);
           if (o.frame) closeBitmap(params as FrameInput);
           reject(e instanceof Error ? e : new Error(String(e)));
+          return;
         }
+        o.onPosted?.();
       });
     if (o.bypassGate || FIRE_AND_FORGET.has(method)) return send();
     return this.waitGate().then(send);
@@ -718,6 +767,7 @@ export class EngineClient implements EngineLike {
         const pe: ProgressEvent = { stage: ev.stage, progress: ev.progress };
         if (ev.message !== undefined) pe.message = ev.message;
         if (ev.detail) pe.detail = ev.detail;
+        if (ev.image) pe.image = ev.image;
         const targetId = ev.requestId ?? this.longTarget();
         const p = targetId !== null && targetId !== undefined ? this.pending.get(targetId) : undefined;
         if (p) {

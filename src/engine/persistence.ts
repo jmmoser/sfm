@@ -6,7 +6,8 @@
  * Layout (keys inside one session):
  *   frames                 keyframe image (JPEG Blob, or raw RGBA without a JPEG encoder) +
  *                          KeyframeRecord as the frame `info`
- *   value  engine/state    EngineStateRecord (options, orientation, counters, flags)
+ *   value  engine/state    EngineStateRecord (options, orientation, counters, capture time
+ *                          segments, flags)
  *   bin    kf/<id>/features   serializeFeatureSet
  *   bin    kf/<id>/colors     3 B per feature (sRGB)
  *   value  kf/<id>/pairs      verified pairs (a, id) found when keyframe id was mapped
@@ -20,13 +21,14 @@
  *   value  dense/meta         undistorted dense views (for meshing after a reload)
  *   bin    depth/<id>         fusion-filtered depth maps (float16 normals / cost)
  *   bin    mesh               serializeTriangleMesh
+ *   value  mesh/meta          MeshMetaRecord (object box of the mesh, meshing stats; null = none)
  *   bin    splat/model        trained Gaussian splats, compact (packSplatModel: f32 means, f16 rest)
  *   value  splat/meta         SplatMetaRecord (count, SH degree, background, stats)
  *   value  splat/progress     SplatProgressRecord: the last complete training checkpoint
  *   bin    splat/ckpt<s>/params | m | v | colour   checkpoint slot s ∈ {0, 1} (f32 parameters,
  *                             bf16 Adam moments, f32 colour-correction state)
  */
-import type { CameraIntrinsics, GeoFix, ImuSample, Mat3, MetricInfo, RGBAImage, TwoViewConfig, TwoViewGeometry, Vec3 } from '../core/types';
+import type { CameraIntrinsics, GeoFix, ImuSample, Mat3, MetricInfo, ObjectRoi, RGBAImage, TwoViewConfig, TwoViewGeometry, Vec3 } from '../core/types';
 import { SessionStore, type SessionMeta } from '../io/storage';
 import { packFloat16, unpackFloat16 } from '../io/serialize';
 import { allocSplatModel, shCoeffCount, type ShDegree, type SplatModel } from '../splat/types';
@@ -297,7 +299,29 @@ export interface EngineStateRecord {
   gyroBias?: [number, number, number] | null;
   /** Rolling-shutter model applied by the last refine / live (canonical image); informational after a reload. */
   rollingShutter?: { axis: 'rows' | 'cols'; readoutMs: number } | null;
+  /**
+   * Capture segments after the first one (absent in older records, empty: one segment, shift 0).
+   * Stored capture times (keyframes, IMU, GPS) are on the SESSION time base: FrameInput times plus
+   * the shift of their segment. performance.now() restarts with every page load, so a capture
+   * continued after a reload (`EngineOptions.extend`) is shifted past everything stored.
+   */
+  timeSegments?: TimeSegmentRecord[];
+  /**
+   * Keyframes were added after the stored results (sparse / dense / mesh / splats) were made — a
+   * continued capture (`EngineOptions.extend`) — until the next refine replaces them; absent = false.
+   */
+  resultsStale?: boolean;
   updatedAt: number;
+}
+
+/** A capture segment on the session time base (EngineStateRecord.timeSegments). */
+export interface TimeSegmentRecord {
+  /** First keyframe id of the segment (the session's nextKeyframeId when it started). */
+  firstKeyframeId: number;
+  /** Added to every FrameInput time of the segment (frame, IMU, GPS, attitude), ms. */
+  shiftMs: number;
+  /** Wall-clock start (epoch ms). */
+  startedAt: number;
 }
 
 /** A verified pair as stored (oriented a → b). */
@@ -355,6 +379,25 @@ export interface SparseMetaRecord {
 export interface DenseMetaRecord {
   views: { id: number; cam: CameraIntrinsics; pose: { R: number[]; t: number[] }; depthWidth: number; depthHeight: number }[];
   maxImageSize: number;
+}
+
+/**
+ * Persisted meta of the stored mesh (`mesh/meta`; written after `mesh`, cleared with it and by
+ * refine): the object box the TSDF was bounded to, in the world frame of the sparse model it was
+ * built from (exports place its bottom centre at the origin), and the meshing stats.
+ */
+export interface MeshMetaRecord {
+  version: 1;
+  objectRoi: ObjectRoi | null;
+  stats: Record<string, number | string>;
+}
+
+/** A well-formed ObjectRoi (a damaged / foreign stored record reads as no box). */
+export function isObjectRoi(x: unknown): x is ObjectRoi {
+  if (!x || typeof x !== 'object') return false;
+  const r = x as Partial<ObjectRoi>;
+  const vec = (v: unknown): boolean => Array.isArray(v) && v.length === 3 && v.every((c) => typeof c === 'number' && Number.isFinite(c));
+  return vec(r.min) && vec(r.max) && vec(r.centre) && Number.isFinite(r.planeZ) && Number.isFinite(r.confidence);
 }
 
 // ---------------------------------------------------------------------------------------------

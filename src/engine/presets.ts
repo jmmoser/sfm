@@ -306,16 +306,21 @@ export interface ModeConfig {
   depthMarginMax: number;
   /** TSDF auto voxel size in pixel footprints at the median depth. */
   tsdfAutoVoxelPixels: number;
+  /**
+   * Mesh only the object: the TSDF is bounded to the automatic object box (src/dense/object-roi.ts)
+   * when the model is gravity-aligned and a box is found (object mode; `MeshOptions.objectRoi`).
+   */
+  objectRoi: boolean;
 }
 
 export function modeConfig(mode: CaptureMode): ModeConfig {
   switch (mode) {
     case 'object':
-      return { keyframeMode: 'object', keyframe: {}, tsdfMaxDepthFactor: 2, depthMarginMin: 0.8, depthMarginMax: 1.25, tsdfAutoVoxelPixels: 2 };
+      return { keyframeMode: 'object', keyframe: {}, tsdfMaxDepthFactor: 2, depthMarginMin: 0.8, depthMarginMax: 1.25, tsdfAutoVoxelPixels: 2, objectRoi: true };
     case 'scene':
-      return { keyframeMode: 'scene', keyframe: {}, tsdfMaxDepthFactor: Infinity, depthMarginMin: 0.7, depthMarginMax: 1.5, tsdfAutoVoxelPixels: 2 };
+      return { keyframeMode: 'scene', keyframe: {}, tsdfMaxDepthFactor: Infinity, depthMarginMin: 0.7, depthMarginMax: 1.5, tsdfAutoVoxelPixels: 2, objectRoi: false };
     default:
-      return { keyframeMode: 'auto', keyframe: {}, tsdfMaxDepthFactor: Infinity, depthMarginMin: 0.75, depthMarginMax: 1.4, tsdfAutoVoxelPixels: 2 };
+      return { keyframeMode: 'auto', keyframe: {}, tsdfMaxDepthFactor: Infinity, depthMarginMin: 0.75, depthMarginMax: 1.4, tsdfAutoVoxelPixels: 2, objectRoi: false };
   }
 }
 

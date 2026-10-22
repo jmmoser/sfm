@@ -1,18 +1,61 @@
 /**
  * MockEngine: an in-page EngineLike for UI development and tests (`?mock=1`). It fakes the
- * live pipeline (keyframe decisions, tracking state, guidance, a growing sparse cloud and
- * camera trajectory, keypoint overlays that are projections of the scene into the current
- * mock camera), runs refine / densify / mesh / splat as timed stages with progress, and returns
- * REAL PointCloud / TriangleMesh / Gaussian-splat objects and export Blobs encoded with src/io.
+ * live pipeline (keyframe decisions, tracking state, guidance, the mode 'auto' resolves to after
+ * 8 keyframes, a growing sparse cloud and camera trajectory — for objects a level orbit, then a
+ * higher loop for the coverage ring —, keypoint overlays that are projections of the scene into
+ * the current mock camera), runs refine / densify / mesh / splat as timed stages with progress,
+ * and returns REAL PointCloud / TriangleMesh / Gaussian-splat objects and export Blobs encoded
+ * with src/io.
+ * The splat stage posts synthetic 'splat_preview' snapshots (the cloud projected into the middle
+ * camera, coarse to fine) with `preview: true` and honours `finishEarly` like the engine.
+ *
+ * Model updates are sent like the real engine's default background mapping: a keyframe's model
+ * (sparse cloud + cameras) is not in its frame response but in a standalone `live` update emitted
+ * while the NEXT frame is in flight — under that frame's index, with the previous frame's
+ * decision and guidance (LiveSession.emitModelUpdate) — and finishCapture flushes a pending one.
  *
  * Time base: the mock trajectory advances with the frame timestamps (`FrameInput.t`) times
- * `speed`, so pauses in frame delivery pause the scan.
+ * `speed`, so pauses in frame delivery pause the scan. A FrameTap (`setFrameTap`, the raw capture
+ * recorder) sees every accepted frame before the mock closes its pixels, like on EngineClient
+ * (every accepted frame counts as posted).
+ *
+ * Frame pixels: every ImageBitmap / VideoFrame is READ (drawn into a 1×1 canvas and sampled,
+ * `lastFrameSample`) before it is closed, as the engine reads every frame. Chromium's
+ * createImageBitmap(<video>) resolves before the GPU process has made the copy, so a consumer that
+ * closes the bitmap unread never waits for the GPU and the FramePump (≤ 10 Hz) queues copies
+ * without back-pressure. Headless on SwiftShader (fake camera, 1920×1080 frames, 4 shared cores)
+ * that made ≈ 10 copies/s against ≈ 2–3 executed: the GPU process grew by 100–230 MB/s to 5–8 GB
+ * (then crashed) and page screenshots (compositor readbacks; a 1×1 WebGL readPixels still took
+ * milliseconds) waited minutes (2026-10-22: the e2e/ui/states.mjs coverage screenshot timeouts;
+ * docs/research/integration-2026-10.md). The capture screen's 3D thumbnail only masked it: while
+ * it draws, the page's WebGL calls block on the GPU (13–20 s round trips) and throttle the pump to
+ * ≈ 2 frames/s. Reading the pixels paces delivery to the GPU like the real engine: GPU memory stays
+ * flat (≈ 300 MB), the same screenshots ≈ 1 s. Unlike the engine, which reads in its worker, the
+ * mock reads synchronously on the UI thread, so headless the UI thread is ≈ 90 % busy waiting for
+ * those copies (the flows still pass; do not read UI timings off a mock capture). Production
+ * capture is unaffected (the engine reads every frame).
+ *
+ * Resume state survives a reload like the real engine's stored `dense/progress` and splat
+ * checkpoints: a persistent session's record gets `stats.denseResumablePass` / `denseResumableQuality`
+ * once its densify stored a "depth map" (the first depth-map tick), `splatResumableIteration` /
+ * `splatResumableQuality` at every CHECKPOINT_EVERY iterations and on a cancel; a finished run (and
+ * refine) removes them. loadSession reports them from the record (e2e/ui/states.mjs kills a run with
+ * a page reload).
+ *
+ * `init` with `resume` + `extend` continues a scan like the engine ("Add more views"): the scan held
+ * in memory, else the stored one rebuilt from its session record as `loadSession` does; the
+ * trajectory goes on after its last keyframe and `InitResult.resumedKeyframes` reports them
+ * (`storedModel`: its sparse model); an unknown scan rejects.
+ * `unconnectedImages` makes refine report keyframes it could not connect (the viewer's card).
  */
-import type { MetricInfo, PointCloud, ProgressCallback, ProgressEvent, TriangleMesh } from '../core/types';
+import type { MetricInfo, PointCloud, ProgressCallback, ProgressEvent, RGBAImage, TriangleMesh } from '../core/types';
+import { buildColourAtlas } from '../dense/colour-atlas';
 import { createColmapZipBlob, encodeGLB, encodeMeshPLY, encodePLY, type ColmapModelInput } from '../io';
+import { encodeUSDZ, selectArPivot } from '../io/usdz';
 import { SessionStore, type SessionMeta } from '../io/storage';
 import { Rng } from '../math/random';
 import { encodeSplatPLY } from '../splat/ply';
+import { encodeSplatSPZ } from '../splat/spz';
 import { SH_C0, allocSplatModel, logit, type SplatModel } from '../splat/types';
 import {
   ENGINE_ERRORS,
@@ -40,6 +83,7 @@ import {
   type TrackingState,
 } from '../workers/protocol';
 import { ABORT_REASON_PREFIX, Emitter, type AbortOutcome, type EngineErrorInfo, type EngineLike, type EngineStatus } from './engine-client';
+import { tapFrame, type FrameTap } from './frame-tap';
 import { MockScene, type MockSamples } from './mock-scene';
 
 export interface MockEngineOptions {
@@ -61,6 +105,8 @@ export interface MockEngineOptions {
    * event (CaptureMemoryLimitError) is emitted.
    */
   memoryLimitKeyframes?: number;
+  /** Keyframes refine reports as not connected (stats.unconnectedImages; default 0). */
+  unconnectedImages?: number;
 }
 
 interface Sizes {
@@ -69,6 +115,11 @@ interface Sizes {
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, Math.max(0, ms)));
+
+/** Like the engine's splat `checkpointEvery` (ENGINE.md "Splat"). */
+const CHECKPOINT_EVERY = 500;
+const DENSE_RESUME_KEYS = { denseResumablePass: null, denseResumableQuality: null };
+const SPLAT_RESUME_KEYS = { splatResumableIteration: null, splatResumableQuality: null, splatContinuesModel: null };
 
 function frameSize(f: FrameInput): { w: number; h: number } {
   const b = f.bitmap as { width?: number; height?: number; displayWidth?: number; displayHeight?: number };
@@ -83,6 +134,7 @@ export class MockEngine implements EngineLike {
   private readonly stallOn: NonNullable<MockEngineOptions['stallOn']>;
   private readonly memoryLimitKeyframes: number;
   private memoryLimitHit = false;
+  private readonly unconnectedImages: number;
   /** Rejects the running long operation (abortLongOperation: simulated restart). */
   private abortCurrent: ((e: Error) => void) | null = null;
   /** Ends a stalled operation (abort / dispose). */
@@ -92,6 +144,8 @@ export class MockEngine implements EngineLike {
   /** Quality of the interrupted densify (a resume needs the same one; another starts over). */
   private denseResumableQuality: QualityPreset | null = null;
   private readonly sessionsSrc: () => Promise<SessionStore | null>;
+  /** Writes of the resume markers into the session record, in order (persistResume). */
+  private persistQ: Promise<void> = Promise.resolve();
   private st: EngineStatus = { state: 'idle', respawns: 0 };
   private options: EngineOptions | null = null;
   private scene: MockScene | null = null;
@@ -100,8 +154,15 @@ export class MockEngine implements EngineLike {
   /** The init / loadSession running now: a closeSession of its scan ends it (EngineClient: 'close' disposes the engine). */
   private pendingSetup: { id: string | null; closed: boolean } | null = null;
   private busy = false;
+  private frameTap: FrameTap | null = null;
+  /** 1×1 canvas the frames are read into (undefined: not created yet; null: no OffscreenCanvas, e.g. Node). */
+  private sampler: OffscreenCanvasRenderingContext2D | null | undefined = undefined;
+  /** RGB of the last frame's 1×1 sample (null: not read — a fake bitmap, raw RGBA, no canvas). */
+  private lastSample: [number, number, number] | null = null;
   private hidden = false;
   private cancelled = false;
+  /** finishEarly() during the running long operation (only the splat stage reacts). */
+  private finishRequested = false;
   private longOp = false;
   private disposed = false;
   // Live state.
@@ -112,6 +173,10 @@ export class MockEngine implements EngineLike {
   private lastKfS = -1;
   private revealedCount = 0;
   private lastSparseKf = -1;
+  /** Background mapping: the newest keyframe's model waits for the next frame (or finishCapture). */
+  private modelPending = false;
+  /** The last frame response's decision and guidance (a model update repeats them). */
+  private lastFrame: { decision: KeyframeDecision; guidance: Guidance } = { decision: 'skip', guidance: 'initializing' };
   private captureDone = false;
   private sparse: SparseResult | null = null;
   private denseCloud: PointCloud | null = null;
@@ -121,6 +186,8 @@ export class MockEngine implements EngineLike {
   private splatResumable: number | null = null;
   /** Quality of that run (stats.splatResumableQuality; another quality starts over). */
   private splatResumableQuality: QualityPreset | null = null;
+  /** That iteration is the stored model's, ended early (stats.splatContinuesModel), not an interrupted run's. */
+  private splatContinues = false;
   private sessionId: string | null = null;
   private sessionName = 'Mock scan';
   private readonly live = new Emitter<LiveUpdate>();
@@ -135,6 +202,7 @@ export class MockEngine implements EngineLike {
     this.failOn = opts.failOn ?? {};
     this.stallOn = opts.stallOn ?? {};
     this.memoryLimitKeyframes = opts.memoryLimitKeyframes && opts.memoryLimitKeyframes > 0 ? opts.memoryLimitKeyframes : Infinity;
+    this.unconnectedImages = Math.max(0, Math.floor(opts.unconnectedImages ?? 0));
     this.sessionsSrc =
       opts.sessions ??
       (async () => {
@@ -198,6 +266,8 @@ export class MockEngine implements EngineLike {
     this.lastKfS = -1;
     this.revealedCount = 0;
     this.lastSparseKf = -1;
+    this.modelPending = false;
+    this.lastFrame = { decision: 'skip', guidance: 'initializing' };
     this.captureDone = false;
     this.sparse = null;
     this.denseCloud = null;
@@ -205,6 +275,7 @@ export class MockEngine implements EngineLike {
     this.splatOut = null;
     this.splatResumable = null;
     this.splatResumableQuality = null;
+    this.splatContinues = false;
     this.cancelled = false;
     this.memoryLimitHit = false;
     this.denseResumablePass = null;
@@ -223,11 +294,44 @@ export class MockEngine implements EngineLike {
       this.setState('idle', (e as Error).message);
       throw e;
     }
-    this.options = { ...options };
-    this.sessionId = options.sessionId ?? null;
-    this.reset(options.mode === 'scene' ? 'scene' : 'object', options.quality);
+    const extendId = options.resume && options.extend ? (options.sessionId ?? null) : null;
+    let resumed = 0;
+    if (extendId && this.sessionId === extendId && this.scene && this.options) {
+      // the scan held in memory continues (its stored mode / quality, like the engine)
+      resumed = this.keyframes.length;
+    } else {
+      const store = extendId ? await this.sessionsSrc() : null;
+      const meta = store ? await store.getSession(extendId!).catch(() => null) : null;
+      if (setup.closed) throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');
+      if (extendId && !meta) {
+        // like the engine: a scan without a stored capture is not continued from scratch
+        const e = new Error(`Session ${extendId} has no stored capture to continue`);
+        this.setState('idle', e.message);
+        throw e;
+      }
+      this.options = { ...options };
+      this.sessionId = options.sessionId ?? null;
+      if (meta) {
+        this.loadStored(meta, options.quality);
+        resumed = this.keyframes.length;
+      } else this.reset(options.mode === 'scene' ? 'scene' : 'object', options.quality);
+    }
+    if (extendId && resumed > 0) {
+      // reopened: the trajectory goes on after the last keyframe
+      this.captureDone = false;
+      this.lastT = null;
+      this.lastKfS = this.keyframes[this.keyframes.length - 1].s;
+      this.scanMs = this.lastKfS * this.periodMs;
+      this.memoryLimitHit = false;
+    }
     const gpu = typeof navigator !== 'undefined' && !!(navigator as Navigator & { gpu?: unknown }).gpu;
     const res: InitResult = { gpu, adapter: 'Mock engine (no reconstruction)' };
+    if (resumed > 0) {
+      res.resumedKeyframes = resumed;
+      res.captureMemory = { usedMB: Math.round(20 + resumed * 1.5), capMB: 420 };
+      const sp = extendId ? this.sparse : null;
+      if (sp) res.storedModel = { sparse: { positions: sp.points.positions, colors: sp.points.colors }, cameras: sp.cameras.map((c) => ({ pose: c.pose, intrinsics: c.intrinsics })) };
+    }
     this.setState('ready', undefined, res);
     this.log(`mock init ${options.mode}/${options.quality}`);
     return res;
@@ -235,13 +339,53 @@ export class MockEngine implements EngineLike {
 
   // ---- live ----------------------------------------------------------------------------------
 
+  /** Scan time of one full orbit / path (ms). */
+  private get periodMs(): number {
+    return this.scene?.kind === 'scene' ? 60_000 : 50_000;
+  }
+
   /** Trajectory parameter of the scan so far (1 = one full orbit / path). */
   private get progressS(): number {
-    const periodMs = this.scene?.kind === 'scene' ? 60_000 : 50_000;
-    return this.scanMs / periodMs;
+    return this.scanMs / this.periodMs;
   }
 
   async processFrame(f: FrameInput): Promise<LiveUpdate> {
+    // a frame rejected as busy never reaches the tap
+    return this.busy || !this.frameTap
+      ? this.mockFrame(f)
+      : tapFrame(this.frameTap, f, (x, posted) => {
+          posted();
+          return this.mockFrame(x);
+        });
+  }
+
+  setFrameTap(tap: FrameTap | null): void {
+    this.frameTap = tap;
+  }
+
+  /**
+   * Read the frame's pixels (a 1×1 sample of the whole frame) before it is closed, as the engine
+   * reads every frame: this waits for the GPU copy behind a grabbed ImageBitmap / VideoFrame (see
+   * the header, "Frame pixels"). Fake bitmaps (unit tests) and raw RGBA frames are not read.
+   */
+  private sampleFrame(bitmap: FrameInput['bitmap']): void {
+    this.lastSample = null;
+    const image =
+      (typeof ImageBitmap === 'function' && bitmap instanceof ImageBitmap) || (typeof VideoFrame === 'function' && bitmap instanceof VideoFrame) ? bitmap : null;
+    if (!image) return;
+    if (this.sampler === undefined) this.sampler = typeof OffscreenCanvas === 'function' ? new OffscreenCanvas(1, 1).getContext('2d', { willReadFrequently: true }) : null;
+    const ctx = this.sampler;
+    if (!ctx) return;
+    try {
+      ctx.drawImage(image, 0, 0, 1, 1);
+      const d = ctx.getImageData(0, 0, 1, 1).data;
+      this.lastSample = [d[0], d[1], d[2]];
+    } catch {
+      /* closed / detached: processed without its pixels */
+    }
+  }
+
+  private async mockFrame(f: FrameInput): Promise<LiveUpdate> {
     const b = f.bitmap as { close?: () => void };
     if (this.busy) {
       b.close?.();
@@ -250,6 +394,8 @@ export class MockEngine implements EngineLike {
     this.busy = true;
     try {
       const { w, h } = frameSize(f);
+      // read the pixels like the engine does (back-pressure on the GPU copy: see the header)
+      this.sampleFrame(f.bitmap);
       try {
         b.close?.();
       } catch {
@@ -265,6 +411,8 @@ export class MockEngine implements EngineLike {
       }
       this.lastT = f.t;
       await sleep((25 + rng.next() * 45) / Math.sqrt(this.speed));
+      // the previous keyframe's mapping job finishes while this frame is in flight
+      if (this.modelPending) this.emitModelUpdate(this.frameIndex);
 
       const s = this.progressS;
       const nKf = this.keyframes.length;
@@ -310,6 +458,7 @@ export class MockEngine implements EngineLike {
         decision,
         guidance,
         tracking,
+        resolvedMode: this.resolvedMode(k),
         numKeyframes: k,
         numRegistered: Math.max(0, k - (k > 6 ? 1 : 0)),
         numPoints: revealed,
@@ -319,15 +468,76 @@ export class MockEngine implements EngineLike {
       upd.overlay = this.overlay(pose, cam, rng);
       // the real engine poses every tracked frame (frame PnP in the live model)
       if (tracking === 'tracking' && decision !== 'reject_blur' && decision !== 'reject_motion') upd.framePose = { pose, t: f.t };
-      if (decision === 'keyframe' && k >= 2 && k !== this.lastSparseKf) {
-        this.lastSparseKf = k;
-        upd.sparse = this.liveSparse(k);
-        upd.cameras = this.keyframes.map((x) => x.pose);
-      }
+      if (decision === 'keyframe' && k >= 2 && k !== this.lastSparseKf) this.modelPending = true;
+      this.lastFrame = { decision, guidance };
       this.live.emit(upd);
       return upd;
     } finally {
       this.busy = false;
+    }
+  }
+
+  private resolvedMode(k: number): LiveUpdate['resolvedMode'] {
+    const mode = this.options?.mode ?? 'auto';
+    return mode === 'auto' ? (k >= 8 && this.scene ? this.scene.kind : 'auto') : mode;
+  }
+
+  /**
+   * The live model after the newest keyframe, as LiveSession.emitModelUpdate sends it with
+   * background mapping: under `frameIndex` (the frame in flight, else the last one), with the last
+   * frame's decision and guidance, without overlay or frame pose.
+   */
+  private emitModelUpdate(frameIndex: number): void {
+    this.modelPending = false;
+    const k = this.keyframes.length;
+    if (!this.scene || !this.samples || k < 2) return;
+    this.lastSparseKf = k;
+    this.live.emit({
+      frameIndex,
+      decision: this.lastFrame.decision,
+      guidance: this.lastFrame.guidance,
+      tracking: 'tracking',
+      resolvedMode: this.resolvedMode(k),
+      numKeyframes: k,
+      numRegistered: Math.max(0, k - (k > 6 ? 1 : 0)),
+      numPoints: this.revealedCount,
+      timings: {},
+      sparse: this.liveSparse(k),
+      cameras: this.keyframes.map((x) => x.pose),
+    });
+  }
+
+  /**
+   * A stored scan rebuilt from its session record (loadSession, init with `extend`): keyframes along
+   * the trajectory for its photo count, and the models its status says were built.
+   */
+  private loadStored(meta: SessionMeta, quality?: QualityPreset): void {
+    const id = meta.id;
+    const mode = meta.mode === 'scene' ? 'scene' : 'object';
+    const q = (quality ?? (meta.stats?.quality as EngineOptions['quality'] | undefined) ?? 'balanced') as EngineOptions['quality'];
+    this.options = { mode: meta.mode, quality: q, sessionId: id, persist: true };
+    this.sessionId = id;
+    this.reset(mode, q);
+    // A finished capture: the whole trajectory was scanned.
+    const kfStat = meta.stats?.keyframes;
+    const kf = Math.max(8, Math.min(36, meta.numFrames || (typeof kfStat === 'number' ? kfStat : 0) || 24));
+    const span = Math.min(1, kf / 36);
+    const scene = this.scene!;
+    for (let i = 0; i < kf; i++) {
+      const s = (span * i) / Math.max(1, kf - 1);
+      this.keyframes.push({ s, pose: { pose: scene.poseAt(s), intrinsics: scene.intrinsics(1440, 1920) } });
+    }
+    this.captureDone = true;
+    const st = meta.status;
+    if (st === 'sparse' || st === 'dense' || st === 'meshed') this.sparse = this.buildSparse(kf, {});
+    if (st === 'dense' || st === 'meshed') this.denseCloud = scene.dense(this.sizes.dense);
+    if (st === 'meshed') this.meshModel = scene.mesh();
+    // the splats persist like the engine's splat/model (the app records their size)
+    const sg = meta.stats?.splatGaussians;
+    if (typeof sg === 'number' && sg > 0 && this.sparse) {
+      const it = meta.stats?.splatIterations;
+      const model = this.mockSplats(this.denseCloud ?? this.sparse.points);
+      this.splatOut = { model, info: this.splatInfo(model, typeof it === 'number' ? it : 3000, 0) };
     }
   }
 
@@ -364,6 +574,7 @@ export class MockEngine implements EngineLike {
 
   finishCapture(): Promise<void> {
     return this.longRun(async () => {
+      if (this.modelPending) this.emitModelUpdate(this.frameIndex - 1);
       if (this.stallOn.finishCapture) await this.stall('mapping 2 keyframes');
       await this.stage('matching', 200, undefined, 'finishing capture');
       this.captureDone = true;
@@ -412,6 +623,7 @@ export class MockEngine implements EngineLike {
 
   private async longRun<T>(fn: () => Promise<T>): Promise<T> {
     this.cancelled = false;
+    this.finishRequested = false;
     this.longOp = true;
     const aborted = new Promise<never>((_, reject) => {
       this.abortCurrent = reject;
@@ -421,6 +633,7 @@ export class MockEngine implements EngineLike {
     } finally {
       this.longOp = false;
       this.cancelled = false;
+      this.finishRequested = false;
       this.abortCurrent = null;
     }
   }
@@ -497,12 +710,19 @@ export class MockEngine implements EngineLike {
       await run('reconstruction', 2200, 'reconstructionMs');
       await run('alignment', 700, 'alignmentMs');
       this.sparse = this.buildSparse(this.keyframes.length, t);
+      if (this.unconnectedImages > 0) {
+        const n = this.sparse.stats.images as number;
+        const u = Math.min(this.unconnectedImages, n - 2);
+        this.sparse.stats = { ...this.sparse.stats, registeredImages: n - u, unconnectedImages: u };
+      } else this.sparse.stats.unconnectedImages = 0;
       this.captureDone = true;
       this.denseResumablePass = null; // refine invalidates stored depth maps
       this.denseResumableQuality = null;
       this.splatOut = null; // … and the splats
       this.splatResumable = null;
       this.splatResumableQuality = null;
+      await this.persistResume({ ...DENSE_RESUME_KEYS, ...SPLAT_RESUME_KEYS });
+      this.splatContinues = false;
       return this.sparse;
     });
   }
@@ -517,8 +737,17 @@ export class MockEngine implements EngineLike {
       const t0 = performance.now();
       const resumed = this.denseResumablePass !== null && (this.denseResumableQuality ?? q) === q ? this.denseResumablePass : null;
       let t1 = t0;
+      // the first stored depth map makes the run resumable after a kill (the engine's dense/progress)
+      let stored = false;
+      const depthProgress: ProgressCallback = (e) => {
+        if (!stored && e.progress > 0) {
+          stored = true;
+          void this.persistResume({ denseResumablePass: 1, denseResumableQuality: q });
+        }
+        onProgress?.(e);
+      };
       try {
-        await this.stage('depth_maps', 2600 * f * (resumed !== null ? 0.4 : 1), onProgress, `${this.sparse.cameras.length} views`);
+        await this.stage('depth_maps', 2600 * f * (resumed !== null ? 0.4 : 1), depthProgress, `${this.sparse.cameras.length} views`);
         t1 = performance.now();
         await this.stage('fusion', 1100 * f, onProgress);
       } catch (e) {
@@ -526,11 +755,17 @@ export class MockEngine implements EngineLike {
         if ((e as { name?: string })?.name === ENGINE_ERRORS.cancelled) {
           this.denseResumablePass = 1;
           this.denseResumableQuality = q;
+          if (!this.disposed) await this.persistResume({ denseResumablePass: 1, denseResumableQuality: q });
         }
         throw e;
       }
       this.denseResumablePass = null;
       this.denseResumableQuality = null;
+      // like the engine: the splat checkpoints of the previous cloud go (a new run; the model stays)
+      this.splatResumable = null;
+      this.splatResumableQuality = null;
+      this.splatContinues = false;
+      await this.persistResume({ ...DENSE_RESUME_KEYS, ...SPLAT_RESUME_KEYS });
       const n = Math.round(this.sizes.dense * (q === 'fast' ? 0.6 : q === 'max' ? 1.5 : 1));
       this.denseCloud = scene.dense(n);
       const size = q === 'fast' ? 800 : q === 'max' ? 1600 : 1280;
@@ -564,16 +799,23 @@ export class MockEngine implements EngineLike {
 
   /**
    * Like the real stage: 'splat_prepare' → 'splat_training' (progress `detail`: iteration,
-   * iterations, loss, itPerSec, gaussians) → 'splat_finishing'; a cancel keeps the iteration for
-   * a resume. The model: one isotropic Gaussian per point of the dense (else sparse) cloud.
+   * iterations, loss, itPerSec, gaussians, finishFrom) → 'splat_finishing'; with `preview`,
+   * 'splat_preview' snapshots after the preparation and about 12 times during the training. A
+   * cancel keeps the iteration for a resume; `finishEarly` (from 30 % of the iterations on) ends
+   * the training there and keeps it resumable too (stats splatFinishedEarly / splatContinueFrom;
+   * loadSession adds splatContinuesModel). A densify drops the resume state, as the engine does.
+   * The model: one isotropic Gaussian per point of the dense (else sparse) cloud.
    */
   splat(options?: SplatOptions, onProgress?: ProgressCallback): Promise<SplatResult> {
     return this.longRun(async () => {
       this.check('splat');
       this.ensureScene();
       if (!this.sparse) throw new Error('Run refine() first');
+      const sparse = this.sparse;
       const q = options?.quality ?? this.options?.quality ?? 'balanced';
       const iterations = options?.iterations ?? (q === 'fast' ? 3000 : q === 'max' ? 7000 : 5000);
+      // the engine's: the end of the trainer's coarse-to-fine schedule
+      const finishFrom = Math.round(0.3 * iterations);
       const t0 = performance.now();
       const emit = (e: ProgressEvent): void => {
         try {
@@ -583,6 +825,14 @@ export class MockEngine implements EngineLike {
         }
         this.progressE.emit(e);
       };
+      const cam = sparse.cameras[Math.floor(sparse.cameras.length / 2)];
+      const preview = (it: number): void => {
+        if (!options?.preview || !cam) return;
+        const f = it / iterations;
+        const image = mockSplatPreview(this.denseCloud ?? sparse.points, cam, f);
+        const psnr = Math.round(100 * (19 + 11 * (1 - Math.exp(-4 * f)))) / 100;
+        emit({ stage: SPLAT_STAGES.preview, progress: f, message: `iteration ${it}`, detail: { iteration: it, iterations, viewId: cam.id, psnr }, image });
+      };
       await this.stage(SPLAT_STAGES.prepare, 700, onProgress, 'initial Gaussians');
       // like the engine's run key: only the same settings resume
       const sameRun = !this.splatResumableQuality || this.splatResumableQuality === q;
@@ -590,35 +840,89 @@ export class MockEngine implements EngineLike {
       const ms = (2600 * (q === 'fast' ? 0.6 : q === 'max' ? 1.6 : 1)) / this.speed;
       let elapsed = (ms * start) / iterations;
       let it = start;
+      preview(it);
+      let lastPreview = elapsed;
+      let finishedEarly = false;
       while (it < iterations) {
         if (this.cancelled) {
           this.splatResumable = it;
           this.splatResumableQuality = q;
+          this.splatContinues = false;
+          // (a disposed engine is gone, like a terminated worker: it writes nothing more)
+          if (it > 0 && !this.disposed) await this.persistResume({ splatResumableIteration: it, splatResumableQuality: q, splatContinuesModel: null });
           throw namedError(ENGINE_ERRORS.cancelled, 'Cancelled');
+        }
+        if (this.finishRequested && it >= finishFrom) {
+          finishedEarly = true;
+          break;
         }
         if (this.disposed) throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');
         await sleep(80);
         if (this.hidden) continue;
         elapsed += 80;
+        const prev = it;
         it = Math.min(iterations, Math.round((iterations * elapsed) / ms));
+        // a checkpoint (not of the last iteration: the model is saved then)
+        const ckpt = Math.floor(it / CHECKPOINT_EVERY) * CHECKPOINT_EVERY;
+        if (ckpt > prev && ckpt < iterations) void this.persistResume({ splatResumableIteration: ckpt, splatResumableQuality: q, splatContinuesModel: null });
         const loss = 0.04 + 0.2 * Math.exp((-5 * it) / iterations);
-        emit({ stage: SPLAT_STAGES.training, progress: it / iterations, message: `iteration ${it}/${iterations}`, detail: { iteration: it, iterations, loss, itPerSec: Math.round((1000 * iterations) / ms), gaussians: 20_000 + Math.round(it * 10) } });
+        emit({
+          stage: SPLAT_STAGES.training,
+          progress: it / iterations,
+          message: `iteration ${it}/${iterations}`,
+          detail: { iteration: it, iterations, loss, itPerSec: Math.round((1000 * iterations) / ms), gaussians: 20_000 + Math.round(it * 10), finishFrom },
+        });
+        if (it < iterations && elapsed - lastPreview >= Math.max(400, ms / 12)) {
+          lastPreview = elapsed;
+          preview(it);
+        }
       }
-      this.splatResumable = null;
-      this.splatResumableQuality = null;
+      // finished early: resumable from there, like the engine's kept checkpoint
+      this.splatResumable = finishedEarly ? it : null;
+      this.splatResumableQuality = finishedEarly ? q : null;
+      this.splatContinues = finishedEarly;
+      await this.persistResume(finishedEarly ? { splatResumableIteration: it, splatResumableQuality: q, splatContinuesModel: 1 } : SPLAT_RESUME_KEYS);
       // like the engine: a cancel arriving now is ignored (the training is complete)
       emit({ stage: SPLAT_STAGES.finishing, progress: 0, message: 'saving' });
       await sleep(300 / this.speed);
       emit({ stage: SPLAT_STAGES.finishing, progress: 1 });
-      const model = this.mockSplats(this.denseCloud ?? this.sparse.points);
-      const info = this.splatInfo(model, iterations, Math.round(performance.now() - t0));
+      const model = this.mockSplats(this.denseCloud ?? sparse.points);
+      const info = this.splatInfo(model, it, Math.round(performance.now() - t0), iterations);
       if (start) info.stats.splatResumedFrom = start;
+      if (finishedEarly) Object.assign(info.stats, { splatFinishedEarly: 1, splatContinueFrom: it });
       this.splatOut = { model, info };
       return info;
     });
   }
 
-  private splatInfo(model: SplatModel, iterations: number, ms: number): SplatResult {
+  /**
+   * Set (value) / remove (null) resume markers in the persistent session's stored stats — the
+   * mock's stand-in for the engine's stored progress records (see the header). Queued, so a later
+   * removal never lands before an earlier write; storage errors are ignored.
+   */
+  private persistResume(patch: Record<string, number | string | null>): Promise<void> {
+    const id = this.sessionId;
+    if (!id || !this.options?.persist) return this.persistQ;
+    this.persistQ = this.persistQ
+      .then(async () => {
+        const store = await this.sessionsSrc();
+        const cur = store ? await store.getSession(id) : null;
+        if (!store || !cur) return;
+        const stats = { ...(cur.stats ?? {}) };
+        let changed = false;
+        for (const [k, v] of Object.entries(patch)) {
+          if (v === null ? k in stats : stats[k] !== v) changed = true;
+          if (v === null) delete stats[k];
+          else stats[k] = v;
+        }
+        if (changed) await store.updateSession(id, { stats });
+      })
+      .catch(() => undefined);
+    return this.persistQ;
+  }
+
+  /** Info of a model trained `iterations` of a `schedule`-iteration run. */
+  private splatInfo(model: SplatModel, iterations: number, ms: number, schedule = iterations): SplatResult {
     return {
       count: model.count,
       iterations,
@@ -626,7 +930,7 @@ export class MockEngine implements EngineLike {
       shDegree: model.shDegree,
       bytes: 56 * model.count,
       antialiased: true,
-      stats: { splatViews: this.sparse?.cameras.length ?? 0, splatIterations: iterations, splatItPerSec: 40, splatTrainMs: ms },
+      stats: { splatViews: this.sparse?.cameras.length ?? 0, splatIterations: schedule, splatItPerSec: 40, splatTrainMs: ms },
     };
   }
 
@@ -646,6 +950,7 @@ export class MockEngine implements EngineLike {
     this.meshModel = o.mesh;
     this.splatOut = o.splat ? { model: o.splat, info: this.splatInfo(o.splat, 3000, 0) } : null;
     this.splatResumable = null;
+    this.splatContinues = false;
     this.sessionName = o.name;
     this.setState('ready');
   }
@@ -707,6 +1012,19 @@ export class MockEngine implements EngineLike {
         if (!this.splatOut) throw new Error('Train Gaussian splats first');
         const ply = encodeSplatPLY(this.splatOut.model, { comments: [`exported by sfm mock engine: ${name}`] });
         return new Blob([ply as Uint8Array<ArrayBuffer>], { type: 'application/octet-stream' });
+      }
+      case 'usdz': {
+        // the engine's recipe (src/engine/export.ts) with a small atlas
+        if (!this.meshModel) throw new Error('Build the mesh first');
+        const atlas = buildColourAtlas(this.meshModel, { size: 512 });
+        const jpeg = await mockJpeg(atlas.texture);
+        if (!jpeg) throw new Error('USDZ export needs OffscreenCanvas (JPEG encoding), which this browser lacks');
+        const usdz = encodeUSDZ({ mesh: atlas.mesh, uvs: atlas.uvs, texture: jpeg, pivot: selectArPivot(this.meshModel), name });
+        return new Blob([usdz as Uint8Array<ArrayBuffer>], { type: 'model/vnd.usdz+zip' });
+      }
+      case 'spz': {
+        if (!this.splatOut) throw new Error('Train Gaussian splats first');
+        return new Blob([(await encodeSplatSPZ(this.splatOut.model)) as Uint8Array<ArrayBuffer>], { type: 'application/octet-stream' });
       }
     }
   }
@@ -796,35 +1114,12 @@ export class MockEngine implements EngineLike {
         meta = store ? await store.getSession(id) : null;
         stopIfClosed();
         if (!meta) throw new Error(`Session not found: ${id}`);
-        const mode = meta.mode === 'scene' ? 'scene' : 'object';
-        const quality = (options?.quality ?? (meta.stats?.quality as EngineOptions['quality'] | undefined) ?? 'balanced') as EngineOptions['quality'];
-        this.options = { mode: meta.mode, quality, sessionId: id, persist: true };
-        this.sessionId = id;
-        this.reset(mode, quality);
-        // A finished capture: the whole trajectory was scanned.
-        const kf = Math.max(8, Math.min(36, meta.numFrames || 24));
-        const span = Math.min(1, kf / 36);
-        const scene = this.scene!;
-        for (let i = 0; i < kf; i++) {
-          const s = (span * i) / Math.max(1, kf - 1);
-          this.keyframes.push({ s, pose: { pose: scene.poseAt(s), intrinsics: scene.intrinsics(1440, 1920) } });
-        }
-        this.captureDone = true;
-        const st = meta.status;
-        if (st === 'sparse' || st === 'dense' || st === 'meshed') this.sparse = this.buildSparse(kf, {});
-        if (st === 'dense' || st === 'meshed') this.denseCloud = scene.dense(this.sizes.dense);
-        if (st === 'meshed') this.meshModel = scene.mesh();
-        // the splats persist like the engine's splat/model (the app records their size)
-        const sg = meta.stats?.splatGaussians;
-        if (typeof sg === 'number' && sg > 0 && this.sparse) {
-          const it = meta.stats?.splatIterations;
-          const model = this.mockSplats(this.denseCloud ?? this.sparse.points);
-          this.splatOut = { model, info: this.splatInfo(model, typeof it === 'number' ? it : 3000, 0) };
-        }
+        this.loadStored(meta, options?.quality);
         const sr = meta.stats?.splatResumableIteration;
         if (typeof sr === 'number' && this.sparse) this.splatResumable = sr;
         const sq = meta.stats?.splatResumableQuality;
         if (sq === 'fast' || sq === 'balanced' || sq === 'max') this.splatResumableQuality = sq;
+        this.splatContinues = this.splatResumable !== null && meta.stats?.splatContinuesModel === 1;
         const rp = meta.stats?.denseResumablePass;
         if (typeof rp === 'number' && this.sparse && !this.denseCloud) this.denseResumablePass = rp;
         const rq = meta.stats?.denseResumableQuality;
@@ -850,6 +1145,7 @@ export class MockEngine implements EngineLike {
           ...(this.sparse?.stats ?? {}),
           ...(this.splatResumable !== null ? { splatResumableIteration: this.splatResumable } : {}),
           ...(this.splatResumable !== null && this.splatResumableQuality ? { splatResumableQuality: this.splatResumableQuality } : {}),
+          ...(this.splatResumable !== null && this.splatContinues && this.splatOut?.info.iterations === this.splatResumable ? { splatContinuesModel: 1 } : {}),
           ...(this.denseResumablePass !== null ? { denseResumablePass: this.denseResumablePass } : {}),
           ...(this.denseResumablePass !== null && this.denseResumableQuality ? { denseResumableQuality: this.denseResumableQuality } : {}),
         },
@@ -870,6 +1166,11 @@ export class MockEngine implements EngineLike {
   /** (One long operation runs at a time here — exports are not long ones —: `method` is not checked.) */
   cancel(_method?: EngineMethod): void {
     if (this.longOp) this.cancelled = true;
+  }
+
+  /** Like the engine: only the splat training reacts (from its `finishFrom` on). */
+  finishEarly(_method?: EngineMethod): void {
+    if (this.longOp) this.finishRequested = true;
   }
 
   async abortLongOperation(opts: { graceMs?: number; reinit?: boolean; method?: EngineMethod } = {}): Promise<AbortOutcome> {
@@ -967,4 +1268,75 @@ export class MockEngine implements EngineLike {
   get captureFinished(): boolean {
     return this.captureDone;
   }
+  /** Test helper: RGB of the last frame's 1×1 pixel sample (null: the frame was not read). */
+  get lastFrameSample(): readonly [number, number, number] | null {
+    return this.lastSample;
+  }
+}
+
+/** JPEG bytes of an RGBA image (null without OffscreenCanvas, e.g. in Node). */
+async function mockJpeg(img: RGBAImage): Promise<Uint8Array | null> {
+  if (typeof OffscreenCanvas === 'undefined') return null;
+  const c = new OffscreenCanvas(img.width, img.height);
+  const ctx = c.getContext('2d');
+  if (!ctx) return null;
+  ctx.putImageData(new ImageData(new Uint8ClampedArray(img.data), img.width, img.height), 0, 0);
+  return new Uint8Array(await (await c.convertToBlob({ type: 'image/jpeg', quality: 0.9 })).arrayBuffer());
+}
+
+/**
+ * Synthetic 'splat_preview' snapshot: `pc` projected into `cam` (pinhole, distortion ignored) at
+ * ≤ 400 px, coarse to fine like the trainer's resolution schedule (8 / 4 / 2 / 1 px blocks until
+ * 10 / 30 / 60 % of the training, `frac`), fading in from the black training background.
+ */
+export function mockSplatPreview(pc: PointCloud, cam: SparseCamera, frac: number): RGBAImage {
+  const K = cam.intrinsics;
+  const factor = Math.max(1, Math.ceil(Math.max(K.width, K.height) / 400));
+  const W = Math.max(1, Math.floor(K.width / factor));
+  const H = Math.max(1, Math.floor(K.height / factor));
+  const block = frac < 0.1 ? 8 : frac < 0.3 ? 4 : frac < 0.6 ? 2 : 1;
+  const w = Math.ceil(W / block);
+  const h = Math.ceil(H / block);
+  const depth = new Float32Array(w * h).fill(Infinity);
+  const rgb = new Uint8Array(3 * w * h);
+  const { R, t } = cam.pose;
+  // §2 downscale of the camera by factor · block
+  const s = factor * block;
+  const f = K.f / s;
+  const cx = (K.cx + 0.5) / s - 0.5;
+  const cy = (K.cy + 0.5) / s - 0.5;
+  // a 2 × 2 footprint at full resolution (the samples are sparser than the pixels there)
+  const foot = block === 1 ? 2 : 1;
+  const P = pc.positions;
+  for (let i = 0, stride = Math.max(1, Math.floor(pc.count / 60_000)); i < pc.count; i += stride) {
+    const X = P[3 * i];
+    const Y = P[3 * i + 1];
+    const Z = P[3 * i + 2];
+    const z = R[6] * X + R[7] * Y + R[8] * Z + t[2];
+    if (!(z > 0.02)) continue;
+    const u = Math.round((f * (R[0] * X + R[1] * Y + R[2] * Z + t[0])) / z + cx);
+    const v = Math.round((f * (R[3] * X + R[4] * Y + R[5] * Z + t[1])) / z + cy);
+    for (let y = v; y < v + foot; y++) {
+      for (let x = u; x < u + foot; x++) {
+        if (x < 0 || y < 0 || x >= w || y >= h) continue;
+        const k = y * w + x;
+        if (z >= depth[k]) continue;
+        depth[k] = z;
+        rgb.set(pc.colors.subarray(3 * i, 3 * i + 3), 3 * k);
+      }
+    }
+  }
+  const a = Math.min(1, 0.35 + 0.65 * frac);
+  const data = new Uint8ClampedArray(4 * W * H);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const k = 3 * (Math.floor(y / block) * w + Math.floor(x / block));
+      const o = 4 * (y * W + x);
+      data[o] = a * rgb[k];
+      data[o + 1] = a * rgb[k + 1];
+      data[o + 2] = a * rgb[k + 2];
+      data[o + 3] = 255;
+    }
+  }
+  return { width: W, height: H, data };
 }

@@ -1,9 +1,10 @@
 /**
  * Types of the dataset-driven engine harness (harness.html, `window.runPipeline(config)`).
  * Everything in {@link HarnessResult} is plain JSON (typed arrays are converted), so it survives
- * Playwright's `page.evaluate` and can be written to disk as is.
+ * Playwright's `page.evaluate` (or the bridge's POST of a phone run) and can be written to disk as is.
  */
-import type { MetricInfo } from '../../core/types';
+import type { MetricInfo, ObjectRoi } from '../../core/types';
+import type { CoveragePrompt } from '../../app/coverage';
 import type { DebugKeyframe, DebugPair } from './debug-dump';
 import type {
   CaptureMode,
@@ -51,9 +52,9 @@ export interface HarnessConfig {
   baseUrl?: string;
   /** 'worker' (EngineClient over src/workers/engine.worker.ts, default), 'inline' (src/engine on the page) or 'mock'. */
   engine?: HarnessEngineKind;
-  /** Default: 'object' for object datasets, 'scene' otherwise. */
+  /** Default: 'object' for object datasets, 'scene' otherwise; a recording's recorded mode. */
   mode?: CaptureMode;
-  /** Default 'fast'. */
+  /** Default 'fast'; a recording's recorded preset. */
   quality?: QualityPreset;
   /** First dataset frame (position in time order, default 0). */
   startFrame?: number;
@@ -79,18 +80,37 @@ export interface HarnessConfig {
    * the dataset has a location and GPS is fed, else 'true'.
    */
   headingNorth?: 'magnetic' | 'app' | 'true';
-  /** Capture date (epoch ms) for the magnetic declination of the replayed headings (default: the run's start). */
+  /** Capture date (epoch ms) for the magnetic declination of the replayed headings (default: the run's start; a recording's own date). */
   captureDateMs?: number;
+  /**
+   * Raw capture recordings (frames.jsonl, src/io/recording.ts): replay the recorded FrameInputs
+   * verbatim (default true when the dataset is a recording). false = synthesize them from
+   * frames.json / imu.json / geo.json / heading.json like a synthetic dataset.
+   */
+  verbatim?: boolean;
+  /**
+   * Verbatim replay: 'recorded' (default) = the recorded JPEG as is (≤ 1280 px); 'original' =
+   * resized back to the size the engine got on the device (a VideoFrame's display size fitted to
+   * its `maxSide`, else the bitmap size).
+   */
+  replaySize?: 'recorded' | 'original';
   /** Pass `gravityDevice` (FramePump metadata, from the IMU; default = useImu). */
   useGravity?: boolean;
   /**
    * EngineOptions.hfovPriorDeg (FOV across the long side). Default 67.3 (what CameraCapture
-   * reports for an iPhone main camera; the synthetic datasets use 65°). 'gt' = exact value from
-   * the dataset intrinsics, 'none' = no prior.
+   * reports for an iPhone main camera; the synthetic datasets use 65°), for a recording the
+   * recorded prior. 'gt' = exact value from the dataset intrinsics, 'none' = no prior.
    */
   hfovPriorDeg?: number | 'gt' | 'none';
   /** Run densify (default false). */
   densify?: boolean | DenseOptions;
+  /**
+   * Experiments: after densify, densify the SAME sparse model again with these options over the
+   * first run's (e.g. `{ overlap: false }`: the CPU/GPU overlap A/B on identical inputs) and compare
+   * the two clouds bit for bit (`result.denseRepeat`; its stage timings under step 'densifyRepeat').
+   * Default null (once).
+   */
+  densifyRepeat?: DenseOptions | null;
   /** Run mesh (default false; needs densify). */
   mesh?: boolean | MeshOptions;
   /** Run the Gaussian-splatting stage after mesh / densify / refine (default false). */
@@ -110,7 +130,7 @@ export interface HarnessConfig {
   /** MockEngine time multiplier (default 4). */
   mockSpeed?: number;
   timeouts?: HarnessTimeouts;
-  /** Stream PLY files to Node through `window.__e2eWrite` (installed by e2e/run-e2e.mjs). */
+  /** Stream PLY files to the runner through `window.__e2eWrite` (Playwright or the fetch bridge, e2e/run-e2e.mjs). */
   output?: HarnessOutput;
   /** Embed the dense cloud as base64 in the result when it is not streamed (default true). */
   embedDensePoints?: boolean;
@@ -137,10 +157,36 @@ export interface HarnessConfig {
    * (src/harness/engine/replay.ts, e2e/splat-replay.mjs). Default false.
    */
   dumpSession?: boolean;
+  /**
+   * Continue the capture after a page reload (EngineOptions.extend, docs/ENGINE.md "Extend"): at
+   * this fraction (0 < f < 1) of the planned frames the harness finishes and refines the first
+   * segment, re-inits the engine with `{ sessionId, resume: true, extend: true }` (implies
+   * `persist`), skips `extendSkipS` seconds of frames and feeds the rest with every time (frame,
+   * IMU, GPS) rebased to start at 500 ms, like a reloaded page's performance.now(); then
+   * finishCapture, refine and the rest as usual (`result.extend`). Default null (off).
+   */
+  extendAt?: number | null;
+  /** Seconds of planned frames skipped after the `extendAt` split (default 0). */
+  extendSkipS?: number;
+}
+
+/** One 'splat_preview' snapshot of the splat stage (SplatPreviewDetail + where it went). */
+export interface SplatPreviewRecord {
+  iteration: number;
+  /** Arrival, ms after the splat stage started. */
+  ms: number;
+  /** PSNR (dB) against that training view's photo, raw trainer colours. */
+  psnr: number;
+  viewId: number;
+  width: number;
+  height: number;
+  /** The streamed PNG (relative to the runner's output directory), null when not written. */
+  file: string | null;
 }
 
 /** Config with every default filled in. */
-export interface ResolvedHarnessConfig extends Required<Omit<HarnessConfig, 'output' | 'fps' | 'maxFrames' | 'timeouts' | 'hfovPriorDeg' | 'engineConfig'>> {
+export interface ResolvedHarnessConfig extends Required<Omit<HarnessConfig, 'output' | 'fps' | 'maxFrames' | 'timeouts' | 'hfovPriorDeg' | 'engineConfig' | 'extendAt'>> {
+  extendAt: number | null;
   engineConfig: Record<string, unknown> | null;
   output: HarnessOutput | null;
   fps: number | null;
@@ -167,7 +213,7 @@ export interface IntrinsicsJSON {
 }
 
 export interface FrameRecord {
-  /** Delivered-frame counter (FrameInput.index). */
+  /** FrameInput.index sent: the delivered-frame counter, or in a verbatim replay the recorded index. */
   i: number;
   /** Dataset frame index (frames.json `index`). */
   index: number;
@@ -272,12 +318,36 @@ export interface LiveSummary {
   keyframeMs: NumStats;
   /** Last live cameras (LiveUpdate.cameras of the newest update carrying them). */
   cameras: { pose: PoseJSON; f: number }[];
+  /** Coverage of those cameras (what the capture screen's object-mode ring shows); null without cameras. */
+  coverage: LiveCoverage | null;
   /**
    * Last live cameras mapped to dataset frames by keyframe order (only when every keyframe of
    * that update is registered and each one was announced by a 'keyframe' frame response;
    * integrator must verify the ordering assumption).
    */
   images: { index: number; pose: PoseJSON }[] | null;
+}
+
+/**
+ * Object coverage of a set of live cameras (src/app/coverage.ts `computeCoverage`; elevation
+ * bands only when gravity is fed — the app's rule for a running motion sensor). Recorded for
+ * every capture: a scene capture usually stays `stable: false` (the cameras do not converge).
+ */
+export interface LiveCoverage {
+  stable: boolean;
+  /** Elevation bands in use (gravity fed). */
+  elevation: boolean;
+  /** Covered sectors of the level (low + mid) and high tiers / 24 (azimuth only: covered sectors / 12). */
+  completeness: number;
+  /** Covered cells (≥ 2 keyframes) of the 12 sectors per band: low −10–10°, mid 10–40°, high > 40°. */
+  covered: [number, number, number];
+  /** Covered sectors at any height. */
+  coveredSectors: number;
+  prompt: CoveragePrompt;
+  /** Keyframes per cell, [band][sector] (sector 0 = the first keyframe, counter-clockwise from above). */
+  counts: number[][];
+  /** Cameras the coverage was computed from. */
+  cameras: number;
 }
 
 export interface CloudSummary {
@@ -303,6 +373,61 @@ export interface LogRecord {
   message: string;
 }
 
+/** A raw capture recording's replay (`HarnessResult.recording`). */
+export interface RecordingSummary {
+  /** The recorded FrameInputs were replayed verbatim. */
+  verbatim: boolean;
+  /**
+   * frames.jsonl rows replayed as frames (the engine got them, with pixels) / not replayed
+   * (unparseable, no pixels — their IMU goes to the next frame —, not sent) / of those, rows the
+   * device engine never got (left out, IMU included).
+   */
+  rows: number;
+  skipped: number;
+  notSent: number;
+  /** What the engine answered on the device (live.jsonl; null without it). */
+  device: {
+    frames: number;
+    decisions: Record<string, number>;
+    /** Counts of the device's last answer. */
+    keyframes: number | null;
+    registered: number | null;
+    /** processFrame wall time / recorder back-pressure wait on the device (ms). */
+    frameMs: NumStats;
+    waitMs: NumStats;
+    errors: number;
+  } | null;
+  /** Per-frame decisions of the replay vs the device's (same recorded frame). */
+  agreement: { compared: number; same: number; rate: number | null; keyframesDevice: number; keyframesReplay: number; confusion: Record<string, number> } | null;
+}
+
+/** What the run ran on (./device.ts); queried while the dataset loads. */
+export interface HarnessDevice {
+  userAgent: string;
+  /** `navigator.platform` (deprecated, but 'iPhone' / 'MacIntel' / 'Linux x86_64' is useful here). */
+  platform: string | null;
+  /** Every iPhone reports 4 (docs/research/ios-platform.md). */
+  hardwareConcurrency: number | null;
+  devicePixelRatio: number;
+  /** CSS px. */
+  screen: [number, number] | null;
+  secureContext: boolean;
+  /** The page's WebGPU adapter (requested only, no device). */
+  adapter: {
+    vendor: string;
+    architecture: string;
+    device: string;
+    description: string;
+    features: string[];
+    /** maxBufferSize (≈ RAM class on Apple GPUs), maxStorageBufferBindingSize, … */
+    limits: Record<string, number>;
+  } | null;
+  /** Why `adapter` is null. */
+  adapterError?: string;
+  /** Bridged runs (./bridge-run.ts): the screen wake lock when the result was sent, and its last request error. */
+  wakeLock?: { active: boolean; error: string | null };
+}
+
 export interface HarnessResult {
   ok: boolean;
   aborted: boolean;
@@ -319,8 +444,13 @@ export interface HarnessResult {
     hasGeo: boolean;
     hasHeading: boolean;
     imuSamples: number;
+    /** A raw capture recording (frames.jsonl). */
+    recording?: boolean;
   };
+  /** Raw capture recordings: verbatim replay and the device comparison. */
+  recording?: RecordingSummary;
   engine: { kind: HarnessEngineKind; init: InitResult | null; respawns: number; statusChanges: { ms: number; state: string; reason?: string }[] };
+  device: HarnessDevice | null;
   /** Harness steps (ms): load, init, capture, finishCapture, refine, densify, mesh, splat, export, total. */
   timings: Record<string, number>;
   stageTimings: StageTiming[];
@@ -332,9 +462,24 @@ export interface HarnessResult {
   progress: ProgressRecord[];
   sparse: SparseSummary | null;
   dense: CloudSummary | null;
+  /** `densifyRepeat`: the second cloud vs the first (`difference`: the first mismatch, when not identical). */
+  denseRepeat?: { options: DenseOptions; count: number; ms: number; identical: boolean; difference?: string };
   /** Dense cloud as base64 (Float32 LE xyz + Uint8 rgb) when not streamed. */
   densePoints?: { count: number; xyz: string; rgb: string };
-  mesh: { vertexCount: number; triangleCount: number; file: string | null; bboxMin: number[] | null; bboxMax: number[] | null } | null;
+  /**
+   * `objectRoi`: the object box the TSDF was bounded to (MeshResult.objectRoi; null = none, e.g. scene
+   * mode); `stats`: the mesh stage's stats (voxelSize, tsdfAutoVoxelSize, tsdfCoarsenLevels, tsdfBlocks,
+   * tsdfMaxBlocks, objectRoi text, objectRoiConfidence, meshingMs, …), {} from engines without them.
+   */
+  mesh: {
+    vertexCount: number;
+    triangleCount: number;
+    file: string | null;
+    bboxMin: number[] | null;
+    bboxMax: number[] | null;
+    objectRoi: ObjectRoi | null;
+    stats: Record<string, number | string>;
+  } | null;
   /** The splat stage's result (SplatResult) and the streamed `splats.ply`. */
   splat?: {
     count: number;
@@ -347,6 +492,9 @@ export interface HarnessResult {
     /** `detail` of the last 'splat_training' progress event (SplatTrainingDetail). */
     lastDetail: Record<string, number> | null;
     file: string | null;
+    /** With `splat.preview`: every 'splat_preview' snapshot, and when the first training report came (ms after the stage started). */
+    previews?: SplatPreviewRecord[];
+    firstTrainingMs?: number | null;
   } | null;
   exports: Record<string, { bytes: number; ms: number; type: string } | { error: string }>;
   /** Files streamed through `__e2eWrite` (relative to the runner's output directory). */
@@ -355,12 +503,23 @@ export interface HarnessResult {
   errors: HarnessError[];
   /** JS heap of the page (Chromium `performance.memory`, bytes) after each step. Worker memory not included. */
   memory: Record<string, number>;
+  /** With `extendAt`: the split, the first segment's refine and the second segment's keyframes. */
+  extend?: ExtendSummary | null;
   /**
    * With `liveTrace`: one entry per LiveUpdate with cameras (frame responses and background
    * model updates). `poses` are the registered keyframes' poses sorted by keyframe id; when
    * `registered === keyframes` the k-th pose is the k-th keyframe (`live.keyframeIndices[k]`).
    */
-  liveTrace?: { ms: number; frameIndex: number; keyframes: number; registered: number; points: number; poses: PoseJSON[] }[];
+  liveTrace?: {
+    ms: number;
+    frameIndex: number;
+    keyframes: number;
+    registered: number;
+    points: number;
+    poses: PoseJSON[];
+    /** The coverage ring of this update (LiveCoverage without the counts). */
+    coverage: Omit<LiveCoverage, 'counts'>;
+  }[];
   /** With `debugDump` (inline engine). */
   debug?: {
     keyframeTrace: { frameIndex: number; keyframes: DebugKeyframe[] }[];
@@ -369,3 +528,22 @@ export interface HarnessResult {
   };
 }
 
+/** HarnessResult.extend (`extendAt`). */
+export interface ExtendSummary {
+  /** Frames delivered before the "reload" and the dataset frame index the second segment starts at. */
+  firstFrames: number;
+  resumeIndex: number;
+  /** Planned frames skipped after the split (`extendSkipS`). */
+  skippedFrames: number;
+  /** Subtracted from the dataset times of the second segment (ms). */
+  rebaseMs: number;
+  /** The first segment's finishCapture + refine (live counts after finishCapture). */
+  first: { keyframes: number; registeredLive: number; registeredImages: number | null; refineMs: number; error: string | null };
+  /** The re-init with resume + extend. */
+  init: InitResult | null;
+  resumedKeyframes: number | null;
+  /** Keyframes of the second segment: delivered, registered in the live model, in the final model. */
+  secondKeyframes: number | null;
+  secondRegisteredLive: number | null;
+  secondRegisteredFinal: number | null;
+}

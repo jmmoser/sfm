@@ -1,0 +1,147 @@
+# Slow tier, kept out of ci.yml (which stays typecheck + unit tests + build on every push / PR):
+#  * the WebGPU / DOM tests (vitest gpu project, headless Chromium + SwiftShader) in 6 shards;
+#    SwiftShader needs minutes for some files (splat-engine.gpu.test.ts ≈ 280 s alone). The
+#    engine worker test (src/engine/engine.gpu.test.ts) skips itself without e2e/data/object
+#    (gitignored), so the gpu-data job makes it once (cached) and every shard restores it;
+#  * a mock-engine e2e smoke on 40-frame datasets: the desktop runner, then the phone bridge
+#    (run-e2e.mjs --device local-bridge: harness.html?bridge=1 over HTTP, opened by Chromium);
+#  * the UI smoke (npm run ui:smoke: the whole app flow on the mock engine at iPhone size).
+# Playwright's Chromium is installed by e2e/ensure-chromium.mjs unless the runner image already
+# has it (PLAYWRIGHT_BROWSERS_PATH).
+name: Nightly
+
+on:
+  schedule:
+    - cron: '17 3 * * *' # 03:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # e2e/data/object for engine.gpu.test.ts: the first 40 frames of the default object set (8 fps over
+  # its 25 s orbit, the same poses and per-frame noise; the test reads frames 0-38 only). --frames 40
+  # alone would spread 40 frames over the whole orbit, 5x the baseline the test was written for.
+  gpu-data:
+    name: GPU test dataset
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache the dataset
+        id: data
+        uses: actions/cache@v4
+        with:
+          path: e2e/data/object
+          key: synth-object-head40-${{ hashFiles('src/harness/synth/**', 'synth.html', 'e2e/generate-synth.mjs', 'e2e/lib/synth-cli.mjs') }}
+      - uses: actions/setup-node@v4
+        if: steps.data.outputs.cache-hit != 'true'
+        with:
+          node-version: 22
+          cache: npm
+      - if: steps.data.outputs.cache-hit != 'true'
+        run: npm ci
+      - name: Playwright Chromium
+        if: steps.data.outputs.cache-hit != 'true'
+        run: node e2e/ensure-chromium.mjs
+      - name: Generate it
+        if: steps.data.outputs.cache-hit != 'true'
+        run: node e2e/generate-synth.mjs object --frames 40 --fps 8 --duration 25
+
+  gpu:
+    name: GPU tests (SwiftShader) ${{ matrix.shard }}/6
+    needs: gpu-data
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Playwright Chromium
+        run: node e2e/ensure-chromium.mjs
+      - name: Restore the GPU test dataset
+        uses: actions/cache/restore@v4
+        with:
+          path: e2e/data/object
+          key: synth-object-head40-${{ hashFiles('src/harness/synth/**', 'synth.html', 'e2e/generate-synth.mjs', 'e2e/lib/synth-cli.mjs') }}
+          fail-on-cache-miss: true
+      - name: GPU tests
+        run: npx vitest run --project gpu --shard=${{ matrix.shard }}/6
+      - name: Upload failure screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-shard-${{ matrix.shard }}
+          path: |
+            **/__screenshots__/**
+            .vitest-attachments/**
+          if-no-files-found: ignore
+
+  e2e-smoke:
+    name: e2e smoke (mock engine; desktop + phone bridge)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Playwright Chromium
+        run: node e2e/ensure-chromium.mjs
+      - name: Cache the 40-frame datasets
+        id: data
+        uses: actions/cache@v4
+        with:
+          path: e2e/data
+          key: synth40-${{ hashFiles('src/harness/synth/**', 'synth.html', 'e2e/generate-synth.mjs', 'e2e/lib/synth-cli.mjs') }}
+      - name: Generate datasets (object + yard, 40 frames)
+        if: steps.data.outputs.cache-hit != 'true'
+        run: node e2e/generate-synth.mjs all --frames 40
+      - name: Desktop runner
+        run: node e2e/run-e2e.mjs all --engine mock --quiet
+      - name: Phone bridge (local Chromium)
+        run: node e2e/run-e2e.mjs all --engine mock --quiet --device local-bridge
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-smoke
+          path: |
+            e2e/out/e2e/*/result.json
+            e2e/out/e2e/*/metrics.json
+          if-no-files-found: ignore
+
+  ui-smoke:
+    name: UI smoke (mock engine)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Playwright Chromium
+        run: node e2e/ensure-chromium.mjs
+      - run: npm run ui:smoke
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-smoke
+          path: e2e/out/ui/
+          if-no-files-found: ignore

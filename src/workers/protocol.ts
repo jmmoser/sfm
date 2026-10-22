@@ -16,9 +16,18 @@
  * Extensions over ENGINE.md (superset, nothing removed): the `visibility` request (workers get
  * no `visibilitychange`; the engine must not submit GPU work while the page is hidden), the
  * `close` request (let go of a session before it is deleted),
- * `EngineOptions.resume` (re-open a persisted session after a worker respawn), optional
- * FramePump metadata on `FrameInput`, `SessionSummary` carries the stored models, the Gaussian
- * splatting stage (`splat`, `splatModel`, export 'ply-splat', `ProgressEvent.detail`).
+ * `EngineOptions.resume` (re-open a persisted session after a worker respawn) and `extend`
+ * (continue a stored capture: "Add more views"; `InitResult.resumedKeyframes` / `captureMemory` /
+ * `storedModel`, `LiveUpdate.modelRebuild`),
+ * optional FramePump metadata on `FrameInput`, `SessionSummary` carries the stored models, the
+ * Gaussian splatting stage (`splat`, `splatModel`, exports 'ply-splat' / 'spz', `ProgressEvent.detail`, the
+ * 'splat_preview' snapshots in `ProgressEvent.image`, the `finishEarly` request), the
+ * object box of object-mode meshes (`MeshOptions.objectRoi`, `MeshResult`, `SessionSummary.objectRoi`), export
+ * 'usdz' (AR Quick Look).
+ *
+ * Times: FrameInput and LiveUpdate times are on the page's performance.now() base. The engine
+ * stores a capture on its session time base (FrameInput time + the capture segment's shift, see
+ * `extend`), which is what SparseResult camera times (`t`) are on.
  */
 import type {
   CameraIntrinsics,
@@ -26,6 +35,7 @@ import type {
   ImuSample,
   Mat3,
   MetricInfo,
+  ObjectRoi,
   PointCloud,
   Pose,
   ProgressEvent,
@@ -62,6 +72,15 @@ export interface EngineOptions {
    * EngineClient when it re-initialises a respawned worker).
    */
   resume?: boolean;
+  /**
+   * Extension, with `resume`: continue the stored capture — also a finished one ("Add more views")
+   * — with new frames: the capture is reopened (tracking restarts and relocalises against the
+   * rebuilt live model), its stored mode and quality are kept (different `mode` / `quality` are
+   * ignored), only the sparse model is loaded (not the dense cloud / mesh), and the new frames are
+   * shifted onto the session time base after the stored capture (EngineStateRecord.timeSegments).
+   * The next `refine` covers every keyframe and invalidates the later stages, as always.
+   */
+  extend?: boolean;
 }
 
 export interface InitResult {
@@ -69,6 +88,18 @@ export interface InitResult {
   adapter?: string;
   /** Why the engine runs on the CPU although a GPU was preferred. */
   fallbackReason?: string;
+  /** Extension (`resume`): keyframes restored from the store (absent: nothing restored). */
+  resumedKeyframes?: number;
+  /**
+   * Extension (`resume`): capture memory after the restore and the cap above which the engine adds
+   * no more keyframes (MB) — how much room a continued capture has.
+   */
+  captureMemory?: { usedMB: number; capMB: number };
+  /**
+   * Extension (`extend`): the stored sparse model (decimated like LiveUpdate.sparse; cameras without
+   * times), for the capture view until the rebuilt live model arrives.
+   */
+  storedModel?: { sparse: { positions: Float32Array; colors: Uint8Array }; cameras: LiveCamera[] };
 }
 
 export interface HeadingSample {
@@ -139,13 +170,18 @@ export interface FrameInput {
 export type DecodedFrameInput = FrameInput & { bitmap: ImageBitmap | RGBAImage };
 
 export type KeyframeDecision = 'keyframe' | 'skip' | 'reject_blur' | 'reject_motion';
-export type Guidance = 'good' | 'move_slower' | 'more_texture' | 'translate_more' | 'tracking_lost' | 'initializing';
+/** 'too_dark': the recent frames are too dark to track (median luma, or blur in dim light; src/engine/frame-ingest.ts LowLightMonitor). */
+export type Guidance = 'good' | 'move_slower' | 'more_texture' | 'translate_more' | 'tracking_lost' | 'initializing' | 'too_dark';
 export type TrackingState = 'initializing' | 'tracking' | 'lost';
 
 export interface LiveCamera {
   pose: Pose;
   intrinsics: CameraIntrinsics;
-  /** Capture time of the keyframe on the IMU clock (camera time + estimated camera–IMU offset), ms. */
+  /**
+   * Capture time of the keyframe on the IMU clock (camera time + estimated camera–IMU offset), ms,
+   * on the page's FrameInput time base: keyframes of an earlier capture segment (a scan continued
+   * after a reload, `EngineOptions.extend`) come out before the current segment's.
+   */
   t?: number;
   /**
    * Physical up in the camera frame (unit): −gravity when known, else up for a phone held in the
@@ -160,6 +196,12 @@ export interface LiveUpdate {
   decision: KeyframeDecision;
   guidance: Guidance;
   tracking: TrackingState;
+  /**
+   * Capture mode in effect: the session's mode, or for 'auto' the engine's decision once made
+   * ('auto' until then — LiveSession resolves it from ≥ 8 registered keyframes). Absent from
+   * older engines: treat as the configured mode.
+   */
+  resolvedMode?: CaptureMode;
   numKeyframes: number;
   numRegistered: number;
   numPoints: number;
@@ -183,6 +225,13 @@ export interface LiveUpdate {
   /** With `cameras`: the engine's gyro bias estimate (rad/s, device frame, subtracted from ω); null = none yet. */
   gyroBias?: [number, number, number] | null;
   timings: Record<string, number>;
+  /**
+   * Extension (`resume`): the restored capture's live model is still being rebuilt — keyframes
+   * re-added / total; its model update comes when it is done. Meanwhile at most
+   * `maxMappingBacklog` new keyframes are added (later keyframe frames are skipped,
+   * `timings.rebuildLimited`).
+   */
+  modelRebuild?: { done: number; total: number };
   /** Per-frame diagnostics for the capture debug overlay. */
   debug?: LiveDebug;
 }
@@ -232,6 +281,7 @@ export interface SparseResult {
   /**
    * Free-form statistics for the info sheet. Well-known keys (all optional): `images`,
    * `registeredImages`, `points`, `meanReprojErrorPx`, `meanTrackLength`, `focalPx`, `k1`, `k2`,
+   * `captureMode` (refine: 'object' | 'scene' as the capture resolved it, 'auto' when it never did),
    * and timings `<stage>Ms` (e.g. `matchingMs`, `reconstructionMs`, `alignmentMs`).
    */
   stats: Record<string, number | string>;
@@ -244,6 +294,11 @@ export interface DenseOptions {
   maxImageSize?: number;
   /** Limit the number of reference views. */
   maxViews?: number;
+  /**
+   * CPU/GPU overlap of the depth-map stage for this run (default `EngineConfig.denseOverlap`, on):
+   * an A/B switch for timings — the results are bit-identical either way.
+   */
+  overlap?: boolean;
 }
 
 export interface MeshOptions {
@@ -252,15 +307,34 @@ export interface MeshOptions {
   voxelSize?: number;
   /** Simplify to about this many triangles (default: no simplification). */
   targetTriangles?: number;
+  /**
+   * Object mode: mesh only inside the automatic object box (default true; false = the whole scene
+   * within the depth cut, "re-mesh full scene"). Ignored in scene mode.
+   */
+  objectRoi?: boolean;
+}
+
+/**
+ * Result of `mesh` (extension over ENGINE.md's TriangleMesh): the mesh plus the object box it was
+ * bounded to (object mode, gravity-aligned model, box found; else null) and the meshing stats
+ * (also merged into the session stats).
+ */
+export interface MeshResult extends TriangleMesh {
+  objectRoi?: ObjectRoi | null;
+  stats?: Record<string, number | string>;
 }
 
 /**
  * 'ply-splat': the trained Gaussian splats as an INRIA 3DGS PLY (x y z, f_dc / f_rest, opacity
  * logit, log-scales, rot w x y z; appearance-normalised; world frame of the model) — opens in
  * SuperSplat, Brush, Spark and most splat viewers.
+ * 'usdz': the mesh for AR Quick Look (≤ 100 k triangles, colours baked into a 2048² JPEG atlas,
+ * Y-up metres, origin at the AR pivot, horizontal-plane anchoring; src/io/usdz.ts) — needs a mesh.
+ * 'spz': the same model as a Niantic SPZ v3 file (gzip, ≈ 20 B per Gaussian before compression,
+ * RUB axes; src/splat/spz.ts) — SuperSplat, Spark and the reference spz library read it.
  */
-export type ExportFormat = 'ply-points' | 'ply-mesh' | 'glb' | 'colmap-zip' | 'ply-splat';
-export const EXPORT_FORMATS: readonly ExportFormat[] = ['ply-points', 'ply-mesh', 'glb', 'colmap-zip', 'ply-splat'];
+export type ExportFormat = 'ply-points' | 'ply-mesh' | 'glb' | 'colmap-zip' | 'ply-splat' | 'usdz' | 'spz';
+export const EXPORT_FORMATS: readonly ExportFormat[] = ['ply-points', 'ply-mesh', 'glb', 'colmap-zip', 'ply-splat', 'usdz', 'spz'];
 
 // ---------------------------------------------------------------------------------------------
 // Gaussian splatting stage (extension; docs/ENGINE.md "Splat")
@@ -281,6 +355,11 @@ export interface SplatOptions {
   backgroundShell?: boolean;
   /** Ignore a resumable checkpoint of the same run and train from the start. */
   restart?: boolean;
+  /**
+   * Post 'splat_preview' events while training: snapshots of the model from one training view
+   * (default off: the harness and tests opt in like the app).
+   */
+  preview?: boolean;
 }
 
 /** Progress stage names of `splat` (ProgressEvent.stage). */
@@ -289,6 +368,12 @@ export const SPLAT_STAGES = {
   prepare: 'splat_prepare',
   /** Training; `ProgressEvent.detail` is a `SplatTrainingDetail`. */
   training: 'splat_training',
+  /**
+   * With `SplatOptions.preview`: a snapshot of the model being trained (`ProgressEvent.image`,
+   * RGBA8 ≤ 400 px; `detail`: `SplatPreviewDetail`), once before the training and then every ≥ 2 s
+   * of it. Interleaved with the other stages and never throttled.
+   */
+  preview: 'splat_preview',
   /** Appearance normalisation, read-back, persisting the model. */
   finishing: 'splat_finishing',
 } as const;
@@ -303,6 +388,26 @@ export interface SplatTrainingDetail {
   /** Iterations per second of the last chunk. */
   itPerSec: number;
   gaussians: number;
+  /**
+   * First iteration at which `finishEarly` ends the training (the end of the coarse-to-fine
+   * resolution schedule: 30 % of the iterations by default); a request before it takes effect there.
+   */
+  finishFrom: number;
+}
+
+/** `ProgressEvent.detail` of the 'splat_preview' stage. */
+export interface SplatPreviewDetail {
+  [key: string]: number;
+  /** Iterations trained when the snapshot was rendered (0: the initial Gaussians). */
+  iteration: number;
+  iterations: number;
+  /** Keyframe id of the training view it is rendered from (the one nearest the middle photo). */
+  viewId: number;
+  /**
+   * PSNR (dB) against that view's training photo at the snapshot size, raw colours (no per-view
+   * colour correction or appearance normalisation). A training view: it flatters the model.
+   */
+  psnr: number;
 }
 
 /** What `splat` resolves with (the model itself: `splatModel`). */
@@ -321,7 +426,12 @@ export interface SplatResult {
   /**
    * Well-known keys: splatViews, splatWidth / splatHeight, splatMaxGaussians, splatInitGaussians,
    * splatShell, splatItPerSec, splatLoss, splatResumedFrom, splatMemPeakMB, splatGpuMB,
-   * splatDegraded, splatTrainMs, splatPrepareMs, splatStoredBytes.
+   * splatDegraded, splatTrainMs, splatPrepareMs, splatStoredBytes, splatIterations (the
+   * schedule), splatPreviews and splatPreviewFinalPsnr (with `preview`: the trained model from the
+   * preview view, the PSNR the previews converge to). Ended by `finishEarly`: splatFinishedEarly = 1
+   * and, when the checkpoint at that iteration was kept for a later `splat` to continue from,
+   * splatContinueFrom (that iteration) and splatContinueKey (its run): loadSession then reports
+   * splatResumableIteration and, while that checkpoint is still the kept one, splatContinuesModel = 1.
    */
   stats: Record<string, number | string>;
 }
@@ -358,6 +468,8 @@ export interface SessionSummary {
   sparse: SparseResult | null;
   dense: PointCloud | null;
   mesh: TriangleMesh | null;
+  /** Extension: the object box the stored mesh was bounded to (null = none / unknown). */
+  objectRoi?: ObjectRoi | null;
   /** Extension: the stored splat model's info (fetch the model with `splatModel`). */
   splat?: SplatResult | null;
   stats: Record<string, number | string>;
@@ -373,7 +485,7 @@ export interface EngineMethodMap {
   finishCapture: { params: undefined; result: void };
   refine: { params: undefined; result: SparseResult };
   densify: { params: DenseOptions | undefined; result: PointCloud };
-  mesh: { params: MeshOptions | undefined; result: TriangleMesh };
+  mesh: { params: MeshOptions | undefined; result: MeshResult };
   /** Extension: train Gaussian splats (after densify, or after refine without a dense cloud). */
   splat: { params: SplatOptions | undefined; result: SplatResult };
   /** Extension: the stored splat model (packed, transferred), null when none was trained. */
@@ -383,6 +495,12 @@ export interface EngineMethodMap {
   loadSession: { params: { id: string; options?: Partial<EngineOptions> }; result: SessionSummary };
   /** Cancel the request `target` (default: the running long operation). Resolves at once. */
   cancel: { params: { target?: number } | undefined; result: void };
+  /**
+   * Extension: end the request `target` (default: the running long operation) early and keep its
+   * result — the splat training stops at its current iteration (from `SplatTrainingDetail.finishFrom`
+   * on) and finishes like a complete run. Others ignore it. Resolves at once.
+   */
+  finishEarly: { params: { target?: number } | undefined; result: void };
   /** Extension: page visibility (pause GPU submissions while hidden). */
   visibility: { params: { hidden: boolean }; result: void };
   /**
@@ -410,6 +528,7 @@ export const ENGINE_METHODS: readonly EngineMethod[] = [
   'export',
   'loadSession',
   'cancel',
+  'finishEarly',
   'visibility',
   'close',
   'dispose',

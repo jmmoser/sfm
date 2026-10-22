@@ -2,10 +2,16 @@
  * Refine after capture (ENGINE.md "Refine"): vocabulary retrain / extend → candidate pairs
  * (sequential 10, retrieval 15, spatial 10) → match + verify → refined live model → unless it is
  * healthy (`liveModelHealth`), a full incremental SfM from scratch (live-refined intrinsics as the
- * initial guess) and the better of the live and the offline model (gyro breaks, registered
- * images, explained correspondences, mean reprojection error) → final global BA with
- * self-calibration (f, k1, k2), re-triangulation and filtering → world alignment (IMU gravity /
- * time offset / metric scale, GPS, compass; verified R_cam_device) → SparseModel.
+ * initial guess; gyro-aided registration after P3P failed on every candidate, unless the live model
+ * it checks holds such registrations) and the better of the live and the offline model (gyro
+ * breaks, registered images — the gyro-aided ones only for a model without an unclosed loop —,
+ * explained correspondences, mean reprojection error) → final global BA with self-calibration (f,
+ * k1, k2), re-triangulation and filtering → world alignment (IMU gravity / time offset / metric
+ * scale, GPS, compass; verified R_cam_device) → SparseModel.
+ *
+ * The offline SfM can return several models: only the largest is kept (no merging); stats
+ * `offlineModels` / `offlineDroppedImages` report the others, and `unconnectedImages` the
+ * keyframes missing from the final model (the viewer offers "Add more views" for them).
  *
  * Progress stages: 'matching', 'reconstruction', 'alignment' (src/app/stages.ts).
  */
@@ -134,9 +140,18 @@ export function modelPointCloud(m: SparseModel): PointCloud {
 }
 
 /**
- * When the only reason the IMU scale was rejected is low excitation, but the fit itself is
- * excellent, return the relaxed threshold to retry with: relative σ ≤ 3 % and either R² ≥ 0.9 with
- * excitation ≥ 0.03 m/s², or R² ≥ 0.95 with excitation ≥ 0.015 m/s².
+ * When the only reason the band-pass IMU scale was rejected is low excitation, but the fit itself
+ * is excellent, return the relaxed threshold to retry with: relative σ ≤ 3 % and either R² ≥ 0.9
+ * with excitation ≥ 0.03 m/s², or R² ≥ 0.95 with excitation ≥ 0.015 m/s². Reached when the
+ * alignment found no metric scale at all — the keyframe-interval estimate that
+ * `computeWorldAlignment` falls back to (`estimateMetricScaleFromIntervals`, not limited by the
+ * keyframe rate) was unreliable as well and no GPS scale exists, e.g. a gentle orbit, whose slow
+ * centripetal acceleration is degenerate with a device-frame accelerometer bias — or when the scale
+ * is that interval estimate alone and the retry would claim a smaller σ (`lowExcitationSigma`):
+ * the more precise of the two wins, not the one `computeWorldAlignment` happens to try first
+ * (e2e object-real: interval σ 2.4 % with κ just above its 2 % gate vs the retry's 2.0 %). Not
+ * when the interval regression also supplied the time offset (`intervalTimeOffset`): the re-run
+ * at the relaxed threshold takes the band-pass path and would fall back to the default offset.
  *
  * The excitation the inertial module measures is the band-limited IMU acceleration AS SAMPLED AT
  * THE KEYFRAMES: it falls with the keyframe rate, not only with the hand motion (e2e `object`, GT
@@ -148,7 +163,13 @@ export function modelPointCloud(m: SparseModel): PointCloud {
  */
 export function lowExcitationRetry(a: WorldAlignment): { minExcitation: number; excitation: number; r2: number } | null {
   const s = a.details.imuScale;
-  if (!s || s.reliable || a.metric.metric) return null;
+  if (!s || s.reliable) return null;
+  if (a.metric.metric) {
+    // (not when the interval regression also found the time offset: the re-run would lose it)
+    const iv = a.details.imuScaleIntervals;
+    if (a.metric.source !== 'imu' || !iv || !iv.reliable || a.details.intervalTimeOffset?.reliable) return null;
+    if (!(lowExcitationSigma(s.relUncertainty, s.r2) < iv.relUncertainty)) return null;
+  }
   const reasons = s.reason.split(';').map((r) => r.trim()).filter(Boolean);
   if (reasons.length !== 1 || !reasons[0].startsWith('insufficient excitation')) return null;
   if (!(s.scale > 0 && s.relUncertainty <= 0.03)) return null;
@@ -296,6 +317,8 @@ export interface SplitPairStats {
   /** Loop-like split pairs and their split correspondences. */
   loopPairs: number;
   loopCorrespondences: number;
+  /** The loop-like split pairs (image ids) and their split correspondences. */
+  loops: { a: number; b: number; split: number }[];
   /** The split pairs, most split first: "a-b split/inliers rotation° reprojection px" (diagnostics). */
   detail: string[];
 }
@@ -320,6 +343,7 @@ export function splitPairs(rec: Reconstruction, db: FeatureDatabase, opts: Parti
     splitCorr = 0,
     nLoop = 0,
     loopCorr = 0;
+  const loops: SplitPairStats['loops'] = [];
   const detail: { key: string; n: number }[] = [];
   const Rba = new Float64Array(9);
   const errs: number[] = [];
@@ -356,6 +380,7 @@ export function splitPairs(rec: Reconstruction, db: FeatureDatabase, opts: Parti
     if (med > o.minReprojPx && med <= o.maxReprojFocal * cam.f) {
       nLoop++;
       loopCorr += ns;
+      loops.push({ a, b, split: ns });
     }
     // diagnostics: the pair's rotation against the model's relative rotation R_b R_aᵀ
     let errDeg = NaN;
@@ -379,6 +404,7 @@ export function splitPairs(rec: Reconstruction, db: FeatureDatabase, opts: Parti
     splitCorrespondences: splitCorr,
     loopPairs: nLoop,
     loopCorrespondences: loopCorr,
+    loops,
     detail: detail.map((d) => d.key),
   };
 }
@@ -405,6 +431,11 @@ export interface LiveHealthOptions {
   /** Split correspondences on any split pair: at most max(abs, fraction × all) (defaults 1000, 1.5 %). */
   maxSplitCorrespondences: number;
   maxSplitFraction: number;
+  /**
+   * No loop-like split pair may join keyframes this fraction of the capture apart or more (in
+   * `keyframes` order; default 1/3): the two ends of a loop the model did not close.
+   */
+  maxLoopSpan: number;
   split: Partial<SplitPairOptions>;
 }
 
@@ -415,6 +446,7 @@ export const DEFAULT_LIVE_HEALTH_OPTIONS: Readonly<Omit<LiveHealthOptions, 'spli
   maxLoopFraction: 0.0025,
   maxSplitCorrespondences: 1000,
   maxSplitFraction: 0.015,
+  maxLoopSpan: 1 / 3,
 });
 
 /**
@@ -427,12 +459,29 @@ export const DEFAULT_LIVE_HEALTH_OPTIONS: Readonly<Omit<LiveHealthOptions, 'spli
  * reconstruction time. Healthy when ALL hold (a deterministic function of the model and the pairs):
  *  - every keyframe of `keyframes` is registered, and at least `minImages`;
  *  - the gyro is verified (`gyro` not null) and the model has no gyro breaks or outliers;
+ *  - no keyframe of the model was registered with the gyro-predicted rotation (`gyroAided`,
+ *    IncrementalMapper.knownRotationImages; only with EngineConfig.gyroAidedRegistration 'all'):
+ *    its rotation agrees with the gyro by construction, so the gyro checks are no evidence for it,
+ *    and it makes "every keyframe registered" easy (the offline SfM then runs without the gyro
+ *    path, as their independent check). A live
+ *    model registered through the gyro path drifted unnoticed (e2e yard-real at stride 3 from frame
+ *    1, the gyro path alone: 49/49 registered, 0.5 m / 3° apart at the loop's ends, ATE 6.9e-3, 16
+ *    loop-like split correspondences — healthy by the other rules);
  *  - at least `minExplained` of the verified correspondences are explained (same 3-D point);
  *  - no unclosed loop (`splitPairs`): few correspondences on loop-like split pairs (a loop gap of a
  *    few to a few hundred pixels), and few on split pairs at all (any gap). The thresholds sit
  *    between the e2e closed models (≤ 190 loop-like / ≤ 1940 split correspondences of 168 k on
  *    yard-real: limits 420 / 2520; none on object-real) and the unclosed live models (≥ 1200
- *    loop-like, or 2950–5650 split).
+ *    loop-like, or 2950–5650 split);
+ *  - and no loop-like split pair across ≥ `maxLoopSpan` of the capture: the two ends of a loop
+ *    the model did not close. A phone-rate capture has few, short loop tracks, so the counts above
+ *    miss it: e2e yard-real at stride 3 from frame 1 is mapped live with the focal 2.8 % long (the
+ *    self-calibration of the first ≈ 8 keyframes: weak geometry, far points), its loop's ends ≈ 11°
+ *    apart before refine; refine closed it in 11 of 13 runs (ATE 9.6e-4–1.0e-3) and left it open
+ *    in 2 (ATE 1.8e-2, rotation 2.4°) on only 47–69 loop-like correspondences (limit 150) — on the
+ *    loop's own pairs, keyframes 1–2 ↔ 42–44 (≈ 210 px). The closed models' loop-like pairs join
+ *    keyframes ≤ 17 % of the capture apart (yard-real: 14 of 81 at stride 1, 7 of 48 at stride 3);
+ *    a 12 px split across the capture in one closed model only costs the offline SfM's time.
  * Any doubt runs the offline SfM, as before: a wrong "unhealthy" only costs time.
  */
 export function liveModelHealth(
@@ -441,6 +490,7 @@ export function liveModelHealth(
   keyframes: readonly number[],
   gyro: GyroConsistency | null,
   opts: Partial<LiveHealthOptions> = {},
+  gyroAided: Iterable<number> = [],
 ): LiveModelHealth {
   const o = { ...DEFAULT_LIVE_HEALTH_OPTIONS, ...opts };
   const out = (healthy: boolean, reason: string, explained = NaN, split: SplitPairStats | null = null): LiveModelHealth => ({ healthy, reason, explained, split });
@@ -450,22 +500,84 @@ export function liveModelHealth(
   const n = rec.numRegisteredImages;
   if (n < o.minImages) return out(false, `only ${n} registered images (< ${o.minImages})`);
   if (!gyro) return out(false, 'no verified gyro to check it against');
+  let aided = 0;
+  for (const id of gyroAided) if (rec.images.get(id)?.registered) aided++;
+  if (aided > 0) return out(false, `${aided} keyframe(s) registered with the gyro-predicted rotation (no independent check)`);
   if (gyro.breaksWithoutOutliers > 0) return out(false, `${gyro.breaksWithoutOutliers} gyro break(s)`);
   if (gyro.outliers.length > 0) return out(false, `${gyro.outliers.length} keyframe(s) disagree with the gyro`);
   const explained = explainedCorrespondenceRatio(rec, db);
   if (!(explained >= o.minExplained)) return out(false, `${(100 * explained).toFixed(1)} % of the correspondences explained (< ${(100 * o.minExplained).toFixed(0)} %)`, explained);
   const sp = splitPairs(rec, db, opts.split);
-  const maxLoop = Math.max(o.maxLoopCorrespondences, o.maxLoopFraction * sp.correspondences);
-  const maxSplit = Math.max(o.maxSplitCorrespondences, o.maxSplitFraction * sp.correspondences);
-  const counts = `${sp.loopCorrespondences} correspondences on ${sp.loopPairs} loop-like and ${sp.splitCorrespondences} on ${sp.splitPairs} split pairs`;
-  if (sp.loopCorrespondences > maxLoop || sp.splitCorrespondences > maxSplit)
-    return out(false, `unclosed loop? ${counts} (limits ${Math.round(maxLoop)} / ${Math.round(maxSplit)})`, explained, sp);
+  const open = unclosedLoop(sp, keyframes, opts);
+  if (open) return out(false, open, explained, sp);
   return out(
     true,
-    `all ${n} keyframes registered, gyro-consistent (median ${gyro.medianErrDeg.toFixed(2)}°), ${(100 * explained).toFixed(1)} % explained, ${counts}`,
+    `all ${n} keyframes registered, gyro-consistent (median ${gyro.medianErrDeg.toFixed(2)}°), ${(100 * explained).toFixed(1)} % explained, ${splitCounts(sp)}`,
     explained,
     sp,
   );
+}
+
+function splitCounts(sp: SplitPairStats): string {
+  return `${sp.loopCorrespondences} correspondences on ${sp.loopPairs} loop-like and ${sp.splitCorrespondences} on ${sp.splitPairs} split pairs`;
+}
+
+/**
+ * The unclosed-loop rules of `liveModelHealth` on a model's `splitPairs`: too many correspondences
+ * on loop-like split pairs or on split pairs at all, or a loop-like split pair across ≥ maxLoopSpan
+ * of `keyframes` (capture order). Returns the symptom, or null when the model shows none.
+ */
+export function unclosedLoop(sp: SplitPairStats, keyframes: readonly number[], opts: Partial<LiveHealthOptions> = {}): string | null {
+  const o = { ...DEFAULT_LIVE_HEALTH_OPTIONS, ...opts };
+  const maxLoop = Math.max(o.maxLoopCorrespondences, o.maxLoopFraction * sp.correspondences);
+  const maxSplit = Math.max(o.maxSplitCorrespondences, o.maxSplitFraction * sp.correspondences);
+  if (sp.loopCorrespondences > maxLoop || sp.splitCorrespondences > maxSplit)
+    return `unclosed loop? ${splitCounts(sp)} (limits ${Math.round(maxLoop)} / ${Math.round(maxSplit)})`;
+  const pos = new Map(keyframes.map((id, k) => [id, k]));
+  const span = (l: { a: number; b: number }): number => Math.abs((pos.get(l.a) ?? NaN) - (pos.get(l.b) ?? NaN));
+  const far = sp.loops.filter((l) => span(l) >= o.maxLoopSpan * keyframes.length);
+  if (far.length > 0) return `unclosed loop? loop-like split pairs across the capture: ${far.map((l) => `${l.a}-${l.b} (${l.split})`).join(', ')}`;
+  return null;
+}
+
+/** What `liveModelBetter` compares of a model. */
+export interface ModelScore {
+  registered: number;
+  /** Gyro breaks without outliers (`gyroConsistency`). */
+  gyroBreaks: number;
+  /** Explained share of the verified correspondences, mean reprojection error (px). */
+  explained: number;
+  reprojError: number;
+  /** Registered images of the model registered with the gyro-predicted rotation. */
+  gyroAided: number;
+  /** `unclosedLoop` of the model (only needed when gyroAided > 0). */
+  unclosedLoop: string | null;
+}
+
+/**
+ * Refine's model choice: true when the live model is at least as good as the offline one — fewer
+ * gyro breaks, then more registered images, then (beyond `minExplainedGap`) a larger explained
+ * share, then a reprojection error no larger. Registrations with the gyro-predicted rotation (≥ 15
+ * inliers; their rotation agrees with the gyro by construction) count only for a model without an
+ * unclosed loop: a wrong one joining two fragments leaves the loop of a loop capture open, and
+ * they must not win the choice by registered images on their own (before the gyro path the
+ * offline SfM kept the largest P3P fragment). Not caught: a wrong join in a capture without a loop.
+ */
+export function liveModelBetter(live: ModelScore, offline: ModelScore, minExplainedGap: number): boolean {
+  if (live.gyroBreaks !== offline.gyroBreaks) return live.gyroBreaks < offline.gyroBreaks;
+  const counted = (m: ModelScore): number => m.registered - (m.unclosedLoop ? m.gyroAided : 0);
+  const lr = counted(live),
+    or = counted(offline);
+  if (lr !== or) return lr > or;
+  if (Math.abs(live.explained - offline.explained) > minExplainedGap) return live.explained > offline.explained;
+  return live.reprojError <= offline.reprojError;
+}
+
+/** The images of `ids` registered in `rec`. */
+function registeredOf(rec: Reconstruction, ids: Iterable<number>): number[] {
+  const out: number[] = [];
+  for (const id of ids) if (rec.images.get(id)?.registered) out.push(id);
+  return out;
 }
 
 /** Full refine pipeline. */
@@ -672,7 +784,10 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   await tick();
   let liveRec: Reconstruction | null = null;
   if (live.mapper.initialized) {
-    // keyframes that never registered live get another chance with the enriched graph
+    // keyframes that never registered live get another chance with the enriched graph (with the
+    // live mapper's neighbour re-triangulation and gyro-aided registration)
+    const aided = live.mapper.incrementalMapper.numKnownRotationRegistrations,
+      retri = live.mapper.retriangulation.registered;
     for (const id of live.mapper.pendingIds()) {
       checkCancel(cancel, 'reconstruction');
       try {
@@ -681,6 +796,8 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
         /* stays unregistered */
       }
     }
+    stats.gyroAidedRegistrations = live.mapper.opts.predictRotation ? `${aided} live, ${live.mapper.incrementalMapper.numKnownRotationRegistrations - aided} in refine` : 'off live';
+    stats.retriangulatedRegistrations = `${retri} live, ${live.mapper.retriangulation.registered - retri} in refine (${live.mapper.retriangulation.attempts} attempts)`;
     await live.mapper.incrementalMapper.iterativeGlobalRefinement(undefined, cancel, true);
     liveRec = live.mapper.reconstruction;
   }
@@ -771,30 +888,56 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   }
   checkCancel(cancel, 'reconstruction');
   const liveCam = liveRec && liveRec.numRegisteredImages >= 3 ? [...liveRec.cameras.values()][0] : undefined;
+  // keyframes registered with the gyro-predicted rotation (EngineConfig.gyroAidedRegistration 'all')
+  const liveAided = liveRec ? registeredOf(liveRec, live.mapper.incrementalMapper.knownRotationImages) : [];
   const mapperOpts: Partial<RunSfMOptions> = {
     hfovPriorDeg: live.mapper.opts.hfovPriorDeg,
     ...(liveCam ? { intrinsics: { ...liveCam } } : {}),
     // gyro gate of registrations / initial pairs (active once R_cam_device is verified)
     rotationCheck: live.rotationCheck(),
+    // gyro-aided registration (EngineConfig.gyroAidedRegistration, default 'offline'): at a phone's
+    // analysis rate P3P alone splits the from-scratch SfM where the live mapper's re-triangulated
+    // neighbours carried it (e2e yard-real at stride 3 from frame 1: 3 models, the largest 32 of 48
+    // keyframes; with it 1 model of 48), so it could never replace a live model whose loop did not
+    // close (docs/research/real-capture-robustness.md "Phone-rate capture"). Not when the live
+    // model holds such registrations: the offline SfM is their independent check, so P3P only.
+    ...((cfg.gyroAidedRegistration ?? 'offline') !== 'off' && liveAided.length === 0
+      ? { predictRotation: (id: number, r: Reconstruction) => live.predictRotation(id, r) }
+      : {}),
     ...(cfg.mapper ?? {}),
   };
   // the offline SfM checks the live model independently: skipped when the live model is healthy
   const lc = consistency(liveRec);
-  const health = liveRec && cfg.refineOfflineSfM !== 'always' ? liveModelHealth(liveRec, st.db, order, lc) : null;
+  const health = liveRec && cfg.refineOfflineSfM !== 'always' ? liveModelHealth(liveRec, st.db, order, lc, {}, liveAided) : null;
   stats.offlineSfM = health?.healthy ? `skipped: ${health.reason}` : health ? `run: ${health.reason}` : 'run';
   deps.log('info', `refine: offline SfM ${stats.offlineSfM}`);
   if (health?.split) deps.log('info', `refine: live model split pairs: ${health.split.detail.slice(0, 40).join('; ')}`);
   let offline: Reconstruction | null = null;
+  let offlineAided: number[] = [];
   if (!health?.healthy) {
     const tOff = now();
     try {
+      const gyroAided = new Map<Reconstruction, readonly number[]>();
       const models = await runIncrementalSfM(
         st.db,
-        mapperOpts,
+        { ...mapperOpts, onModel: (r, _t, m) => gyroAided.set(r, [...m.knownRotationImages]) },
         (e) => report('reconstruction', 0.1 + 0.85 * Math.max(0, e.progress), e.message),
         cancel,
       );
       offline = models[0] ?? null;
+      if (offline) {
+        offlineAided = registeredOf(offline, gyroAided.get(offline) ?? []);
+        stats.gyroAidedRegistrations = `${stats.gyroAidedRegistrations ?? 'off live'}, ${mapperOpts.predictRotation ? offlineAided.length : 'off'} offline`;
+      }
+      // only the largest model is kept: report what the others held (split frequency on real captures)
+      stats.offlineModels = models.length;
+      if (models.length > 1) {
+        const kept = new Set(models[0].registeredImageIds());
+        const dropped = new Set<number>();
+        for (const m of models.slice(1)) for (const id of m.registeredImageIds()) if (!kept.has(id)) dropped.add(id);
+        stats.offlineDroppedImages = dropped.size;
+        deps.log('warn', `refine: offline SfM found ${models.length} models; ${dropped.size} keyframes only in the ${models.length - 1} smaller one(s) were dropped`);
+      }
     } catch (e) {
       if ((e as Error)?.name === 'CancelledError') throw e;
       deps.log('warn', `offline SfM failed: ${(e as Error)?.message ?? e}`);
@@ -821,24 +964,38 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   if (offline) stats.offlineExplained = Math.round(1000 * ox) / 1000;
   const fmtSplit = (sp: SplitPairStats): string =>
     `${(100 * sp.splitRatio).toFixed(2)} % of ${sp.correspondences} correspondences split; ${sp.splitCorrespondences} on ${sp.splitPairs} split pairs, ${sp.loopCorrespondences} on ${sp.loopPairs} loop-like`;
+  let liveSp: SplitPairStats | null = null,
+    offlineSp: SplitPairStats | null = null;
   if (liveRec) {
-    const sp = health?.split ?? splitPairs(liveRec, st.db);
-    stats.liveSplit = fmtSplit(sp);
-    if (!health?.split) deps.log('info', `refine: live model ${stats.liveSplit}; split pairs: ${sp.detail.slice(0, 40).join('; ')}`);
+    liveSp = health?.split ?? splitPairs(liveRec, st.db);
+    stats.liveSplit = fmtSplit(liveSp);
+    if (!health?.split) deps.log('info', `refine: live model ${stats.liveSplit}; split pairs: ${liveSp.detail.slice(0, 40).join('; ')}`);
   }
   if (offline) {
-    const sp = splitPairs(offline, st.db);
-    stats.offlineSplit = fmtSplit(sp);
-    deps.log('info', `refine: offline model ${stats.offlineSplit}; split pairs: ${sp.detail.slice(0, 40).join('; ')}`);
+    offlineSp = splitPairs(offline, st.db);
+    stats.offlineSplit = fmtSplit(offlineSp);
+    deps.log('info', `refine: offline model ${stats.offlineSplit}; split pairs: ${offlineSp.detail.slice(0, 40).join('; ')}`);
   }
   const minExplainedGap = cfg.modelChoiceExplainedGap ?? 0.015;
-  const liveBetter = (): boolean => {
-    if (lb !== ob) return lb < ob;
-    if (lr !== or) return lr > or;
-    if (Math.abs(lx - ox) > minExplainedGap) return lx > ox;
-    return le <= oe;
-  };
-  if (!offline || (liveRec && liveBetter())) {
+  const scoreOf = (n: number, breaks: number, explained: number, reproj: number, aided: readonly number[], sp: SplitPairStats | null): ModelScore => ({
+    registered: n,
+    gyroBreaks: breaks,
+    explained,
+    reprojError: reproj,
+    gyroAided: aided.length,
+    unclosedLoop: aided.length > 0 && sp ? unclosedLoop(sp, order) : null,
+  });
+  const ls = scoreOf(lr, lb, lx, le, liveAided, liveSp),
+    os = scoreOf(or, ob, ox, oe, offlineAided, offlineSp);
+  for (const [name, m] of [
+    ['live', ls],
+    ['offline', os],
+  ] as const) {
+    if (!m.unclosedLoop) continue;
+    stats[`${name}GyroAidedNotCounted`] = m.gyroAided;
+    deps.log('warn', `refine: ${m.gyroAided} gyro-aided registration(s) of the ${name} model not counted in the model choice (${m.unclosedLoop})`);
+  }
+  if (!offline || (liveRec && liveModelBetter(ls, os, minExplainedGap))) {
     chosen = liveRec!;
     which = 'live';
   } else {
@@ -867,6 +1024,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   }
   stats.gyroRejectedPairs = live.stats.gyroRejectedPairs;
   stats.gyroRejectedPoses = live.stats.gyroRejectedPoses;
+  stats.gyroRecoveredPoses = live.stats.gyroRecoveredPoses;
   stats.forcedKeyframes = live.stats.forcedKeyframes;
   stats.heldKeyframes = live.stats.heldKeyframes;
   // final global BA with the principal point free (well constrained by the many views of a
@@ -976,11 +1134,17 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     const lowEx = lowExcitationRetry(alignment);
     if (lowEx) {
       // gentle hand-held motion (smooth orbits) or sparse keyframes: the IMU scale fit is excellent
-      // but below the excitation floor of the inertial module → accept it with an inflated σ
+      // but below the excitation floor of the inertial module → accept it with an inflated σ, unless
+      // the keyframe-interval scale already used is more precise
       const a2 = computeWorldAlignment(input, { timeOffsetMs: st.timeOffsetMs ?? 0, scale: { minExcitation: lowEx.minExcitation } });
-      if (a2.metric.metric && a2.metric.source === 'imu') {
-        a2.metric.relativeUncertainty = lowExcitationSigma(a2.metric.relativeUncertainty, lowEx.r2);
-        a2.details.warnings.push(`IMU scale accepted at low excitation (${lowEx.excitation.toFixed(3)} m/s², R² ${lowEx.r2.toFixed(2)})`);
+      const sigma = lowExcitationSigma(a2.metric.relativeUncertainty, lowEx.r2);
+      const prior = alignment.metric.metric ? alignment.metric.relativeUncertainty : null;
+      if (a2.metric.metric && a2.metric.source === 'imu' && (prior === null || sigma < prior)) {
+        a2.metric.relativeUncertainty = sigma;
+        a2.details.warnings.push(
+          `IMU scale accepted at low excitation (${lowEx.excitation.toFixed(3)} m/s², R² ${lowEx.r2.toFixed(2)}, σ ${(100 * sigma).toFixed(1)} %)` +
+            (prior !== null ? ` instead of the keyframe-interval scale (σ ${(100 * prior).toFixed(1)} %)` : ''),
+        );
         alignment = a2;
       }
     }
@@ -990,6 +1154,8 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     stats.timeOffsetMs = Math.round(alignment.details.offsetMs * 10) / 10;
     stats.timeOffsetSource = alignment.details.offsetSource;
     stats.scaleSource = alignment.metric.source;
+    if (alignment.metric.source === 'imu' || alignment.metric.source === 'imu+gps')
+      stats.scaleMethod = alignment.details.imuScale?.reliable ? 'bandpass' : 'intervals';
     stats.yawSource = alignment.details.yawSource;
     Object.assign(stats, alignment.details.headingStats); // north reference, declination, yaw σ / fusion
     if (alignment.metric.relativeUncertainty !== null) stats.scaleUncertainty = alignment.metric.relativeUncertainty;
@@ -1025,9 +1191,13 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   const cam0 = cameras[0]?.intrinsics;
   const trackLens: number[] = [];
   for (let i = 0; i < model.numPoints; i++) trackLens.push(model.trackOffsets[i + 1] - model.trackOffsets[i]);
+  // keyframes the final model could not connect (the viewer says so and offers to add views)
+  const unconnected = order.length - model.images.length;
+  if (unconnected > 0) deps.log('warn', `refine: ${unconnected} of ${order.length} keyframes could not be connected to the model`);
   Object.assign(stats, {
     images: order.length,
     registeredImages: model.images.length,
+    unconnectedImages: unconnected,
     points: model.numPoints,
     meanReprojErrorPx: Math.round(chosen.meanReprojectionError() * 1000) / 1000,
     meanTrackLength: Math.round(chosen.meanTrackLength() * 100) / 100,

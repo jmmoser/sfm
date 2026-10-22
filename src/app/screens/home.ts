@@ -1,7 +1,16 @@
 /**
  * Home: hero + "New scan", saved sessions (thumbnail, name, date, status, frames) with
- * open / rename / delete, storage usage + "Install to Home Screen" hint, environment banners
- * (Lockdown Mode, HTTPS, camera / storage blocking, WebGPU → CPU mode), Diagnostics link.
+ * open / add more views (continue scanning: src/app/extend-scan.ts) / rename / delete, storage
+ * usage + "Install to Home Screen" hint, environment banners (Lockdown Mode, HTTPS, camera /
+ * storage blocking, WebGPU → CPU mode), Diagnostics link.
+ *
+ * "Run interrupted" card (testId 'run-interrupted'): the run journal (src/app/run-journal.ts) found
+ * a long run of a stored scan that never ended — iOS killed the app while it was open, or evicted
+ * it in the background. It names the scan and the step; Resume opens the scan exactly like its list
+ * item (OPEN_SESSION: Processing for a captured scan, else the viewer with its dense / photoreal
+ * resume card, or a hint pointing to Build when nothing of the run was stored), which acknowledges
+ * the card (`RunJournal.open`; the kill count stays: the retry runs in light mode). Shown once the
+ * session list loaded; dropped when the scan no longer exists.
  */
 import type { SessionMeta, StorageEstimateInfo } from '../../io/storage';
 import type { App, Screen } from '../app';
@@ -14,6 +23,8 @@ import { canScan, environmentIssues, type EnvInfo } from '../env';
 import { formatBytes, formatRelativeDate, modeLabel, plural, statusInfo } from '../format';
 import { icon } from '../icons';
 import { MIN_KEYFRAMES, routeForSession } from '../router';
+import { interruptionCopy } from '../run-journal';
+import { isProcessed, openExtendSheet } from '../extend-scan';
 
 const INSTALL_HINT_KEY = 'sfm.hideInstallHint';
 
@@ -23,6 +34,7 @@ export function createHomeScreen(app: App): Screen {
   const thumbUrls = new Map<string, { blob: Blob; url: string }>();
   let closed = false;
   const banners = h('div', { class: 'banners' });
+  const interruptHost = h('div', { class: 'interrupt-host' });
   const listHost = h('div', { class: 'session-list-host' });
   const storageHost = h('div', { class: 'storage-host' });
   let sessions: SessionMeta[] = [];
@@ -56,7 +68,7 @@ export function createHomeScreen(app: App): Screen {
   const el = h(
     'div',
     { class: 'screen-scroll home' },
-    h('div', { class: 'content' }, header, banners, hero, listHost, storageHost, footer(app)),
+    h('div', { class: 'content' }, header, banners, interruptHost, hero, listHost, storageHost, footer(app)),
   );
 
   function renderBanners(env: EnvInfo): void {
@@ -97,7 +109,35 @@ export function createHomeScreen(app: App): Screen {
       toast(`This capture was interrupted with ${plural(n, 'photo')} — at least ${MIN_KEYFRAMES} are needed.`, { tone: 'warn' });
       return;
     }
+    // opening the interrupted scan (its card's Resume, or its list item) answers the card and
+    // tells the screen it opens what stopped
+    app.journal.open(s.id);
     app.navigate({ type: 'OPEN_SESSION', sessionId: s.id, status: s.status, numFrames: n });
+  }
+
+  /** The run journal's "run interrupted" card (see the header), once the list is known. */
+  function renderInterruption(listed: boolean): void {
+    const it = app.journal.interruption();
+    const s = it ? sessions.find((x) => x.id === it.sessionId) : undefined;
+    // the scan is gone (deleted): nothing to resume
+    if (it && !s && listed) app.journal.acknowledge();
+    if (!it || !s) {
+      replaceChildren(interruptHost);
+      return;
+    }
+    const copy = interruptionCopy({ ...it, name: s.name, hasDense: s.status === 'dense' || s.status === 'meshed' });
+    const card = banner({
+      tone: 'warn',
+      title: copy.title,
+      body: copy.body,
+      actions: [button({ label: 'Resume', icon: 'refresh', variant: 'primary', size: 'md', testId: 'run-interrupted-resume', onClick: () => openSession(s) })],
+      onDismiss: () => app.journal.acknowledge(),
+      testId: 'run-interrupted',
+    });
+    card.classList.add('run-interrupted');
+    card.dataset.kind = it.kind;
+    card.dataset.step = it.step;
+    replaceChildren(interruptHost, card);
   }
 
   async function rename(s: SessionMeta): Promise<void> {
@@ -125,10 +165,21 @@ export function createHomeScreen(app: App): Screen {
 
   function more(s: SessionMeta): void {
     const canOpen = !!routeForSession(s.id, s.status, photoCount(s));
+    const processed = isProcessed(s.status);
+    const sg = s.stats?.splatGaussians;
+    const built = { dense: s.status === 'dense' || s.status === 'meshed', mesh: s.status === 'meshed', splat: typeof sg === 'number' && sg > 0 };
     actionSheet(
       s.name,
       [
         { label: canOpen ? (s.status === 'captured' || s.status === 'capturing' ? 'Process' : 'Open') : 'Open', icon: 'cube', disabled: !canOpen, onSelect: () => openSession(s), testId: 'session-open' },
+        {
+          // continue the capture: new views for a processed scan, the rest of an interrupted one
+          label: processed ? 'Add more views' : 'Continue scanning',
+          icon: 'camera',
+          disabled: !canScan(app.env) || (!processed && photoCount(s) < 1),
+          onSelect: () => void openExtendSheet(app, { id: s.id, status: s.status, built }),
+          testId: 'session-extend',
+        },
         { label: 'Rename', icon: 'pencil', onSelect: () => void rename(s), testId: 'session-rename' },
         { label: 'Delete', icon: 'trash', destructive: true, onSelect: () => void remove(s), testId: 'session-delete' },
       ],
@@ -190,16 +241,19 @@ export function createHomeScreen(app: App): Screen {
       replaceChildren(listHost);
       return;
     }
+    let listed = true;
     try {
       sessions = await store.listSessions({ orderBy: 'createdAt' });
     } catch (e) {
       console.warn('[home] listSessions failed', e);
       sessions = [];
+      listed = false;
     }
     // `closed`, not isConnected: the element stays in the DOM during the exit transition, and
     // object URLs created after leave() would never be revoked.
     if (closed) return;
     renderList();
+    renderInterruption(listed);
   }
 
   async function loadStorage(): Promise<void> {

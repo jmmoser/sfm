@@ -6,6 +6,7 @@
  * and sway; frames are rendered upright for a UI angle θ (R = R_cam_device(θ)·R_wdᵀ), and an
  * exact IMU (gyro = ω_dev, accelG = R_wdᵀ(a − g), 60 Hz) is sampled from the same trajectory.
  * Frames report t = tTrue + timeOffsetMs (IMU on the true clock), like the e2e datasets.
+ * `denseFixture`: a tiny dense-stage input (renders + exact sparse model) for runDensify tests.
  */
 import type { CameraIntrinsics, ImuSample, Mat3, Pose, RGBAImage } from '../core/types';
 import { lookAt, pinholeIntrinsics, renderSynthetic, type SynthScene } from '../dense/synthetic';
@@ -14,6 +15,7 @@ import { mat3TransposeMul, mat3Transpose } from '../math/mat3';
 import { mat3ToRotvec } from '../math/rotation';
 import { cameraFromDevice } from '../sensors/frame-orientation';
 import type { FrameInput, ScreenAngle } from '../workers/protocol';
+import type { SparseModel } from './types';
 
 export function objectScene(): SynthScene {
   const c = 6;
@@ -200,3 +202,45 @@ export function centre(p: Pose): Float64Array {
     t = p.t;
   return Float64Array.of(-(R[0] * t[0] + R[3] * t[1] + R[6] * t[2]), -(R[1] * t[0] + R[4] * t[1] + R[7] * t[2]), -(R[2] * t[0] + R[5] * t[1] + R[8] * t[2]));
 }
+
+/**
+ * A tiny dense-stage input: `n` 96×128 renders of the object scene on a 12° arc (keyframe images
+ * by id 0…n−1, raw RGBA) and a sparse model with exact poses and 60 points on the object seen by
+ * every view.
+ */
+export function denseFixture(n: number): { cam: CameraIntrinsics; poses: Pose[]; images: RGBAImage[]; model: SparseModel } {
+  const cam = pinholeIntrinsics(96, 128, (55 * Math.PI) / 180);
+  const scene = objectScene();
+  const poses = Array.from({ length: n }, (_, k) => {
+    const a = ((-18 + 12 * k) * Math.PI) / 180;
+    return lookAt([1.4 * Math.sin(a), -1.4 * Math.cos(a), 0.9], [0, 0, 0.2]);
+  });
+  const images = poses.map((p) => renderSynthetic(scene, cam, p, { supersample: 1 }).image);
+  const xyz: number[] = [];
+  for (let i = 0; i < 60; i++) xyz.push(0.2 * Math.cos(i), 0.2 * Math.sin(i), 0.1 + 0.004 * i);
+  const m = xyz.length / 3;
+  const offsets = new Uint32Array(m + 1);
+  const ti: number[] = [];
+  const tf: number[] = [];
+  for (let i = 0; i < m; i++) {
+    offsets[i] = ti.length;
+    for (let id = 0; id < n; id++) {
+      ti.push(id);
+      tf.push(i);
+    }
+  }
+  offsets[m] = ti.length;
+  const model: SparseModel = {
+    cameras: new Map([[1, { ...cam }]]),
+    images: poses.map((p, id) => ({ id, cameraId: 1, pose: { R: Float64Array.from(p.R), t: Float64Array.from(p.t) } })),
+    numPoints: m,
+    xyz: Float64Array.from(xyz),
+    colors: new Uint8Array(3 * m).fill(128),
+    errors: new Float32Array(m),
+    trackOffsets: offsets,
+    trackImages: Uint32Array.from(ti),
+    trackFeatures: Uint32Array.from(tf),
+  };
+  return { cam, poses, images, model };
+}
+

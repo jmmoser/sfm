@@ -3,8 +3,8 @@
  * a MemoryEngineStore flagged persistent): dense resume after a kill / cancel, the live session
  * released before the dense stage (and restored by a later refine), the capture state kept
  * intact across state writes without a live session, store back-pressure during capture, results
- * whose write failed or was cut short by a kill, a deleted session not re-created by a resume,
- * and no writes after dispose.
+ * whose write failed or was cut short by a kill, the mesh's object box (`mesh/meta`) across a
+ * reload, a deleted session not re-created by a resume, and no writes after dispose.
  */
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import type { FeaturePipeline } from '../features/extractor';
@@ -13,7 +13,7 @@ import { decodePLY } from '../io/ply';
 import { readZip } from '../io/zip';
 import { createCpuFeaturePipeline } from './cpu-pipeline';
 import { PhotogrammetryEngine } from './engine';
-import { MemoryEngineStore, type EngineStateRecord, type EngineStore, type StoredImage } from './persistence';
+import { MemoryEngineStore, type EngineStateRecord, type EngineStore, type MeshMetaRecord, type StoredImage } from './persistence';
 import { frameInputs, makeCapture, type SynthCapture } from './testutil';
 import type { KeyframeRecord } from './types';
 import type { SessionSummary } from '../workers/protocol';
@@ -297,6 +297,30 @@ describe('stored results after a failed or interrupted write', () => {
     expect(ply.mesh?.triangleCount).toBe(mesh.triangleCount);
     e.dispose();
     expect(await reload(store)).toEqual({ status: 'dense', sparse: true, dense: baseDense, mesh: false });
+  }, 300_000);
+
+  it('the object box of the mesh comes back with it after a reload (mesh/meta) and goes with it', async () => {
+    const store = await meshedScan();
+    const meta = await store.getValue<MeshMetaRecord>('mesh/meta');
+    expect(meta?.version).toBe(1);
+    expect(typeof meta?.stats.objectRoi).toBe('string');
+    console.log(`[persist] object box of the fixture mesh: ${meta?.stats.objectRoi}`);
+    // (the fixture's 55° arc has none: its optical axes spread < 10°) a stored box comes back with the mesh
+    const roi = { min: [-0.5, -0.5, 0.01], max: [0.5, 0.5, 0.6], planeZ: 0, centre: [0, 0, 0.2], confidence: 0.8 };
+    await store.putValue('mesh/meta', { ...meta!, objectRoi: roi });
+    const { e, sum } = await open(store);
+    expect(sum.objectRoi).toEqual(roi);
+    expect(e.objectRoi).toEqual(roi);
+    // a damaged record reads as no box
+    await store.putValue('mesh/meta', { version: 1, objectRoi: { min: [0, 0], max: [1, 1, 1] }, stats: {} });
+    const damaged = await open(store);
+    expect(damaged.sum.objectRoi).toBeNull();
+    damaged.e.dispose();
+    // a new dense cloud drops the mesh and its box
+    await e.densify(DENSE_2);
+    expect(e.objectRoi).toBeNull();
+    expect(await store.getValue('mesh/meta')).toBeNull();
+    e.dispose();
   }, 300_000);
 
   it('a kill right after a rebuilt dense cloud was stored does not pair it with the mesh of the old cloud', async () => {

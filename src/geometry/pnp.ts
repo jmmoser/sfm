@@ -1,12 +1,13 @@
 /**
- * Absolute pose (PnP): Lambda Twist P3P, EPnP, robust LM refinement and LO-MSAC.
- * Poses are world-to-camera (x_cam = R X + t).
+ * Absolute pose (PnP): Lambda Twist P3P, EPnP, robust LM refinement and LO-MSAC, plus PnP with a
+ * KNOWN rotation (from the gyro): a linear 2-point translation solver under LO-MSAC
+ * (`solvePnPKnownRotationRansac`). Poses are world-to-camera (x_cam = R X + t).
  */
-import type { CameraIntrinsics, Pose } from '../core/types';
+import type { CameraIntrinsics, Mat3, Pose, Vec3 } from '../core/types';
 import { solveSPD, symEig } from '../math/decomp';
 import { polyRealRoots } from '../math/poly';
 import type { Rng } from '../math/random';
-import { rotvecToMat3 } from '../math/rotation';
+import { rotationAngleBetween, rotvecToMat3 } from '../math/rotation';
 import { umeyama } from '../math/sim3';
 import { pixelToNormalized } from './camera';
 import { ransac, type RansacEstimator } from './ransac';
@@ -1072,5 +1073,268 @@ export function solvePnPRansac(
   }
   if (numInliers < minInliers) return null;
   return { pose, inlierMask: mask, numInliers };
+}
+
+// ---------------------------------------------------------------------------
+// PnP with a known rotation (e.g. gyro-predicted)
+//
+// With R known, every 2D–3D correspondence gives two LINEAR equations in t (the bearing is
+// parallel to R X + t): with q = R X and the normalised observation (x, y),
+//   (q_x + t_x) − x (q_z + t_z) = 0,   (q_y + t_y) − y (q_z + t_z) = 0,
+// so 2 points determine t (4 equations, 3 unknowns). Each equation is the reprojection error
+// times the depth z = q_z + t_z; the least-squares refit weights it by 1 / z of the current
+// estimate, so it minimises the reprojection error to first order. At 30 % inliers RANSAC needs
+// ≈ 100 samples (2 points) instead of ≈ 340 (P3P) for 99.99 % confidence, and a known rotation
+// leaves only the 3 translation parameters to the few inliers a keyframe at the edge of the map
+// sees.
+// ---------------------------------------------------------------------------
+
+/**
+ * Least-squares translation of a pose with KNOWN rotation R from the points idx[0..count) (all
+ * n when idx is omitted): the linear equations above, each weighted by w[i] (default 1). Null
+ * when the system is degenerate (fewer than 2 points, coinciding bearings).
+ */
+export function translationKnownRotation(
+  R: ArrayLike<number>,
+  X: ArrayLike<number>,
+  xn: ArrayLike<number>,
+  count: number,
+  idx?: ArrayLike<number>,
+  w?: ArrayLike<number>,
+): Vec3 | null {
+  let s = 0,
+    a02 = 0,
+    a12 = 0,
+    a22 = 0,
+    b0 = 0,
+    b1 = 0,
+    b2 = 0;
+  for (let k = 0; k < count; k++) {
+    const i = idx ? idx[k] : k;
+    const X0 = X[3 * i],
+      X1 = X[3 * i + 1],
+      X2 = X[3 * i + 2];
+    const qx = R[0] * X0 + R[1] * X1 + R[2] * X2,
+      qy = R[3] * X0 + R[4] * X1 + R[5] * X2,
+      qz = R[6] * X0 + R[7] * X1 + R[8] * X2;
+    const x = xn[2 * i],
+      y = xn[2 * i + 1];
+    const ww = w ? w[i] * w[i] : 1;
+    // rows (1, 0, −x) t = x qz − qx and (0, 1, −y) t = y qz − qy
+    const r0 = x * qz - qx,
+      r1 = y * qz - qy;
+    s += ww;
+    a02 -= ww * x;
+    a12 -= ww * y;
+    a22 += ww * (x * x + y * y);
+    b0 += ww * r0;
+    b1 += ww * r1;
+    b2 -= ww * (x * r0 + y * r1);
+  }
+  const a00 = s,
+    a11 = s;
+  // 3×3 symmetric solve (Cramer); singular ⇔ all bearings coincide
+  const c00 = a11 * a22 - a12 * a12,
+    c01 = a02 * a12,
+    c02 = -a11 * a02;
+  const det = a00 * c00 + a02 * c02;
+  const scale = (a00 + a22) * (a00 + a22) * (a00 + a22);
+  if (!(count >= 2) || !(Math.abs(det) > 1e-12 * scale)) return null;
+  const c11 = a00 * a22 - a02 * a02,
+    c12 = -a00 * a12,
+    c22 = a00 * a11;
+  const inv = 1 / det;
+  // adjugate of [[a00, 0, a02], [0, a11, a12], [a02, a12, a22]] (symmetric)
+  const t0 = (c00 * b0 + c01 * b1 + c02 * b2) * inv,
+    t1 = (c01 * b0 + c11 * b1 + c12 * b2) * inv,
+    t2 = (c02 * b0 + c12 * b1 + c22 * b2) * inv;
+  if (!Number.isFinite(t0) || !Number.isFinite(t1) || !Number.isFinite(t2)) return null;
+  return Float64Array.of(t0, t1, t2);
+}
+
+class KnownRotationEstimator implements RansacEstimator<Pose> {
+  sampleSize = 2;
+  numData: number;
+  minRefitSize = 3;
+  private readonly w: Float64Array;
+  private readonly Xi: Float64Array;
+  private readonly xi: Float64Array;
+  constructor(
+    private readonly R: Mat3,
+    private readonly X: ArrayLike<number>,
+    private readonly xn: Float64Array,
+    n: number,
+    /** Local optimisation also refines the rotation (robust 6-DOF LM, Huber threshold). */
+    private readonly freeRotation: boolean,
+    private readonly huber: number,
+  ) {
+    this.numData = n;
+    this.w = new Float64Array(n);
+    this.Xi = new Float64Array(3 * n);
+    this.xi = new Float64Array(2 * n);
+  }
+  isDegenerate(s: Uint32Array): boolean {
+    const a = s[0],
+      b = s[1],
+      xn = this.xn,
+      X = this.X;
+    const du = xn[2 * a] - xn[2 * b],
+      dv = xn[2 * a + 1] - xn[2 * b + 1];
+    const dx = X[3 * a] - X[3 * b],
+      dy = X[3 * a + 1] - X[3 * b + 1],
+      dz = X[3 * a + 2] - X[3 * b + 2];
+    return !(du * du + dv * dv > 1e-14) || !(dx * dx + dy * dy + dz * dz > 0);
+  }
+  /** Depth of point i under (R, t). */
+  private depth(R: ArrayLike<number>, t: ArrayLike<number>, i: number): number {
+    const X = this.X;
+    return R[6] * X[3 * i] + R[7] * X[3 * i + 1] + R[8] * X[3 * i + 2] + t[2];
+  }
+  fit(s: Uint32Array, models: Pose[]): number {
+    const t = translationKnownRotation(this.R, this.X, this.xn, 2, s);
+    if (!t || !(this.depth(this.R, t, s[0]) > 0) || !(this.depth(this.R, t, s[1]) > 0)) return 0;
+    models[0] = { R: this.R, t };
+    return 1;
+  }
+  residualsSq(m: Pose, out: Float64Array): void {
+    this.residualsSqRange(m, out, 0, this.numData);
+  }
+  residualsSqRange(m: Pose, out: Float64Array, start: number, end: number): void {
+    const R = m.R,
+      t = m.t,
+      X = this.X,
+      xn = this.xn;
+    const r0 = R[0], r1 = R[1], r2 = R[2], r3 = R[3], r4 = R[4], r5 = R[5], r6 = R[6], r7 = R[7], r8 = R[8];
+    const t0 = t[0], t1 = t[1], t2 = t[2];
+    for (let i = start; i < end; i++) {
+      const x = X[3 * i],
+        y = X[3 * i + 1],
+        z = X[3 * i + 2];
+      const pz = r6 * x + r7 * y + r8 * z + t2;
+      if (!(pz > 0)) {
+        out[i] = Infinity;
+        continue;
+      }
+      const iz = 1 / pz;
+      const du = (r0 * x + r1 * y + r2 * z + t0) * iz - xn[2 * i];
+      const dv = (r3 * x + r4 * y + r5 * z + t1) * iz - xn[2 * i + 1];
+      out[i] = du * du + dv * dv;
+    }
+  }
+  /**
+   * Local optimisation from model m: least squares for t with m's rotation, re-weighted by 1 / depth
+   * (2 rounds), then — with `freeRotation` — a few robust 6-DOF LM steps, which absorb the error of
+   * the given rotation (its inliers are gathered at up to twice the threshold, ransac.ts).
+   */
+  refine(m: Pose, inl: Uint32Array, count: number): Pose | null {
+    const R = m.R;
+    let t = translationKnownRotation(R, this.X, this.xn, count, inl);
+    for (let round = 0; round < 2 && t; round++) {
+      for (let k = 0; k < count; k++) {
+        const z = this.depth(R, t, inl[k]);
+        this.w[inl[k]] = z > 0 ? 1 / z : 0;
+      }
+      t = translationKnownRotation(R, this.X, this.xn, count, inl, this.w);
+    }
+    if (!t) return null;
+    if (!this.freeRotation) return { R, t };
+    for (let k = 0; k < count; k++) {
+      const i = inl[k];
+      this.Xi[3 * k] = this.X[3 * i];
+      this.Xi[3 * k + 1] = this.X[3 * i + 1];
+      this.Xi[3 * k + 2] = this.X[3 * i + 2];
+      this.xi[2 * k] = this.xn[2 * i];
+      this.xi[2 * k + 1] = this.xn[2 * i + 1];
+    }
+    return refinePose({ R, t }, this.Xi, this.xi, count, { iterations: 4, huberNormalized: this.huber });
+  }
+}
+
+/** Options of `solvePnPKnownRotationRansac`. */
+export interface PnPKnownRotationOptions extends PnPRansacOptions {
+  /**
+   * Final robust LM refinement of all 6 degrees of freedom on the inliers (default true): the given
+   * rotation is a prediction with its own error, which the inliers then correct; false = R stays
+   * exactly as given (only t is refined, by the re-weighted least squares).
+   */
+  refineRotation?: boolean;
+}
+
+/**
+ * Robust absolute pose with a KNOWN rotation R (world-to-camera, e.g. propagated from a registered
+ * image by the gyro): observed pixels are undistorted to normalised coordinates; LO-MSAC with
+ * 2-point linear translation samples (`translationKnownRotation`, cheirality-checked) at threshold
+ * maxErrorPx / f, whose local optimisation is the re-weighted least squares for t followed (unless
+ * `refineRotation` is false) by a few robust 6-DOF LM steps; then the robust 6-DOF LM refinement of
+ * `solvePnPRansac` on all inliers, an inlier recount and a second refinement. `rotationChangeRad`
+ * is the angle between the returned and the given rotation (the caller decides how far the
+ * refinement may move it). Returns null if fewer than minInliers (default 12) inliers remain.
+ * Defaults: maxErrorPx 8, 1000 iterations.
+ */
+export function solvePnPKnownRotationRansac(
+  X: Float64Array,
+  uv: Float64Array,
+  n: number,
+  cam: CameraIntrinsics,
+  R: ArrayLike<number>,
+  opts: PnPKnownRotationOptions = {},
+): { pose: Pose; inlierMask: Uint8Array; numInliers: number; rotationChangeRad: number } | null {
+  const maxErrorPx = opts.maxErrorPx ?? 8;
+  const minInliers = Math.max(2, opts.minInliers ?? 12);
+  if (n < minInliers) return null;
+  const xn = new Float64Array(2 * n);
+  const tmp = new Float64Array(2);
+  for (let i = 0; i < n; i++) {
+    pixelToNormalized(cam, uv[2 * i], uv[2 * i + 1], tmp);
+    xn[2 * i] = tmp[0];
+    xn[2 * i + 1] = tmp[1];
+  }
+  const R0 = Float64Array.from(R);
+  const thr = maxErrorPx / cam.f;
+  const t2 = thr * thr;
+  const freeRotation = opts.refineRotation ?? true;
+  const est = new KnownRotationEstimator(R0, X, xn, n, freeRotation, 0.5 * thr);
+  const res = ransac(est, {
+    thresholdSq: t2,
+    confidence: opts.confidence ?? 0.9999,
+    maxIterations: opts.maxIterations ?? 1000,
+    rng: opts.rng,
+  });
+  if (!res.model || res.numInliers < minInliers) return null;
+  let pose: Pose = { R: Float64Array.from(res.model.R), t: Float64Array.from(res.model.t) };
+  let mask = res.inlierMask;
+  let numInliers = res.numInliers;
+  if (freeRotation) {
+    const resid = new Float64Array(n);
+    const inl = new Uint32Array(n);
+    const Xi = new Float64Array(3 * n),
+      xi = new Float64Array(2 * n);
+    for (let pass = 0; pass < 2; pass++) {
+      let c = 0;
+      for (let i = 0; i < n; i++) {
+        if (!mask[i]) continue;
+        inl[c] = i;
+        Xi[3 * c] = X[3 * i];
+        Xi[3 * c + 1] = X[3 * i + 1];
+        Xi[3 * c + 2] = X[3 * i + 2];
+        xi[2 * c] = xn[2 * i];
+        xi[2 * c + 1] = xn[2 * i + 1];
+        c++;
+      }
+      pose = refinePose(pose, Xi, xi, c, { iterations: 20, huberNormalized: 0.5 * thr });
+      est.residualsSq(pose, resid);
+      const m2 = new Uint8Array(n);
+      let c2 = 0;
+      for (let i = 0; i < n; i++)
+        if (resid[i] <= t2) {
+          m2[i] = 1;
+          c2++;
+        }
+      mask = m2;
+      numInliers = c2;
+    }
+  }
+  if (numInliers < minInliers) return null;
+  return { pose, inlierMask: mask, numInliers, rotationChangeRad: rotationAngleBetween(pose.R, R0) };
 }
 

@@ -329,6 +329,9 @@ describe('engine: synthetic orbit, CPU path', () => {
     for (const v of ov) expect(v >= 0 && v <= 1).toBe(true);
     // the first frames warm up the sharpness statistic, guidance says initialising
     expect(updates[0].guidance).toBe('initializing');
+    // the mode in effect rides along; a lit scene never reads as too dark
+    expect(updates.every((u) => u.resolvedMode === 'object')).toBe(true);
+    expect(updates.some((u) => u.guidance === 'too_dark')).toBe(false);
     // R_cam_device verified against the gyro
     expect(engine.liveSession!.state.cameraThetaVerified).toBe(true);
     expect(engine.liveSession!.state.cameraTheta).toBe(0);

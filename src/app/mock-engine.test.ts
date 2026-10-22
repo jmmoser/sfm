@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { decodePLY, parseGLB, readZip } from '../io';
-import type { FrameInput, LiveUpdate } from '../workers/protocol';
+import type { FrameInput, LiveUpdate, SplatResult } from '../workers/protocol';
+import { computeCoverage } from './coverage';
+import { decodeSplatSPZ } from '../splat/spz';
 import { MockEngine } from './mock-engine';
 import { MockScene, lookAt, poseCenter } from './mock-scene';
 
@@ -56,6 +58,75 @@ describe('mock scene', () => {
 });
 
 describe('MockEngine', () => {
+  it("auto resolves to 'object' after 8 keyframes; a level orbit, then the higher loop, fill the coverage ring", async () => {
+    const e = new MockEngine({ speed: 8, sessions: async () => null });
+    await e.init({ mode: 'auto', quality: 'fast' });
+    let t = 1000;
+    // the model comes in the standalone (background-mapping) updates
+    const model: { afterLoop: LiveUpdate | null; last: LiveUpdate | null } = { afterLoop: null, last: null };
+    e.onLive((u) => {
+      if (!u.cameras) return;
+      model.last = u;
+      if (e.scanProgress < 1.05) model.afterLoop = u;
+    });
+    const modes: string[] = [];
+    while (e.scanProgress < 2.3) {
+      t += 100;
+      const u = await e.processFrame(frame(t));
+      modes.push(`${u.numKeyframes}:${u.resolvedMode}`);
+    }
+    expect(modes[0]).toBe('1:auto'); // the first frame is a keyframe
+    expect(modes.find((m) => m.endsWith('object'))).toBe('8:object');
+    expect(modes.filter((m) => m.endsWith('auto')).every((m) => Number(m.split(':')[0]) < 8)).toBe(true);
+    // the mock cameras carry no upCam: up from the camera axes (the fallback path)
+    const loop = computeCoverage(model.afterLoop!.cameras!);
+    expect(loop.stable).toBe(true);
+    expect(loop.covered[1]).toBeGreaterThanOrEqual(11);
+    expect(loop.covered[2]).toBe(0);
+    expect(loop.prompt).toBe('look_down');
+    const both = computeCoverage(model.last!.cameras!);
+    expect(both.covered[1]).toBe(12);
+    expect(both.covered[2]).toBeGreaterThanOrEqual(10);
+    expect(both.prompt).toBe('done');
+    e.dispose();
+  });
+
+  it("sends a keyframe's model like background mapping: under the in-flight frame's index, before that frame's response", async () => {
+    const e = new MockEngine({ speed: 8, sessions: async () => null });
+    await e.init({ mode: 'object', quality: 'fast' });
+    const lives: LiveUpdate[] = [];
+    e.onLive((u) => lives.push(u));
+    const responses: LiveUpdate[] = [];
+    let t = 1000;
+    while (responses.filter((r) => r.decision === 'keyframe').length < 6) {
+      t += 100;
+      responses.push(await e.processFrame(frame(t)));
+    }
+    expect(responses.every((r) => !r.cameras && !r.sparse)).toBe(true);
+    const models = lives.filter((u) => !responses.includes(u));
+    expect(models.length).toBe(4); // keyframes 2–5 (the 6th is pending)
+    for (const m of models) {
+      const i = lives.indexOf(m);
+      const [prev, next] = [lives[i - 1], lives[i + 1]];
+      // the keyframe's own response, then the model, then the response of the frame in flight
+      expect(prev.decision).toBe('keyframe');
+      expect(responses).toContain(next);
+      expect(m.frameIndex).toBe(next.frameIndex);
+      expect([m.decision, m.guidance]).toEqual([prev.decision, prev.guidance]);
+      expect(m.cameras!.length).toBe(prev.numKeyframes);
+      expect(m.sparse!.positions.length).toBeGreaterThan(0);
+      expect(m.overlay).toBeUndefined();
+      expect(m.framePose).toBeUndefined();
+    }
+    // finishCapture flushes the pending one
+    await e.finishCapture();
+    const flushed = lives[lives.length - 1];
+    expect(responses).not.toContain(flushed);
+    expect(flushed.cameras!.length).toBe(6);
+    expect(flushed.frameIndex).toBe(responses[responses.length - 1].frameIndex);
+    e.dispose();
+  });
+
   it('runs capture → refine → densify → mesh → export with real data', async () => {
     const e = new MockEngine({ speed: 40, sessions: async () => null });
     const lives: LiveUpdate[] = [];
@@ -65,16 +136,20 @@ describe('MockEngine', () => {
     let t = 1000;
     let last: LiveUpdate | null = null;
     const bitmaps: ReturnType<typeof fakeBitmap>[] = [];
+    const responses: LiveUpdate[] = [];
     for (let i = 0; i < 60 && (last?.numKeyframes ?? 0) < 8; i++) {
       t += 100;
       const bm = fakeBitmap();
       bitmaps.push(bm);
       last = await e.processFrame(frame(t, bm));
+      responses.push(last);
     }
     expect(bitmaps.every((b) => b.closed)).toBe(true); // the engine owns (and closes) frames
     expect(last!.numKeyframes).toBeGreaterThanOrEqual(8);
     expect(last!.tracking).toBe('tracking');
-    expect(lives.length).toBe(bitmaps.length);
+    // every frame response is also a live event; the others are model updates
+    expect(responses.every((r) => lives.includes(r))).toBe(true);
+    expect(lives.filter((u) => !responses.includes(u)).every((u) => u.sparse && u.cameras)).toBe(true);
     const withSparse = lives.filter((u) => u.sparse);
     expect(withSparse.length).toBeGreaterThan(3);
     const sp = withSparse[withSparse.length - 1].sparse!;
@@ -107,6 +182,8 @@ describe('MockEngine', () => {
     expect(names).toContain('sparse/0/cameras.txt');
     expect(names).toContain('sparse/0/images.txt');
     expect(names).toContain('sparse/0/points3D.txt');
+    // the USDZ atlas is JPEG-encoded with OffscreenCanvas (browser: src/app/ar-quicklook.gpu.test.ts)
+    await expect(e.exportModel('usdz')).rejects.toThrow(/OffscreenCanvas/);
   });
 
   it('back-pressure: a concurrent frame is rejected and its bitmap closed', async () => {
@@ -236,7 +313,7 @@ describe('MockEngine', () => {
     expect(sum.stats.yawSource).toBe('compass');
   });
 
-  it('splat: prepare → training (detail) → finishing; a cancel is resumable; model and ply-splat export', async () => {
+  it('splat: prepare → training (detail) → finishing; a cancel is resumable; model and ply-splat / spz exports', async () => {
     const e = new MockEngine({ speed: 2, sessions: async () => null });
     await e.init({ mode: 'object', quality: 'fast', sessionId: 's1' });
     for (let i = 0; i < 40; i++) await e.processFrame(frame(100 + i * 400));
@@ -268,8 +345,88 @@ describe('MockEngine', () => {
     const ply = new TextDecoder().decode(new Uint8Array(await (await e.exportModel('ply-splat')).arrayBuffer()).subarray(0, 400));
     expect(ply).toContain(`element vertex ${info.count}`);
     expect(ply).toContain('property float f_dc_0');
+    const spz = await decodeSplatSPZ(new Uint8Array(await (await e.exportModel('spz')).arrayBuffer()));
+    expect(spz.model.count).toBe(info.count);
     await e.refine(); // new poses: the splats are gone
     await expect(e.splatModel()).resolves.toBeNull();
+  });
+
+  it('splat previews; finishEarly keeps that model and a later run continues from it', async () => {
+    // (slow enough for a preview before iteration 900: one every 400 ms of a 1.6 s training)
+    const e = new MockEngine({ speed: 1, sessions: async () => null });
+    await e.init({ mode: 'object', quality: 'fast', sessionId: 's3' });
+    for (let i = 0; i < 40; i++) await e.processFrame(frame(100 + i * 400));
+    await e.refine();
+    const previews: { iteration: number; sum: number; w: number; h: number }[] = [];
+    let requested = 0;
+    let firstTraining = -1;
+    const info = await e.splat({ preview: true }, (p) => {
+      if (p.stage === 'splat_preview' && p.image && p.detail) {
+        previews.push({ iteration: p.detail.iteration, sum: Array.from(p.image.data).reduce((s, v) => s + v, 0), w: p.image.width, h: p.image.height });
+      }
+      if (p.stage === 'splat_training' && p.detail) {
+        if (firstTraining < 0) firstTraining = previews.length;
+        expect(p.detail.finishFrom).toBe(900);
+        // a request before finishFrom waits for it
+        if (!requested) {
+          requested = p.detail.iteration;
+          e.finishEarly('splat');
+        }
+      }
+    });
+    expect(requested).toBeLessThan(900);
+    expect(firstTraining).toBe(1); // the first preview comes before the training
+    expect(previews[0]).toMatchObject({ iteration: 0, w: 288, h: 384 });
+    expect(previews.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(previews.map((p) => p.sum)).size).toBe(previews.length); // they change
+    expect(info.iterations).toBeGreaterThanOrEqual(900);
+    expect(info.iterations).toBeLessThan(3000);
+    expect(info.stats).toMatchObject({ splatFinishedEarly: 1, splatContinueFrom: info.iterations, splatIterations: 3000 });
+    const sum = await e.loadSession('s3');
+    expect(sum.splat?.iterations).toBe(info.iterations);
+    expect(sum.stats).toMatchObject({ splatResumableIteration: info.iterations, splatResumableQuality: 'fast', splatContinuesModel: 1 });
+    // continue: from there to the end, no longer resumable
+    const done = await e.splat();
+    expect(done.iterations).toBe(3000);
+    expect(done.stats.splatResumedFrom).toBe(info.iterations);
+    expect(done.stats.splatFinishedEarly).toBeUndefined();
+    const end = (await e.loadSession('s3')).stats;
+    expect(end.splatResumableIteration).toBeUndefined();
+    expect(end.splatContinuesModel).toBeUndefined();
+  });
+
+  it('a continued run cancelled later, or a new dense cloud, ends "continue" (review)', async () => {
+    const e = new MockEngine({ speed: 4, sessions: async () => null });
+    await e.init({ mode: 'object', quality: 'fast', sessionId: 's4' });
+    for (let i = 0; i < 40; i++) await e.processFrame(frame(100 + i * 400));
+    await e.refine();
+    await e.densify();
+    const endEarly = (): Promise<SplatResult> =>
+      e.splat(undefined, (p) => {
+        if (p.stage === 'splat_training') e.finishEarly('splat');
+      });
+    const early = await endEarly();
+    expect((await e.loadSession('s4')).stats.splatContinuesModel).toBe(1);
+    // continued, then cancelled further on: an interrupted run's checkpoint
+    const cancelled = await e
+      .splat(undefined, (p) => {
+        if (p.stage === 'splat_training' && p.detail && p.detail.iteration > early.iterations + 100) e.cancel();
+      })
+      .catch((x: unknown) => x);
+    expect((cancelled as Error).name).toBe('CancelledError');
+    const st = (await e.loadSession('s4')).stats;
+    expect(st.splatResumableIteration).toBeGreaterThan(early.iterations);
+    expect(st.splatContinuesModel).toBeUndefined();
+    // ended early again, then the dense cloud is rebuilt: its checkpoint is gone (a new run)
+    await e.splat({ restart: true }, (p) => {
+      if (p.stage === 'splat_training') e.finishEarly('splat');
+    });
+    expect((await e.loadSession('s4')).stats.splatContinuesModel).toBe(1);
+    await e.densify({ quality: 'balanced' });
+    const after = (await e.loadSession('s4')).stats;
+    expect(after.splatResumableIteration).toBeUndefined();
+    expect(after.splatContinuesModel).toBeUndefined();
+    expect((await e.loadSession('s4')).splat).not.toBeNull(); // the model stays
   });
 
   it('failOn makes a method fail (error UI)', async () => {
@@ -304,6 +461,54 @@ describe('MockEngine', () => {
     expect(info.stats.splatResumedFrom).toBeUndefined();
   });
 
+  it('resume markers survive a reload in the session record (densify after a stored map, splat checkpoints) and go when the run ends', async () => {
+    const rec = { id: 'k1', name: 'Wall', createdAt: 1, updatedAt: 2, mode: 'object' as const, status: 'sparse' as const, numFrames: 20, stats: { quality: 'fast' } as Record<string, number | string> };
+    const store = {
+      getSession: async (id: string) => (id === rec.id ? { ...rec, stats: { ...rec.stats } } : null),
+      updateSession: async (_id: string, patch: { stats?: Record<string, number | string> }) => Object.assign(rec, patch),
+    };
+    const sessions = async () => store as never;
+    // a densify killed after its first depth map (the page reloads: a new engine)
+    const a = new MockEngine({ speed: 1, sessions });
+    await a.loadSession('k1');
+    let resolveTick!: () => void;
+    const ticked = new Promise<void>((r) => (resolveTick = r));
+    const dense = a.densify(undefined, (p) => {
+      if (p.stage === 'depth_maps' && p.progress > 0.1) resolveTick();
+    });
+    await ticked;
+    a.dispose();
+    await dense.catch(() => undefined);
+    expect(rec.stats).toMatchObject({ denseResumablePass: 1, denseResumableQuality: 'fast' });
+    const b = new MockEngine({ speed: 20, sessions });
+    expect((await b.loadSession('k1')).stats).toMatchObject({ denseResumablePass: 1, denseResumableQuality: 'fast' });
+    await b.densify();
+    expect(rec.stats.denseResumablePass).toBeUndefined();
+    expect(rec.stats.denseResumableQuality).toBeUndefined();
+
+    // a photoreal build killed after its first checkpoint resumes from it
+    let resolveCkpt!: () => void;
+    const pastCkpt = new Promise<void>((r) => (resolveCkpt = r));
+    const c = new MockEngine({ speed: 1, sessions });
+    await c.loadSession('k1');
+    const train = c.splat({ quality: 'fast' }, (p) => {
+      if (p.detail && p.detail.iteration > 700) resolveCkpt();
+    });
+    await pastCkpt;
+    c.dispose();
+    await train.catch(() => undefined);
+    expect(rec.stats).toMatchObject({ splatResumableIteration: 500, splatResumableQuality: 'fast' });
+    const d = new MockEngine({ speed: 20, sessions });
+    expect((await d.loadSession('k1')).stats).toMatchObject({ splatResumableIteration: 500 });
+    const info = await d.splat({ quality: 'fast' });
+    expect(info.stats.splatResumedFrom).toBe(500);
+    expect(rec.stats.splatResumableIteration).toBeUndefined();
+    // refine removes every marker (new poses)
+    rec.stats = { ...rec.stats, denseResumablePass: 1, splatResumableIteration: 900 };
+    await d.refine();
+    expect(Object.keys(rec.stats).filter((k) => /Resumable/.test(k))).toEqual([]);
+  });
+
   it('injectSession serves real models as the in-memory session (screenshot harness)', async () => {
     const e = new MockEngine({ speed: 50, sessions: async () => null });
     const cloud = { count: 2, positions: new Float32Array([0, 0, 0, 1, 1, 1]), colors: new Uint8Array(6) };
@@ -316,5 +521,50 @@ describe('MockEngine', () => {
     expect(sum.dense).toBe(cloud);
     expect(sum.splat?.count).toBe(1);
     expect((await e.splatModel())!.model.count).toBe(1);
+  });
+});
+
+describe('MockEngine: continue a stored scan (init with resume + extend)', () => {
+  async function capture(e: MockEngine, t0: number, keyframes: number): Promise<{ t: number; last: LiveUpdate }> {
+    let t = t0;
+    let last: LiveUpdate | null = null;
+    for (let i = 0; i < 400 && (last?.numKeyframes ?? 0) < keyframes; i++) {
+      t += 100;
+      last = await e.processFrame(frame(t));
+    }
+    return { t, last: last! };
+  }
+
+  it('continues the scan held in memory after its last keyframe; refine covers every keyframe', async () => {
+    const e = new MockEngine({ speed: 40, sessions: async () => null, unconnectedImages: 2 });
+    await e.init({ mode: 'object', quality: 'fast', sessionId: 'x', persist: true });
+    const first = await capture(e, 1000, 8);
+    await e.finishCapture();
+    const s1 = await e.refine();
+    expect(s1.stats).toMatchObject({ unconnectedImages: 2, registeredImages: (s1.stats.images as number) - 2 });
+    const sAt = e.scanProgress;
+    // a reloaded page: the clock restarts
+    const init = await e.init({ mode: 'scene', quality: 'max', sessionId: 'x', persist: true, resume: true, extend: true });
+    expect(init.resumedKeyframes).toBe(first.last.numKeyframes);
+    expect(init.captureMemory!.capMB).toBeGreaterThan(init.captureMemory!.usedMB);
+    expect(e.captureFinished).toBe(false);
+    expect(e.scanProgress).toBeCloseTo(sAt, 1);
+    const second = await capture(e, 500, first.last.numKeyframes + 4);
+    expect(second.last.numKeyframes).toBe(first.last.numKeyframes + 4);
+    const s2 = await e.refine();
+    expect(s2.stats.images).toBeGreaterThanOrEqual(second.last.numKeyframes);
+  });
+
+  it('rebuilds a stored scan from its session record and rejects an unknown one', async () => {
+    const meta = { id: 's3', name: 'Vase', createdAt: 1, updatedAt: 2, mode: 'object' as const, status: 'meshed' as const, numFrames: 0, stats: { keyframes: 14, quality: 'fast' } };
+    const e = new MockEngine({ speed: 50, sessions: async () => ({ getSession: async (id: string) => (id === 's3' ? meta : null) }) as never });
+    const init = await e.init({ mode: 'object', quality: 'balanced', sessionId: 's3', persist: true, resume: true, extend: true });
+    expect(init.resumedKeyframes).toBe(14);
+    // the stored model for the capture view (the engine's InitResult.storedModel)
+    expect(init.storedModel!.cameras).toHaveLength(14);
+    expect(init.storedModel!.sparse.positions.length).toBeGreaterThan(0);
+    const { last } = await capture(e, 100, 16);
+    expect(last.numKeyframes).toBe(16);
+    await expect(e.init({ mode: 'object', quality: 'fast', sessionId: 'gone', persist: true, resume: true, extend: true })).rejects.toThrow(/no stored capture/);
   });
 });

@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  coverageHint,
+  coveragePromptText,
   defaultSessionName,
   escapeHtml,
   exportFilename,
@@ -134,7 +136,7 @@ describe('labels', () => {
     expect(statusInfo('capturing').tone).toBe('warn');
   });
   it('every guidance code has friendly copy', () => {
-    const codes: Guidance[] = ['good', 'move_slower', 'more_texture', 'translate_more', 'tracking_lost', 'initializing'];
+    const codes: Guidance[] = ['good', 'move_slower', 'more_texture', 'translate_more', 'tracking_lost', 'initializing', 'too_dark'];
     for (const c of codes) {
       for (const mode of ['object', 'scene', 'auto'] as const) {
         const g = guidanceInfo(c, mode);
@@ -144,6 +146,18 @@ describe('labels', () => {
     }
     expect(guidanceInfo('tracking_lost').tone).toBe('bad');
     expect(guidanceInfo('translate_more', 'object').title).not.toBe(guidanceInfo('translate_more', 'scene').title);
+    // too dark: the torch when there is one (and it is off)
+    expect(guidanceInfo('too_dark', 'object', 'off').detail).toMatch(/torch/);
+    expect(guidanceInfo('too_dark', 'object', 'none').detail).not.toMatch(/torch/);
+    expect(guidanceInfo('too_dark', 'object', 'on').detail).toMatch(/light/);
+  });
+  it('coverage prompt and readiness copy', () => {
+    for (const p of ['other_side', 'fill_gaps', 'look_down', 'go_lower', 'done'] as const) expect(coveragePromptText(p).length).toBeGreaterThan(10);
+    expect(coveragePromptText('locating')).toBe('');
+    expect(coveragePromptText('done', false)).toMatch(/sides/);
+    expect(coverageHint({ stable: true, completeness: 0.62, prompt: 'look_down' })).toBe('Coverage 62 % · top not captured');
+    expect(coverageHint({ stable: true, completeness: 1, prompt: 'done' })).toBe('Coverage 100 % · ready to finish');
+    expect(coverageHint({ stable: false, completeness: 0, prompt: 'locating' })).toBeNull();
   });
   it('escapeHtml', () => {
     expect(escapeHtml(`<a href="x">'&'</a>`)).toBe('&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;');

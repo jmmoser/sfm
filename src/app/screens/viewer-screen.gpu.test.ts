@@ -4,7 +4,14 @@
  * hardware adapter, E2E_GPU=host — the WebGPU splat layer): a rebuild drops the Gaussian-splat
  * PLY prepared from the previous model; the previous model's splat layer is freed while the
  * trainer runs and shown again when the build stops; a build settling after the screen was left
- * does not take the wake lock / busy flag of the next screen.
+ * does not take the wake lock / busy flag of the next screen; after a killed build (run journal)
+ * the next one runs in light mode — no mesh, at most LIGHT_MODE_MAX_POINTS shown, no prepared
+ * exports (one in flight is discarded, none is made meanwhile) — and everything comes back when it
+ * stops, the view matching the layer pill at once; opened from Home's card for a build that stored
+ * nothing, the viewer points to Build. "Add more views": the card for
+ * photos refine could not connect (dismissed per refine) and the Build sheet item open the confirm
+ * sheet (saying which stages Finish rebuilds), whose button requests the capture permissions
+ * inside its tap.
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import { getGPU } from '../../gpu/device';
@@ -12,8 +19,10 @@ import { lookAt } from '../../splat/testutil';
 import { SH_C0, allocSplatModel, logit } from '../../splat/types';
 import type { Viewer } from '../../viewer';
 import { ENGINE_ERRORS, namedError, type ExportFormat, type SparseResult, type SplatModelPayload, type SplatOptions, type SplatResult } from '../../workers/protocol';
+import type { PointCloud, TriangleMesh } from '../../core/types';
 import type { App, Results } from '../app';
 import { closeAllModals } from '../components/layers';
+import { LIGHT_MODE_MAX_POINTS, RUN_JOURNAL_KEY, RunJournal, parseRunRecord, type JournalStorage } from '../run-journal';
 import { createViewerScreen } from './viewer';
 
 class FakeEngine {
@@ -24,11 +33,14 @@ class FakeEngine {
   modelLoads = 0;
   /** Exports wait for this while set. */
   exportGate: Promise<void> | null = null;
+  /** splatModel() waits for this while set. */
+  modelGate: Promise<void> | null = null;
   splat(opts?: SplatOptions): Promise<SplatResult> {
     return new Promise((resolve, reject) => this.builds.push({ opts, resolve, reject }));
   }
   async splatModel(): Promise<SplatModelPayload | null> {
     this.modelLoads++;
+    if (this.modelGate) await this.modelGate;
     return this.model;
   }
   async exportModel(format: ExportFormat): Promise<Blob> {
@@ -77,6 +89,29 @@ function info(count: number): SplatResult {
   return { count, iterations: 100, ms: 1, shDegree: 0, bytes: 56 * count, antialiased: true, stats: {} };
 }
 
+function cloud(n: number): PointCloud {
+  const positions = new Float32Array(3 * n);
+  for (let i = 0; i < 3 * n; i++) positions[i] = Math.sin(1.3 * i + 0.7) * 0.5;
+  return { count: n, positions, colors: new Uint8Array(3 * n).fill(200), radii: new Float32Array(n).fill(0.004) };
+}
+
+/** Two triangles (a quad in the z = 0 plane). */
+function quad(): TriangleMesh {
+  return {
+    vertexCount: 4,
+    triangleCount: 2,
+    positions: new Float32Array([-0.3, -0.3, 0, 0.3, -0.3, 0, 0.3, 0.3, 0, -0.3, 0.3, 0]),
+    normals: new Float32Array([0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1]),
+    colors: new Uint8Array(12).fill(150),
+    indices: new Uint32Array([0, 1, 2, 0, 2, 3]),
+  };
+}
+
+function memStorage(): JournalStorage & { map: Map<string, string> } {
+  const map = new Map<string, string>();
+  return { map, getItem: (k) => map.get(k) ?? null, setItem: (k, v) => void map.set(k, v), removeItem: (k) => void map.delete(k) };
+}
+
 function fakeApp(engine: FakeEngine, splat: SplatResult | null) {
   const wakeLock = {
     active: false,
@@ -94,8 +129,10 @@ function fakeApp(engine: FakeEngine, splat: SplatResult | null) {
     wakeLock,
     busy: false,
     loadedSessionId: 's1' as string | null,
+    config: { mode: 'object', quality: 'fast', autoDense: true },
     env: { webgpu: 'available', webgl: true, share: false },
     debug: {} as { viewer?: unknown },
+    journal: new RunJournal(null),
     navigate: (): void => undefined,
     updateSession: async (): Promise<void> => undefined,
     ensureSessionLoaded: async (): Promise<boolean> => true,
@@ -154,6 +191,17 @@ async function loaded(app: ReturnType<typeof fakeApp>, screen: { el: HTMLElement
   if (app.results.splat) await waitFor(() => ['ready', 'unavailable'].includes(screen.el.dataset.splats ?? ''));
 }
 
+/** The run journal over `storage` after a photoreal build of scan s1 was killed (its next launch). */
+function killedSplat(storage: JournalStorage, stage = 'splat_training'): RunJournal {
+  new RunJournal(storage).begin({ sessionId: 's1', name: 'Bench', step: 'splat', stage, quality: 'fast' });
+  const j = new RunJournal(storage);
+  j.recover();
+  return j;
+}
+
+/** The visible toasts' texts. */
+const toasts = (): string[] => [...document.querySelectorAll('.toast:not(.hide)')].map((t) => t.textContent ?? '');
+
 /** Build sheet → quality → the photoreal item's Build / Rebuild / Resume. */
 async function startBuild(quality: 'fast' | 'balanced' | 'max'): Promise<void> {
   await tap('tool-build');
@@ -164,6 +212,155 @@ async function startBuild(quality: 'fast' | 'balanced' | 'max'): Promise<void> {
 }
 
 describe('viewer screen: photoreal build', () => {
+  it('after a killed build the next one runs in light mode, and the full view comes back when it stops (run journal)', async () => {
+    const engine = new FakeEngine();
+    const app = fakeApp(engine, null);
+    app.results.dense = cloud(LIGHT_MODE_MAX_POINTS + 100_000);
+    app.results.mesh = quad();
+    const storage = memStorage();
+    // the photoreal build of this scan was killed: the next launch counted it
+    new RunJournal(storage).begin({ sessionId: 's1', name: 'Bench', step: 'splat', stage: 'splat_training', quality: 'fast' });
+    app.journal = new RunJournal(storage);
+    app.journal.recover();
+    app.journal.acknowledge();
+    const screen = mount(app);
+    await loaded(app, screen);
+    const viewer = app.debug.viewer as Viewer;
+    expect(viewer.getStats()).toMatchObject({ densePoints: LIGHT_MODE_MAX_POINTS + 100_000, triangles: 2 });
+    // an export prepared before the build, and one still being prepared when it starts
+    await tap('tool-export');
+    await tap('export-prepare-ply-points');
+    await waitFor(() => !!q('export-save-ply-points'));
+    let openExport!: () => void;
+    engine.exportGate = new Promise((r) => (openExport = r));
+    await tap('export-prepare-glb');
+    await waitFor(() => !!document.querySelector('[data-testid="export-glb"] .export-building'));
+    engine.exportGate = null;
+    await closeSheets();
+
+    await startBuild('fast');
+    expect(engine.builds.length).toBe(1);
+    expect(screen.el.dataset.light).toBe('1');
+    expect(viewer.getStats().densePoints).toBe(LIGHT_MODE_MAX_POINTS);
+    expect(viewer.getStats().triangles).toBe(0);
+    expect(document.querySelector('[data-testid="layer-switch"] .segment[data-value="mesh"]')).toBeNull();
+    expect(parseRunRecord(storage.map.get(RUN_JOURNAL_KEY) ?? null)).toMatchObject({ step: 'splat', kills: { splat: 1 } });
+    await tap('tool-export');
+    await waitFor(() => !!q('export-ply-points'));
+    expect(q('export-save-ply-points')).toBeNull(); // the prepared file was dropped
+    // no export file is made in the page during the light build
+    expect(document.querySelector('[data-testid="sheet-export"] [data-testid^="export-prepare-"]')).toBeNull();
+    expect(q('export-glb')!.textContent).toMatch(/After the build/);
+    // the export in flight lands during the build: discarded, not kept in the page (review)
+    openExport();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(q('export-save-glb')).toBeNull();
+    expect(q('export-glb')!.textContent).toMatch(/After the build/);
+
+    // cancelled: everything back, the kill count kept (the next build is light again)
+    engine.builds[0].reject(namedError(ENGINE_ERRORS.cancelled, 'Cancelled'));
+    await waitFor(() => q('splat-progress')!.hidden === true);
+    expect(screen.el.dataset.light).toBeUndefined();
+    expect(viewer.getStats()).toMatchObject({ densePoints: LIGHT_MODE_MAX_POINTS + 100_000, triangles: 2 });
+    expect(document.querySelector('[data-testid="layer-switch"] .segment[data-value="mesh"]')).not.toBeNull();
+    expect(parseRunRecord(storage.map.get(RUN_JOURNAL_KEY) ?? null)).toMatchObject({ step: null, kills: { splat: 1 } });
+    // the open export sheet offers its exports again (none was kept)
+    expect(q('export-prepare-glb')).not.toBeNull();
+    expect(q('export-save-glb')).toBeNull();
+    await closeSheets();
+
+    // the resumed build in light mode completes: full view back, the count reset
+    await startBuild('fast');
+    expect(viewer.getStats().triangles).toBe(0);
+    engine.model = payload(30);
+    engine.builds[1].resolve(info(30));
+    await waitFor(() => q('splat-progress')!.hidden === true);
+    expect(viewer.getStats()).toMatchObject({ densePoints: LIGHT_MODE_MAX_POINTS + 100_000, triangles: 2 });
+    expect(app.journal.lightMode('s1', 'splat')).toBe(false);
+    expect(parseRunRecord(storage.map.get(RUN_JOURNAL_KEY) ?? null)).toMatchObject({ step: null, kills: {} });
+
+    // no kill: the next build keeps the mesh
+    await startBuild('balanced');
+    expect(screen.el.dataset.light).toBeUndefined();
+    expect(viewer.getStats().triangles).toBe(2);
+    engine.builds[2].reject(namedError(ENGINE_ERRORS.cancelled, 'Cancelled'));
+    await waitFor(() => q('splat-progress')!.hidden === true);
+  });
+
+  it('a light build that stops shows the mesh at once, as the layer pill says, while the stored splat model reloads (review)', async () => {
+    const engine = new FakeEngine();
+    engine.model = payload(40);
+    // the stored model is still loading when the build starts, and again when it stops
+    let openModel!: () => void;
+    engine.modelGate = new Promise((r) => (openModel = r));
+    const app = fakeApp(engine, info(40));
+    app.results.dense = cloud(2000);
+    app.results.mesh = quad();
+    app.journal = killedSplat(memStorage());
+    const screen = mount(app);
+    await waitFor(() => !!app.debug.viewer);
+    const viewer = app.debug.viewer as Viewer;
+    const shown: Parameters<Viewer['setDisplay']>[0][] = [];
+    const setDisplay = viewer.setDisplay.bind(viewer);
+    viewer.setDisplay = (o) => {
+      shown.push(o);
+      setDisplay(o);
+    };
+    // (a rebuild: the stored model was built at Fast)
+    await startBuild('balanced');
+    expect(screen.el.dataset.light).toBe('1');
+    expect(shown[shown.length - 1]).toMatchObject({ splats: false, points: true, mesh: false });
+    expect(viewer.getStats().triangles).toBe(0);
+
+    engine.builds[0].reject(namedError(ENGINE_ERRORS.cancelled, 'Cancelled'));
+    await waitFor(() => q('splat-progress')!.hidden === true);
+    // the model reload is pending: the pill says Mesh, and the mesh is what the view shows
+    expect(engine.modelLoads).toBe(2);
+    expect(q('layer-switch')!.dataset.layer).toBe('mesh');
+    expect(shown[shown.length - 1]).toMatchObject({ splats: false, points: false, mesh: true });
+    expect(viewer.getStats().triangles).toBe(2);
+    openModel();
+    await waitFor(() => ['ready', 'unavailable'].includes(screen.el.dataset.splats ?? ''));
+  });
+
+  it('opened from Home’s card after a photoreal build that stored nothing, the viewer points to Build; a stored checkpoint has its resume card instead (review)', async () => {
+    const hint = /stopped before any training was saved/;
+    const engine = new FakeEngine();
+    const app = fakeApp(engine, null);
+    const storage = memStorage();
+    // killed while preparing: no checkpoint (loadSession reports no splatResumableIteration)
+    app.journal = killedSplat(storage, 'splat_prepare');
+    app.journal.open('s1');
+    const screen = mount(app);
+    await loaded(app, screen);
+    await waitFor(() => toasts().some((t) => hint.test(t)));
+    expect(q('splat-resume')!.hidden).toBe(true);
+    const el = [...document.querySelectorAll<HTMLElement>('.toast:not(.hide)')].find((t) => hint.test(t.textContent ?? ''))!;
+    el.querySelector<HTMLElement>('.toast-action')!.click();
+    await waitFor(() => !!q('sheet-build'));
+    expect(q('build-splat')).not.toBeNull();
+    await closeSheets();
+    leave(screen);
+    await waitFor(() => !toasts().some((t) => hint.test(t)));
+
+    // killed after a checkpoint: the splat-resume card offers it, no hint
+    app.journal = killedSplat(storage);
+    app.journal.open('s1');
+    app.results.stats = { splatResumableIteration: 500, splatResumableQuality: 'fast' };
+    const again = mount(app);
+    await loaded(app, again);
+    await waitFor(() => q('splat-resume')?.hidden === false);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(toasts().some((t) => hint.test(t))).toBe(false);
+    // opened again later (not from the card): nothing handed over
+    leave(again);
+    app.results.stats = {};
+    const later = mount(app);
+    await loaded(app, later);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(toasts().some((t) => hint.test(t))).toBe(false);
+  });
+
   it('a rebuild drops the Gaussian-splat PLY prepared from the previous model (review)', async () => {
     const engine = new FakeEngine();
     engine.model = payload(40);
@@ -270,5 +467,65 @@ describe('viewer screen: photoreal build', () => {
     engine.model = payload(70);
     engine.builds[1].resolve(info(70));
     if (hw) await waitFor(() => screen.el.dataset.splats === 'ready' && viewer.getStats().splatLayer?.gaussians === 70);
+  });
+});
+
+describe('viewer screen: add more views', () => {
+  it('photos refine could not connect: a card offers Add more views (dismissed per refine); the sheet asks for permissions in its tap', async () => {
+    const engine = new FakeEngine();
+    const app = fakeApp(engine, null);
+    Object.assign(app.env, { secureContext: true, camera: true, indexedDB: true });
+    app.results.stats = { unconnectedImages: 3, refineMs: 1234 };
+    const patches: unknown[] = [];
+    let perms = 0;
+    const started: string[] = [];
+    Object.assign(app as unknown as Record<string, unknown>, {
+      updateSession: async (_id: string | null, patch: unknown): Promise<void> => {
+        patches.push(patch);
+      },
+      requestCapturePermissions: (): Promise<unknown> => {
+        perms++;
+        return Promise.resolve({});
+      },
+      startExtendScan: (id: string): boolean => {
+        started.push(id);
+        return true;
+      },
+    });
+    const screen = mount(app);
+    await loaded(app, screen);
+    await waitFor(() => q('unconnected-photos')!.hidden === false);
+    expect(q('unconnected-photos')!.textContent).toMatch(/3 photos could not be connected/);
+    await tap('unconnected-extend');
+    await waitFor(() => !!q('sheet-extend'));
+    expect(q('sheet-extend')!.textContent).toMatch(/processed again/);
+    // what Finish rebuilds: the refine and (auto-dense) the dense cloud — said as it is
+    expect(q('sheet-extend')!.textContent).toMatch(/the 3D model and the dense cloud are rebuilt/);
+    q('extend-start')!.click();
+    // the capture permissions are requested synchronously inside the tap, then the capture opens
+    expect(perms).toBe(1);
+    expect(started).toEqual(['s1']);
+    await closeSheets();
+
+    // dismissed: hidden for this refine, remembered with the session
+    q('unconnected-dismiss')!.click();
+    expect(q('unconnected-photos')!.hidden).toBe(true);
+    expect(patches).toContainEqual({ stats: { unconnectedNoticeRefineMs: 1234 } });
+    leave(screen);
+    const again = mount(app);
+    await loaded(app, again);
+    expect(q('unconnected-photos')!.hidden).toBe(true);
+    leave(again);
+
+    // a new refine shows it again; the Build sheet offers Add more views too
+    app.results.stats = { ...app.results.stats, refineMs: 999 };
+    const third = mount(app);
+    await loaded(app, third);
+    await waitFor(() => q('unconnected-photos')!.hidden === false);
+    await tap('tool-build');
+    await tap('build-extend');
+    await waitFor(() => !!q('sheet-extend'));
+    q('extend-start')!.click();
+    expect(started).toEqual(['s1', 's1']);
   });
 });

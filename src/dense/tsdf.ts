@@ -3,8 +3,8 @@
  * TSDF integration of depth maps, marching cubes, small-component removal.
  *
  * Pipeline of `tsdfMesh` / `buildTsdfVolume`:
- *  1. Scene scale: depths sampled from (up to 16) depth maps → median depth z̃ and median
- *     focal length f̃ (depth-map pixels). Auto voxel size = autoVoxelPixels · z̃ / f̃
+ *  1. Scene scale: depths sampled from (up to 16) depth maps (inside `bounds` when given) → median
+ *     depth z̃ and median focal length f̃ (depth-map pixels). Auto voxel size = autoVoxelPixels · z̃ / f̃
  *     (≈ 2 pixel footprints at the median depth), clamped to [1e-4, 0.05] · z̃.
  *  2. Allocation pass over all depth maps: valid pixels insert the blocks along their
  *     band [d − reach, d + reach] on the viewing ray (reach: see 3.), sampled densely enough that
@@ -35,6 +35,16 @@
  *     `minComponentFraction` of the largest AND not wider than `componentKeepVoxels` voxels
  *     (bounding-box diagonal) are removed.
  *
+ * `bounds` (a world AABB, e.g. the object box of src/dense/object-roi.ts): step 1 takes the scene
+ * scale from the depth samples whose surface point is inside it (≥ 32 of them, else from all), so
+ * the auto voxel is 2 px footprints at the object rather than at the table and room behind it;
+ * step 2 inserts only blocks that hold a voxel centre inside it (band samples elsewhere are
+ * skipped, so the block budget, and with it the coarsening, goes to the box), and step 3 updates
+ * only voxels whose centre is inside it. Voxels outside keep weight 0, so marching cubes (which
+ * needs all eight corners observed) emits no vertex outside the bounds; the cut faces stay open.
+ * Inside, the volume equals the unbounded one at the same voxel size: every block holding an
+ * inside voxel that the unbounded pass allocates is allocated too.
+ *
  * Memory: 11 B per voxel (Int16 TSDF, Uint16 weight, 3 × Uint16 colour, Uint8 colour
  * weight) = 5.6 KB per block; default maxBlocks 50 000 ≈ 280 MB worst case (lower it on
  * iPhone, e.g. 25–30 k). With a user-given `voxelSize` there is no coarsening: allocation stops
@@ -45,10 +55,10 @@
  * at 120° FOV and culled visible blocks.
  *
  * Limits: one voxel size per volume, from the median depth (for an object in front of a room the
- * room decides — pass `maxDepth`, e.g. 2 × the object distance, in object mode); structures thinner
- * than ≈ τ (fences, poles) are lost and sharp edges round by ≈ 1 voxel; grazing ground with
- * cos θ < 0.1 (beyond ≈ 10× the camera height) falls back to the ray distance and can still
- * fragment where few views overlap. Integration of one view and marching cubes are synchronous:
+ * room decides — pass `maxDepth`, e.g. 2 × the object distance, or `bounds` in object mode);
+ * structures thinner than ≈ τ (fences, poles) are lost and sharp edges round by ≈ 1 voxel;
+ * grazing ground with cos θ < 0.1 (beyond ≈ 10× the camera height) falls back to the ray
+ * distance and can still fragment where few views overlap. Integration of one view and marching cubes are synchronous:
  * cancel latency is one view's integration (≤ ~1 s at 50 k blocks) — run it in a worker.
  */
 import type { CameraIntrinsics, CancelToken, Pose, ProgressCallback, TriangleMesh } from '../core/types';
@@ -96,8 +106,19 @@ export interface TsdfOptions {
   color?: boolean;
   /** Depth pixels with a photometric cost above this are ignored. Default 2. */
   maxCost?: number;
+  /**
+   * World AABB that blocks and voxel updates are limited to (see file header): the mesh has no
+   * vertex outside it. Default: none. An empty or non-finite box gives an empty mesh.
+   */
+  bounds?: TsdfBounds | null;
   /** Receives statistics when meshing finishes. */
   onStats?: (s: TsdfStats) => void;
+}
+
+/** Axis-aligned box in world coordinates. */
+export interface TsdfBounds {
+  min: ArrayLike<number>;
+  max: ArrayLike<number>;
 }
 
 export interface TsdfStats {
@@ -135,6 +156,7 @@ const DEFAULTS = {
   componentKeepVoxels: 16,
   color: true,
   maxCost: 2,
+  bounds: null as TsdfBounds | null,
 };
 
 /**
@@ -322,6 +344,46 @@ function viewGeom(view: DenseView, dm: DepthMap): ViewGeom {
   return { cam: scaleCamera(view.cam, dm.width, dm.height), R: view.pose.R, t: view.pose.t, C: poseCentre(view.pose) };
 }
 
+/**
+ * Test of a depth sample (pixel i of `dm` at depth d) whose world point must lie inside `bounds`
+ * (scene scale of a bounded volume); null without bounds.
+ */
+function sampleInBounds(bounds: TsdfBounds | null, view: DenseView, dm: DepthMap): ((i: number, d: number) => boolean) | null {
+  if (!bounds) return null;
+  const { cam, R, C } = viewGeom(view, dm);
+  const W = dm.width;
+  const { min, max } = bounds;
+  return (i, d) => {
+    const rx = ((i % W) - cam.cx) / cam.f;
+    const ry = (Math.floor(i / W) - cam.cy) / cam.f;
+    // world point C + d · Rᵀ (rx, ry, 1)
+    const x = C[0] + d * (R[0] * rx + R[3] * ry + R[6]);
+    const y = C[1] + d * (R[1] * rx + R[4] * ry + R[7]);
+    const z = C[2] + d * (R[2] * rx + R[5] * ry + R[8]);
+    return x >= min[0] && x <= max[0] && y >= min[1] && y <= max[1] && z >= min[2] && z <= max[2];
+  };
+}
+
+/** Depth samples inside the bounds needed for a bounded scene scale (else every sample counts). */
+const MIN_BOUNDED_SAMPLES = 32;
+
+/**
+ * Voxel index range [lo, hi] per axis whose voxel centres (g · voxelSize) lie inside `bounds`:
+ * unbounded (±Infinity) without bounds, empty (lo > hi) for an empty or non-finite box.
+ */
+function voxelRange(bounds: TsdfBounds | null, voxelSize: number): { lo: number[]; hi: number[] } {
+  if (!bounds) return { lo: [-Infinity, -Infinity, -Infinity], hi: [Infinity, Infinity, Infinity] };
+  const lo = [0, 1, 2].map((a) => Math.ceil(bounds.min[a] / voxelSize));
+  const hi = [0, 1, 2].map((a) => Math.floor(bounds.max[a] / voxelSize));
+  for (let a = 0; a < 3; a++) {
+    if (!(Number.isFinite(lo[a]) && Number.isFinite(hi[a]))) {
+      lo[a] = 1;
+      hi[a] = 0;
+    }
+  }
+  return { lo, hi };
+}
+
 /** One voxel size of the allocation ladder (see `allocateBands`). */
 interface AllocLevel {
   voxelSize: number;
@@ -347,6 +409,10 @@ const MAX_SUBRAYS = 6;
  * covers more than half a block) → the pixel is split into m × m sub-pixel rays. A single
  * stride derived from a low depth percentile (the previous scheme) left holes in far
  * surfaces and on grazing ones.
+ *
+ * With `bounds`, samples that fall in a block holding no voxel centre inside the bounds are
+ * skipped (per level: the block range depends on the voxel size), and pixels whose surface point
+ * is too far outside the bounds for any band sample to reach such a block are skipped whole.
  */
 function allocateBands(
   dm: DepthMap,
@@ -357,6 +423,7 @@ function allocateBands(
   maxDepth: number,
   maxCost: number,
   planeMode: boolean,
+  bounds: TsdfBounds | null,
 ): void {
   const { cam, R, C } = g;
   const W = dm.width;
@@ -371,6 +438,18 @@ function allocateBands(
   const tauL = levels.map((l) => truncVox * l.voxelSize);
   // per level: last inserted block (skip consecutive duplicates)
   const last = new Int32Array(3 * nL).fill(0x7fffffff);
+  // per level: block index range of the bounds (lo x y z, hi x y z; ±Infinity without bounds)
+  const bRange = new Float64Array(6 * nL);
+  for (let l = 0; l < nL; l++) {
+    const r = voxelRange(bounds, levels[l].voxelSize);
+    for (let a = 0; a < 3; a++) {
+      const empty = r.lo[a] > r.hi[a];
+      bRange[6 * l + a] = empty ? 1 : Math.floor(r.lo[a] / BLOCK_SIZE);
+      bRange[6 * l + 3 + a] = empty ? 0 : Math.floor(r.hi[a] / BLOCK_SIZE);
+    }
+  }
+  const bMin = bounds?.min ?? null;
+  const bMax = bounds?.max ?? null;
   let active = 0;
   for (const l of levels) if (!l.done) active++;
   for (let y = 0; y < H && active > 0; y++) {
@@ -382,6 +461,16 @@ function allocateBands(
       if (cost && cost[i] > maxCost) continue;
       const rxc = (x - cam.cx) / f;
       const Lc = Math.sqrt(rxc * rxc + ryc * ryc + 1);
+      // bounds: the pixel's surface point; its band samples lie within τ_obs (along the ray) + the
+      // pixel footprint (sub-rays) of it, and an allowed block within one block of the bounds
+      let px = 0;
+      let py = 0;
+      let pz = 0;
+      if (bMin) {
+        px = C[0] + d * (R[0] * rxc + R[3] * ryc + R[6]);
+        py = C[1] + d * (R[1] * rxc + R[4] * ryc + R[7]);
+        pz = C[2] + d * (R[2] * rxc + R[5] * ryc + R[8]);
+      }
       const nx = normal[3 * i];
       const ny = normal[3 * i + 1];
       const nz = normal[3 * i + 2];
@@ -413,6 +502,10 @@ function allocateBands(
         const tau0 = Math.max(tauL[l], tauAd);
         // band half-length along the ray = the integration's reach (symmetric)
         const tauObs = invCosPlane > 0 ? Math.max(tau0, Math.min(MAX_REACH * tau0, BEHIND_PLANE_VOX * levels[l].voxelSize * invCosPlane)) : tau0;
+        if (bMin && bMax) {
+          const pad = tauObs + 2 * halfBw[l] + ((d + tauObs) * Lc) / f;
+          if (px < bMin[0] - pad || py < bMin[1] - pad || pz < bMin[2] - pad || px > bMax[0] + pad || py > bMax[1] + pad || pz > bMax[2] + pad) continue;
+        }
         const iv = invV[l];
         const stepLen = halfBw[l]; // ≤ half a block between band samples
         let ok = true;
@@ -439,6 +532,8 @@ function allocateBands(
               last[o] = bx;
               last[o + 1] = by;
               last[o + 2] = bz;
+              const ob = 6 * l;
+              if (bx < bRange[ob] || by < bRange[ob + 1] || bz < bRange[ob + 2] || bx > bRange[ob + 3] || by > bRange[ob + 4] || bz > bRange[ob + 5]) continue;
               if (!lev.insert(bx, by, bz)) {
                 lev.done = true;
                 active--;
@@ -463,14 +558,26 @@ export function tsdfScratchBytes(): number {
   return pixScratch.byteLength;
 }
 
-/** Integrate one depth map into the volume (all allocated blocks; see file header). */
+/**
+ * Integrate one depth map into the volume (all allocated blocks; see file header). With
+ * `params.bounds`, only voxels whose centre lies inside the bounds are updated.
+ */
 export function integrateDepthMap(
   vol: TsdfVolume,
   dm: DepthMap,
   cam: CameraIntrinsics,
   pose: Pose,
   rgb: Uint8Array | null,
-  params: { truncation: number; adaptiveTruncationPx: number; sdfMode: 'plane' | 'ray'; refDepth: number; maxDepth: number; maxCost: number; maxWeight: number },
+  params: {
+    truncation: number;
+    adaptiveTruncationPx: number;
+    sdfMode: 'plane' | 'ray';
+    refDepth: number;
+    maxDepth: number;
+    maxCost: number;
+    maxWeight: number;
+    bounds?: TsdfBounds | null;
+  },
 ): number {
   const W = dm.width;
   const H = dm.height;
@@ -541,12 +648,22 @@ export function integrateDepthMap(
   const azx = R[2] * vs;
   const azy = R[5] * vs;
   const azz = R[8] * vs;
+  // voxel index range inside the bounds (±Infinity without)
+  const vr = voxelRange(params.bounds ?? null, vs);
   let updated = 0;
 
   for (let b = 0; b < vol.blockCount; b++) {
     const gx0 = BLOCK_SIZE * vol.blockCoords[3 * b];
     const gy0 = BLOCK_SIZE * vol.blockCoords[3 * b + 1];
     const gz0 = BLOCK_SIZE * vol.blockCoords[3 * b + 2];
+    // local voxel range of the block inside the bounds (0 … 7 when entirely inside)
+    const lx0 = Math.max(0, vr.lo[0] - gx0);
+    const lx1 = Math.min(7, vr.hi[0] - gx0);
+    const ly0 = Math.max(0, vr.lo[1] - gy0);
+    const ly1 = Math.min(7, vr.hi[1] - gy0);
+    const lz0 = Math.max(0, vr.lo[2] - gz0);
+    const lz1 = Math.min(7, vr.hi[2] - gz0);
+    if (lx0 > lx1 || ly0 > ly1 || lz0 > lz1) continue;
     // block centre in camera frame
     const wx = (gx0 + 3.5) * vs;
     const wy = (gy0 + 3.5) * vs;
@@ -595,13 +712,13 @@ export function integrateDepthMap(
     const c0y = R[3] * ox + R[4] * oy + R[5] * oz + t[1];
     const c0z = R[6] * ox + R[7] * oy + R[8] * oz + t[2];
     const vbase = b * BLOCK_VOXELS;
-    for (let lz = 0; lz < 8; lz++) {
-      for (let ly = 0; ly < 8; ly++) {
-        let X = c0x + ly * ayx + lz * azx;
-        let Y = c0y + ly * ayy + lz * azy;
-        let Z = c0z + ly * ayz + lz * azz;
+    for (let lz = lz0; lz <= lz1; lz++) {
+      for (let ly = ly0; ly <= ly1; ly++) {
+        let X = c0x + lx0 * axx + ly * ayx + lz * azx;
+        let Y = c0y + lx0 * axy + ly * ayy + lz * azy;
+        let Z = c0z + lx0 * axz + ly * ayz + lz * azz;
         const rowBase = vbase + 8 * (ly + 8 * lz);
-        for (let lx = 0; lx < 8; lx++, X += axx, Y += axy, Z += axz) {
+        for (let lx = lx0; lx <= lx1; lx++, X += axx, Y += axy, Z += axz) {
           if (!(Z > 1e-9)) continue;
           const iz = 1 / Z;
           const u = f * X * iz + cx;
@@ -709,27 +826,41 @@ export async function buildTsdfVolume(
   const cache = new DepthMapCache(store, 2);
   const tA = performance.now();
 
-  // 1. scene scale from a subset of views
+  // 1. scene scale from a subset of views (with bounds: from the samples inside them)
   const sampleIdx: number[] = [];
   const nSample = Math.min(views.length, 16);
   for (let k = 0; k < nSample; k++) sampleIdx.push(Math.floor(((k + 0.5) * views.length) / nSample));
-  const depthSamples: number[] = [];
-  const fs: number[] = [];
+  let depthSamples: number[] = [];
+  let fs: number[] = [];
+  const inDepth: number[] = [];
+  const inFs: number[] = [];
   for (const vi of sampleIdx) {
     await yielder.tick();
     const dm = await cache.get(views[vi].id);
     if (!dm) continue;
     const n = dm.width * dm.height;
     const step = Math.max(1, Math.floor(n / 2048));
+    const inside = sampleInBounds(o.bounds, views[vi], dm);
     let any = false;
+    let anyIn = false;
     for (let i = 0; i < n; i += step) {
       const d = dm.depth[i];
       if (d > 0 && d <= o.maxDepth && d < Infinity && !(dm.cost && dm.cost[i] > o.maxCost)) {
         depthSamples.push(d);
         any = true;
+        if (inside?.(i, d)) {
+          inDepth.push(d);
+          anyIn = true;
+        }
       }
     }
-    if (any) fs.push(scaleCamera(views[vi].cam, dm.width, dm.height).f);
+    const f = scaleCamera(views[vi].cam, dm.width, dm.height).f;
+    if (any) fs.push(f);
+    if (anyIn) inFs.push(f);
+  }
+  if (inDepth.length >= MIN_BOUNDED_SAMPLES) {
+    depthSamples = inDepth;
+    fs = inFs;
   }
   if (depthSamples.length === 0) {
     // maybe the sampled views were empty; scan all
@@ -789,7 +920,7 @@ export async function buildTsdfVolume(
       const view = views[k];
       const dm = await cache.get(view.id);
       if (!dm) continue;
-      allocateBands(dm, viewGeom(view, dm), levels, truncVox, o.adaptiveTruncationPx, o.maxDepth, o.maxCost, o.sdfMode === 'plane');
+      allocateBands(dm, viewGeom(view, dm), levels, truncVox, o.adaptiveTruncationPx, o.maxDepth, o.maxCost, o.sdfMode === 'plane', o.bounds);
       for (let l = 0; l < nL; l++) if (levels[l].done) levelMaps[l] = new Int3HashMap(16); // release
       if (levels.every((x) => x.done)) break;
     }
@@ -814,7 +945,7 @@ export async function buildTsdfVolume(
       await yielder.tick();
       const dm = await cache.get(view.id);
       if (!dm) continue;
-      allocateBands(dm, viewGeom(view, dm), [greedy], truncVox, o.adaptiveTruncationPx, o.maxDepth, o.maxCost, o.sdfMode === 'plane');
+      allocateBands(dm, viewGeom(view, dm), [greedy], truncVox, o.adaptiveTruncationPx, o.maxDepth, o.maxCost, o.sdfMode === 'plane', o.bounds);
       if (greedy.done) break;
     }
   } else {
@@ -843,6 +974,7 @@ export async function buildTsdfVolume(
         maxDepth: o.maxDepth,
         maxCost: o.maxCost,
         maxWeight: o.maxWeight,
+        bounds: o.bounds,
       });
     }
   } finally {

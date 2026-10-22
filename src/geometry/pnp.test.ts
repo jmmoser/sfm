@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { Pose } from '../core/types';
 import { Rng } from '../math/random';
-import { createIntrinsics, projectWorld } from './camera';
-import { epnp, p3p, refinePose, solvePnPRansac } from './pnp';
+import { createIntrinsics, pixelToNormalized, projectWorld } from './camera';
+import { epnp, p3p, refinePose, solvePnPKnownRotationRansac, solvePnPRansac, translationKnownRotation } from './pnp';
 import { poseCenter } from './pose';
 import { randomPoseLookingAtOrigin, randomRotation, randomUnitVector, rotErrDeg } from './testutil';
 
@@ -233,5 +233,143 @@ describe('solvePnPRansac', () => {
     const uv = new Float64Array(2 * n).map(() => rng.uniform(0, 480));
     expect(solvePnPRansac(X, uv, n, cam, { maxIterations: 500 })).toBeNull();
     expect(solvePnPRansac(X, uv, 5, cam)).toBeNull();
+  });
+});
+
+describe('solvePnPKnownRotationRansac (gyro-known rotation)', () => {
+  const DEG = Math.PI / 180;
+  const cam = createIntrinsics(960, 720, 65 * DEG, -0.03, 0.005);
+
+  /**
+   * A keyframe 1 m (the baseline) from a reference camera at the origin, rotated up to 35°, seeing
+   * `nIn` points at zmin–zmax m (σ = noisePx) and `nOut` wrong observations (uniform pixels ≥ 40 px
+   * from the true projection).
+   */
+  function keyframe(rng: Rng, nIn: number, nOut: number, noisePx: number, zmin = 3, zmax = 15) {
+    const R = randomRotation(rng, 35 * DEG);
+    const C = randomUnitVector(rng);
+    const t = Float64Array.of(
+      -(R[0] * C[0] + R[1] * C[1] + R[2] * C[2]),
+      -(R[3] * C[0] + R[4] * C[1] + R[5] * C[2]),
+      -(R[6] * C[0] + R[7] * C[1] + R[8] * C[2]),
+    );
+    const pose: Pose = { R, t };
+    const n = nIn + nOut;
+    const { X } = makePoints(rng, pose, n, zmin, zmax);
+    const uv = new Float64Array(2 * n);
+    const pr = new Float64Array(2);
+    for (let i = 0; i < n; i++) {
+      expect(projectWorld(cam, pose, X.subarray(3 * i, 3 * i + 3), pr)).toBe(true);
+      if (i < nIn) {
+        uv[2 * i] = pr[0] + noisePx * rng.gaussian();
+        uv[2 * i + 1] = pr[1] + noisePx * rng.gaussian();
+        continue;
+      }
+      // a wrong match: anywhere in the image but ≥ 40 px from the true projection
+      do {
+        uv[2 * i] = rng.uniform(0, cam.width);
+        uv[2 * i + 1] = rng.uniform(0, cam.height);
+      } while (Math.hypot(uv[2 * i] - pr[0], uv[2 * i + 1] - pr[1]) < 40);
+    }
+    return { pose, X, uv, n };
+  }
+
+  /** `R` turned by `deg` about a random axis (the gyro's error). */
+  function perturbed(rng: Rng, R: ArrayLike<number>, deg: number): Float64Array {
+    const E = randomRotation(rng, deg * DEG, deg * DEG);
+    const out = new Float64Array(9);
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) out[3 * i + j] = E[3 * i] * R[j] + E[3 * i + 1] * R[3 + j] + E[3 * i + 2] * R[6 + j];
+    return out;
+  }
+
+  it('recovers t exactly (1e-9) from 2 noise-free points', () => {
+    const rng = new Rng(201);
+    const pin = createIntrinsics(960, 720, 65 * DEG);
+    for (let k = 0; k < 200; k++) {
+      const pose = randomPoseLookingAtOrigin(rng, rng.uniform(0.5, 20), 0.3);
+      const { X, xn } = makePoints(rng, pose, 2, 0.3, 40);
+      const t = translationKnownRotation(pose.R, X, xn, 2)!;
+      expect(t).not.toBeNull();
+      const tol = 1e-9 * Math.max(1, Math.hypot(pose.t[0], pose.t[1], pose.t[2]));
+      for (let c = 0; c < 3; c++) expect(Math.abs(t[c] - pose.t[c])).toBeLessThan(tol);
+      // through the pixel path and RANSAC (2 points: the sample itself)
+      const uv = new Float64Array(4);
+      const pr = new Float64Array(2);
+      for (let i = 0; i < 2; i++) {
+        projectWorld(pin, pose, X.subarray(3 * i, 3 * i + 3), pr);
+        uv.set(pr, 2 * i);
+      }
+      const res = solvePnPKnownRotationRansac(X, uv, 2, pin, pose.R, { minInliers: 2, rng: new Rng(k) })!;
+      expect(res).not.toBeNull();
+      expect(res.numInliers).toBe(2);
+      for (let c = 0; c < 3; c++) expect(Math.abs(res.pose.t[c] - pose.t[c])).toBeLessThan(tol);
+      expect(res.rotationChangeRad).toBe(0); // < 3 points: refinePose leaves the pose as it is
+    }
+    // degenerate: coinciding bearings
+    const X2 = Float64Array.of(0, 0, 5, 0, 0, 10);
+    expect(translationKnownRotation(Float64Array.of(1, 0, 0, 0, 1, 0, 0, 0, 1), X2, Float64Array.of(0, 0, 0, 0), 2)).toBeNull();
+  });
+
+  it('12 inliers among 70 % outliers, 0.5 px noise, rotation 0 / 1° off: the optimal pose (0.5° / 1 % of the baseline) in ≥ 99 % of 200 trials', () => {
+    const huber = 6 / cam.f;
+    const xn = new Float64Array(24);
+    const tmp = new Float64Array(2);
+    for (const [gyroErrDeg, zmin, zmax] of [
+      [0, 2, 8],
+      [1, 2, 8],
+      [1, 5, 40], // yard-like: depth 5–40 × the baseline
+    ]) {
+      const rng = new Rng(202 + gyroErrDeg + zmax);
+      let ok = 0,
+        withinBaseline = 0;
+      const trials = 200;
+      for (let k = 0; k < trials; k++) {
+        const s = keyframe(rng, 12, 28, 0.5, zmin, zmax);
+        const res = solvePnPKnownRotationRansac(s.X, s.uv, s.n, cam, perturbed(rng, s.pose.R, gyroErrDeg), { maxErrorPx: 12, rng: new Rng(1000 + k) });
+        if (!res) continue;
+        // what any estimator reaches from these 12 noisy points: the robust LM optimum from the truth
+        for (let i = 0; i < 12; i++) {
+          pixelToNormalized(cam, s.uv[2 * i], s.uv[2 * i + 1], tmp);
+          xn.set(tmp, 2 * i);
+        }
+        const best = refinePose(s.pose, s.X, xn, 12, { iterations: 50, huberNormalized: huber });
+        let wrong = 0;
+        for (let i = 12; i < s.n; i++) wrong += res.inlierMask[i];
+        const found = res.numInliers === 12 && wrong === 0 && rotErrDeg(res.pose.R, s.pose.R) < 0.5 && centerErr(res.pose, best) < 0.01;
+        if (found) ok++;
+        if (found && centerErr(res.pose, s.pose) < 0.01) withinBaseline++;
+        if (found) expect(Math.abs(res.rotationChangeRad / DEG - gyroErrDeg)).toBeLessThan(0.5);
+      }
+      expect(ok).toBeGreaterThanOrEqual(0.99 * trials);
+      // and that optimum within 1 % of the 1 m baseline at 2–8 m (its centre error: p50 0.35 cm, p95
+      // 0.75 cm; at 5–40 m p50 1.1 cm, p95 2.8 cm — the rotation ↔ translation coupling of 12 points)
+      if (zmax === 8) expect(withinBaseline).toBeGreaterThanOrEqual(0.99 * trials);
+    }
+  });
+
+  it('refineRotation: false keeps the given rotation exactly; seeded Rng ⇒ identical results', () => {
+    const rng = new Rng(204);
+    const s = keyframe(rng, 30, 30, 0.5);
+    const fixed = solvePnPKnownRotationRansac(s.X, s.uv, s.n, cam, s.pose.R, { refineRotation: false, rng: new Rng(7) })!;
+    expect(fixed).not.toBeNull();
+    expect(Array.from(fixed.pose.R)).toEqual(Array.from(s.pose.R));
+    expect(fixed.rotationChangeRad).toBe(0);
+    expect(centerErr(fixed.pose, s.pose)).toBeLessThan(0.01);
+    const a = solvePnPKnownRotationRansac(s.X, s.uv, s.n, cam, s.pose.R, { rng: new Rng(9) })!;
+    const b = solvePnPKnownRotationRansac(s.X, s.uv, s.n, cam, s.pose.R, { rng: new Rng(9) })!;
+    expect(Array.from(a.pose.t)).toEqual(Array.from(b.pose.t));
+    expect(Array.from(a.inlierMask)).toEqual(Array.from(b.inlierMask));
+  });
+
+  it('returns null without enough inliers (and for a rotation far off)', () => {
+    const rng = new Rng(205);
+    const n = 100;
+    const X = new Float64Array(3 * n).map(() => rng.uniform(-1, 1) + 5);
+    const uv = new Float64Array(2 * n).map(() => rng.uniform(0, 700));
+    expect(solvePnPKnownRotationRansac(X, uv, n, cam, Float64Array.of(1, 0, 0, 0, 1, 0, 0, 0, 1), { maxIterations: 500 })).toBeNull();
+    const s = keyframe(rng, 14, 0, 0.5);
+    expect(solvePnPKnownRotationRansac(s.X, s.uv, 11, cam, s.pose.R)).toBeNull(); // n < minInliers
+    // a prediction 25° off: no consistent translation explains 12 of the points
+    expect(solvePnPKnownRotationRansac(s.X, s.uv, s.n, cam, perturbed(rng, s.pose.R, 25), { maxErrorPx: 12 })).toBeNull();
   });
 });

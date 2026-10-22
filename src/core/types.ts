@@ -192,6 +192,27 @@ export interface MetricInfo {
   originLatLonAlt: [number, number, number] | null;
 }
 
+/**
+ * Box around the object of an object-mode capture (src/dense/object-roi.ts): axis-aligned in the
+ * gravity-aligned world frame (+Z up), world units. Plain arrays (JSON / IndexedDB / postMessage).
+ * Exports that put the object on the ground place the bottom centre
+ * ((min[0] + max[0]) / 2, (min[1] + max[1]) / 2, planeZ) at the origin.
+ */
+export interface ObjectRoi {
+  /**
+   * Lower corner; min[2] = the support plane's highest point under the box (≈ planeZ: the plane
+   * tilts ≤ 2°) + the clearance that keeps the support surface out.
+   */
+  min: [number, number, number];
+  max: [number, number, number];
+  /** Height of the support plane (table, floor) under the box centre. */
+  planeZ: number;
+  /** Orbit centre: the least-squares convergence point of the optical axes. */
+  centre: [number, number, number];
+  /** 0..1 (plane share of the points around the object × object point support). */
+  confidence: number;
+}
+
 export interface ProgressEvent {
   stage: string;
   /** 0..1 within the stage, or -1 for indeterminate. */
@@ -202,6 +223,11 @@ export interface ProgressEvent {
    * iteration, loss, it/s). Plain numbers only, so it survives the worker message as is.
    */
   detail?: Record<string, number>;
+  /**
+   * A picture of the stage's state (e.g. the splat stage's 'splat_preview' snapshot of the model
+   * being trained, RGBA8). The engine worker transfers its buffer, never copies it.
+   */
+  image?: RGBAImage;
 }
 
 export type ProgressCallback = (e: ProgressEvent) => void;
@@ -209,4 +235,10 @@ export type ProgressCallback = (e: ProgressEvent) => void;
 /** Cooperative cancellation token passed through long-running work. */
 export interface CancelToken {
   readonly cancelled: boolean;
+  /**
+   * Optional: end the work early and keep its result so far. Only the splat training honours it
+   * (src/engine/splat.ts: it stops at the current iteration and finishes like a complete run);
+   * other work ignores it.
+   */
+  readonly finishEarly?: boolean;
 }

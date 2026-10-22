@@ -17,4 +17,5 @@ export * from './pnp';
 export * from './triangulation';
 export * from './twoview';
 export * from './align';
+export * from './convergence';
 export { eigenvaluesNonsymmetric, eigenvectorInverseIteration } from './eigen';

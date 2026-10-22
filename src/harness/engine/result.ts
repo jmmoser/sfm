@@ -8,7 +8,7 @@ import type { IntrinsicsJSON, MappedImage, PoseJSON, ProgressRecord, StageTiming
 
 /** A frame the harness delivered, with what the engine said about it. */
 export interface DeliveredRef {
-  /** Delivered-frame counter (FrameInput.index). */
+  /** FrameInput.index sent: the delivered-frame counter (a verbatim replay of a recording: the recorded index). */
   delivered: number;
   /** Dataset frame index. */
   index: number;
@@ -40,8 +40,8 @@ const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFin
 /**
  * Dataset frame index of the keyframe a 'keyframe' LiveUpdate created. Best-of-window keyframing
  * (src/sfm/keyframes.ts) can make an EARLIER, held frame the keyframe: the update of the later
- * frame then names its source in `timings.keyframeFrameIndex` (FrameInput.index of the held frame
- * = the harness's delivered counter). Otherwise the keyframe is the update's own frame (`current`).
+ * frame then names its source in `timings.keyframeFrameIndex` (FrameInput.index of the held frame,
+ * mapped back by `datasetIndexOfDelivered`). Otherwise the keyframe is the update's own frame (`current`).
  */
 export function keyframeSourceIndex(timings: Record<string, number> | undefined, datasetIndexOfDelivered: (delivered: number) => number | undefined, current: number): number {
   const k = timings?.keyframeFrameIndex;
@@ -55,7 +55,7 @@ export function keyframeSourceIndex(timings: Record<string, number> | undefined,
 /**
  * Map every camera to the dataset frame it came from. Per camera, in this order:
  *  1. `frameIndex` (extension field, src/engine SparseCameraEx): FrameInput.index of the source
- *     frame (= the harness's delivered counter), else LiveUpdate.frameIndex;
+ *     frame (= DeliveredRef.delivered), else LiveUpdate.frameIndex;
  *  2. `t` (extension field): the delivered frame with the nearest capture time (within 1 ms);
  *  3. `id` as the keyframe ordinal (k-th frame answered with decision 'keyframe') — used when the
  *     ids of the cameras without 1./2. are distinct integers below the number of keyframes;

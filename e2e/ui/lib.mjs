@@ -122,6 +122,8 @@ export function layoutAudit() {
   const screen = document.querySelector('.screen:not(.screen-exit)');
   if (screen && screen.scrollWidth > screen.clientWidth + 1) problems.push(`screen scrollWidth ${screen.scrollWidth} > ${screen.clientWidth}`);
   const visible = (el) => {
+    // screen-reader-only text (.sr-only) is clipped on purpose
+    if (el.closest('.sr-only')) return false;
     const r = el.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) return false;
     const cs = getComputedStyle(el);

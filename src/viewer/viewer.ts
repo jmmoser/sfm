@@ -13,7 +13,8 @@
  *
  * Gaussian splats (`setSplats`, WebGPU, ./splat-layer.ts, loaded lazily) are drawn in a canvas
  * under the WebGL one; while they are shown the WebGL canvas clears to transparent and draws the
- * overlays only (the points / mesh are kept for picking).
+ * overlays only (the points / mesh are kept for picking). `openSplatFrames` renders the loaded
+ * splats offscreen at a fixed size for the fly-through video (also while another layer is shown).
  */
 import {
   BufferAttribute,
@@ -67,7 +68,7 @@ import {
 import { MeasureTool, measureDistance, type MeasureCallback } from './measure';
 import { PointCloudMaterial, patchMeshMaterial } from './points-material';
 import { subsampleMeans } from './splat-camera';
-import type { SplatLayer, SplatLayerStats, SplatView } from './splat-layer';
+import type { SplatLayer, SplatLayerStats, SplatOffscreen, SplatOffscreenOptions, SplatView } from './splat-layer';
 import type { SplatModel } from '../splat/types';
 
 /** State of the splat layer: no model, compiling / uploading, shown-able, recovering a lost device, failed. */
@@ -724,6 +725,21 @@ export class Viewer {
       console.error(e);
     }
     this.requestRender();
+  }
+
+  /**
+   * Offscreen frames of the loaded splat model (fly-through video; `SplatLayer.openOffscreen`): null
+   * while no model is ready. The background defaults to the viewer's (opaque). Close the session to
+   * let the viewer draw the splats again.
+   */
+  openSplatFrames(o: SplatOffscreenOptions): SplatOffscreen | null {
+    if (this.disposed || this.splatState !== 'ready' || !this.splatLayer?.ready) return null;
+    let background = o.background;
+    if (!background) {
+      this.bgColor.getRGB(this.splatBg, SRGBColorSpace);
+      background = [this.splatBg.r, this.splatBg.g, this.splatBg.b];
+    }
+    return this.splatLayer.openOffscreen({ ...o, background });
   }
 
   /** Splats are drawn instead of the points / mesh this frame. */

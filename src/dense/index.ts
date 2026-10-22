@@ -1,7 +1,8 @@
 /**
  * Dense reconstruction (ARCHITECTURE §4.6): PatchMatch MVS (WebGPU + CPU), undistortion,
- * view selection, fusion, halo / sky filter, TSDF + marching cubes, simplification, point-cloud
- * filters, tuned presets, and the synthetic test-data generator (`synthetic` namespace).
+ * view selection, fusion, halo / sky filter, TSDF + marching cubes, simplification, the colour
+ * atlas of AR exports, point-cloud filters, tuned presets, the object box of object-mode captures,
+ * and the synthetic test-data generator (`synthetic` namespace).
  */
 export * from './types';
 export { patchMatchCPU, lastPatchMatchCPUStats, type PatchMatchCPUStats } from './patchmatch-cpu';
@@ -27,9 +28,10 @@ export {
   type SparsePointsInput,
 } from './view-selection';
 export { fuseDepthMaps, DEFAULT_FUSION_OPTIONS, type FusionOptions, type FusionStats } from './fusion';
-export { depthHaloMask, removeDepthHalos, worldUpInCamera, skyBorders, DEFAULT_HALO_FILTER_OPTIONS, type HaloFilterOptions } from './depth-filter';
+export { depthHaloMask, removeDepthHalos, applyDepthHaloMask, worldUpInCamera, skyBorders, DEFAULT_HALO_FILTER_OPTIONS, type HaloFilterOptions } from './depth-filter';
 export { DENSE_PRESETS, type DensePreset, type DenseQuality } from './presets';
-export { tsdfMesh, buildTsdfVolume, integrateDepthMap, TsdfVolume, type TsdfOptions, type TsdfStats } from './tsdf';
+export { tsdfMesh, buildTsdfVolume, integrateDepthMap, TsdfVolume, type TsdfBounds, type TsdfOptions, type TsdfStats } from './tsdf';
+export { proposeObjectRoi, objectRoiPivot, type ObjectRoiInput, type ObjectRoiOptions, type ObjectRoiProposal } from './object-roi';
 export {
   marchingCubes,
   removeSmallComponents,
@@ -45,6 +47,7 @@ export {
   type MarchingCubesOptions,
 } from './marching-cubes';
 export { simplifyMesh, type SimplifyOptions } from './simplify';
+export { buildColourAtlas, buildColourAtlasAsync, ClosestTriangleFinder, type ColourAtlas, type ColourAtlasOptions, type ColourAtlasStats } from './colour-atlas';
 export {
   filterPointCloud,
   voxelDownsample,

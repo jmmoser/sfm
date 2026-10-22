@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { ENGINE_ERRORS, namedError } from '../workers/protocol';
-import { frameErrorAction, isQuotaError, isStorageWriteError, overlayMatchesView } from './capture-policy';
+import { GUIDANCE_PRIORITY, GuidanceGate, frameErrorAction, isQuotaError, isStorageWriteError, overlayMatchesView } from './capture-policy';
+import type { Guidance } from '../workers/protocol';
 
 describe('frameErrorAction', () => {
   it('ignores back-pressure and cancellation', () => {
@@ -48,5 +49,103 @@ describe('overlayMatchesView', () => {
     expect(overlayMatchesView(0, 90)).toBe(false);
     expect(overlayMatchesView(90, 270)).toBe(false);
     expect(overlayMatchesView(180, 0)).toBe(false);
+  });
+});
+
+describe('GuidanceGate', () => {
+  /** Feed one code per 100 ms frame (10 Hz) from t = `t0`; returns the shown code after each frame. */
+  function feed(gate: GuidanceGate, codes: Guidance[], t0 = 0): (Guidance | null)[] {
+    return codes.map((c, i) => gate.update(c, t0 + 100 * i).code);
+  }
+
+  it('shows the first code at once, a new one after 2 frames and 1.5 s of dwell', () => {
+    const g = new GuidanceGate();
+    expect(g.update('initializing', 0)).toEqual({ code: 'initializing', changed: true, announce: true });
+    // 'good' is lower priority than 'initializing': confirmed after 2 frames, shown once 1.5 s passed
+    const shown = feed(g, ['good', 'good', 'good', 'good', 'good', 'good', 'good', 'good', 'good', 'good', 'good', 'good', 'good', 'good', 'good', 'good'], 100);
+    expect(shown.indexOf('good')).toBe(14); // t = 1500
+    expect(g.code).toBe('good');
+  });
+
+  it('single-frame blips never reach the banner', () => {
+    const g = new GuidanceGate();
+    g.reset('good', 0);
+    const shown = feed(g, ['move_slower', 'good', 'more_texture', 'good', 'translate_more', 'good', 'move_slower', 'good'], 2000);
+    expect(shown.every((c) => c === 'good')).toBe(true);
+    // two frames of other codes that each persist one frame neither
+    expect(feed(g, ['move_slower', 'more_texture', 'good', 'more_texture', 'translate_more', 'good'], 3000).every((c) => c === 'good')).toBe(true);
+  });
+
+  it('a stale code gives way to the most frequent of the next 3 frames when none of them confirms', () => {
+    // tracking is back, but every other frame is blur-rejected: neither code persists 2 frames
+    const alternating = (n: number): Guidance[] => Array.from({ length: n }, (_, i) => (i % 2 ? 'move_slower' : 'good'));
+    const g = new GuidanceGate();
+    expect(g.update('tracking_lost', 0).code).toBe('tracking_lost');
+    const shown = feed(g, alternating(9), 2000);
+    expect(shown.slice(0, 3)).toEqual(['tracking_lost', 'tracking_lost', 'good']);
+    // then the single-frame blips do not reach the banner
+    expect(shown.slice(2).every((c) => c === 'good')).toBe(true);
+    // within the dwell the stale code waits for it (the most frequent is lower priority)
+    const d = new GuidanceGate();
+    d.update('tracking_lost', 0);
+    const early = feed(d, alternating(18), 100);
+    expect(early.indexOf('good')).toBe(14); // t = 1500
+    expect(early.slice(0, 14).every((c) => c === 'tracking_lost')).toBe(true);
+    // a higher-priority one replaces it at once: three frames of warnings, none twice in a row
+    const w = new GuidanceGate();
+    w.reset('good', 0);
+    expect(feed(w, ['move_slower', 'more_texture', 'move_slower'], 100)).toEqual(['good', 'good', 'move_slower']);
+    // ties go to the latest
+    const t = new GuidanceGate({ staleFrames: 2 });
+    t.reset('good', -5000);
+    expect(feed(t, ['more_texture', 'move_slower'], 0)).toEqual(['good', 'move_slower']);
+  });
+
+  it('a higher-priority code replaces a fresh one after its 2 frames; a lower one waits for the dwell', () => {
+    const g = new GuidanceGate();
+    g.reset('translate_more', 0);
+    expect(g.update('move_slower', 100).changed).toBe(false);
+    const r = g.update('move_slower', 200);
+    expect(r).toEqual({ code: 'move_slower', changed: true, announce: false }); // both warnings: no announcement
+    // back to 'good' (lowest): shown only 1.5 s after move_slower appeared
+    const shown = feed(g, new Array<Guidance>(20).fill('good'), 300);
+    expect(shown.indexOf('good')).toBe(14); // t = 1700 ≥ 200 + 1500
+  });
+
+  it("'tracking_lost' and 'too_dark' show on their first frame, even during the dwell", () => {
+    const g = new GuidanceGate();
+    g.reset('good', 0);
+    expect(g.update('move_slower', 100).code).toBe('good');
+    expect(g.update('move_slower', 200).code).toBe('move_slower');
+    expect(g.update('tracking_lost', 300)).toEqual({ code: 'tracking_lost', changed: true, announce: true });
+    expect(g.update('too_dark', 400)).toEqual({ code: 'too_dark', changed: true, announce: false }); // outranks lost, same severity
+    // lost is lower than too_dark: it waits for the dwell like any other code
+    expect(g.update('tracking_lost', 500).code).toBe('too_dark');
+    expect(g.update('tracking_lost', 1900).code).toBe('tracking_lost');
+  });
+
+  it('announces severity changes only', () => {
+    const g = new GuidanceGate({ dwellMs: 0 });
+    const ann: boolean[] = [];
+    let t = 0;
+    for (const c of ['initializing', 'initializing', 'good', 'good', 'move_slower', 'move_slower', 'more_texture', 'more_texture', 'tracking_lost', 'good', 'good'] as Guidance[]) {
+      const r = g.update(c, (t += 100));
+      if (r.changed) ann.push(r.announce);
+    }
+    // initializing (first), good, move_slower, more_texture (same severity), tracking_lost, good
+    expect(ann).toEqual([true, true, true, false, true, true]);
+  });
+
+  it('reset(null): the next code shows at once (resume after a pause)', () => {
+    const g = new GuidanceGate();
+    g.reset('move_slower', 0);
+    g.reset();
+    expect(g.code).toBeNull();
+    expect(g.update('good', 50)).toEqual({ code: 'good', changed: true, announce: true });
+  });
+
+  it('ranks every guidance code', () => {
+    const all: Guidance[] = ['good', 'move_slower', 'more_texture', 'translate_more', 'tracking_lost', 'initializing', 'too_dark'];
+    expect([...GUIDANCE_PRIORITY].sort()).toEqual([...all].sort());
   });
 });

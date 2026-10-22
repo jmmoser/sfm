@@ -25,9 +25,9 @@ import type { DensePresetConfig, SplatPresetConfig } from './presets';
  * keep the extra fields, so they also arrive through the worker / EngineClient.
  */
 export type SparseCameraEx = SparseCamera & {
-  /** Capture time of the keyframe (ms, FrameInput.t). */
+  /** Capture time of the keyframe (ms, FrameInput.t on the session time base: + its segment's shift). */
   t?: number;
-  /** FrameInput.index of the frame that became this keyframe. */
+  /** FrameInput.index of the frame that became this keyframe (+ its segment's index offset). */
   frameIndex?: number;
 };
 
@@ -117,6 +117,33 @@ export interface EngineConfig {
   /** Tolerance of the gyro gates (defaults: 5° + 0.3°/s × |Δt| + 5 % of the rotation). */
   gyroTolerance?: Partial<GyroToleranceOptions>;
   /**
+   * Gyro-aided registration (active once R_cam_device is verified; independent of `gyroGate`): an
+   * image P3P cannot register (fewer than 30 inliers, or a pose the gyro rejects) is registered with
+   * its rotation predicted by the gyro from the registered keyframe nearest in time, from ≥ 15
+   * inliers and a baseline that agrees with its best verified pair — refused without such a pair
+   * (`LiveSession.predictRotation`, `MapperOptions.predictRotation`).
+   *  - 'offline' (default): only in refine's offline SfM, after P3P failed on every candidate. It
+   *    joins what the phone-rate live map holds but P3P alone splits into fragments (e2e yard-real
+   *    at stride 3 from frame 1: 1 model of 48 keyframes instead of 3, the largest 32), so that an
+   *    open-loop live model can be replaced; the model choice counts such registrations only for a
+   *    model without an unclosed loop (`unclosedLoop`).
+   *  - 'all': also live and in refine's retry of the pending keyframes, after LiveMapper
+   *    re-triangulated the registered neighbours (`live.retriangulateNeighbours`) and P3P still
+   *    failed; a live model with such keyframes is checked by an offline SfM WITHOUT the gyro path
+   *    (`liveModelHealth`). Opt-in: it registered no keyframe live in any e2e run (re-triangulation
+   *    gives P3P its points), and nothing checks it against translational aliasing (false matches on
+   *    structure repeating along the walking direction shift the centre along the baseline).
+   *  - 'off': never.
+   * Measurements: docs/research/real-capture-robustness.md "Phone-rate capture".
+   */
+  gyroAidedRegistration?: 'off' | 'offline' | 'all';
+  /**
+   * Shift the frames of a restored / extended capture past the stored capture times (default true:
+   * `LiveSession` time segments, EngineStateRecord.timeSegments). false only in tests that prove
+   * the hazard (a reloaded page's performance.now() interleaves new IMU samples with stored ones).
+   */
+  extendTimeShift?: boolean;
+  /**
    * Estimate the gyro bias / camera–IMU offset from the live keyframes every 10 registrations
    * during capture (default false; refine always calibrates once before the rolling-shutter estimation).
    * Off because it changes the keyframe selection and measured equal or worse (yard-real ATE 7.0e-4
@@ -162,16 +189,25 @@ export interface EngineConfig {
   /**
    * The from-scratch offline SfM of refine, the independent check of the live model: 'auto'
    * (default) runs it only when the live model shows a symptom it has to be checked for (keyframes
-   * not registered, no verified gyro, gyro breaks or outliers, few images, a low explained ratio,
-   * unmerged loop-closure pairs: `liveModelHealth` in refine.ts); 'always' runs it every time.
+   * not registered, no verified gyro, keyframes registered with the gyro-predicted rotation, gyro
+   * breaks or outliers, few images, a low explained ratio, unmerged loop-closure pairs:
+   * `liveModelHealth` in refine.ts); 'always' runs it every time.
    */
   refineOfflineSfM?: 'auto' | 'always';
   /**
    * CPU helper workers (nested in the engine worker) that verify refine's candidate pairs and
-   * quantise its vocabulary in parallel (default: hardware threads − 2, at most 3; 0 = everything
+   * quantise its vocabulary in parallel, and in densify decode the next views and halo-filter the
+   * final depth maps while the GPU runs (default: hardware threads − 2, at most 3; 0 = everything
    * on the engine thread). Same results either way.
    */
   cpuWorkers?: number;
+  /**
+   * CPU/GPU overlap of densify's depth-map stage (src/engine/dense.ts; default true): keyframe
+   * decoding ahead and the final maps' halo filter on the CPU helper workers, and map writes in
+   * flight, while the GPU computes the next views — within the memory plan's headroom. false =
+   * serial (every CPU step on the engine thread between GPU passes). Bit-identical results.
+   */
+  denseOverlap?: boolean;
   /** Per-image focal lengths tied to the shared focal in the final refinement (default true; kept only if it helps). */
   perImageFocal?: boolean;
   /** Prior σ of the per-image focal (relative, default 0.005) and the required reprojection improvement (default 0.005). */
@@ -217,8 +253,9 @@ export interface EngineConfig {
 /** What the engine knows about one keyframe (persisted with its JPEG as the frame `info`). */
 export interface KeyframeRecord {
   id: number;
-  /** FrameInput.index (or the engine's frame counter). */
+  /** FrameInput.index (or the engine's frame counter), + an offset in a continued capture's segment. */
   frameIndex: number;
+  /** FrameInput.t on the session time base (+ the shift of its capture segment, EngineStateRecord.timeSegments). */
   t: number;
   /** Canonical full-resolution size. */
   width: number;

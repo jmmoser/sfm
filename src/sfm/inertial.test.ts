@@ -14,12 +14,15 @@ import {
   type SimTrajectory,
 } from './extras-testutil';
 import {
+  accelNoiseLevel,
   AttitudeInterpolator,
   composeGravityAlignment,
   estimateGravity,
   estimateInertialAlignment,
   estimateMetricScale,
+  estimateMetricScaleFromIntervals,
   estimateTimeOffset,
+  estimateTimeOffsetFromAcceleration,
   filtfiltBandpass,
   GyroIntegrator,
   SplineSecondDerivative,
@@ -219,6 +222,24 @@ describe('estimateGravity', () => {
     });
   }
 
+  it('a capture continued after a gap (EngineOptions.extend): the samples between the segments are not used', () => {
+    const { imu, kf } = scenario('orbit', 24, -30);
+    // the middle 3 s are missing (keyframes and IMU) and the rest comes 10 s later: a second
+    // segment whose IMU starts 1.5 s before its first keyframe (frames before the first keyframe)
+    const ts = kf.keyframes.map((k) => k.t).sort((a, b) => a - b);
+    const cut0 = ts[Math.floor(ts.length / 2)],
+      cut1 = cut0 + 3000,
+      shift = 10_000;
+    const keyframes = kf.keyframes.filter((k) => k.t < cut0 || k.t >= cut1).map((k) => (k.t >= cut1 ? { ...k, t: k.t + shift } : k));
+    const imu2 = imu.filter((s) => s.t < cut0 || s.t >= cut1 - 1500).map((s) => (s.t >= cut1 - 1500 ? { ...s, t: s.t + shift } : s));
+    const fixed = angleDeg(estimateGravity(keyframes, imu2, { offsetMs: -30 })!.down, kf.downRec);
+    // the attitude interpolated across the gap (no IMU there) tilts gravity
+    const across = angleDeg(estimateGravity(keyframes, imu2, { offsetMs: -30, maxImuGapMs: Infinity })!.down, kf.downRec);
+    if (LOG) console.log('gravity err deg with a segment gap: skipped', fixed.toFixed(3), 'interpolated', across.toFixed(3));
+    expect(fixed).toBeLessThan(1);
+    expect(across).toBeGreaterThan(2 * fixed);
+  });
+
   it('falls back to per-keyframe gravityCam', () => {
     const { kf } = scenario('orbit', 23, 0);
     for (const k of kf.keyframes) {
@@ -323,5 +344,187 @@ describe('estimateMetricScale', () => {
     expect(estimateMetricScale(kf.keyframes, imu, { offsetMs: 0, source: 'accelG' })).toBeNull();
     const none = imu.map((s) => ({ ...s, accel: null, accelG: null }));
     expect(estimateMetricScale(kf.keyframes, none, { offsetMs: 0, gravity: { down: kf.downRec } })).toBeNull();
+  });
+});
+
+describe('estimateMetricScaleFromIntervals', () => {
+  /** Hand-held orbit or walk with keyframes every 0.75/rate–1.25/rate s and a 60 Hz IMU (iOS). */
+  function lowRate(kind: 'orbit' | 'walk', seed: number, rateHz: number, imuOpts: Parameters<typeof simulateImu>[3] = {}) {
+    const rng = new Rng(seed);
+    const traj: SimTrajectory = kind === 'orbit' ? orbitTrajectory(rng) : walkTrajectory(rng);
+    const Rcd = cameraFromDevice(kind === 'orbit' ? 0 : 90);
+    const imu = simulateImu(traj, Rcd, rng, { rateHz: 60, ...imuOpts });
+    const kf = simulateKeyframes(traj, Rcd, rng, {
+      offsetMs: kind === 'orbit' ? -37 : 55,
+      s: rng.uniform(0.2, 5),
+      posNoise: kind === 'orbit' ? 0.0005 : 0.002,
+      rotNoise: 0.0005,
+      minIntervalS: 0.75 / rateHz,
+      maxIntervalS: 1.25 / rateHz,
+    });
+    return { imu, kf };
+  }
+  /** Both scale estimates with the estimated time offset, gyro bias and gravity (as computeWorldAlignment). */
+  function estimate(kf: ReturnType<typeof lowRate>['kf'], imu: ImuSample[]) {
+    const to = estimateTimeOffset(kf.keyframes, imu);
+    const offsetMs = to && to.reliable ? to.offsetMs : 0;
+    const gyroBias = to && to.reliable ? to.gyroBias : null;
+    const g = estimateGravity(kf.keyframes, imu, { offsetMs, gyroBias })!;
+    const gravity = { down: g.down, magnitude: g.magnitude };
+    return {
+      band: estimateMetricScale(kf.keyframes, imu, { offsetMs, gyroBias, gravity }),
+      int: estimateMetricScaleFromIntervals(kf.keyframes, imu, { offsetMs, gyroBias, gravity }),
+    };
+  }
+
+  it('walk at 1.2 keyframes/s: the band-pass estimate lacks excitation, the interval estimate is within 2.5 %', () => {
+    for (const seed of [51, 52, 53]) {
+      const { imu, kf } = lowRate('walk', seed, 1.2);
+      const { band, int } = estimate(kf, imu);
+      const err = int!.scale * kf.s - 1;
+      if (LOG)
+        console.log('walk 1.2 Hz', seed, 'band', band?.reason, 'int err %', (100 * err).toFixed(2), '± %', (100 * int!.relUncertainty).toFixed(2), 'span', int!.intervals!.spanS, 'κ', int!.intervals!.attenuation, int!.reason);
+      expect(band!.reliable).toBe(false);
+      expect(band!.reason).toMatch(/excitation/);
+      expect(int!.method).toBe('intervals');
+      expect(int!.reliable).toBe(true);
+      expect(Math.abs(err)).toBeLessThan(0.025);
+      expect(Math.abs(err)).toBeLessThan(3 * int!.relUncertainty);
+      expect(int!.relUncertainty).toBeLessThan(0.02);
+      expect(int!.intervals!.attenuation).toBeGreaterThan(0);
+      expect(int!.intervals!.spanS).toBeGreaterThan(0.6);
+    }
+  });
+
+  it('orbit at 1.2 keyframes/s, accelG source: within 3 %', () => {
+    const { imu, kf } = lowRate('orbit', 54, 1.2, { withAccel: false });
+    const { int } = estimate(kf, imu);
+    const err = int!.scale * kf.s - 1;
+    if (LOG) console.log('orbit 1.2 Hz accelG err %', (100 * err).toFixed(2), '± %', (100 * int!.relUncertainty).toFixed(2), int!.reason);
+    expect(int!.source).toBe('accelG');
+    expect(int!.reliable).toBe(true);
+    expect(Math.abs(err)).toBeLessThan(0.03);
+    expect(Math.abs(err)).toBeLessThan(3 * int!.relUncertainty);
+  });
+
+  it('claims a calibrated σ at 1 and 2 keyframes/s (orbit and walk, 8 seeds each)', () => {
+    const z: number[] = [];
+    let maxErr = 0;
+    for (const kind of ['orbit', 'walk'] as const)
+      for (const rate of [1, 2])
+        for (let seed = 0; seed < 8; seed++) {
+          const { imu, kf } = lowRate(kind, 6000 + 100 * rate + seed, rate);
+          const { int } = estimate(kf, imu);
+          const err = int!.scale * kf.s - 1;
+          z.push(err / int!.relUncertainty);
+          maxErr = Math.max(maxErr, Math.abs(err));
+        }
+    const zRms = Math.sqrt(z.reduce((a, b) => a + b * b, 0) / z.length);
+    if (LOG) console.log('interval scale z rms', zRms.toFixed(2), 'max err %', (100 * maxErr).toFixed(2));
+    expect(zRms).toBeGreaterThan(0.5);
+    expect(zRms).toBeLessThan(1.3);
+    expect(maxErr).toBeLessThan(0.04);
+  });
+
+  it('flags a slow pan by its IMU-noise attenuation', () => {
+    const traj = slowPanTrajectory(15);
+    const Rcd = cameraFromDevice(0);
+    const rng = new Rng(41);
+    const imu = simulateImu(traj, Rcd, rng);
+    const kf = simulateKeyframes(traj, Rcd, rng, { offsetMs: 0 });
+    const res = estimateMetricScaleFromIntervals(kf.keyframes, imu, { offsetMs: 0 });
+    if (LOG && res) console.log('slow pan (intervals)', res.scale * kf.s, res.relUncertainty, res.excitationRms, res.reason);
+    expect(res === null || !res.reliable).toBe(true);
+    if (res) expect(res.reason).toMatch(/IMU-noise attenuation κ [\d.]+ % > 2 %/);
+  });
+
+  it('perfectly regular orbit: the centripetal term is degenerate with a device-frame bias, and σ says so', () => {
+    const rng = new Rng(43);
+    const traj = orbitTrajectory(rng, { regular: true, posJitterMm: [0, 0], rotJitterDeg: [0, 0] });
+    const Rcd = cameraFromDevice(0);
+    const imu = simulateImu(traj, Rcd, rng, { rateHz: 60 });
+    const kf = simulateKeyframes(traj, Rcd, rng, { offsetMs: 0, s: 2, minIntervalS: 0.6, maxIntervalS: 1 });
+    const res = estimateMetricScaleFromIntervals(kf.keyframes, imu, { offsetMs: 0 })!;
+    if (LOG) console.log('regular orbit (intervals)', (100 * (res.scale * 2 - 1)).toFixed(2), '±', (100 * res.relUncertainty).toFixed(2), res.reason);
+    expect(!res.reliable || Math.abs(res.scale * 2 - 1) < 3 * res.relUncertainty).toBe(true);
+  });
+
+  it('measures the accelerometer noise; a noisier device is rejected by κ instead of read high, a quieter one keeps the floor', () => {
+    for (const noise of [0.01, 0.05, 0.15]) {
+      const { imu } = lowRate('walk', 61, 1.2, { accelNoise: noise });
+      for (const field of ['accel', 'accelG'] as const) expect(Math.abs(accelNoiseLevel(imu, field) / noise - 1)).toBeLessThan(0.15);
+    }
+    for (const kind of ['orbit', 'walk'] as const)
+      for (const seed of [62, 63, 64]) {
+        // before: κ from a fixed 0.05 m/s² passed every seed with a scale up to 9 % high (orbit)
+        const noisy = lowRate(kind, seed, 1.2, { accelNoise: 0.15 });
+        const n = estimate(noisy.kf, noisy.imu).int!;
+        const err = n.scale * noisy.kf.s - 1;
+        if (LOG) console.log(kind, 'noise 0.15', (100 * err).toFixed(2), n.reason);
+        expect(n.intervals!.accelNoise).toBeCloseTo(0.15, 1);
+        if (kind === 'orbit') expect(n.reason).toMatch(/IMU-noise attenuation κ/);
+        expect(!n.reliable || Math.abs(err) < 3 * n.relUncertainty).toBe(true);
+        const quiet = lowRate(kind, seed, 1.2, { accelNoise: 0.01 });
+        const q = estimate(quiet.kf, quiet.imu).int!;
+        expect(q.intervals!.accelNoiseMeasured).toBeLessThan(0.015);
+        expect(q.intervals!.accelNoise).toBe(0.05);
+        expect(q.reliable).toBe(true);
+      }
+  });
+
+  it('cross-checks the gravity removal of accel against accelG: a lagging gravity estimate is caught', () => {
+    for (const seed of [71, 72, 73]) {
+      const { imu, kf } = lowRate('walk', seed, 1.2);
+      const ok = estimate(kf, imu).int!;
+      expect(ok.source).toBe('accel+accelG');
+      expect(ok.reliable).toBe(true);
+      expect(Math.abs(ok.intervals!.sourceDisagreement!)).toBeLessThan(0.015);
+      // CoreMotion-like: the gravity estimate behind `accel` absorbs 30 % of the slow (τ = 1 s) acceleration
+      const ema = [0, 0, 0];
+      let tPrev = imu[0].t;
+      const lag = imu.map((x) => {
+        const al = 1 - Math.exp(-(x.t - tPrev) / 1000);
+        tPrev = x.t;
+        for (let c = 0; c < 3; c++) ema[c] += al * (x.accel![c] - ema[c]);
+        return { ...x, accel: [x.accel![0] - 0.3 * ema[0], x.accel![1] - 0.3 * ema[1], x.accel![2] - 0.3 * ema[2]] as [number, number, number] };
+      });
+      const to = estimateTimeOffset(kf.keyframes, lag)!;
+      const g = estimateGravity(kf.keyframes, lag, { offsetMs: to.offsetMs, gyroBias: to.gyroBias })!;
+      const base = { offsetMs: to.offsetMs, gyroBias: to.gyroBias, gravity: { down: g.down, magnitude: g.magnitude } };
+      const accelOnly = estimateMetricScaleFromIntervals(kf.keyframes, lag, { ...base, source: 'accel' })!;
+      const checked = estimateMetricScaleFromIntervals(kf.keyframes, lag, base)!;
+      if (LOG) console.log('gravity lag', seed, (100 * (accelOnly.scale * kf.s - 1)).toFixed(2), accelOnly.reliable, checked.reason);
+      expect(accelOnly.reliable).toBe(true);
+      expect(accelOnly.scale * kf.s - 1).toBeLessThan(-0.05);
+      expect(checked.reliable).toBe(false);
+      expect(checked.reason).toMatch(/accel and accelG scales disagree/);
+    }
+  });
+
+  it('time offset from the interval regression where the band-pass one has no excitation; σ carries the offset σ', () => {
+    for (const seed of [81, 82]) {
+      const { imu, kf } = lowRate('walk', seed, 1.2);
+      const gravity = { down: kf.downRec };
+      const band = estimateTimeOffsetFromAcceleration(kf.keyframes, imu, { initialOffsetMs: 0, scale: { gravity } });
+      const int = estimateTimeOffsetFromAcceleration(kf.keyframes, imu, { initialOffsetMs: 0, method: 'intervals', intervalScale: { gravity } })!;
+      if (LOG) console.log('interval offset', seed, int.offsetMs, int.stdMs, int.quality, 'band', band?.reliable, band?.offsetMs);
+      expect(band === null || !band.reliable).toBe(true);
+      expect(int.reliable).toBe(true);
+      expect(Math.abs(int.offsetMs - 55)).toBeLessThan(10);
+      expect(int.scale.method).toBe('intervals');
+      // the scale's sensitivity to a 25 ms offset σ enters σ
+      const at = estimateMetricScaleFromIntervals(kf.keyframes, imu, { offsetMs: int.offsetMs, gravity })!;
+      const unsure = estimateMetricScaleFromIntervals(kf.keyframes, imu, { offsetMs: int.offsetMs, gravity, offsetStdMs: 25 })!;
+      expect(at.intervals!.offsetSensitivity).toBe(0);
+      expect(unsure.intervals!.offsetSensitivity).toBeGreaterThan(0.001);
+      expect(unsure.relUncertainty).toBeCloseTo(Math.hypot(at.relUncertainty, unsure.intervals!.offsetSensitivity), 10);
+    }
+  });
+
+  it('returns null without accelerations / gravity', () => {
+    const { imu, kf } = lowRate('orbit', 42, 1.5, { withAccel: false });
+    expect(estimateMetricScaleFromIntervals(kf.keyframes, imu, { offsetMs: 0, source: 'accelG' })).toBeNull();
+    const none = imu.map((s) => ({ ...s, accel: null, accelG: null }));
+    expect(estimateMetricScaleFromIntervals(kf.keyframes, none, { offsetMs: 0, gravity: { down: kf.downRec } })).toBeNull();
   });
 });

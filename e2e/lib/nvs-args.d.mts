@@ -17,6 +17,8 @@ export interface NvsArgs {
   background: number[];
   ssim: boolean;
   common: boolean;
+  /** The splat model file in the run directory (splats.ply; *.spz is decoded first). */
+  splatFile: string;
   saveImages: boolean;
   out: string | null;
   verbose: boolean;
