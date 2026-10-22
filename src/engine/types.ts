@@ -117,13 +117,14 @@ export interface EngineConfig {
   /** Tolerance of the gyro gates (defaults: 5° + 0.3°/s × |Δt| + 5 % of the rotation). */
   gyroTolerance?: Partial<GyroToleranceOptions>;
   /**
-   * Gyro-aided registration (default true, active once R_cam_device is verified): a keyframe P3P
-   * cannot register (fewer than 30 inliers) is registered with its rotation predicted by the gyro
-   * from the registered keyframe nearest in time, from ≥ 15 inliers (`LiveSession.predictRotation`,
-   * `MapperOptions.predictRotation`; live and in refine's retry of the pending keyframes). With the
-   * LiveMapper's neighbour re-triangulation (`live.retriangulateNeighbours`) it keeps a phone-rate
-   * capture registered through fast pans (e2e yard-real at stride 3: 19/48 → 48/48 keyframes live;
-   * docs/research/real-capture-robustness.md "Phone-rate capture").
+   * Gyro-aided registration (default true, active once R_cam_device is verified; independent of
+   * `gyroGate`): a keyframe P3P cannot register (fewer than 30 inliers) even after the LiveMapper
+   * re-triangulated its registered neighbours (`live.retriangulateNeighbours`) is registered with
+   * its rotation predicted by the gyro from the registered keyframe nearest in time, from ≥ 15
+   * inliers and a baseline that agrees with its best verified pair (`LiveSession.predictRotation`,
+   * `MapperOptions.predictRotation`; live and in refine's retry of the pending keyframes). A live
+   * model with such keyframes is checked by the offline SfM (`liveModelHealth`). Measurements:
+   * docs/research/real-capture-robustness.md "Phone-rate capture".
    */
   gyroAidedRegistration?: boolean;
   /**
@@ -172,8 +173,9 @@ export interface EngineConfig {
   /**
    * The from-scratch offline SfM of refine, the independent check of the live model: 'auto'
    * (default) runs it only when the live model shows a symptom it has to be checked for (keyframes
-   * not registered, no verified gyro, gyro breaks or outliers, few images, a low explained ratio,
-   * unmerged loop-closure pairs: `liveModelHealth` in refine.ts); 'always' runs it every time.
+   * not registered, no verified gyro, keyframes registered with the gyro-predicted rotation, gyro
+   * breaks or outliers, few images, a low explained ratio, unmerged loop-closure pairs:
+   * `liveModelHealth` in refine.ts); 'always' runs it every time.
    */
   refineOfflineSfM?: 'auto' | 'always';
   /**

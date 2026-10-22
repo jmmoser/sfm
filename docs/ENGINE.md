@@ -124,10 +124,12 @@ picks object vs scene after initialisation from the scene depth / baseline.
    pose of the last registered keyframe), verify, reject pairs whose rotation disagrees
    with the gyro, update the graph, `LiveMapper.addKeyframe` (registrations checked
    against the gyro too). A keyframe at the edge of the map (after a fast pan at a phone's
-   2–4 analysed frames per second) first has its registered neighbours triangulated again —
-   its pairs turned their two-view tracks multi-view — and one P3P still cannot register
-   (fewer than 30 inliers) is registered with its gyro-predicted rotation from ≥ 15 inliers
-   (`EngineConfig.gyroAidedRegistration`).
+   2–4 analysed frames per second: it sees fewer than 30 map points, or P3P failed) has its
+   registered neighbours triangulated again — its pairs turned their two-view tracks
+   multi-view — and P3P is tried again; only one P3P still cannot register (fewer than 30
+   inliers) is registered with its gyro-predicted rotation from ≥ 15 inliers, if its baseline
+   agrees with its best verified pair (`EngineConfig.gyroAidedRegistration`). Registrations
+   other than a plain P3P one are logged at debug level (points, inliers per solver).
 
 ### Refine
 Train/extend the vocabulary → candidate pairs (sequential 10, retrieval 15,
@@ -136,7 +138,9 @@ with the enriched graph, as during capture) → gyro calibration
 (bias, camera–IMU offset) → rolling-shutter estimation on the live model (gyro rotation +
 translation from the neighbouring keyframes × point depth; 2 passes) and keypoint
 correction → only when the live model is unhealthy (`liveModelHealth`: unregistered keyframes,
-no verified gyro, gyro breaks / outliers, few explained correspondences, an unclosed loop),
+no verified gyro, keyframes registered with the gyro-predicted rotation, gyro breaks / outliers,
+few explained correspondences, an unclosed loop — many split loop-like correspondences, or a
+loop-like split pair joining the two ends of the capture),
 `runIncrementalSfM` (gyro-checked registrations) and the better of live
 vs offline (gyro breaks, then registered images, then explained correspondences, then
 reprojection error; isolated gyro outliers deregistered) → final global BA (focal + principal point + k1 + k2) →

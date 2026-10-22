@@ -112,6 +112,16 @@ describe('liveModelHealth (offline SfM skipped for a healthy live model)', () =>
     const h = liveModelHealth(open, db, ids, gyro);
     expect(h.healthy).toBe(false);
     expect(h.reason).toMatch(/unclosed loop/);
+    // with too few split correspondences for the count limits (a phone-rate capture's short loop
+    // tracks), the loop-like pairs that join the two ends of the capture still tell
+    const lax = { maxLoopCorrespondences: 1e9, maxSplitCorrespondences: 1e9 };
+    const far = liveModelHealth(open, db, ids, gyro, lax);
+    expect(far.healthy).toBe(false);
+    expect(far.reason).toMatch(/loop-like split pairs across the capture/);
+    const span = (l: { a: number; b: number }): number => Math.abs(ids.indexOf(l.a) - ids.indexOf(l.b));
+    expect(Math.max(...far.split!.loops.map(span))).toBeGreaterThanOrEqual(10);
+    expect(liveModelHealth(open, db, ids, gyro, { ...lax, maxLoopSpan: 1 }).healthy).toBe(true);
+    expect(liveModelHealth(rec, db, ids, gyro, lax).healthy).toBe(true);
     // a keyframe the live model never registered
     const missing = rec.clone();
     missing.deregisterImage(ids[7]);
@@ -120,6 +130,10 @@ describe('liveModelHealth (offline SfM skipped for a healthy live model)', () =>
     expect(liveModelHealth(rec, db, ids, null).healthy).toBe(false);
     expect(liveModelHealth(rec, db, ids, { ...gyro, breaksWithoutOutliers: 1 }).reason).toMatch(/gyro break/);
     expect(liveModelHealth(rec, db, ids, { ...gyro, outliers: [ids[3]] }).reason).toMatch(/disagree with the gyro/);
+    // keyframes registered with the gyro-predicted rotation: the gyro checks are no evidence for them
+    // (one the model no longer registers, or an unknown id, does not count)
+    expect(liveModelHealth(rec, db, ids, gyro, {}, new Set([ids[3], ids[9]])).reason).toMatch(/2 keyframe\(s\) registered with the gyro-predicted rotation/);
+    expect(liveModelHealth(missing, db, ids.filter((id) => id !== ids[7]), gyro, {}, [ids[7], 999]).healthy).toBe(true);
     // too few images to judge
     expect(liveModelHealth(rec, db, ids, gyro, { minImages: 40 }).healthy).toBe(false);
   }, 120_000);

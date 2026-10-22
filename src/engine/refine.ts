@@ -296,6 +296,8 @@ export interface SplitPairStats {
   /** Loop-like split pairs and their split correspondences. */
   loopPairs: number;
   loopCorrespondences: number;
+  /** The loop-like split pairs (image ids) and their split correspondences. */
+  loops: { a: number; b: number; split: number }[];
   /** The split pairs, most split first: "a-b split/inliers rotation° reprojection px" (diagnostics). */
   detail: string[];
 }
@@ -320,6 +322,7 @@ export function splitPairs(rec: Reconstruction, db: FeatureDatabase, opts: Parti
     splitCorr = 0,
     nLoop = 0,
     loopCorr = 0;
+  const loops: SplitPairStats['loops'] = [];
   const detail: { key: string; n: number }[] = [];
   const Rba = new Float64Array(9);
   const errs: number[] = [];
@@ -356,6 +359,7 @@ export function splitPairs(rec: Reconstruction, db: FeatureDatabase, opts: Parti
     if (med > o.minReprojPx && med <= o.maxReprojFocal * cam.f) {
       nLoop++;
       loopCorr += ns;
+      loops.push({ a, b, split: ns });
     }
     // diagnostics: the pair's rotation against the model's relative rotation R_b R_aᵀ
     let errDeg = NaN;
@@ -379,6 +383,7 @@ export function splitPairs(rec: Reconstruction, db: FeatureDatabase, opts: Parti
     splitCorrespondences: splitCorr,
     loopPairs: nLoop,
     loopCorrespondences: loopCorr,
+    loops,
     detail: detail.map((d) => d.key),
   };
 }
@@ -405,6 +410,11 @@ export interface LiveHealthOptions {
   /** Split correspondences on any split pair: at most max(abs, fraction × all) (defaults 1000, 1.5 %). */
   maxSplitCorrespondences: number;
   maxSplitFraction: number;
+  /**
+   * No loop-like split pair may join keyframes this fraction of the capture apart or more (in
+   * `keyframes` order; default 1/3): the two ends of a loop the model did not close.
+   */
+  maxLoopSpan: number;
   split: Partial<SplitPairOptions>;
 }
 
@@ -415,6 +425,7 @@ export const DEFAULT_LIVE_HEALTH_OPTIONS: Readonly<Omit<LiveHealthOptions, 'spli
   maxLoopFraction: 0.0025,
   maxSplitCorrespondences: 1000,
   maxSplitFraction: 0.015,
+  maxLoopSpan: 1 / 3,
 });
 
 /**
@@ -427,12 +438,23 @@ export const DEFAULT_LIVE_HEALTH_OPTIONS: Readonly<Omit<LiveHealthOptions, 'spli
  * reconstruction time. Healthy when ALL hold (a deterministic function of the model and the pairs):
  *  - every keyframe of `keyframes` is registered, and at least `minImages`;
  *  - the gyro is verified (`gyro` not null) and the model has no gyro breaks or outliers;
+ *  - no keyframe of the model was registered with the gyro-predicted rotation (`gyroAided`,
+ *    IncrementalMapper.knownRotationImages): its rotation agrees with the gyro by construction, so
+ *    the gyro checks are no evidence for it, and it makes "every keyframe registered" easy. A live
+ *    model registered through the gyro path drifted unnoticed (e2e yard-real at stride 3 from frame
+ *    1, the gyro path alone: 49/49 registered, 0.5 m / 3° apart at the loop's ends, ATE 6.9e-3, 16
+ *    loop-like split correspondences — healthy by the other rules);
  *  - at least `minExplained` of the verified correspondences are explained (same 3-D point);
  *  - no unclosed loop (`splitPairs`): few correspondences on loop-like split pairs (a loop gap of a
  *    few to a few hundred pixels), and few on split pairs at all (any gap). The thresholds sit
  *    between the e2e closed models (≤ 190 loop-like / ≤ 1940 split correspondences of 168 k on
  *    yard-real: limits 420 / 2520; none on object-real) and the unclosed live models (≥ 1200
- *    loop-like, or 2950–5650 split).
+ *    loop-like, or 2950–5650 split);
+ *  - and no loop-like split pair across ≥ `maxLoopSpan` of the capture. A phone-rate capture has
+ *    fewer, shorter loop tracks: e2e yard-real at stride 3 from frame 1 registered 48/48 live and
+ *    refine left its loop open in 2 of 6 runs (ATE 1.8e-2, rotation 2.4°) on only 47–69 loop-like
+ *    correspondences (limit 150) — but on the loop's own pairs, keyframes 1–2 ↔ 42–44 (≈ 210 px
+ *    apart); the closed models' loop-like pairs join keyframes 7 apart (14 of 81 at stride 1).
  * Any doubt runs the offline SfM, as before: a wrong "unhealthy" only costs time.
  */
 export function liveModelHealth(
@@ -441,6 +463,7 @@ export function liveModelHealth(
   keyframes: readonly number[],
   gyro: GyroConsistency | null,
   opts: Partial<LiveHealthOptions> = {},
+  gyroAided: Iterable<number> = [],
 ): LiveModelHealth {
   const o = { ...DEFAULT_LIVE_HEALTH_OPTIONS, ...opts };
   const out = (healthy: boolean, reason: string, explained = NaN, split: SplitPairStats | null = null): LiveModelHealth => ({ healthy, reason, explained, split });
@@ -450,6 +473,9 @@ export function liveModelHealth(
   const n = rec.numRegisteredImages;
   if (n < o.minImages) return out(false, `only ${n} registered images (< ${o.minImages})`);
   if (!gyro) return out(false, 'no verified gyro to check it against');
+  let aided = 0;
+  for (const id of gyroAided) if (rec.images.get(id)?.registered) aided++;
+  if (aided > 0) return out(false, `${aided} keyframe(s) registered with the gyro-predicted rotation (no independent check)`);
   if (gyro.breaksWithoutOutliers > 0) return out(false, `${gyro.breaksWithoutOutliers} gyro break(s)`);
   if (gyro.outliers.length > 0) return out(false, `${gyro.outliers.length} keyframe(s) disagree with the gyro`);
   const explained = explainedCorrespondenceRatio(rec, db);
@@ -460,6 +486,11 @@ export function liveModelHealth(
   const counts = `${sp.loopCorrespondences} correspondences on ${sp.loopPairs} loop-like and ${sp.splitCorrespondences} on ${sp.splitPairs} split pairs`;
   if (sp.loopCorrespondences > maxLoop || sp.splitCorrespondences > maxSplit)
     return out(false, `unclosed loop? ${counts} (limits ${Math.round(maxLoop)} / ${Math.round(maxSplit)})`, explained, sp);
+  const pos = new Map(keyframes.map((id, k) => [id, k]));
+  const span = (l: { a: number; b: number }): number => Math.abs((pos.get(l.a) ?? NaN) - (pos.get(l.b) ?? NaN));
+  const far = sp.loops.filter((l) => span(l) >= o.maxLoopSpan * keyframes.length);
+  if (far.length > 0)
+    return out(false, `unclosed loop? loop-like split pairs across the capture: ${far.map((l) => `${l.a}-${l.b} (${l.split})`).join(', ')}`, explained, sp);
   return out(
     true,
     `all ${n} keyframes registered, gyro-consistent (median ${gyro.medianErrDeg.toFixed(2)}°), ${(100 * explained).toFixed(1)} % explained, ${counts}`,
@@ -785,7 +816,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   };
   // the offline SfM checks the live model independently: skipped when the live model is healthy
   const lc = consistency(liveRec);
-  const health = liveRec && cfg.refineOfflineSfM !== 'always' ? liveModelHealth(liveRec, st.db, order, lc) : null;
+  const health = liveRec && cfg.refineOfflineSfM !== 'always' ? liveModelHealth(liveRec, st.db, order, lc, {}, live.mapper.incrementalMapper.knownRotationImages) : null;
   stats.offlineSfM = health?.healthy ? `skipped: ${health.reason}` : health ? `run: ${health.reason}` : 'run';
   deps.log('info', `refine: offline SfM ${stats.offlineSfM}`);
   if (health?.split) deps.log('info', `refine: live model split pairs: ${health.split.detail.slice(0, 40).join('; ')}`);

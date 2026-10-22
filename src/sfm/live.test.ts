@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { mat3Mul, mat3MulTranspose } from '../math/mat3';
 import { CorrespondenceGraph } from './correspondence-graph';
-import { LiveMapper } from './live';
+import { LiveMapper, type LiveKeyframeResult } from './live';
 import { buildSyntheticDatabase, evaluateReconstruction, generateScene } from './synthetic';
 import { ROTATION_ONLY_CAMERA, rotationOnlyDb } from './e2e-testutil';
 
@@ -154,6 +155,95 @@ describe('LiveMapper', () => {
     expect(ev.maxRotErrorDeg).toBeLessThan(0.5);
   });
 
+  it('a keyframe P3P rejects on the map as it is: re-triangulation and P3P again before the gyro-predicted rotation', () => {
+    const scene = generateScene({ kind: 'walk', numImages: 30, seed: 6, numPoints: 6000, noisePx: 0.5, descriptors: false });
+    const { db } = buildSyntheticDatabase(scene, { verify: false });
+    const ids = db.frameIds();
+    const K = 14;
+    const point = (k: number, f: number): number => scene.featurePoint[k][f];
+    const seen = (k: number): Set<number> => new Set(Array.from(scene.featurePoint[k]).filter((p) => p >= 0));
+    const s3 = seen(K - 3),
+      s2 = seen(K - 2),
+      s1 = seen(K - 1);
+    // As in the test above, the "new region" S (seen by K − 2, K − 1 and K) stays two-view between
+    // K − 2 and K − 1 until K arrives, but for 36 points that K − 3 sees too (map points before K):
+    // enough for P3P to be tried before re-triangulating (≥ 30). 9 of K's 36 correspondences with
+    // them are false matches (features of K that see no point of K − 1 / K − 2): too few P3P inliers
+    // (27 < 30), a share the known rotation accepts (75 %; e2e yard-real at stride 3, the keyframe
+    // past the pan: 36 map points, 27 P3P inliers).
+    const S = new Set([...seen(K)].filter((p) => s2.has(p) && s1.has(p)));
+    const mapped = [...S].filter((p) => s3.has(p)).slice(0, 36);
+    expect(mapped).toHaveLength(36);
+    const spare: number[] = [];
+    scene.featurePoint[K].forEach((p, f) => {
+      if (p >= 0 && !s1.has(p) && !s2.has(p)) spare.push(f);
+    });
+    const falseMatch = new Map(mapped.slice(27).map((p, q) => [p, spare[q]]));
+    const isMapped = new Set(mapped);
+    const stream = (opts: { retriangulateNeighbours: number }): { live: LiveMapper; atK: LiveKeyframeResult } => {
+      const graph = new CorrespondenceGraph();
+      // the "gyro": GT relative rotation from the registered keyframe nearest in capture order
+      const live = new LiveMapper(db, graph, {
+        intrinsics: { ...scene.camera },
+        ...opts,
+        predictRotation: (id, rec) => {
+          let nb = -1;
+          for (const r of rec.registeredImageIds()) if (r !== id && (nb < 0 || Math.abs(r - id) < Math.abs(nb - id))) nb = r;
+          if (nb < 0) return null;
+          const k = ids.indexOf(id),
+            kn = ids.indexOf(nb);
+          return { R: mat3Mul(mat3MulTranspose(scene.poses[k].R, scene.poses[kn].R), rec.images.get(nb)!.pose.R), sigmaRad: Math.PI / 180 };
+        },
+      });
+      let atK: LiveKeyframeResult | null = null;
+      for (const [k, id] of ids.entries()) {
+        graph.addImage(id, db.features.get(id)!.count);
+        for (const [kj, j] of ids.entries()) {
+          if (j >= id) break;
+          const g = db.getTwoView(j, id);
+          if (!g) continue;
+          const out: number[] = [];
+          for (let q = 0; q < g.inliers.length; q += 2) {
+            const p = point(kj, g.inliers[q]);
+            if (k < K - 2 || kj >= K) out.push(g.inliers[q], g.inliers[q + 1]);
+            else if (k < K) {
+              if (kj >= K - 2 || !S.has(p) || isMapped.has(p)) out.push(g.inliers[q], g.inliers[q + 1]);
+            } else if (kj >= K - 2 && S.has(p)) out.push(g.inliers[q], (k === K && falseMatch.get(p)) || g.inliers[q + 1]);
+          }
+          if (out.length >= 60) graph.addTwoView(j, id, Uint32Array.from(out));
+        }
+        const r = live.addKeyframe(id);
+        if (k === K) atK = r;
+      }
+      return { live, atK: atK! };
+    };
+    // re-triangulation off: P3P fails (27 inliers), the known rotation registers K
+    const off = stream({ retriangulateNeighbours: 0 });
+    const offK = off.atK.registrations.find((a) => a.id === ids[K])!;
+    expect(off.atK.registered).toBe(true);
+    expect(offK.visible).toBeGreaterThanOrEqual(30); // of the 36 (a point may have been filtered)
+    expect(offK.calls).toHaveLength(1);
+    expect(offK.calls[0]).toMatchObject({ p3pInliers: 0, via: 'knownRotation' });
+    expect(offK.calls[0].knownRotationInliers).toBeGreaterThanOrEqual(offK.visible - 9);
+    expect(offK.calls[0].knownRotationInliers).toBeLessThan(30);
+    // on: P3P alone first, re-triangulation (S), then P3P registers K; the gyro path is never used
+    const { live, atK } = stream({ retriangulateNeighbours: 6 });
+    const a = atK.registrations.find((r) => r.id === ids[K])!;
+    expect(atK.registered).toBe(true);
+    expect(a.visible).toBeGreaterThanOrEqual(30);
+    expect(a.visibleRetriangulated).toBeGreaterThan(100);
+    expect(a.calls).toHaveLength(2);
+    expect(a.calls[0]).toMatchObject({ p3pInliers: 0, via: null });
+    expect(a.calls[0].knownRotationInliers).toBeNaN();
+    expect(a.calls[1].via).toBe('p3p');
+    expect(a.calls[1].p3pInliers).toBeGreaterThan(100);
+    expect(live.incrementalMapper.numKnownRotationRegistrations).toBe(0);
+    expect(live.pendingIds()).toEqual([]);
+    const ev = evaluateReconstruction(live.reconstruction, scene);
+    expect(ev.numRegistered).toBe(30);
+    expect(ev.maxRotErrorDeg).toBeLessThan(0.5);
+  });
+
   it('never initialises from pure rotation', () => {
     const db = rotationOnlyDb();
     const graph = new CorrespondenceGraph();
@@ -179,7 +269,7 @@ describe('LiveMapper', () => {
     for (const id of db.frameIds()) {
       graph.addImage(id, db.features.get(id)!.count);
       const r = live.addKeyframe(id);
-      expect(r).toEqual({ registered: false, initialized: false, numPoints: 0, reprojError: 0 });
+      expect(r).toEqual({ registered: false, initialized: false, numPoints: 0, reprojError: 0, registrations: [] });
     }
     expect(live.pendingIds().length).toBe(10);
     expect(live.snapshot().points.length).toBe(0);

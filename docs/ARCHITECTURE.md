@@ -566,10 +566,11 @@ and extra methods that keep the documented call working are not listed.
    rotation-compensated parallax → keyframe decision (`sfm/keyframes.ts`).
 4. Keyframe: store JPEG (IndexedDB), add to `FeatureDatabase`, match against the
    last N keyframes + retrieval candidates, verify (two-view geometry), update the
-   correspondence graph, then `LiveMapper` initialises / registers (P3P PnP, after
-   re-triangulating the registered neighbours of a keyframe that sees few map points; when
-   P3P fails, PnP with the gyro-predicted rotation) / triangulates / local BA. Emits live
-   state: poses, sparse points, tracking quality, user guidance.
+   correspondence graph, then `LiveMapper` initialises / registers (P3P PnP; at the edge of
+   the map — few map points, or P3P failed — the registered neighbours are re-triangulated
+   and P3P tried again; only then PnP with the gyro-predicted rotation, checked against the
+   keyframe's best verified pair) / triangulates / local BA. Emits live state: poses, sparse
+   points, tracking quality, user guidance.
 
 **Refine (after capture)**: extra pairs (sequential window, vocabulary-tree
 retrieval for loop closure, spatial neighbours) → verify (pairs and vocabulary on CPU helper
