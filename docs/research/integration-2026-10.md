@@ -81,6 +81,23 @@ reads every frame (src/app/mock-engine.ts "Frame pixels"), the scenario keeps th
 (hiding it had removed the only thing that slowed the pump), and `states.mjs` closes a scenario's
 pages even when it fails.
 
+## Phone-rate capture (final head d11c210, sparse, `--no-dense`)
+
+`--stride 3` replays about 2 analysed frames per second, the rate an iPhone is expected to reach;
+the "before" row is the 2026-10-21 run of aeff8f6 + the shared convergence solve (tag `s3-base`).
+Every A/B run of the two slices behind it is in `imu-scale.md` and `real-capture-robustness.md`
+"Phone-rate capture".
+
+| yard-real | live registered / lost frames | refine | ATE ÷ extent, rot p50 | scale error (method) | checks |
+|---|---|---|---|---|---|
+| stride 3, before | 19 / 48, 38 of 80 lost | offline SfM (29 pending) | 5.10e-4, 0.111° | −6.4 % (GPS: IMU excitation 0.010 m/s²) | scaleError fails |
+| stride 3, final | 48 / 48, 0 lost | live model kept | 5.32e-4, 0.119° | −0.9 % (IMU + GPS, interval estimator) | all pass |
+| stride 1, final | 81 / 81, 0 lost | live model kept | 5.68e-4, 0.108° | +1.2 % (IMU + GPS, band-pass) | all pass |
+
+object-real final: stride 3 50 / 50, 5.95e-4; stride 1 89 / 89, 2.72e-4; all checks pass. The cost
+of re-triangulating neighbours is visible at full rate on yard-real (ATE ≈ +8 % over 4.8–5.3e-4,
+far inside the 1e-3 limit); gyro-aided registration runs in refine's offline SfM only by default.
+
 ## Not measured
 
 Nothing here ran on an iPhone or a real GPU: device timings, memory peaks, AR Quick Look,
