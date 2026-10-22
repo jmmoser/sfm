@@ -7,6 +7,14 @@
  *   engine.processFrame (one frame in flight = FramePump back-pressure) → record the LiveUpdate
  *   → finishCapture → refine (progress) → [densify] → [mesh] → [splat] → [exports, sizes only].
  *
+ * Raw capture recordings (a dataset with frames.jsonl, src/io/recording.ts; e2e/README.md "Raw
+ * capture recordings"): VERBATIM replay — each FrameInput is the recorded one (feed.ts
+ * verbatimInput: no synthesized screen angle / segment / time source, no recomputed gravity, no
+ * WMM heading conversion), in the order it was sent; only the pixels are the recorded JPEG
+ * (`replaySize: 'original'` resizes it back to the size the engine got). The recorded mode,
+ * quality, hfov prior and date are the defaults. With live.jsonl, `result.recording` compares
+ * the replay's per-frame decisions with the device's.
+ *
  * Every step is guarded: a failure is recorded in `errors` and the steps that depend on it are
  * skipped, so a partial result is always returned. Big outputs (PLY files) are streamed to
  * Node through `window.__e2eWrite` when the runner installed it (e2e/run-e2e.mjs).
@@ -28,6 +36,7 @@ import {
   type SplatOptions,
   type SplatResult,
 } from '../../workers/protocol';
+import { datasetIndices, decodeFrameRow, decodeLiveRow, parseJsonl, recordedSize, type RecordedFrame, type RecordedLive } from '../../io/recording';
 import { debugKeyframes, debugPairs } from './debug-dump';
 import { dumpSession } from './replay';
 import { createHarnessEngine, type HarnessEngine } from './engines';
@@ -41,10 +50,11 @@ import {
   numStats,
   planFrames,
   samplesBetween,
+  verbatimInput,
   type HeadingRow,
 } from './feed';
 import { bbox, keyframeSourceIndex, mapCamerasToFrames, medianIntrinsics, normalizeIntrinsics, poseToJSON, stageTimings, type CameraLike, type DeliveredRef } from './result';
-import type { CloudSummary, FrameRecord, HarnessConfig, HarnessError, HarnessResult, LiveSummary, ProgressRecord, ResolvedHarnessConfig } from './types';
+import type { CloudSummary, FrameRecord, HarnessConfig, HarnessError, HarnessResult, LiveSummary, ProgressRecord, RecordingSummary, ResolvedHarnessConfig } from './types';
 
 // ------------------------------------------------------------------ dataset
 
@@ -57,15 +67,26 @@ interface DatasetMeta {
   numFrames: number;
   screenAngle: ScreenAngle;
   sceneExtent: number;
-  intrinsics: { f: number; cx: number; cy: number; k1: number; k2: number; width: number; height: number };
+  /** GT intrinsics (null: a recording). */
+  intrinsics: { f: number; cx: number; cy: number; k1: number; k2: number; width: number; height: number } | null;
   /** WGS84 [lat°, lon°, alt m] of the dataset's ENU origin (null: no location). */
   originLatLonAlt?: [number, number, number] | null;
+  /** Recordings (src/io/recording.ts RecordingDatasetMeta): the recorded EngineOptions and start (epoch ms). */
+  mode?: string;
+  quality?: string;
+  hfovPriorDeg?: number | null;
+  createdAt?: number;
+  /** Recordings: frames the export left out (no pixels / unparseable rows). */
+  missingImages?: number;
+  badLines?: number;
 }
 
 interface DatasetFrame {
   index: number;
   file: string;
   t: number;
+  /** Recordings: position in `Dataset.recorded`. */
+  pos?: number;
 }
 
 interface Dataset {
@@ -75,6 +96,12 @@ interface Dataset {
   imu: ImuSample[];
   geo: GeoFix[] | null;
   headings: HeadingRow[] | null;
+  /** frames.jsonl rows with pixels, in the order they were sent (null: a synthetic dataset). */
+  recorded: RecordedFrame[] | null;
+  /** live.jsonl rows by `seq` (null: none). */
+  device: Map<number, RecordedLive> | null;
+  /** frames.jsonl rows left out (unparseable / without pixels). */
+  recordedSkipped: number;
 }
 
 function joinUrl(base: string, rel: string): string {
@@ -101,16 +128,40 @@ async function fetchJSON<T>(url: string, optional = false): Promise<T | null> {
   }
 }
 
+/** An optional text file (null: missing, or the dev server's HTML fallback). */
+async function fetchText(url: string): Promise<string | null> {
+  const r = await fetch(url);
+  if (!r.ok) return null;
+  const text = await r.text();
+  return /^\s*</.test(text) ? null : text;
+}
+
 async function loadDataset(baseUrl: string): Promise<Dataset> {
-  const [meta, frames, imu, geo, headings] = await Promise.all([
+  const [meta, frames, imu, geo, headings, jsonl, live] = await Promise.all([
     fetchJSON<DatasetMeta>(joinUrl(baseUrl, 'meta.json')),
-    fetchJSON<DatasetFrame[]>(joinUrl(baseUrl, 'frames.json')),
+    fetchJSON<DatasetFrame[]>(joinUrl(baseUrl, 'frames.json'), true),
     fetchJSON<ImuSample[]>(joinUrl(baseUrl, 'imu.json'), true),
     fetchJSON<GeoFix[]>(joinUrl(baseUrl, 'geo.json'), true),
     fetchJSON<HeadingRow[]>(joinUrl(baseUrl, 'heading.json'), true),
+    fetchText(joinUrl(baseUrl, 'frames.jsonl')),
+    fetchText(joinUrl(baseUrl, 'live.jsonl')),
   ]);
   const byT = <T extends { t: number }>(a: T[] | null): T[] | null => (a ? [...a].sort((x, y) => x.t - y.t) : null);
-  return { baseUrl, meta: meta!, frames: frames!, imu: byT(imu) ?? [], geo: byT(geo), headings: byT(headings) };
+  let recorded: RecordedFrame[] | null = null;
+  let device: Map<number, RecordedLive> | null = null;
+  let recordedSkipped = 0;
+  let list = frames;
+  if (jsonl !== null) {
+    const p = parseJsonl(jsonl, decodeFrameRow);
+    recorded = p.rows.filter((r) => r.image).sort((a, b) => a.seq - b.seq);
+    // left out here, and already by the export (rows without pixels: meta.json counts them)
+    recordedSkipped = p.bad + p.rows.length - recorded.length + (meta?.missingImages ?? 0) + (meta?.badLines ?? 0);
+    const idx = datasetIndices(recorded);
+    list = recorded.map((r, pos) => ({ index: idx[pos], file: r.image!.file, t: r.input.t, pos }));
+    if (live !== null) device = new Map(parseJsonl(live, decodeLiveRow).rows.map((r) => [r.seq, r]));
+  }
+  if (!list) throw new Error(`fetch ${joinUrl(baseUrl, 'frames.json')}: missing (and no frames.jsonl)`);
+  return { baseUrl, meta: meta!, frames: list, imu: byT(imu) ?? [], geo: byT(geo), headings: byT(headings), recorded, device, recordedSkipped };
 }
 
 // ------------------------------------------------------------------ helpers
@@ -169,18 +220,24 @@ const round = (v: number, d = 1): number => {
   return Math.round(v * k) / k;
 };
 
-function resolveConfig(c: HarnessConfig, meta: DatasetMeta | null): ResolvedHarnessConfig {
+const MODES = ['object', 'scene', 'auto'] as const;
+const QUALITIES = ['fast', 'balanced', 'max'] as const;
+const oneOf = <T extends string>(v: unknown, list: readonly T[]): T | null => (list.includes(v as T) ? (v as T) : null);
+
+function resolveConfig(c: HarnessConfig, meta: DatasetMeta | null, recording = false): ResolvedHarnessConfig {
   const useImu = c.useImu ?? true;
-  const prior = c.hfovPriorDeg ?? 67.3;
+  // a recording replays with its own prior (none recorded: none), a synthetic dataset with the iPhone one
+  const prior = c.hfovPriorDeg ?? (recording ? (meta?.hfovPriorDeg ?? 'none') : 67.3);
   let used: number | null = null;
   if (typeof prior === 'number') used = prior;
-  else if (prior === 'gt' && meta) used = round(hfovLongSideDeg(meta.intrinsics.f, meta.width, meta.height), 4);
+  else if (prior === 'gt' && meta?.intrinsics) used = round(hfovLongSideDeg(meta.intrinsics.f, meta.width, meta.height), 4);
+  const recMode = recording ? oneOf(meta?.mode, MODES) : null;
   return {
     dataset: c.dataset,
     baseUrl: c.baseUrl ?? `/e2e/data/${c.dataset}/`,
     engine: c.engine ?? 'worker',
-    mode: c.mode ?? (meta ? (meta.scene === 'object' ? 'object' : 'scene') : 'auto'),
-    quality: c.quality ?? 'fast',
+    mode: c.mode ?? recMode ?? (meta ? (meta.scene === 'object' ? 'object' : 'scene') : 'auto'),
+    quality: c.quality ?? (recording ? oneOf(meta?.quality, QUALITIES) : null) ?? 'fast',
     startFrame: c.startFrame ?? 0,
     frameStride: c.frameStride ?? 1,
     maxFrames: c.maxFrames ?? null,
@@ -189,7 +246,9 @@ function resolveConfig(c: HarnessConfig, meta: DatasetMeta | null): ResolvedHarn
     useGps: c.useGps ?? true,
     useHeading: c.useHeading ?? true,
     headingNorth: c.headingNorth ?? (meta?.originLatLonAlt && (c.useGps ?? true) ? 'magnetic' : 'true'),
-    captureDateMs: c.captureDateMs ?? Date.now(),
+    captureDateMs: c.captureDateMs ?? (recording && typeof meta?.createdAt === 'number' ? meta.createdAt : Date.now()),
+    verbatim: c.verbatim ?? recording,
+    replaySize: c.replaySize ?? 'recorded',
     useGravity: c.useGravity ?? useImu,
     hfovPriorDeg: prior,
     hfovPriorDegUsed: used,
@@ -238,6 +297,52 @@ function emptyLive(): LiveSummary {
     keyframeMs: s,
     cameras: [],
     images: null,
+  };
+}
+
+/** Replay vs device decisions of the same recorded frames. */
+interface Agreement {
+  compared: number;
+  same: number;
+  keyframesDevice: number;
+  keyframesReplay: number;
+  /** 'device decision>replay decision' counts. */
+  confusion: Record<string, number>;
+}
+
+function countAgreement(a: Agreement, device: string, replay: string): void {
+  a.compared++;
+  if (device === replay) a.same++;
+  if (device === 'keyframe') a.keyframesDevice++;
+  if (replay === 'keyframe') a.keyframesReplay++;
+  const key = `${device}>${replay}`;
+  a.confusion[key] = (a.confusion[key] ?? 0) + 1;
+}
+
+/** HarnessResult.recording: the device's own outcome (live.jsonl) and the agreement with the replay. */
+function recordingSummary(ds: Dataset, verbatim: boolean, a: Agreement): RecordingSummary {
+  let device: RecordingSummary['device'] = null;
+  if (ds.device && ds.device.size) {
+    const rows = [...ds.device.values()].sort((x, y) => x.seq - y.seq);
+    const decisions: Record<string, number> = {};
+    for (const r of rows) if (r.update) decisions[r.update.decision] = (decisions[r.update.decision] ?? 0) + 1;
+    const lastUpd = [...rows].reverse().find((r) => r.update)?.update ?? null;
+    device = {
+      frames: rows.length,
+      decisions,
+      keyframes: lastUpd?.numKeyframes ?? null,
+      registered: lastUpd?.numRegistered ?? null,
+      frameMs: numStats(rows.map((r) => r.ms)),
+      waitMs: numStats(rows.map((r) => r.waitMs)),
+      errors: rows.filter((r) => r.error).length,
+    };
+  }
+  return {
+    verbatim,
+    rows: ds.recorded?.length ?? 0,
+    skipped: ds.recordedSkipped,
+    device,
+    agreement: verbatim && a.compared ? { ...a, rate: round(a.same / a.compared, 4) } : null,
   };
 }
 
@@ -330,7 +435,7 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
     try {
       const baseUrl = config.baseUrl ?? `/e2e/data/${config.dataset}/`;
       ds = await loadDataset(baseUrl);
-      result.config = resolveConfig(config, ds.meta);
+      result.config = resolveConfig(config, ds.meta, !!ds.recorded);
       const m = ds.meta;
       result.dataset = {
         name: m.name,
@@ -344,6 +449,7 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
         hasGeo: !!ds.geo?.length,
         hasHeading: !!ds.headings?.length,
         imuSamples: ds.imu.length,
+        ...(ds.recorded ? { recording: true } : {}),
       };
       mark('load', t0);
     } catch (e) {
@@ -413,8 +519,17 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
     }
 
     // ---- capture ----
-    const plan = planFrames(ds.frames, { startFrame: cfg.startFrame, frameStride: cfg.frameStride, fps: cfg.fps, datasetFps: ds.meta.fps, maxFrames: cfg.maxFrames });
+    const recorded = cfg.verbatim ? ds.recorded : null;
+    const plan = planFrames(ds.frames, { startFrame: cfg.startFrame, frameStride: cfg.frameStride, fps: cfg.fps, datasetFps: ds.meta.fps, maxFrames: cfg.maxFrames, keepOrder: !!recorded });
     log(`[harness] replaying ${plan.length} of ${ds.frames.length} frames (start ${cfg.startFrame}, stride ${cfg.frameStride}${cfg.fps ? `, ${cfg.fps} Hz pump` : ''})`);
+    if (ds.recorded) {
+      const how = recorded ? `verbatim FrameInputs (${cfg.replaySize} size)` : 'FrameInputs synthesized from frames.json / imu.json (verbatim: false)';
+      log(`[harness] raw capture recording: ${how}${ds.recordedSkipped ? `, ${ds.recordedSkipped} frames.jsonl rows left out (no pixels / unparseable)` : ''}`);
+    }
+    /** FrameInput.index sent -> dataset frame index (a held keyframe names its source by FrameInput.index). */
+    const datasetIndexOf = new Map<number, number>();
+    /** Verbatim replay with live.jsonl: the replay's decisions vs the device's for the same recorded frames. */
+    const agreement: Agreement = { compared: 0, same: 0, keyframesDevice: 0, keyframesReplay: 0, confusion: {} };
     const refs: DeliveredRef[] = [];
     const frameMs: number[] = [];
     const keyframeMs: number[] = [];
@@ -428,16 +543,27 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
       const td = performance.now();
       const r = await fetch(joinUrl(ds.baseUrl, f.file));
       if (!r.ok) throw new Error(`fetch ${f.file}: HTTP ${r.status}`);
-      const bitmap = await createImageBitmap(await r.blob());
+      const blob = await r.blob();
+      const row = recorded && f.pos !== undefined ? recorded[f.pos] : null;
+      const img = row?.image;
+      let bitmap: ImageBitmap;
+      if (row && img && cfg.replaySize === 'original') {
+        // the size the engine got: a VideoFrame is converted fitted to its maxSide (src/engine/engine.ts frameToBitmap)
+        const ms = img.kind === 'VideoFrame' ? row.input.maxSide : null;
+        const o = recordedSize(img.srcWidth, img.srcHeight, ms && ms > 0 ? ms : 0);
+        const same = o.width === img.width && o.height === img.height;
+        bitmap = same ? await createImageBitmap(blob) : await createImageBitmap(blob, { resizeWidth: o.width, resizeHeight: o.height, resizeQuality: 'high' });
+      } else bitmap = await createImageBitmap(blob);
       return { bitmap, ms: performance.now() - td };
     };
     let pending: Promise<Decoded> | null = plan.length ? decode(plan[0]) : null;
     pending?.catch(() => undefined);
     let prevT = -Infinity;
+    let prevPos = Math.max(0, cfg.startFrame) - 1;
     // compass north reference: the datasets store TRUE-north headings (feed.ts HeadingNorthMode)
     const northEmu = new HeadingNorthEmulator(cfg.headingNorth, ds.meta.originLatLonAlt ?? null, cfg.captureDateMs);
     cfg.headingNorth = northEmu.mode; // 'true' when the dataset has no location
-    if (cfg.useHeading && ds.headings?.length)
+    if (cfg.useHeading && ds.headings?.length && !recorded)
       log(`[harness] compass north: ${northEmu.mode}${northEmu.mode !== 'true' ? ` (WMM2025 declination at the dataset location ${northEmu.datasetDeclinationDeg.toFixed(3)}°)` : ''}`);
 
     for (let k = 0; k < plan.length; k++) {
@@ -457,21 +583,31 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
         break;
       }
       const t = f.t;
-      const imu = cfg.useImu ? samplesBetween(ds.imu, k === 0 ? t - 1000 : prevT, t) : [];
-      const input: FrameInput = {
-        bitmap: dec.bitmap,
-        t,
-        screenAngle: ds.meta.screenAngle,
-        imu,
-        geo: cfg.useGps ? cleanGeoFix(latestAtOrBefore(ds.geo, t)) : null,
-        heading: null,
-        index: k,
-        segment: 0,
-        gravityDevice: cfg.useGravity && cfg.useImu ? gravityDownAt(ds.imu, t) : null,
-        imuCalibrationVersion: cfg.useImu ? 0 : -1,
-        timeSource: 'captureTime',
-      };
-      if (cfg.useHeading) {
+      let input: FrameInput;
+      if (recorded && f.pos !== undefined) {
+        // a recording: the FrameInput the app sent, verbatim (feed.ts verbatimInput)
+        const use = { imu: cfg.useImu, gps: cfg.useGps, heading: cfg.useHeading, gravity: cfg.useGravity };
+        input = { ...verbatimInput(recorded, f.pos, prevPos, use), bitmap: dec.bitmap };
+        prevPos = f.pos;
+      } else {
+        input = {
+          bitmap: dec.bitmap,
+          t,
+          screenAngle: ds.meta.screenAngle,
+          imu: cfg.useImu ? samplesBetween(ds.imu, k === 0 ? t - 1000 : prevT, t) : [],
+          geo: cfg.useGps ? cleanGeoFix(latestAtOrBefore(ds.geo, t)) : null,
+          heading: null,
+          index: k,
+          segment: 0,
+          gravityDevice: cfg.useGravity && cfg.useImu ? gravityDownAt(ds.imu, t) : null,
+          imuCalibrationVersion: cfg.useImu ? 0 : -1,
+          timeSource: 'captureTime',
+        };
+      }
+      const imu = input.imu;
+      const sentIndex = typeof input.index === 'number' ? input.index : k;
+      datasetIndexOf.set(sentIndex, f.index);
+      if (cfg.useHeading && !recorded) {
         // what CompassSensor.headingAt reports: device-top azimuth while the top is within 45° of
         // horizontal (landscape yard), else the optical axis (dataset `heading`) — gravity from
         // the IMU like the sensor's DeviceOrientation (independent of useImu)
@@ -515,7 +651,7 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
         if (fatalFrameError(e) || consecutiveErrors >= cfg.maxFrameErrors) {
           rec.wallMs = round(performance.now() - tf, 1);
           result.frames.push(rec);
-          refs.push({ delivered: k, index: f.index, t, engineFrameIndex: null, keyframe: false });
+          refs.push({ delivered: sentIndex, index: f.index, t, engineFrameIndex: null, keyframe: false });
           result.live.delivered = k + 1;
           log(`[harness] aborting capture after ${consecutiveErrors} consecutive frame error(s)`);
           captureOk = false;
@@ -542,8 +678,10 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
         if (upd.decision === 'keyframe') {
           keyframeMs.push(rec.wallMs);
           // a held (best-of-window) keyframe comes from an earlier frame than this update's
-          result.live.keyframeIndices.push(keyframeSourceIndex(upd.timings, (d) => plan[d]?.index, f.index));
+          result.live.keyframeIndices.push(keyframeSourceIndex(upd.timings, (d) => datasetIndexOf.get(d), f.index));
         }
+        const dev = recorded && f.pos !== undefined ? ds.device?.get(recorded[f.pos].seq)?.update : undefined;
+        if (dev) countAgreement(agreement, dev.decision, upd.decision);
         if (upd.tracking === 'lost') result.live.trackingLostFrames++;
         if (!result.live.timeToInit && upd.tracking === 'tracking') {
           result.live.timeToInit = {
@@ -555,7 +693,7 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
           };
         }
       }
-      refs.push({ delivered: k, index: f.index, t, engineFrameIndex: upd ? upd.frameIndex : null, keyframe: upd?.decision === 'keyframe' });
+      refs.push({ delivered: sentIndex, index: f.index, t, engineFrameIndex: upd ? upd.frameIndex : null, keyframe: upd?.decision === 'keyframe' });
       result.frames.push(rec);
       result.live.delivered = k + 1;
       if (upd && (cfg.logFrames || k % 10 === 0 || k === plan.length - 1 || upd.decision === 'keyframe')) {
@@ -569,6 +707,7 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
       pending = null;
     }
     mark('capture', tCapture);
+    if (ds.recorded) result.recording = recordingSummary(ds, !!recorded, agreement);
     /**
      * Live summary: the counts from the newest LiveUpdate of any kind, the cameras from the newest
      * one carrying them. Called after the capture AND again after finishCapture: with background

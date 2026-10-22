@@ -8,7 +8,9 @@
  * result.json: { intrinsics: {f,cx,cy,k1,k2}, images: [{index, pose: {R: number[9], t: number[3]}}],
  *   metric: {metric, gravityAligned, northAligned}, pointsFile?: 'binary/ascii PLY or Float32 xyz',
  *   numInputImages? }  (pointsFile is resolved relative to the result file).
- * Prints a table and writes metrics.json next to the result (or --out).
+ * Prints a table and writes metrics.json next to the result (or --out). A dataset without ground
+ * truth (a raw capture recording, frames without `pose`) is scored GT-free from the harness fields
+ * of a run-e2e result.json (e2e/lib/self-metrics.mjs).
  * Library use: import { evaluate, computeMetrics, formatTable } from './metrics.mjs'.
  */
 import { readFile, writeFile } from 'node:fs/promises';
@@ -17,12 +19,15 @@ import { fileURLToPath } from 'node:url';
 import { loadDataset } from './lib/dataset.mjs';
 import { computeMetrics, formatTable } from './lib/metrics-core.mjs';
 import { parsePoints } from './lib/points.mjs';
+import { computeSelfMetrics, formatSelfTable, isGtFree } from './lib/self-metrics.mjs';
 
 export { computeMetrics, formatTable, loadDataset, parsePoints };
 
 /** Load dataset + result (+ points) from disk and compute metrics. */
 export async function evaluate(datasetDir, resultPath, opts = {}) {
   const result = JSON.parse(await readFile(resultPath, 'utf8'));
+  const head = await loadDataset(datasetDir, { points: false }).catch(() => null);
+  if (!head || isGtFree(head.meta, head.frames)) return computeSelfMetrics(result, head?.meta ?? JSON.parse(await readFile(join(datasetDir, 'meta.json'), 'utf8')));
   let points = opts.points;
   if (!points && result.pointsFile) {
     const pf = isAbsolute(result.pointsFile) ? result.pointsFile : join(dirname(resultPath), result.pointsFile);
@@ -79,7 +84,7 @@ if (isMain) {
   const t0 = Date.now();
   evaluate(datasetDir, resultPath, o)
     .then(async (m) => {
-      console.log(formatTable(m));
+      console.log(m.groundTruth === false ? formatSelfTable(m) : formatTable(m));
       const out = o.out ?? join(dirname(resultPath), 'metrics.json');
       await writeFile(out, JSON.stringify(m, null, 2));
       console.log(`\nwrote ${out} (${((Date.now() - t0) / 1000).toFixed(1)} s)`);

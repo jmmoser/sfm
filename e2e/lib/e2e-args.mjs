@@ -3,14 +3,16 @@
 export const USAGE = `usage: node e2e/run-e2e.mjs [object|yard|all|<dataset> ...] [options]
 
   --engine worker|inline|mock   engine back-end (default worker = EngineClient + engine worker)
-  --quality fast|balanced|max   quality preset (default fast)
-  --mode object|scene|auto      capture mode (default: object for object datasets, scene otherwise)
+  --quality fast|balanced|max   quality preset (default fast; a recording: its recorded preset)
+  --mode object|scene|auto      capture mode (default: object for object datasets, scene otherwise;
+                                a recording: its recorded mode)
   --stride N                    replay every Nth frame (default 1)
   --start N                     first frame (default 0)
   --max-frames N                deliver at most N frames
   --fps F                       simulated FramePump rate limit in Hz (drops frames closer than 1/F)
   --no-imu | --no-gps | --no-heading   withhold a sensor stream
-  --hfov DEG|gt|none            hfovPriorDeg passed to the engine (default 67.3, iPhone main camera)
+  --hfov DEG|gt|none            hfovPriorDeg passed to the engine (default 67.3, iPhone main camera;
+                                a recording: its recorded prior)
   --no-dense | --no-mesh        skip densify / mesh (mesh needs dense)
   --dense-size N                DenseOptions.maxImageSize       --dense-views N   DenseOptions.maxViews
   --mesh-voxel V                MeshOptions.voxelSize (world units) --mesh-triangles N MeshOptions.targetTriangles
@@ -56,7 +58,8 @@ function setPath(obj, path, val) {
 export function parseArgs(argv) {
   const o = {
     datasets: [],
-    config: { engine: 'worker', quality: 'fast' },
+    // quality: the harness default ('fast'), or a recording's own preset
+    config: { engine: 'worker' },
     dense: true,
     mesh: true,
     denseOpts: {},

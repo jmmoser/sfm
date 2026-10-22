@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import type { ImuSample } from '../../core/types';
 import { declination } from '../../sensors/wmm';
-import { HeadingNorthEmulator, cleanGeoFix, compassHeading, gravityDownAt, hfovLongSideDeg, latestAtOrBefore, numStats, planFrames, samplesBetween, upperBound } from './feed';
+import { frameMeta, type RecordedFrame } from '../../io/recording';
+import { pumpFrame } from '../../io/recording-testdata';
+import { HeadingNorthEmulator, cleanGeoFix, compassHeading, gravityDownAt, hfovLongSideDeg, latestAtOrBefore, numStats, planFrames, samplesBetween, upperBound, verbatimInput } from './feed';
 
 const frames = (n: number, fps: number, t0 = 10_000): { index: number; t: number }[] =>
   Array.from({ length: n }, (_, i) => ({ index: i, t: t0 + (1000 * i) / fps }));
@@ -16,6 +18,12 @@ describe('planFrames', () => {
     const f = frames(40, 8);
     expect(planFrames(f, { startFrame: 2, frameStride: 4 }).map((x) => x.index)).toEqual([2, 6, 10, 14, 18, 22, 26, 30, 34, 38]);
     expect(planFrames(f, { frameStride: 4, maxFrames: 3 }).map((x) => x.index)).toEqual([0, 4, 8]);
+  });
+
+  it('keepOrder keeps the given order (a recording: the order the frames were sent in)', () => {
+    const f = [{ index: 0, t: 10 }, { index: 1, t: 5 }, { index: 2, t: 20 }];
+    expect(planFrames(f, { keepOrder: true }).map((x) => x.index)).toEqual([0, 1, 2]);
+    expect(planFrames(f).map((x) => x.index)).toEqual([1, 0, 2]);
   });
 
   it('rate-limits like a pump with half a frame of tolerance', () => {
@@ -155,5 +163,34 @@ describe('HeadingNorthEmulator (dataset true-north headings → what the phone r
     const none = new HeadingNorthEmulator('magnetic', null, date);
     expect(none.mode).toBe('true');
     expect(none.convert({ heading: 33, accuracy: 4 }, null)!.north).toBe('true');
+  });
+});
+
+describe('verbatimInput', () => {
+  const rows: RecordedFrame[] = Array.from({ length: 5 }, (_, i) => ({ seq: i, sentAt: 0, input: frameMeta(pumpFrame(i)), image: null }));
+  const all = { imu: true, gps: true, heading: true, gravity: true };
+
+  it('is the recorded FrameInput, unchanged, when every row is replayed', () => {
+    for (let i = 0; i < rows.length; i++) {
+      const v = verbatimInput(rows, i, i - 1, all);
+      expect(v).toStrictEqual(rows[i].input);
+      expect(v.imu).toBe(rows[i].input.imu);
+    }
+  });
+
+  it('prepends the IMU samples of the rows skipped since the previous replayed one', () => {
+    expect(verbatimInput(rows, 3, 0, all).imu).toEqual([...rows[1].input.imu, ...rows[2].input.imu, ...rows[3].input.imu]);
+    expect(verbatimInput(rows, 2, -1, all).imu).toHaveLength(6);
+    expect(rows[3].input.imu).toHaveLength(2); // the rows themselves are untouched
+  });
+
+  it('withholds the streams turned off', () => {
+    const v = verbatimInput(rows, 0, -1, { imu: false, gps: false, heading: false, gravity: true });
+    expect(v).toMatchObject({ imu: [], imuCalibrationVersion: -1, geo: null, heading: null, attitude: null, gravityDevice: null });
+    expect(v.t).toBe(rows[0].input.t);
+    expect(verbatimInput(rows, 0, -1, { ...all, gravity: false }).gravityDevice).toBeNull();
+    // a field the frame never had stays absent
+    const bare: RecordedFrame[] = [{ seq: 0, sentAt: 0, input: { t: 1, screenAngle: 0, imu: [] }, image: null }];
+    expect(Object.keys(verbatimInput(bare, 0, -1, { imu: false, gps: false, heading: false, gravity: false })).sort()).toEqual(['imu', 'screenAngle', 't']);
   });
 });

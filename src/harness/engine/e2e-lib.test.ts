@@ -4,7 +4,11 @@
  */
 import { describe, expect, it } from 'vitest';
 import { ArgError, parseArgs } from '../../../e2e/lib/e2e-args.mjs';
-import { metricsInput, resolveThresholds, runChecks, CHECKS, formatChecks } from '../../../e2e/lib/e2e-checks.mjs';
+import { metricsInput, resolveThresholds, runChecks, skipChecks, summaryRow, CHECKS, formatChecks } from '../../../e2e/lib/e2e-checks.mjs';
+import { computeSelfMetrics, formatSelfTable, isGtFree, parseGyroBreaks } from '../../../e2e/lib/self-metrics.mjs';
+import { readStoreZip, safeEntryName } from '../../../e2e/lib/zip-read.mjs';
+import { partOf } from '../../../e2e/import-recording.mjs';
+import { createZip } from '../../io/zip';
 import type { Metrics } from '../../../e2e/lib/metrics-core.mjs';
 import { plyFromBase64 } from '../../../e2e/lib/e2e-ply.mjs';
 import { parsePoints } from '../../../e2e/lib/points.mjs';
@@ -12,10 +16,11 @@ import { decodePLY } from '../../io/ply';
 import thresholdsJson from '../../../e2e/thresholds.json';
 
 describe('parseArgs', () => {
-  it('defaults: object, worker, fast, dense + mesh + exports', () => {
+  it('defaults: object, worker, dense + mesh + exports; the quality is left to the harness (fast, or a recording\'s own)', () => {
     const o = parseArgs([]);
     expect(o.datasets).toEqual(['object']);
-    expect(o.config).toMatchObject({ engine: 'worker', quality: 'fast', densify: true, mesh: true, exports: true, logFrames: true });
+    expect(o.config).toMatchObject({ engine: 'worker', densify: true, mesh: true, exports: true, logFrames: true });
+    expect(o.config.quality).toBeUndefined();
     expect(o.timeoutMin).toBe(120);
   });
 
@@ -172,5 +177,96 @@ describe('plyFromBase64', () => {
     expect(dec.points?.count).toBe(2);
     expect(Array.from(dec.points!.colors)).toEqual(Array.from(rgb));
     expect(() => plyFromBase64(3, b64(new Uint8Array(xyz.buffer)), b64(rgb))).toThrow(/need/);
+  });
+});
+
+describe('GT-free scoring (raw capture recordings)', () => {
+  it('isGtFree: a recording, or frames without poses', () => {
+    expect(isGtFree({ source: 'sfm-raw-capture' }, [{ index: 0, pose: {} }])).toBe(true);
+    expect(isGtFree({ scene: 'object' }, [{ index: 0 }])).toBe(true);
+    expect(isGtFree({ scene: 'object' }, [])).toBe(true);
+    expect(isGtFree({ scene: 'object', gt: {} }, [{ index: 0, pose: { R: [], t: [] } }])).toBe(false);
+  });
+
+  it('parseGyroBreaks reads refine\'s gyro consistency summary', () => {
+    expect(parseGyroBreaks('3 (+1 outliers, median 0.42°)')).toEqual({ breaks: 3, outliers: 1, medianDeg: 0.42 });
+    expect(parseGyroBreaks('0 (+0 outliers, median 0.05°)')).toEqual({ breaks: 0, outliers: 0, medianDeg: 0.05 });
+    expect(parseGyroBreaks(undefined)).toBeNull();
+    expect(parseGyroBreaks('garbage')).toBeNull();
+  });
+
+  it('computeSelfMetrics: registered fraction, reprojection, tracks, gyro breaks of the chosen model, scale source, focal vs prior, device agreement', () => {
+    const r = {
+      config: { hfovPriorDegUsed: 67.3 },
+      dataset: { name: 'rec', scene: 'recording', numFrames: 120 },
+      decisions: { keyframe: 30, skip: 90 },
+      live: { delivered: 120, keyframes: 30, registered: 29, trackingLostFrames: 2, timeToInit: { delivered: 9 }, frameMs: { median: 140, p90: 260 } },
+      sparse: {
+        intrinsics: { f: 1600, cx: 960, cy: 720, k1: 0.01, k2: -0.002, width: 1920, height: 1440 },
+        images: Array.from({ length: 28 }, (_, i) => ({ index: i })),
+        numCameras: 28,
+        pointsCount: 5000,
+        metric: { metric: true, source: 'imu+gps', relativeUncertainty: 0.03, gravityAligned: true, northAligned: true },
+        stats: { images: 30, registeredImages: 28, meanReprojErrorPx: 0.61, meanTrackLength: 4.2, medianTrackLength: 3, model: 'offline', gyroBreaksLive: '4 (+2 outliers, median 0.90°)', gyroBreaksOffline: '1 (+0 outliers, median 0.30°)', gyroOutliers: '12,17', liveExplained: 0.91, offlineExplained: 0.95, yawSource: 'gps', timeOffsetMs: 21.5 },
+      },
+      dense: { count: 123456 },
+      recording: { device: { frames: 125, keyframes: 31 }, agreement: { compared: 120, same: 114, rate: 0.95, keyframesDevice: 31, keyframesReplay: 30, confusion: {} } },
+    };
+    const m = computeSelfMetrics(r, { name: 'rec', scene: 'recording' });
+    expect(m.groundTruth).toBe(false);
+    expect(m.registration).toMatchObject({ delivered: 120, keyframes: 30, numInput: 30, numRegistered: 28 });
+    expect(m.registration.rateOfInput).toBeCloseTo(28 / 30, 12);
+    expect(m.reprojection.meanPx).toBe(0.61);
+    expect(m.tracks).toEqual({ mean: 4.2, median: 3, points: 5000 });
+    expect(m.gyro).toMatchObject({ model: 'offline', breaks: 1, breakOutliers: 0, medianErrDeg: 0.3, deregisteredOutliers: 2 });
+    expect(m.scale).toMatchObject({ metric: true, source: 'imu+gps', gravityAligned: true, northAligned: true, yawSource: 'gps', timeOffsetMs: 21.5 });
+    const fPrior = 960 / Math.tan((67.3 * Math.PI) / 360);
+    expect(m.intrinsics!.fPrior).toBeCloseTo(fPrior, 9);
+    expect(m.intrinsics!.focalVsPriorPct).toBeCloseTo((100 * (1600 - fPrior)) / fPrior, 9);
+    expect(m.agreement?.rate).toBe(0.95);
+    expect(formatSelfTable(m)).toMatch(/no ground truth[\s\S]*registered fraction[\s\S]*gyro breaks \(offline model\)\s+1 \(\+0 outliers/);
+    // the summary row of run-e2e takes it like computeMetrics output
+    expect(summaryRow('rec', { ok: true, timings: { total: 1000 } }, m, [])).toEqual(['rec', 'ok', '28/30', '—', '—', '—', '—', '—', '—', '—', '—', '—', '1', '—']);
+  });
+
+  it('computeSelfMetrics never throws on a run that failed before refine', () => {
+    const m = computeSelfMetrics({ ok: false, live: { delivered: 3 } }, {});
+    expect(m.registration).toMatchObject({ delivered: 3, numRegistered: 0, numInput: null, rateOfInput: null });
+    expect(m.scale).toBeNull();
+    expect(() => formatSelfTable(m)).not.toThrow();
+    expect(computeSelfMetrics(null).registration.delivered).toBe(0);
+  });
+
+  it('skipChecks skips every limit and claim', () => {
+    const c = skipChecks(resolveThresholds(thresholdsJson, 'recording', 'rec'), 'no ground truth');
+    expect(c.length).toBeGreaterThan(3);
+    expect(c.every((x) => x.status === 'skip' && x.reason === 'no ground truth')).toBe(true);
+    expect(c.map((x) => x.name)).toContain('claims.metric');
+    expect(summaryRow('rec', { ok: true }, null, c).at(-1)).toBe('SKIP');
+  });
+});
+
+describe('recording import (e2e/import-recording.mjs, e2e/lib/zip-read.mjs)', () => {
+  it('reads the STORE archives of src/io/zip.ts and checks their CRCs', () => {
+    const zip = createZip([
+      { name: 'meta.json', data: '{"a":1}' },
+      { name: 'frames/000001.jpg', data: Uint8Array.of(0xff, 0xd8, 1, 2) },
+    ]);
+    const e = readStoreZip(zip);
+    expect(e.map((x) => x.name)).toEqual(['meta.json', 'frames/000001.jpg']);
+    expect(Array.from(e[1].data)).toEqual([0xff, 0xd8, 1, 2]);
+    const bad = zip.slice();
+    bad[30 + 'meta.json'.length + 2] ^= 0xff; // a payload byte of meta.json
+    expect(() => readStoreZip(bad)).toThrow(/CRC/);
+  });
+
+  it('rejects entry names that would leave the dataset directory', () => {
+    for (const n of ['../x', 'a/../../x', '/etc/passwd', 'C:/x', 'a\\b', 'a//b', './a']) expect(() => safeEntryName(n), n).toThrow(/unsafe/);
+    expect(safeEntryName('frames/000001.jpg')).toBe('frames/000001.jpg');
+  });
+
+  it('part names', () => {
+    expect(partOf('/x/sfm-rec-20261021-140210-ab12cd34-part2of3.zip')).toEqual({ base: 'sfm-rec-20261021-140210-ab12cd34', part: 2, count: 3 });
+    expect(partOf('sfm-rec-1.zip')).toEqual({ base: 'sfm-rec-1', part: 1, count: 1 });
   });
 });

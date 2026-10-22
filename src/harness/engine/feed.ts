@@ -2,9 +2,12 @@
  * Pure helpers that turn a synthetic dataset (e2e/data/<name>/) into the FrameInput stream a
  * FramePump would deliver: frame selection (stride / simulated pump rate / limit), IMU slices
  * since the previous delivered frame, the latest GPS fix and compass heading, and the gravity
- * direction metadata. No DOM, unit-tested in feed.test.ts.
+ * direction metadata. For a raw capture recording (frames.jsonl, src/io/recording.ts)
+ * `verbatimInput` gives back the recorded FrameInput fields unchanged instead. No DOM,
+ * unit-tested in feed.test.ts.
  */
 import type { GeoFix, ImuSample } from '../../core/types';
+import type { FrameMeta, RecordedFrame } from '../../io/recording';
 import { CompassSensor } from '../../sensors/orientation';
 import { decimalYearFromDate, magneticField, trueToMagneticHeading } from '../../sensors/wmm';
 
@@ -24,15 +27,18 @@ export interface PlanOptions {
   datasetFps?: number;
   /** Maximum number of frames, null / undefined = all. */
   maxFrames?: number | null;
+  /** Keep the given order instead of sorting by time (a recording: the order frames were sent in). */
+  keepOrder?: boolean;
 }
 
 /**
- * Frames to replay, in time order: from `startFrame`, every `frameStride`-th, then rate-limited
- * like the FramePump (a frame is delivered when at least 1000/fps ms minus half a dataset frame
- * interval passed since the last delivered one), then at most `maxFrames`.
+ * Frames to replay, in time order (or as given with `keepOrder`): from `startFrame`, every
+ * `frameStride`-th, then rate-limited like the FramePump (a frame is delivered when at least
+ * 1000/fps ms minus half a dataset frame interval passed since the last delivered one), then at
+ * most `maxFrames`.
  */
 export function planFrames<T extends TimedFrame>(frames: readonly T[], o: PlanOptions = {}): T[] {
-  const sorted = [...frames].sort((a, b) => a.t - b.t || a.index - b.index);
+  const sorted = o.keepOrder ? [...frames] : [...frames].sort((a, b) => a.t - b.t || a.index - b.index);
   const start = Math.max(0, Math.floor(o.startFrame ?? 0));
   const stride = Math.max(1, Math.floor(o.frameStride ?? 1));
   const out: T[] = [];
@@ -181,4 +187,40 @@ export function numStats(values: readonly number[]): { n: number; mean: number |
   if (v.length === 0) return { n: 0, mean: null, median: null, p90: null, max: null };
   const q = (p: number): number => v[Math.min(v.length - 1, Math.floor(p * v.length))];
   return { n: v.length, mean: v.reduce((a, b) => a + b, 0) / v.length, median: q(0.5), p90: q(0.9), max: v[v.length - 1] };
+}
+
+/** Sensor streams a replay passes (HarnessConfig useImu / useGps / useHeading / useGravity). */
+export interface VerbatimSensors {
+  imu: boolean;
+  gps: boolean;
+  heading: boolean;
+  gravity: boolean;
+}
+
+/**
+ * The FrameInput (without pixels) of recorded frame `rows[pos]` as the app sent it: every field
+ * verbatim, except that the IMU samples of the rows skipped since the previously replayed row
+ * `prevPos` (stride / rate limit / start) are prepended, like the FramePump drains everything
+ * since its last delivered frame — with every row replayed, each frame gets exactly its own
+ * samples. A sensor stream turned off is withheld the way the app would without that sensor
+ * (`imu`: no samples, `imuCalibrationVersion` −1; `heading`: no heading and no attitude).
+ */
+export function verbatimInput(rows: readonly RecordedFrame[], pos: number, prevPos: number, use: VerbatimSensors): FrameMeta {
+  const src = rows[pos].input;
+  const out: FrameMeta = { ...src };
+  if (!use.imu) {
+    out.imu = [];
+    if (src.imuCalibrationVersion !== undefined) out.imuCalibrationVersion = -1;
+  } else if (pos - prevPos > 1) {
+    const imu: ImuSample[] = [];
+    for (let k = Math.max(0, prevPos + 1); k <= pos; k++) imu.push(...(rows[k].input.imu ?? []));
+    out.imu = imu;
+  }
+  if (!use.gps && src.geo !== undefined) out.geo = null;
+  if (!use.heading) {
+    if (src.heading !== undefined) out.heading = null;
+    if (src.attitude !== undefined) out.attitude = null;
+  }
+  if ((!use.gravity || !use.imu) && src.gravityDevice !== undefined) out.gravityDevice = null;
+  return out;
 }

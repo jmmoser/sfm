@@ -115,6 +115,15 @@ export function runChecks(metrics, thresholds, ctx) {
   return out;
 }
 
+/** Every check and claim of `thresholds`, skipped with `reason` (a dataset without ground truth). */
+export function skipChecks(thresholds, reason) {
+  const limits = Object.entries(thresholds.limits ?? {}).map(([name, limit]) => ({ name, label: CHECKS[name]?.label ?? name, value: null, limit, status: 'skip', reason }));
+  const claims = Object.entries(thresholds.claims ?? {})
+    .filter(([, want]) => want)
+    .map(([k]) => ({ name: `claims.${k}`, label: `claims ${k}`, value: null, limit: { equals: true }, status: 'skip', reason }));
+  return [...limits, ...claims];
+}
+
 const fmtNum = (v, d = 4) =>
   v === null || v === undefined
     ? '—'
@@ -159,7 +168,7 @@ export function summaryRow(name, r, m, checks) {
     fmtNum(m?.dense?.completeness ?? null, 3),
     fmtNum(m?.dense?.fscore ?? null, 3),
     r ? fmtNum((r.timings?.total ?? 0) / 1000, 0) : '—',
-    checks.length ? (fails ? `FAIL ${fails}` : 'PASS') : '—',
+    checks.length ? (fails ? `FAIL ${fails}` : checks.every((c) => c.status === 'skip') ? 'SKIP' : 'PASS') : '—',
   ];
 }
 
