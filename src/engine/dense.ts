@@ -679,7 +679,7 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   };
   let helperMs: DenseHelpers['busyMs'] | null = null;
   try {
-    if (workers > 0 && (plan.overlap.decodes > 0 || (halo && plan.overlap.maps > 0))) {
+    if (workers > 0 && resumePass < passes && (plan.overlap.decodes > 0 || (halo && plan.overlap.maps > 0))) {
       try {
         helpers = deps.createHelpers!(workers);
       } catch (e) {
@@ -748,7 +748,8 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
         }
         perf.load += now() - tl;
         const next = nextView(i);
-        if (next) prefetch(next.kind, next.view, next.kind === kind ? [g.id, ...s.sources] : []);
+        // (this view's images count against the LRU the next view's go to: the same resolution's)
+        if (next) prefetch(next.kind, next.view, (next.kind === 'half') === (kind === 'half') ? [g.id, ...s.sources] : []);
         const range = { min: s.depthMin, max: s.depthMax };
         let geometric: { prior: DepthMap; sourceDepths: DepthMap[] } | undefined;
         const ti = now();
