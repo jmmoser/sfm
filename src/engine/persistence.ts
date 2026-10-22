@@ -6,7 +6,8 @@
  * Layout (keys inside one session):
  *   frames                 keyframe image (JPEG Blob, or raw RGBA without a JPEG encoder) +
  *                          KeyframeRecord as the frame `info`
- *   value  engine/state    EngineStateRecord (options, orientation, counters, flags)
+ *   value  engine/state    EngineStateRecord (options, orientation, counters, capture time
+ *                          segments, flags)
  *   bin    kf/<id>/features   serializeFeatureSet
  *   bin    kf/<id>/colors     3 B per feature (sRGB)
  *   value  kf/<id>/pairs      verified pairs (a, id) found when keyframe id was mapped

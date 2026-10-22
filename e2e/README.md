@@ -503,6 +503,18 @@ progress events. A failing step is recorded in `errors`, the steps that depend o
 and a partial result is still written. On `--timeout-min` the runner calls `harnessAbort()`, which
 cancels the long operation, and saves what was done.
 
+**Continued capture (`--extend-at F [--extend-skip-s S]`).** Reproduces "Add more views" after a
+page reload (`EngineOptions.extend`, docs/ENGINE.md "Extend"): the first F of the planned frames
+are delivered, then `finishCapture` and `refine` end that segment, and the engine is initialised
+again with `{ sessionId, resume: true, extend: true }` (forces `persist`: the session is restored
+from IndexedDB). S seconds of frames are skipped, and the rest is delivered with every time —
+frame `t`, IMU, GPS fix — moved so that the first one is at 500 ms, like a reloaded page's
+`performance.now()` (the IMU of that frame is its last second; a GPS fix older than the split is
+withheld). `index` keeps counting, so cameras still map to dataset frames. Then `finishCapture`,
+`refine` and the rest as usual, on all keyframes. `result.extend` reports the split, the first
+refine, the restored keyframes and the second segment's keyframes, how many the live model
+registered and how many are in the final model (also logged as `extend: …`).
+
 `EngineClient` timeouts are raised for SwiftShader: init 600 s, frame 300 s, long operations
 30 min of inactivity. Set them with `--set timeouts.frameMs=…`.
 
@@ -530,6 +542,9 @@ The harness fields of `result.json` are:
 * `sparse`: intrinsics normalised to the dataset size, mapped `images`, `metric`, `stats`,
   `pointsCount`, and the `unmapped` / `duplicates` camera ids.
 * `dense`, `mesh` and `exports` (sizes only), plus `logs`, `errors` and page `memory`.
+* `extend` (with `--extend-at`): `firstFrames`, `resumeIndex`, `skippedFrames`, `rebaseMs`, `first`
+  (keyframes, live-registered, refined images, refine ms, error), the re-init `init`,
+  `resumedKeyframes`, `secondKeyframes`, `secondRegisteredLive`, `secondRegisteredFinal`.
 * `splat` (with `--splat`): the `SplatResult` (count, iterations, ms, `stats`: views, size, init, it/s, memory
   plan, checkpoints, …), `lastDetail` (the last training progress `detail`) and the `splats.ply` path; also
   copied to `metrics.json`.

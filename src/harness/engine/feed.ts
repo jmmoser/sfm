@@ -48,6 +48,28 @@ export function planFrames<T extends TimedFrame>(frames: readonly T[], o: PlanOp
   return out;
 }
 
+/**
+ * The planned frames split for a continued capture (harness `extendAt`, EngineOptions.extend):
+ * the first segment is `plan[0, splitK)`; the second starts at the first planned frame at least
+ * `skipS` seconds after `plan[splitK]` and is fed with every time moved by −`rebaseMs`, so it starts
+ * at `startMs` like the clock of a reloaded page. `feed` = both segments back to back. Null when
+ * either side would get fewer than 2 frames.
+ */
+export function extensionSplit<T extends TimedFrame>(
+  plan: readonly T[],
+  extendAt: number,
+  skipS = 0,
+  startMs = 500,
+): { feed: T[]; splitK: number; skipped: number; rebaseMs: number } | null {
+  if (!(extendAt > 0 && extendAt < 1) || plan.length < 4) return null;
+  const splitK = Math.min(plan.length - 2, Math.max(2, Math.round(extendAt * plan.length)));
+  const until = plan[splitK].t + Math.max(0, skipS) * 1000;
+  let r = splitK;
+  while (r < plan.length && plan[r].t < until) r++;
+  if (plan.length - r < 2) return null;
+  return { feed: [...plan.slice(0, splitK), ...plan.slice(r)], splitK, skipped: r - splitK, rebaseMs: plan[r].t - startMs };
+}
+
 /** Index of the first element with `t > x` (arr sorted by t). */
 export function upperBound(arr: readonly { t: number }[], x: number): number {
   let lo = 0;

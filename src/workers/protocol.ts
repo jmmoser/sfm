@@ -166,7 +166,11 @@ export type TrackingState = 'initializing' | 'tracking' | 'lost';
 export interface LiveCamera {
   pose: Pose;
   intrinsics: CameraIntrinsics;
-  /** Capture time of the keyframe on the IMU clock (camera time + estimated camera–IMU offset), ms. */
+  /**
+   * Capture time of the keyframe on the IMU clock (camera time + estimated camera–IMU offset), ms,
+   * on the page's FrameInput time base: keyframes of an earlier capture segment (a scan continued
+   * after a reload, `EngineOptions.extend`) come out before the current segment's.
+   */
   t?: number;
   /**
    * Physical up in the camera frame (unit): −gravity when known, else up for a phone held in the
