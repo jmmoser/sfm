@@ -7,14 +7,16 @@
  *        [--out DIR] [--force]
  *
  * Extracts every part into <out>/<name>/ (default e2e/data/<name>, name = the archive name
- * without "-partNofM", e.g. sfm-rec-20261021-140210-ab12cd34), then checks the dataset: meta.json,
- * frames.jsonl and every JPEG it names, and that no part is missing. Replay it with
+ * without "-partNofM", e.g. sfm-rec-20261021-140210-ab12cd34; a plain name that does not start
+ * with '.', so `--force` can only ever replace a directory inside <out>), then checks the
+ * dataset: meta.json, frames.jsonl and every JPEG it names (rows recorded without pixels,
+ * `image: null`, are expected and only counted), and that no part is missing. Replay it with
  * `node e2e/run-e2e.mjs <name>` (verbatim FrameInputs, GT-free scoring; e2e/README.md "Raw capture
  * recordings"). Exit code 0 when the dataset is complete, 1 when parts / frames are missing, 2 for
  * usage errors.
  */
 import { mkdir, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readStoreZip } from './lib/zip-read.mjs';
 
@@ -36,8 +38,19 @@ function parseArgs(argv) {
     else if (a.startsWith('--')) throw new Error(`unknown option ${a}`);
     else o.inputs.push(a);
   }
-  if (o.name !== null && !/^[\w.-]+$/.test(o.name)) throw new Error('--name must be a plain name ([A-Za-z0-9_.-])');
+  if (o.name !== null && !isDatasetName(o.name)) throw new Error("--name must be a plain name ([A-Za-z0-9_.-], not starting with '.')");
   return o;
+}
+
+/** A dataset directory name: [A-Za-z0-9_.-] only and not starting with '.' (no '.', '..', hidden dirs). */
+export function isDatasetName(name) {
+  return typeof name === 'string' && /^[\w.-]+$/.test(name) && !name.startsWith('.');
+}
+
+/** `dir` is a directory strictly inside `parent` (what --force may delete). */
+export function isStrictChild(parent, dir) {
+  const rel = relative(resolve(parent), resolve(dir));
+  return rel !== '' && rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
 }
 
 /** "sfm-rec-…-part2of3.zip" → { base: "sfm-rec-…", part: 2, count: 3 }; a single archive → part 1 of 1. */
@@ -77,11 +90,15 @@ async function main() {
   }
   const parts = files.map((f) => ({ file: f, ...partOf(f) })).sort((a, b) => a.part - b.part);
   const name = o.name ?? parts[0].base.replace(/[^\w.-]+/g, '-');
-  if (!/^[\w.-]+$/.test(name)) {
+  if (!isDatasetName(name)) {
     console.error(`error: cannot derive a dataset name from ${basename(parts[0].file)}: use --name`);
     process.exit(2);
   }
   const dir = join(o.out, name);
+  if (!isStrictChild(o.out, dir)) {
+    console.error(`error: ${dir} is not a directory inside ${o.out}`);
+    process.exit(2);
+  }
   const existing = await readdir(dir).catch(() => []);
   if (existing.length && !o.force) {
     console.error(`error: ${dir} exists (use --force to replace it)`);
@@ -115,19 +132,29 @@ async function main() {
   }
   let rows = 0;
   let missing = 0;
+  let noPixels = 0;
+  let notSent = 0;
   try {
     const text = await readFile(join(dir, 'frames.jsonl'), 'utf8');
     for (const line of text.split('\n')) {
       if (!line.trim()) continue;
       rows++;
-      const file = JSON.parse(line)?.image?.file;
+      const row = JSON.parse(line);
+      if (row?.notSent) notSent++;
+      // recorded without pixels on the phone (the engine still got it: its IMU is replayed)
+      if (row?.image === null) {
+        noPixels++;
+        continue;
+      }
+      const file = row?.image?.file;
       if (typeof file !== 'string' || !(await stat(join(dir, file)).catch(() => null))) missing++;
     }
   } catch {
     problems.push('frames.jsonl is missing (it is in part 1)');
   }
   if (missing) problems.push(`${missing} of ${rows} frames have no JPEG`);
-  console.log(`[import] ${dir}: ${entries} files, ${(bytes / 1e6).toFixed(1)} MB; ${rows} frames${meta ? ` (${meta.mode}, ${meta.quality}, ${meta.duration} s at ${meta.fps} Hz, ${meta.width}×${meta.height}${meta.locationStripped ? ', no location' : ''})` : ''}`);
+  const notes = [noPixels ? `${noPixels} recorded without pixels` : '', notSent ? `${notSent} never reached the engine` : ''].filter(Boolean).join(', ');
+  console.log(`[import] ${dir}: ${entries} files, ${(bytes / 1e6).toFixed(1)} MB; ${rows} frames${notes ? ` (${notes})` : ''}${meta ? ` (${meta.mode}, ${meta.quality}, ${meta.duration} s at ${meta.fps} Hz, ${meta.width}×${meta.height}${meta.locationStripped ? ', no location' : ''})` : ''}`);
   for (const p of problems) console.log(`[import] PROBLEM: ${p}`);
   console.log(`[import] replay: node e2e/run-e2e.mjs ${name}${o.out !== join(ROOT, 'e2e', 'data') ? '   (run-e2e reads e2e/data/<name>: import there, or symlink it)' : ''}`);
   process.exit(problems.length ? 1 : 0);

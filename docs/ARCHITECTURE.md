@@ -512,9 +512,11 @@ saveFile(data: Blob, filename: string): Promise<'shared' | 'downloaded'>    // W
 // recording.ts — raw capture recordings (developer option; docs/ENGINE.md §5, e2e/README.md)
 interface RecordedFrame { seq: number; sentAt: number; input: Omit<FrameInput, 'bitmap'> /* verbatim */;
   image: { file: string; width: number; height: number; srcWidth: number; srcHeight: number;
-           kind: 'VideoFrame' | 'ImageBitmap' | 'RGBAImage'; bytes: number } | null; error?: string }
+           kind: 'VideoFrame' | 'ImageBitmap' | 'RGBAImage'; bytes: number } | null /* engine got it, pixels not recorded */;
+  error?: string; notSent?: boolean /* the engine never got it */ }
 encodeFrameRow(r: RecordedFrame): string; decodeFrameRow(line: string): RecordedFrame   // frames.jsonl, exact (JSON-safe)
-buildDatasetFiles(header, framesJsonl, liveJsonl, { stripLocation? }): { meta, texts, images }   // e2e dataset, no GT
+type RecordedSensorRow = { k: 'motion' | 'orientation' | 'geo'; t: number; … }          // sensors.jsonl, raw readings
+buildDatasetFiles(header, framesJsonl, liveJsonl, { stripLocation?, sensorsText? }): { meta, texts, images }   // e2e dataset, no GT
 planZipParts(entries: { name; size }[], maxBytes = 200e6): { part; names; bytes }[]
 // recording-store.ts
 class RecordingStore { static open(); list(): Promise<StoredRecording[]>; reader(info); delete(info) }

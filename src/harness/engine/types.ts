@@ -179,7 +179,7 @@ export interface IntrinsicsJSON {
 }
 
 export interface FrameRecord {
-  /** Delivered-frame counter (= FrameInput.index, except in a verbatim replay: the recorded index). */
+  /** FrameInput.index sent: the delivered-frame counter, or in a verbatim replay the recorded index. */
   i: number;
   /** Dataset frame index (frames.json `index`). */
   index: number;
@@ -319,9 +319,14 @@ export interface LogRecord {
 export interface RecordingSummary {
   /** The recorded FrameInputs were replayed verbatim. */
   verbatim: boolean;
-  /** frames.jsonl rows with pixels / left out (unparseable, no pixels). */
+  /**
+   * frames.jsonl rows replayed as frames (the engine got them, with pixels) / not replayed
+   * (unparseable, no pixels — their IMU goes to the next frame —, not sent) / of those, rows the
+   * device engine never got (left out, IMU included).
+   */
   rows: number;
   skipped: number;
+  notSent: number;
   /** What the engine answered on the device (live.jsonl; null without it). */
   device: {
     frames: number;

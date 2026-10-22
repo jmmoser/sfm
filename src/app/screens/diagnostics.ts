@@ -17,7 +17,9 @@
  * The report is part of "Copy".
  *
  * "Raw capture recordings" (./recordings.ts): the recordings of Setup › Options › Record raw
- * capture with their size — export as ZIP parts (share / save) or delete.
+ * capture with their size — export as ZIP parts (share / save) or delete. Mounted below the
+ * probes, independently of them: a probe that fails or hangs never hides the only place where
+ * those (GB-sized) recordings can be deleted.
  */
 import { startBenchmark, type BenchRun } from '../bench/bench';
 import { STATUS_LABEL, estimateLine, formatMs, qualityName, reportClipboardText, verdict } from '../bench/report';
@@ -112,7 +114,7 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
       h('h1', { class: 'topbar-title', text: 'Diagnostics' }),
       copyBtn,
     ),
-    h('div', { class: 'content' }, benchHost, body),
+    h('div', { class: 'content' }, benchHost, body, recordings.el),
   );
 
   function report(): Record<string, unknown> {
@@ -624,7 +626,6 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
       ),
     );
 
-    sections.push(recordings.el);
     sections.push(section('Memory', group(...memoryHints(g))));
     if (g.errors.length) sections.push(section('Probe errors', h('pre', { class: 'code-block', text: g.errors.join('\n') })));
     // Re-rendering replaces the focused control (e.g. the motion test button): keep focus on it.

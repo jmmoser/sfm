@@ -8,9 +8,10 @@
  *
  * Pipeline: CameraCapture → FramePump (≤ 10 Hz, back-pressure: the next frame is grabbed only
  * after engine.processFrame resolved) → engine; with "Record raw capture" (Setup) the frames
- * sent are also recorded from engine init until the sensors stop (App.startRecording, a FrameTap
- * on the engine: src/app/recorder.ts). WakeLock while capturing (acquired in the Start
- * tap). Lifecycle (docs/research/ios-camera.md §6, ios-platform.md §6.2):
+ * sent, the raw motion / orientation events and every GPS fix are also recorded from engine init
+ * until the sensors stop (App.startRecording, a FrameTap on the engine: src/app/recorder.ts).
+ * WakeLock while capturing (acquired in the Start tap). Lifecycle (docs/research/ios-camera.md
+ * §6, ios-platform.md §6.2):
  *  - page hidden ⇒ pause; on return a TAP resumes (re-acquiring the camera inside the gesture
  *    when the track did not come back — iOS reuses a camera grant without a gesture only ~1 min);
  *  - camera errors show a recovery card whose button restarts the camera from the tap;
@@ -901,7 +902,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     if (cfg.recordRaw) {
       const engine = { mode: cfg.mode, quality: cfg.quality, hfovPriorDeg: camRes?.hfovPriorDeg, preferGPU: true };
       const capture = { grab: frameGrab, videoFrameOrientation: camRes?.apple ? 'raw' : 'upright', targetHz: 10 };
-      await app.startRecording({ name: sessionName, sessionId, engine, camera: camRes, capture, pumpStats: () => (pump ? { ...pump.stats } : null) });
+      await app.startRecording({ name: sessionName, sessionId, engine, camera: camRes, capture, geo, pumpStats: () => (pump ? { ...pump.stats } : null) });
     }
     if (closed) return void app.stopRecording();
     pump = new FramePump({

@@ -3,7 +3,7 @@
  * writes through, and the store the app lists / exports / deletes them with.
  *
  *  - OPFS (preferred; docs/research/ios-platform.md §2.4, §2.6): `sfm-recordings/<id>/` with
- *    `recording.json`, `frames.jsonl`, `live.jsonl` and the JPEGs appended to
+ *    `recording.json`, `frames.jsonl`, `live.jsonl`, `sensors.jsonl` and the JPEGs appended to
  *    `frames/pack-NNNN.bin` files of ≤ 64 MB (the rows hold {pack, offset}; a few large files
  *    instead of thousands keep the per-frame cost at one sync write and delete / list fast).
  *    Written through FileSystemSyncAccessHandles, which exist in dedicated workers only (one
@@ -13,13 +13,13 @@
  *    export references slices of the packs, nothing is copied).
  *  - IndexedDB fallback (no OPFS, e.g. Private Browsing): database `sfm-recordings` with
  *    `recordings` (id → header JSON), `images` ([id, seq] → JPEG Blob) and `lines`
- *    ([id, file, n] → one JSON line).
+ *    ([id, file, n] → one append: a JSON line, or a batch of sensors.jsonl lines).
  * Deleting truncates every OPFS file before `removeEntry` (removeEntry did not always free the
  * space before Safari 27, ios-platform.md §2.4) — through `createWritable` (Safari 26) where it
  * exists. `prepareRecordingExport` turns a stored recording into its ZIP parts (the stored JPEGs
  * are referenced, not copied).
  */
-import { buildDatasetFiles, partFileName, planZipParts, type DatasetBuild, type ImageStoreRef, type RecordedImage, type RecordingHeader, type RecordingSink } from './recording';
+import { buildDatasetFiles, partFileName, planZipParts, type DatasetBuild, type ImageStoreRef, type RecordedImage, type RecordingHeader, type RecordingLineFile, type RecordingSink } from './recording';
 import { createZipBlob, type ZipBlobEntryInput } from './zip';
 
 const OPFS_DIR = 'sfm-recordings';
@@ -153,7 +153,7 @@ export class OpfsRecordingSink implements RecordingSink {
     return this.packCount++;
   }
 
-  async appendLine(file: 'frames.jsonl' | 'live.jsonl', line: string): Promise<void> {
+  async appendLine(file: RecordingLineFile, line: string): Promise<void> {
     let f = this.lines.get(file);
     if (!f) {
       f = await this.openFile(this.dir, file);
@@ -262,7 +262,7 @@ export class IdbRecordingSink implements RecordingSink {
     return { key };
   }
 
-  async appendLine(file: 'frames.jsonl' | 'live.jsonl', line: string): Promise<void> {
+  async appendLine(file: RecordingLineFile, line: string): Promise<void> {
     const tx = this.db.transaction('lines', 'readwrite');
     tx.objectStore('lines').put(line, [this.id, file, this.n++]);
     await done(tx);
@@ -292,8 +292,8 @@ export interface StoredRecording {
 /** Read access to one stored recording. */
 export interface RecordingReader {
   readonly info: StoredRecording;
-  /** frames.jsonl / live.jsonl ('' when missing). */
-  text(file: 'frames.jsonl' | 'live.jsonl'): Promise<string>;
+  /** frames.jsonl / live.jsonl / sensors.jsonl ('' when missing). */
+  text(file: RecordingLineFile): Promise<string>;
   /** The JPEG of a row (a disk-backed Blob: an OPFS pack slice or the IndexedDB Blob). */
   image(img: RecordedImage): Promise<Blob>;
 }
@@ -383,7 +383,7 @@ export class RecordingStore {
 
   private async opfsTextBytes(dir: FileSystemDirectoryHandle): Promise<number> {
     let n = 0;
-    for (const name of ['recording.json', 'frames.jsonl', 'live.jsonl']) n += (await fileOf(dir, name))?.size ?? 0;
+    for (const name of ['recording.json', 'frames.jsonl', 'live.jsonl', 'sensors.jsonl']) n += (await fileOf(dir, name))?.size ?? 0;
     return n;
   }
 
@@ -479,7 +479,10 @@ export interface RecordingExport {
  */
 export async function prepareRecordingExport(store: RecordingStore, info: StoredRecording, opts: { stripLocation?: boolean; maxPartBytes?: number } = {}): Promise<RecordingExport> {
   const reader = await store.reader(info);
-  const build = buildDatasetFiles(info.header, await reader.text('frames.jsonl'), await reader.text('live.jsonl'), { stripLocation: opts.stripLocation ?? true });
+  const build = buildDatasetFiles(info.header, await reader.text('frames.jsonl'), await reader.text('live.jsonl'), {
+    stripLocation: opts.stripLocation ?? true,
+    sensorsText: await reader.text('sensors.jsonl'),
+  });
   const texts = new Map(build.texts.map((t) => [t.name, t.text]));
   const images = new Map(build.images.map((i) => [i.name, i.image]));
   const plan = planZipParts(

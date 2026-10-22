@@ -7,7 +7,8 @@
  *
  * Time base: the mock trajectory advances with the frame timestamps (`FrameInput.t`) times
  * `speed`, so pauses in frame delivery pause the scan. A FrameTap (`setFrameTap`, the raw capture
- * recorder) sees every accepted frame before the mock closes its pixels, like on EngineClient.
+ * recorder) sees every accepted frame before the mock closes its pixels, like on EngineClient
+ * (every accepted frame counts as posted).
  */
 import type { MetricInfo, PointCloud, ProgressCallback, ProgressEvent, TriangleMesh } from '../core/types';
 import { createColmapZipBlob, encodeGLB, encodeMeshPLY, encodePLY, type ColmapModelInput } from '../io';
@@ -246,7 +247,12 @@ export class MockEngine implements EngineLike {
 
   async processFrame(f: FrameInput): Promise<LiveUpdate> {
     // a frame rejected as busy never reaches the tap
-    return this.busy || !this.frameTap ? this.mockFrame(f) : tapFrame(this.frameTap, f, (x) => this.mockFrame(x));
+    return this.busy || !this.frameTap
+      ? this.mockFrame(f)
+      : tapFrame(this.frameTap, f, (x, posted) => {
+          posted();
+          return this.mockFrame(x);
+        });
   }
 
   setFrameTap(tap: FrameTap | null): void {

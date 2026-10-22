@@ -3,11 +3,13 @@
  * FramePump would deliver: frame selection (stride / simulated pump rate / limit), IMU slices
  * since the previous delivered frame, the latest GPS fix and compass heading, and the gravity
  * direction metadata. For a raw capture recording (frames.jsonl, src/io/recording.ts)
- * `verbatimInput` gives back the recorded FrameInput fields unchanged instead. No DOM,
+ * `verbatimInput` gives back the recorded FrameInput fields unchanged instead (IMU of skipped rows
+ * prepended; a stream turned off withheld as the app would without that sensor). No DOM,
  * unit-tested in feed.test.ts.
  */
 import type { GeoFix, ImuSample } from '../../core/types';
 import type { FrameMeta, RecordedFrame } from '../../io/recording';
+import type { HeadingSample } from '../../workers/protocol';
 import { CompassSensor } from '../../sensors/orientation';
 import { decimalYearFromDate, magneticField, trueToMagneticHeading } from '../../sensors/wmm';
 
@@ -199,11 +201,14 @@ export interface VerbatimSensors {
 
 /**
  * The FrameInput (without pixels) of recorded frame `rows[pos]` as the app sent it: every field
- * verbatim, except that the IMU samples of the rows skipped since the previously replayed row
- * `prevPos` (stride / rate limit / start) are prepended, like the FramePump drains everything
- * since its last delivered frame — with every row replayed, each frame gets exactly its own
- * samples. A sensor stream turned off is withheld the way the app would without that sensor
- * (`imu`: no samples, `imuCalibrationVersion` −1; `heading`: no heading and no attitude).
+ * verbatim, except that the IMU samples of the rows since the previously replayed row `prevPos`
+ * (skipped by --start / --stride / --fps, or without recorded pixels; −1 = from the first row)
+ * are prepended, like the FramePump drains everything since its last delivered frame — with
+ * every row replayed, each frame gets exactly its own samples. A sensor stream turned off is
+ * withheld the way the app would without that sensor: `imu` — no samples,
+ * `imuCalibrationVersion` −1; `heading` — no heading and no attitude; `gps` — no fix, and the
+ * compass back on MAGNETIC north (`magneticAsWithoutGps`: the app turns headings and the
+ * absolute attitude to true north only with the declination of a GPS fix).
  */
 export function verbatimInput(rows: readonly RecordedFrame[], pos: number, prevPos: number, use: VerbatimSensors): FrameMeta {
   const src = rows[pos].input;
@@ -216,11 +221,55 @@ export function verbatimInput(rows: readonly RecordedFrame[], pos: number, prevP
     for (let k = Math.max(0, prevPos + 1); k <= pos; k++) imu.push(...(rows[k].input.imu ?? []));
     out.imu = imu;
   }
-  if (!use.gps && src.geo !== undefined) out.geo = null;
+  if (!use.gps) {
+    if (src.geo !== undefined) out.geo = null;
+    magneticAsWithoutGps(out, appliedDeclinationDeg(rows, pos));
+  }
   if (!use.heading) {
     if (src.heading !== undefined) out.heading = null;
     if (src.attitude !== undefined) out.attitude = null;
   }
   if ((!use.gravity || !use.imu) && src.gravityDevice !== undefined) out.gravityDevice = null;
   return out;
+}
+
+/**
+ * The declination (deg) the app had applied to frame `rows[pos]`: that of its heading when it is
+ * TRUE north, else of the newest earlier heading (a frame without one, e.g. its attitude only);
+ * 0 while the headings were magnetic or there are none.
+ */
+export function appliedDeclinationDeg(rows: readonly RecordedFrame[], pos: number): number {
+  for (let k = pos; k >= 0; k--) {
+    const h = rows[k].input.heading as HeadingSample | null | undefined;
+    if (!h) continue;
+    return h.north === 'true' && typeof h.declinationDeg === 'number' && Number.isFinite(h.declinationDeg) ? h.declinationDeg : 0;
+  }
+  return 0;
+}
+
+/**
+ * Undo the app's true-north correction of a frame (CompassSensor.setLocationFromFix, from GPS):
+ * a 'true' heading becomes `heading − declination` flagged 'magnetic' with declination 0 (what
+ * the sensor reports while magnetic), an absolute attitude is rotated back by the declination
+ * about the vertical (CompassSensor.attitudeAt applied −declination). Replaces, never mutates.
+ */
+export function magneticAsWithoutGps(f: FrameMeta, declinationDeg: number): void {
+  const h = f.heading as HeadingSample | null | undefined;
+  if (h && h.north === 'true' && typeof h.declinationDeg === 'number' && Number.isFinite(h.declinationDeg)) {
+    f.heading = { ...h, heading: (((h.heading - h.declinationDeg) % 360) + 360) % 360, north: 'magnetic', declinationDeg: 0 };
+  }
+  const a = f.attitude;
+  if (a && a.absolute && declinationDeg !== 0 && Number.isFinite(declinationDeg)) {
+    // R_mag = Rz(+d) · R_true (yaw about the ENU up axis: rows 0 and 1 of R_world_device)
+    const R = Float64Array.from(a.R_world_device);
+    const c = Math.cos((declinationDeg * Math.PI) / 180);
+    const sn = Math.sin((declinationDeg * Math.PI) / 180);
+    for (let j = 0; j < 3; j++) {
+      const x = R[j];
+      const y = R[3 + j];
+      R[j] = c * x - sn * y;
+      R[3 + j] = sn * x + c * y;
+    }
+    f.attitude = { ...a, R_world_device: R };
+  }
 }

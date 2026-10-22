@@ -6,11 +6,13 @@
  *
  * What is recorded: every FrameInput the app SENT to the engine (EngineLike.setFrameTap, so the
  * frames the FramePump skipped while the engine was busy are not in it), in that order —
- *  - `frames.jsonl`: one line per frame, `{seq, sentAt, input, image, error?}` where `input` is
- *    the FrameInput without its pixels, VERBATIM (t, screenAngle, screenAngleSince, imu, geo,
- *    heading, index, segment, gravityDevice, attitude, imuCalibrationVersion, timeSource,
- *    rawBuffer, maxSide), JSON-safe (src/io/serialize.ts: typed arrays as `{$typed, data}`, −∞ /
- *    NaN / −0 as `{$num}`), so `decodeFrameRow` gives back exactly what the engine received;
+ *  - `frames.jsonl`: one line per frame, `{seq, sentAt, input, image, error?, notSent?}` where
+ *    `input` is the FrameInput without its pixels, VERBATIM (t, screenAngle, screenAngleSince,
+ *    imu, geo, heading, index, segment, gravityDevice, attitude, imuCalibrationVersion,
+ *    timeSource, rawBuffer, maxSide), JSON-safe (src/io/serialize.ts: typed arrays as `{$typed,
+ *    data}`, −∞ / NaN / −0 as `{$num}`), so `decodeFrameRow` gives back exactly what the engine
+ *    received. A row whose pixels could not be recorded keeps `image: null` (the engine still got
+ *    the frame and its IMU slice);
  *  - the pixels as a JPEG (`RECORDING_JPEG_QUALITY`) at most `RECORDING_MAX_SIDE` px on the long
  *    side (bounds storage at ≈ 0.2–0.35 MB per frame; a 'fast' iOS capture already sends 1280 px
  *    frames, 'balanced' 1920 × 1440 ones). `image` keeps the recorded size and what the engine
@@ -20,7 +22,12 @@
  *    VideoFrame stays landscape: `rawBuffer` says so on replay);
  *  - `live.jsonl`: the engine's answer per frame (decision, guidance, tracking, counts, timings,
  *    debug) and the recorder's own back-pressure wait — the device-side outcome a desktop replay
- *    is compared with;
+ *    is compared with. `notSent: true` marks a frame the engine client rejected before posting it
+ *    (engine disposed / stopped, worker could not start): the device engine never got it;
+ *  - `sensors.jsonl`: the continuous sensor streams next to the per-frame slices (raw
+ *    DeviceMotion / DeviceOrientation events with every iOS field, every GPS fix), so the sensors
+ *    can be characterised (rates, jitter, duplicates, GNSS accuracy: docs/research/ios-sensors.md
+ *    §8) — including what was drained into frames the capture dropped. Not used by replays;
  *  - `recording.json`: the header (app / device, EngineOptions, camera, recorder settings) and,
  *    once stopped, its summary (frames, bytes, why it stopped, FramePump stats).
  * Times are the main thread's performance.now() (the frame clock); `header.timeOrigin` maps
@@ -28,14 +35,17 @@
  *
  * Export (`buildDatasetFiles`, `planZipParts`): the e2e dataset layout the harness reads —
  * `meta.json` (no GT: `gt: null`, `intrinsics: null`, `scene: 'recording'`, the recorded
- * `mode` / `quality` / `hfovPriorDeg` as the replay defaults), `frames.json` ({index, file, t}),
- * `frames/NNNNNN.jpg`, `imu.json` (the IMU samples of all frames, concatenated), `geo.json`
+ * `mode` / `quality` / `hfovPriorDeg` as the replay defaults), `frames.json` ({index, file, t}
+ * of the frames with pixels the engine got), `frames/NNNNNN.jpg`, `imu.json` (the IMU samples of
+ * every frame the engine got, concatenated — also those of frames without pixels), `geo.json`
  * (distinct fixes), `heading.json` (per-frame headings with their north reference), plus
- * `frames.jsonl`, `live.jsonl` and `recording.json`. The derived files are what the ENGINE got
- * (FramePump slices), not the raw sensor streams. `stripLocation` drops the GPS fixes (also from
- * `frames.jsonl`) and the location origin. STORE ZIP parts of at most `RECORDING_PART_BYTES`
- * (the iOS share sheet reads every file fully into memory, ≈ 2× — docs/research/ios-platform.md
- * §3), each a standalone archive; extracting all parts into one directory gives the dataset.
+ * `frames.jsonl` (every row; the not-sent ones flagged `notSent` from live.jsonl), `live.jsonl`,
+ * `sensors.jsonl` and `recording.json`. The derived files are what the ENGINE got (FramePump
+ * slices); the raw streams are sensors.jsonl. `stripLocation` drops the GPS fixes (also from
+ * `frames.jsonl` and `sensors.jsonl`) and the location origin. STORE ZIP parts of at most
+ * `RECORDING_PART_BYTES` (the iOS share sheet reads every file fully into memory, ≈ 2× —
+ * docs/research/ios-platform.md §3), each a standalone archive; extracting all parts into one
+ * directory gives the dataset.
  */
 import type { GeoFix, ImuSample } from '../core/types';
 import type { EngineOptions, FrameInput, HeadingSample, LiveUpdate } from '../workers/protocol';
@@ -79,9 +89,14 @@ export interface RecordedFrame {
   /** performance.now() when the recorder saw the frame (just before it was sent). */
   sentAt: number;
   input: FrameMeta;
-  /** null: the pixels could not be recorded (`error` says why); replays skip the frame. */
+  /**
+   * null: the pixels could not be recorded (`error` says why). The engine still got the frame:
+   * a replay cannot send it, but gives its IMU samples to the next replayed frame.
+   */
   image: RecordedImage | null;
   error?: string;
+  /** Export only (from live.jsonl): the engine never got this frame; replays leave it out, its IMU included. */
+  notSent?: boolean;
 }
 
 /** One line of live.jsonl: what the engine answered on the device. */
@@ -95,7 +110,27 @@ export interface RecordedLive {
   waitMs: number;
   update: Pick<LiveUpdate, 'frameIndex' | 'decision' | 'guidance' | 'tracking' | 'numKeyframes' | 'numRegistered' | 'numPoints' | 'timings' | 'debug'> | null;
   error: string | null;
+  /**
+   * The engine client rejected the frame before posting it to the engine (disposed, stopped
+   * after repeated failures, the worker could not start): the device engine never got it.
+   */
+  notSent?: boolean;
 }
+
+/**
+ * One line of sensors.jsonl: a raw sensor reading as it arrived on the main thread (`t` =
+ * performance.now() at arrival, `ts` = the event's timeStamp; null = the platform gave no value).
+ *  - 'motion': DeviceMotionEvent — `rot` = rotationRate [alpha, beta, gamma] (deg/s), `acc` /
+ *    `accG` = acceleration / accelerationIncludingGravity [x, y, z] (m/s²), `interval` (ms);
+ *  - 'orientation': DeviceOrientationEvent (`absolute`: a deviceorientationabsolute event) —
+ *    alpha / beta / gamma (deg), `absoluteFlag` = the event's own `absolute`, iOS
+ *    `webkitCompassHeading` / `webkitCompassAccuracy`;
+ *  - 'geo': a GPS fix as GeoSensor delivered it (every fix, not only the one a frame carried).
+ */
+export type RecordedSensorRow =
+  | { k: 'motion'; t: number; ts: number; interval: number | null; rot: [number | null, number | null, number | null] | null; acc: [number | null, number | null, number | null] | null; accG: [number | null, number | null, number | null] | null }
+  | { k: 'orientation'; t: number; ts: number; absolute: boolean; alpha: number | null; beta: number | null; gamma: number | null; absoluteFlag: boolean | null; compassHeading: number | null; compassAccuracy: number | null }
+  | { k: 'geo'; t: number; fix: GeoFix };
 
 export interface RecordingSummary {
   frames: number;
@@ -105,6 +140,9 @@ export interface RecordingSummary {
   /** Total back-pressure wait of the engine's frames (ms). */
   waitMs: number;
   durationMs: number;
+  /** sensors.jsonl rows posted / dropped because the main-thread buffer was full. */
+  sensorRows?: number;
+  sensorDropped?: number;
   /** FramePump statistics at the end (frames skipped while busy etc.), when known. */
   pump?: Record<string, number> | null;
 }
@@ -161,6 +199,16 @@ export function encodeLiveRow(r: RecordedLive): string {
 export function decodeLiveRow(line: string): RecordedLive {
   const r = parseJSONSafe<RecordedLive>(line);
   if (!r || typeof r !== 'object' || typeof r.seq !== 'number') throw new Error('not a live.jsonl row');
+  return r;
+}
+
+export function encodeSensorRow(r: RecordedSensorRow): string {
+  return stringifyJSONSafe(r);
+}
+
+export function decodeSensorRow(line: string): RecordedSensorRow {
+  const r = parseJSONSafe<RecordedSensorRow>(line);
+  if (!r || typeof r !== 'object' || typeof r.k !== 'string' || typeof r.t !== 'number') throw new Error('not a sensors.jsonl row');
   return r;
 }
 
@@ -223,13 +271,17 @@ export function datasetIndices(rows: readonly RecordedFrame[]): number[] {
 // Writer core (runs in the recorder worker; Node tests drive it with an in-memory sink)
 // ---------------------------------------------------------------------------------------------
 
+/** The JSON-lines files of a recording. */
+export type RecordingLineFile = 'frames.jsonl' | 'live.jsonl' | 'sensors.jsonl';
+
 /** Where a recording's bytes go (OPFS / IndexedDB: ./recording-store.ts). */
 export interface RecordingSink {
   readonly kind: string;
   writeHeader(json: string): Promise<void>;
   /** Store frame `seq`'s JPEG; returns where (kept in the row's `image.store`). */
   putImage(seq: number, jpeg: Uint8Array): Promise<ImageStoreRef>;
-  appendLine(file: 'frames.jsonl' | 'live.jsonl', line: string): Promise<void>;
+  /** Append one line, or several joined by '\n' (no trailing newline). */
+  appendLine(file: RecordingLineFile, line: string): Promise<void>;
   /** Make what was written so far durable (a killed app keeps it). */
   flush(): Promise<void>;
   close(): Promise<void>;
@@ -316,6 +368,16 @@ export class RecordingWriter {
     });
   }
 
+  /** A batch of sensors.jsonl rows (one append). */
+  writeSensors(rows: readonly RecordedSensorRow[]): Promise<void> {
+    if (!rows.length) return Promise.resolve();
+    return this.enqueue(async () => {
+      const text = rows.map(encodeSensorRow).join('\n');
+      await this.sink.appendLine('sensors.jsonl', text);
+      this.stats.lineBytes += text.length + 1;
+    });
+  }
+
   writeHeader(h: RecordingHeader): Promise<void> {
     return this.enqueue(() => this.sink.writeHeader(JSON.stringify(h, null, 1)));
   }
@@ -389,10 +451,11 @@ export interface RecordingDatasetMeta {
   height: number;
   srcWidth: number;
   srcHeight: number;
-  /** Delivered frame rate (frames / duration). */
+  /** Delivered frame rate (frames the engine got / duration). */
   fps: number;
+  /** Frames a replay sends (frames.json: the engine got them, with pixels). */
   numFrames: number;
-  /** Seconds from the first to the last frame. */
+  /** Seconds from the first to the last frame the engine got. */
   duration: number;
   startTimeMs: number;
   screenAngle: number;
@@ -407,9 +470,14 @@ export interface RecordingDatasetMeta {
   app: RecordingHeader['app'];
   recorder: RecordingHeader['recorder'];
   summary: RecordingSummary | null;
-  /** frames.jsonl lines that could not be parsed / frames without pixels (left out). */
+  /**
+   * frames.jsonl lines that could not be parsed (left out) / frames the engine got without
+   * recorded pixels (kept in frames.jsonl with `image: null`, their IMU in imu.json) / frames the
+   * engine never got (kept, flagged `notSent`).
+   */
   badLines: number;
   missingImages: number;
+  notSent: number;
 }
 
 export interface DatasetBuild {
@@ -421,26 +489,46 @@ export interface DatasetBuild {
 }
 
 /**
- * The e2e dataset of a recording (see the header): `framesText` / `liveText` = the stored
- * frames.jsonl / live.jsonl. Rows without pixels are left out (counted in `meta.missingImages`).
+ * The e2e dataset of a recording (see the header): `framesText` / `liveText` /
+ * `opts.sensorsText` = the stored frames.jsonl / live.jsonl / sensors.jsonl. Every frames.jsonl
+ * row is kept (the store reference dropped); the derived files describe what the engine got:
+ * rows without pixels give their IMU / fix / heading, but no frames.json entry (counted in
+ * `meta.missingImages`); rows live.jsonl marks `notSent` are flagged and give nothing.
  */
-export function buildDatasetFiles(header: RecordingHeader, framesText: string, liveText: string | null, opts: { stripLocation?: boolean } = {}): DatasetBuild {
+export function buildDatasetFiles(
+  header: RecordingHeader,
+  framesText: string,
+  liveText: string | null,
+  opts: { stripLocation?: boolean; sensorsText?: string | null } = {},
+): DatasetBuild {
   const strip = !!opts.stripLocation;
   const parsed = parseJsonl(framesText, decodeFrameRow);
-  const all = parsed.rows.sort((a, b) => a.seq - b.seq);
-  const rows = all.filter((r) => r.image);
-  const idx = datasetIndices(rows);
-  const out: RecordedFrame[] = rows.map((r) => {
-    const { store: _store, ...image } = r.image!;
-    const input: FrameMeta = strip ? { ...r.input, geo: r.input.geo === undefined ? undefined : null } : r.input;
-    return { ...r, input, image };
-  });
+  const notSent = new Set<number>();
+  if (liveText) for (const l of parseJsonl(liveText, decodeLiveRow).rows) if (l.notSent) notSent.add(l.seq);
+  const out: RecordedFrame[] = parsed.rows
+    .sort((a, b) => a.seq - b.seq)
+    .map((r) => {
+      const input: FrameMeta = strip ? { ...r.input, geo: r.input.geo === undefined ? undefined : null } : r.input;
+      const row: RecordedFrame = { ...r, input };
+      if (r.image) {
+        const { store: _store, ...image } = r.image;
+        row.image = image;
+      }
+      if (notSent.has(r.seq)) row.notSent = true;
+      else delete row.notSent;
+      return row;
+    });
+  /** What the engine got / the frames a replay decodes. */
+  const sent = out.filter((r) => !r.notSent);
+  const replay = sent.filter((r) => r.image);
+  const sentIdx = datasetIndices(sent);
+  const indexOf = new Map(sent.map((r, i) => [r.seq, sentIdx[i]]));
   const imu: ImuSample[] = [];
-  for (const r of out) if (Array.isArray(r.input.imu)) imu.push(...r.input.imu);
+  for (const r of sent) if (Array.isArray(r.input.imu)) imu.push(...r.input.imu);
   imu.sort((a, b) => a.t - b.t);
   const geo: GeoFix[] = [];
   const seen = new Set<string>();
-  for (const r of out) {
+  for (const r of sent) {
     const g = r.input.geo;
     if (!g) continue;
     const key = `${g.t}|${g.lat}|${g.lon}`;
@@ -450,12 +538,13 @@ export function buildDatasetFiles(header: RecordingHeader, framesText: string, l
   }
   geo.sort((a, b) => a.t - b.t);
   const headings: RecordedHeadingRow[] = [];
-  for (const r of out) {
+  for (const r of sent) {
     const hd = r.input.heading as HeadingSample | null | undefined;
     if (hd && Number.isFinite(hd.heading)) headings.push({ t: r.input.t, heading: hd.heading, accuracy: hd.accuracy, north: hd.north ?? 'true', declinationDeg: hd.declinationDeg ?? null });
   }
-  const first = out[0];
-  const last = out[out.length - 1];
+  const first = sent[0];
+  const last = sent[sent.length - 1];
+  const img0 = replay[0]?.image;
   const durationMs = first && last ? last.input.t - first.input.t : 0;
   const g0 = geo[0];
   const meta: RecordingDatasetMeta = {
@@ -466,12 +555,12 @@ export function buildDatasetFiles(header: RecordingHeader, framesText: string, l
     mode: header.engine.mode,
     quality: header.engine.quality,
     hfovPriorDeg: typeof header.engine.hfovPriorDeg === 'number' ? header.engine.hfovPriorDeg : null,
-    width: first?.image?.width ?? 0,
-    height: first?.image?.height ?? 0,
-    srcWidth: first?.image?.srcWidth ?? 0,
-    srcHeight: first?.image?.srcHeight ?? 0,
-    fps: out.length > 1 && durationMs > 0 ? Math.round(((out.length - 1) / durationMs) * 1000 * 100) / 100 : 0,
-    numFrames: out.length,
+    width: img0?.width ?? 0,
+    height: img0?.height ?? 0,
+    srcWidth: img0?.srcWidth ?? 0,
+    srcHeight: img0?.srcHeight ?? 0,
+    fps: sent.length > 1 && durationMs > 0 ? Math.round(((sent.length - 1) / durationMs) * 1000 * 100) / 100 : 0,
+    numFrames: replay.length,
     duration: Math.round(durationMs) / 1000,
     startTimeMs: first?.input.t ?? 0,
     screenAngle: first?.input.screenAngle ?? 0,
@@ -486,21 +575,32 @@ export function buildDatasetFiles(header: RecordingHeader, framesText: string, l
     recorder: header.recorder,
     summary: header.summary ?? null,
     badLines: parsed.bad,
-    missingImages: all.length - rows.length,
+    missingImages: sent.length - replay.length,
+    notSent: out.length - sent.length,
   };
   const texts: { name: string; text: string }[] = [
     { name: 'meta.json', text: JSON.stringify(meta, null, 1) },
     { name: 'recording.json', text: JSON.stringify(header, null, 1) },
-    { name: 'frames.json', text: JSON.stringify(out.map((r, i) => ({ index: idx[i], file: r.image!.file, t: r.input.t }))) },
+    { name: 'frames.json', text: JSON.stringify(replay.map((r) => ({ index: indexOf.get(r.seq), file: r.image!.file, t: r.input.t }))) },
     { name: 'frames.jsonl', text: out.map((r) => encodeFrameRow(r)).join('\n') + (out.length ? '\n' : '') },
     { name: 'imu.json', text: JSON.stringify(imu) },
   ];
   if (geo.length) texts.push({ name: 'geo.json', text: JSON.stringify(geo) });
   if (headings.length) texts.push({ name: 'heading.json', text: JSON.stringify(headings) });
-  if (liveText) texts.push({ name: 'live.jsonl', text: liveText.endsWith('\n') || !liveText ? liveText : `${liveText}\n` });
-  const images = rows.map((r) => ({ name: r.image!.file, image: r.image! }));
+  if (liveText) texts.push({ name: 'live.jsonl', text: withNewline(liveText) });
+  let sensors = opts.sensorsText ?? '';
+  if (sensors && strip) {
+    const rows = parseJsonl(sensors, decodeSensorRow).rows.filter((r) => r.k !== 'geo');
+    sensors = rows.map(encodeSensorRow).join('\n');
+  }
+  if (sensors.trim()) texts.push({ name: 'sensors.jsonl', text: withNewline(sensors) });
+  // the JPEGs of every row with pixels (a not-sent frame's too: nothing recorded is dropped),
+  // with their store references (parsed.rows, sorted in place above)
+  const images = parsed.rows.filter((r) => r.image).map((r) => ({ name: r.image!.file, image: r.image! }));
   return { meta, texts, images };
 }
+
+const withNewline = (t: string): string => (t.endsWith('\n') ? t : `${t}\n`);
 
 // ---------------------------------------------------------------------------------------------
 // ZIP parts

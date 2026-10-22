@@ -146,6 +146,8 @@ export class App {
   private permissions: Promise<CapturePermissionStatus> | null = null;
   /** Raw capture recorder of the running scan (startRecording). */
   private recorder: CaptureRecorder | null = null;
+  /** Bumped by each startRecording / stopRecording: a start still opening when superseded stops its recorder. */
+  private recordSeq = 0;
   private sessionsP: Promise<SessionStore | null> | null = null;
   private screen: Screen | null = null;
   private readonly host: HTMLElement;
@@ -350,12 +352,16 @@ export class App {
   /**
    * Record the frames the engine gets from now on (a FrameTap on the engine) until
    * stopRecording. Never throws: when it cannot record (no OPFS / IndexedDB, too little storage)
-   * a toast says why and the scan goes on without it. The module is loaded on demand.
+   * a toast says why and the scan goes on without it. The module is loaded on demand. A start
+   * superseded while it opens (stopRecording — the capture closed — or a newer start) never
+   * installs its recorder: it is stopped once open.
    */
   async startRecording(info: RecorderStartInfo): Promise<void> {
     await this.stopRecording();
+    const my = ++this.recordSeq;
     try {
       const { CaptureRecorder } = await import('./recorder');
+      if (my !== this.recordSeq) return;
       const rec = await CaptureRecorder.start(info, {
         onStop: (reason, auto) => {
           if (this.recorder === rec) {
@@ -365,16 +371,21 @@ export class App {
           if (auto) toast(`Raw capture recording stopped: ${reason}. The scan continues.`, { tone: 'warn', durationMs: 7000 });
         },
       });
+      if (my !== this.recordSeq) {
+        await rec.stop('the capture ended while the recording started').catch((e: unknown) => console.warn('[app] stopping the recorder failed', e));
+        return;
+      }
       this.recorder = rec;
       this.engine.setFrameTap(rec);
       toast('Recording raw capture — export or delete it in Diagnostics.', { tone: 'info', icon: 'storage' });
     } catch (e) {
-      toast(`Raw capture recording is off: ${(e as Error)?.message ?? e}`, { tone: 'warn', durationMs: 7000 });
+      if (my === this.recordSeq) toast(`Raw capture recording is off: ${(e as Error)?.message ?? e}`, { tone: 'warn', durationMs: 7000 });
     }
   }
 
-  /** End the running recording (its last frames are written first). */
+  /** End the running recording (its last frames are written first), or the start still opening. */
   async stopRecording(): Promise<void> {
+    this.recordSeq++;
     const rec = this.recorder;
     if (!rec) return;
     this.recorder = null;

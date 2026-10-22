@@ -4,14 +4,14 @@
  * lose (−∞, −0, NaN, typed arrays). Used by recording.test.ts and the replay round-trip tests.
  */
 import type { FrameInput } from '../workers/protocol';
-import type { ImageStoreRef, RecordingHeader, RecordingSink } from './recording';
+import type { ImageStoreRef, RecordingHeader, RecordingLineFile, RecordingSink } from './recording';
 
 /** An in-memory RecordingSink (what the OPFS / IndexedDB sinks store, as plain maps). */
 export class MemorySink implements RecordingSink {
   readonly kind = 'memory';
   header = '';
   readonly images = new Map<string, Uint8Array>();
-  readonly lines: Record<string, string[]> = { 'frames.jsonl': [], 'live.jsonl': [] };
+  readonly lines: Record<RecordingLineFile, string[]> = { 'frames.jsonl': [], 'live.jsonl': [], 'sensors.jsonl': [] };
   flushes = 0;
   closed = false;
   failOn: 'putImage' | 'appendLine' | null = null;
@@ -23,7 +23,7 @@ export class MemorySink implements RecordingSink {
     this.images.set(String(seq), jpeg.slice());
     return { key: String(seq) };
   }
-  async appendLine(file: 'frames.jsonl' | 'live.jsonl', line: string): Promise<void> {
+  async appendLine(file: RecordingLineFile, line: string): Promise<void> {
     if (this.failOn === 'appendLine') throw new Error('I/O error');
     this.lines[file].push(line);
   }
@@ -33,7 +33,7 @@ export class MemorySink implements RecordingSink {
   async close(): Promise<void> {
     this.closed = true;
   }
-  text(file: 'frames.jsonl' | 'live.jsonl'): string {
+  text(file: RecordingLineFile): string {
     return this.lines[file].map((l) => `${l}\n`).join('');
   }
 }

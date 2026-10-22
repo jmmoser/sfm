@@ -1,7 +1,8 @@
 /**
  * FrameTap (./frame-tap.ts) on its own and on both EngineLikes: the tap sees each frame before
  * it is sent (pixels still there), may hold back processFrame's resolution, gets the answer
- * afterwards; a busy-rejected frame never reaches it; a failing tap never fails the frame.
+ * afterwards and whether the frame was posted; a busy-rejected frame never reaches it; a failing
+ * tap never fails the frame.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { EngineRequest, FrameInput, InitResult, LiveUpdate } from '../workers/protocol';
@@ -54,6 +55,20 @@ describe('tapFrame', () => {
     expect(log.at(-1)).toBe('after 3 3 null ms>=0 true wait>=0 true');
   });
 
+  it('t.sent: the send called posted(), or answered; false when it rejected before posting', async () => {
+    const sent: boolean[] = [];
+    const tap: FrameTap = { before: () => undefined, after: (_f, _r, _e, t) => void sent.push(t.sent) };
+    await tapFrame(tap, frame(0), async () => update(0)); // answered ⇒ it got there
+    await expect(tapFrame(tap, frame(1), async () => Promise.reject(new Error('Engine disposed')))).rejects.toThrow();
+    await expect(
+      tapFrame(tap, frame(2), async (_f, posted) => {
+        posted();
+        throw new Error('the engine crashed on it');
+      }),
+    ).rejects.toThrow();
+    expect(sent).toEqual([true, false, true]);
+  });
+
   it('a failing send reaches after() and still rejects; a throwing tap never fails the frame', async () => {
     const seen: unknown[] = [];
     const tap: FrameTap = { before: () => undefined, after: (_f, res, err) => seen.push(res, err) };
@@ -77,11 +92,13 @@ describe('tapFrame', () => {
 
 class FakeWorker {
   readonly posted: EngineRequest[] = [];
+  failPost = false;
   private readonly listeners = new Map<string, ((ev: unknown) => void)[]>();
   addEventListener(type: string, cb: (ev: unknown) => void): void {
     this.listeners.set(type, [...(this.listeners.get(type) ?? []), cb]);
   }
   postMessage(req: EngineRequest): void {
+    if (this.failPost && req.method === 'frame') throw Object.assign(new Error('could not be cloned'), { name: 'DataCloneError' });
     this.posted.push(req);
   }
   terminate(): void {}
@@ -120,13 +137,38 @@ describe('EngineLike.setFrameTap', () => {
     c.dispose();
   });
 
+  it('EngineClient: a frame rejected before it was posted (postMessage failed, engine disposed) reaches after() with sent = false', async () => {
+    let worker!: FakeWorker;
+    const c = new EngineClient({ forwardVisibility: false, createWorker: () => (worker = new FakeWorker()) as unknown as Worker });
+    const ready = c.init({ mode: 'object', quality: 'fast' });
+    await flush();
+    worker.reply('init', { gpu: true } as InitResult);
+    await ready;
+    const seen: [number, boolean][] = [];
+    c.setFrameTap({ before: () => undefined, after: (f, _u, _e, t) => void seen.push([f.index!, t.sent]) });
+    const ok = c.processFrame(frame(1));
+    await flush();
+    worker.reply('frame', update(1));
+    await ok;
+    worker.failPost = true;
+    await expect(c.processFrame(frame(2))).rejects.toMatchObject({ name: 'DataCloneError' });
+    worker.failPost = false;
+    c.dispose();
+    await expect(c.processFrame(frame(3))).rejects.toThrow(/disposed/);
+    expect(seen).toEqual([
+      [1, true],
+      [2, false],
+      [3, false],
+    ]);
+  });
+
   it('MockEngine: the tap copies the frame before the mock closes it', async () => {
     const e = new MockEngine({ speed: 40, sessions: async () => null });
     await e.init({ mode: 'object', quality: 'fast' });
     const seen: string[] = [];
-    e.setFrameTap({ before: (f) => void seen.push(`before closed=${(f.bitmap as unknown as { closed: boolean }).closed}`), after: (_f, u) => void seen.push(`after ${u?.decision}`) });
+    e.setFrameTap({ before: (f) => void seen.push(`before closed=${(f.bitmap as unknown as { closed: boolean }).closed}`), after: (_f, u, _e, t) => void seen.push(`after ${u?.decision} sent=${t.sent}`) });
     const u = await e.processFrame(frame(0));
-    expect(seen).toEqual(['before closed=false', `after ${u.decision}`]);
+    expect(seen).toEqual(['before closed=false', `after ${u.decision} sent=true`]);
     e.dispose();
   });
 });

@@ -10,7 +10,8 @@
  *    (copied on the main thread), RGBAImages as a copy of their pixels.
  *  - Encoding (one reused OffscreenCanvas, `convertToBlob` JPEG) and writing run one frame at a
  *    time in arrival order (RecordingWriter); every frame is acknowledged (`frame`), which is the
- *    main thread's back-pressure signal.
+ *    main thread's back-pressure signal. The engine's answers (`live`) and the batched raw
+ *    sensor readings (`sensors`, sensors.jsonl) go through the same queue, unacknowledged.
  *  - A sink failure (quota, I/O) is reported once as a fatal `error`; later frames are dropped
  *    (closed) and the main thread stops the recording.
  * Times are never taken here (a worker's performance.now() has its own origin): `sentAt` and the
@@ -148,10 +149,11 @@ async function handle(req: RecorderWorkerRequest): Promise<void> {
       }
       return;
     }
-    case 'live': {
+    case 'live':
+    case 'sensors': {
       if (!writer || broken) return;
       try {
-        await writer.writeLive(req.row);
+        await (req.type === 'live' ? writer.writeLive(req.row) : writer.writeSensors(req.rows));
       } catch (e) {
         if (!broken) {
           broken = true;

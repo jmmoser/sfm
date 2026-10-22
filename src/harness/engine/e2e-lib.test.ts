@@ -7,7 +7,7 @@ import { ArgError, parseArgs } from '../../../e2e/lib/e2e-args.mjs';
 import { metricsInput, resolveThresholds, runChecks, skipChecks, summaryRow, CHECKS, formatChecks } from '../../../e2e/lib/e2e-checks.mjs';
 import { computeSelfMetrics, formatSelfTable, isGtFree, parseGyroBreaks } from '../../../e2e/lib/self-metrics.mjs';
 import { readStoreZip, safeEntryName } from '../../../e2e/lib/zip-read.mjs';
-import { partOf } from '../../../e2e/import-recording.mjs';
+import { isDatasetName, isStrictChild, partOf } from '../../../e2e/import-recording.mjs';
 import { createZip } from '../../io/zip';
 import type { Metrics } from '../../../e2e/lib/metrics-core.mjs';
 import { plyFromBase64 } from '../../../e2e/lib/e2e-ply.mjs';
@@ -268,5 +268,14 @@ describe('recording import (e2e/import-recording.mjs, e2e/lib/zip-read.mjs)', ()
   it('part names', () => {
     expect(partOf('/x/sfm-rec-20261021-140210-ab12cd34-part2of3.zip')).toEqual({ base: 'sfm-rec-20261021-140210-ab12cd34', part: 2, count: 3 });
     expect(partOf('sfm-rec-1.zip')).toEqual({ base: 'sfm-rec-1', part: 1, count: 1 });
+    // an archive named '..zip' derives the name '.'
+    expect(partOf('/x/..zip').base).toBe('.');
+  });
+
+  it('dataset names: never ".", "..", hidden or a path, so --force only replaces a directory inside the output', () => {
+    for (const n of ['.', '..', '.git', '...', 'a/b', '../x', 'a b', '']) expect(isDatasetName(n), n).toBe(false);
+    for (const n of ['sfm-rec-20261021-140210-ab12cd34', 'kitchen_1', 'a.b', 'x..']) expect(isDatasetName(n), n).toBe(true);
+    expect(isStrictChild('/r/e2e/data', '/r/e2e/data/kitchen')).toBe(true);
+    for (const d of ['/r/e2e/data', '/r/e2e/data/..', '/r/e2e', '/r/e2e/data2', '/elsewhere']) expect(isStrictChild('/r/e2e/data', d), d).toBe(false);
   });
 });

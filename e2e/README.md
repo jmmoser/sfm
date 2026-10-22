@@ -1002,19 +1002,30 @@ without ground truth, so it is scored GT-free.
 
 **Recording (phone).** Setup › Options › **Record raw capture** (developer option, off by default).
 From the engine's init until the capture ends, `CaptureRecorder` (`src/app/recorder.ts`) is a
-`FrameTap` on the engine client (`src/app/frame-tap.ts`). It sees exactly the frames that reach the
-engine, not the ones the FramePump skipped while the engine was busy. For each frame it sends the
+`FrameTap` on the engine client (`src/app/frame-tap.ts`). It sees every frame the engine client
+accepts, not the ones the FramePump skipped while the engine was busy. For each frame it sends the
 pixels and every `FrameInput` field to the recorder worker (`src/workers/recorder.worker.ts`). The
 worker encodes a JPEG at q 0.9, at most 1280 px on the long side. It writes to OPFS through sync
-access handles, or to IndexedDB where OPFS is missing (`src/io/recording-store.ts`).
+access handles, or to IndexedDB where OPFS is missing (`src/io/recording-store.ts`). A frame the
+engine client rejected before posting it (engine disposed or stopped after repeated failures,
+worker not startable) is flagged `notSent` in `live.jsonl`: the engine never got it.
 
 * **Size:** about 0.1–0.35 MB per frame. At the pump's ≤ 10 Hz that is 1–3 MB/s.
+* **Sensor log:** next to the frames, `sensors.jsonl` records the raw DeviceMotion and
+  DeviceOrientation events with every field iOS gives (rotation rate, both accelerations,
+  `interval`, `webkitCompassHeading` / `webkitCompassAccuracy`, arrival time and event
+  `timeStamp`) and every GPS fix. It is posted to the worker in 500 ms batches, an estimated
+  10–20 KB/s. It is for characterising the sensors (rates, jitter, duplicates, GNSS accuracy:
+  docs/research/ios-sensors.md §8), and it also holds the IMU drained into frames the capture
+  dropped while paused. Replays do not use it.
 * **Free space:** a recording needs 1 GB of free origin quota to start (the capture screen warns at
-  300 MB). It stops by itself on low storage, a write error, or a worker that falls 8 s behind.
-  This stops only the recording, not the scan, and a toast says so.
-* **Back-pressure:** at most 3 frames wait in the recorder worker. Beyond that the frame's
-  `processFrame` resolves late, so the FramePump skips camera frames as when the engine is busy,
-  and the recording still equals the engine's input. `live.jsonl` keeps the wait per frame.
+  300 MB). It stops by itself on low storage, a write error, or a worker that falls 8 s behind
+  (time with the page hidden does not count: iOS suspends the worker too). This stops only the
+  recording, not the scan, and a toast says so.
+* **Back-pressure:** when more than 3 frames are in the recorder worker, the frame just sent
+  resolves its `processFrame` only when the worker caught up, so at most 4 are in it. The
+  FramePump then skips camera frames as when the engine is busy, and the recording still equals
+  the engine's input. `live.jsonl` keeps the wait per frame.
 
 **Export (phone).** Diagnostics › **Raw capture recordings** lists each recording with its frames,
 duration and size. **Export** builds STORE ZIP parts of at most 200 MB each, because the iOS share
@@ -1030,20 +1041,23 @@ node e2e/import-recording.mjs <parts or a folder of them> --name kitchen-1 [--ou
 ```
 
 The importer extracts every part into one directory. It checks the CRCs and the entry names, that
-no part is missing, and that every frame in `frames.jsonl` has its JPEG. Extracting the parts with
-any unzip tool into one folder gives the same result.
+no part is missing, and that every frame in `frames.jsonl` has its JPEG (rows recorded without
+pixels, `image: null`, are only counted). The dataset name must be a plain name that does not
+start with '.', so `--force` can only replace a directory inside the output directory. Extracting
+the parts with any unzip tool into one folder gives the same result.
 
 **Layout** (the synthetic layout without ground truth, plus the verbatim stream):
 
 | File | Content |
 |---|---|
-| `meta.json` | `scene: 'recording'`, `source: 'sfm-raw-capture'`, `gt: null`, `intrinsics: null`, `sceneExtent: null`; the recorded `mode`, `quality`, `hfovPriorDeg`, `createdAt` (the replay defaults); `width × height` (first recorded JPEG), `srcWidth × srcHeight` (what the engine got), `fps` (delivered rate), `numFrames`, `duration`, `screenAngle`, `originLatLonAlt` (first fix, null without location), `locationStripped`, `camera` (no device ids), `app`, `recorder`, `summary`, `missingImages` |
-| `frames.jsonl` | one line per frame sent, in order: `{seq, sentAt, input, image: {file, width, height, srcWidth, srcHeight, kind, bytes}}`. `input` is the `FrameInput` without pixels, VERBATIM: `t, screenAngle, screenAngleSince, imu, geo, heading, index, segment, gravityDevice, attitude, imuCalibrationVersion, timeSource, rawBuffer, maxSide`. It is JSON-safe (`src/io/serialize.ts`): typed arrays are `{"$typed": "Float64Array", "data": […]}`, and −∞ / NaN / −0 are `{"$num": "-Infinity"}`. |
+| `meta.json` | `scene: 'recording'`, `source: 'sfm-raw-capture'`, `gt: null`, `intrinsics: null`, `sceneExtent: null`; the recorded `mode`, `quality`, `hfovPriorDeg`, `createdAt` (the replay defaults); `width × height` (first recorded JPEG), `srcWidth × srcHeight` (what the engine got), `fps` (delivered rate), `numFrames` (frames a replay sends), `duration`, `screenAngle`, `originLatLonAlt` (first fix, null without location), `locationStripped`, `camera` (no device ids), `app`, `recorder`, `summary`, `missingImages` (frames recorded without pixels), `notSent`, `badLines` |
+| `frames.jsonl` | one line per frame sent, in order: `{seq, sentAt, input, image: {file, width, height, srcWidth, srcHeight, kind, bytes}}`. `input` is the `FrameInput` without pixels, VERBATIM: `t, screenAngle, screenAngleSince, imu, geo, heading, index, segment, gravityDevice, attitude, imuCalibrationVersion, timeSource, rawBuffer, maxSide`. It is JSON-safe (`src/io/serialize.ts`): typed arrays are `{"$typed": "Float64Array", "data": […]}`, and −∞ / NaN / −0 are `{"$num": "-Infinity"}`. `image: null` (with `error`): the engine got the frame, but its pixels could not be recorded. `notSent: true` (from `live.jsonl`): the engine never got the frame. |
 | `frames/NNNNNN.jpg` | the pixels the engine got, ≤ 1280 px, in the same pixel layout. A raw sensor-landscape VideoFrame stays landscape, and `rawBuffer` says so. `kind` is VideoFrame / ImageBitmap / RGBAImage. |
-| `frames.json` | `[{index, file, t}]`: `index` is `FrameInput.index`, or `seq` when those are not unique. There is no `pose`. |
-| `imu.json`, `geo.json`, `heading.json` | derived from the frames: the IMU slices concatenated, the distinct GPS fixes, and the per-frame headings with `north` / `declinationDeg`. This is what the engine got, not the raw sensor streams. |
-| `live.jsonl` | the device's answer per frame: `{seq, index, ms, waitMs, update: {decision, guidance, tracking, numKeyframes, numRegistered, numPoints, timings, debug}, error}` |
-| `recording.json` | the recorder header: app / device, EngineOptions, camera, capture settings, stop reason, and the summary (frames, bytes, FramePump stats) |
+| `frames.json` | `[{index, file, t}]` of the frames a replay sends (the engine got them, with pixels): `index` is `FrameInput.index`, or `seq` when those are not unique. There is no `pose`. |
+| `imu.json`, `geo.json`, `heading.json` | derived from the frames the engine got (those without pixels included): the IMU slices concatenated, the distinct GPS fixes, and the per-frame headings with `north` / `declinationDeg`. This is what the engine got; the raw sensor streams are `sensors.jsonl`. |
+| `live.jsonl` | the device's answer per frame: `{seq, index, ms, waitMs, update: {decision, guidance, tracking, numKeyframes, numRegistered, numPoints, timings, debug}, error, notSent?}` |
+| `sensors.jsonl` | the raw sensor log, one reading per line: `{k: 'motion', t, ts, interval, rot: [α, β, γ], acc: [x, y, z], accG: [x, y, z]}`, `{k: 'orientation', t, ts, absolute, alpha, beta, gamma, absoluteFlag, compassHeading, compassAccuracy}`, `{k: 'geo', t, fix}`. `t` is the arrival time (performance.now()), `ts` the event's `timeStamp`, null a value the platform did not give. The `geo` rows are left out unless the export includes the location. |
+| `recording.json` | the recorder header: app / device, EngineOptions, camera, capture settings, stop reason, and the summary (frames, bytes, sensor rows, FramePump stats) |
 
 **Replay.** `node e2e/run-e2e.mjs <name>` works like any dataset, but in VERBATIM mode
 (`src/harness/engine/pipeline.ts`, `feed.ts verbatimInput`):
@@ -1054,16 +1068,25 @@ any unzip tool into one folder gives the same result.
 * The recorded mode, quality, hfov prior and date are the defaults. `--mode`, `--quality` and
   `--hfov` override them.
 * `--start`, `--stride` and `--fps` still select frames. The IMU samples of the skipped rows are
-  prepended to the next replayed frame, as the FramePump drains everything since its last frame.
+  prepended to the next replayed frame, as the FramePump drains everything since its last frame;
+  with `--start` the first frame gets those of every row before it.
+* A frame recorded without pixels cannot be sent. Its IMU samples go to the next replayed frame,
+  because the device engine had them. A `notSent` frame is left out with its IMU, because the
+  device engine never got it.
 * `--no-imu`, `--no-gps` and `--no-heading` withhold a stream the way the app would without that
-  sensor: no samples and calibration version −1; no fix; no heading and no attitude.
+  sensor: no samples and calibration version −1; no fix; no heading and no attitude. Without GPS
+  the compass also goes back to magnetic north: a heading the app had turned to true north with
+  the declination of a fix becomes `heading − declinationDeg`, flagged `north: 'magnetic'`, and an
+  absolute attitude is rotated back by the same declination.
 * `--set replaySize='"original"'` resizes each JPEG back to the size the engine got: a VideoFrame
   fitted to its `maxSide`, else the bitmap size.
 * `--set verbatim=false` synthesizes the inputs from `frames.json` / `imu.json` like a synthetic
   dataset.
-* With `live.jsonl`, `result.recording` holds the device's decision histogram, its last counts,
-  its frame ms and recorder wait, and the per-frame agreement of the replay's decisions with the
-  device's (`rate`, keyframes on each side, and a `device>replay` confusion count).
+* `result.recording` counts the rows replayed (`rows`), the rows not replayed (`skipped`: no pixels,
+  not sent, unparseable) and the `notSent` ones. With `live.jsonl` it also holds the device's
+  decision histogram, its last counts, its frame ms and recorder wait, and the per-frame agreement
+  of the replay's decisions with the device's (`rate`, keyframes on each side, and a
+  `device>replay` confusion count).
 
 **GT-free scoring.** A dataset whose `meta.source` is `sfm-raw-capture`, or whose frames lack
 `pose`, gets self-consistency metrics instead of `computeMetrics` (`e2e/lib/self-metrics.mjs`;
@@ -1113,8 +1136,8 @@ busy.
   error.
 
 **Not yet measured on an iPhone:** the encode cost per frame next to the engine, the OPFS write
-rate, how many frames back-pressure costs at 10 Hz, and sharing 200 MB parts from a Safari tab and
-from a Home Screen app.
+rate, how many frames back-pressure costs at 10 Hz, the sensor log's event rates and size, and
+sharing 200 MB parts from a Safari tab and from a Home Screen app.
 
 ## Novel-view evaluation (`nvs.mjs`)
 

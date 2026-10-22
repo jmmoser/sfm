@@ -11,9 +11,12 @@
  * capture recordings"): VERBATIM replay — each FrameInput is the recorded one (feed.ts
  * verbatimInput: no synthesized screen angle / segment / time source, no recomputed gravity, no
  * WMM heading conversion), in the order it was sent; only the pixels are the recorded JPEG
- * (`replaySize: 'original'` resizes it back to the size the engine got). The recorded mode,
- * quality, hfov prior and date are the defaults. With live.jsonl, `result.recording` compares
- * the replay's per-frame decisions with the device's.
+ * (`replaySize: 'original'` resizes it back to the size the engine got). Rows the device engine
+ * never got (`notSent`, from frames.jsonl or live.jsonl) are left out entirely; rows without
+ * recorded pixels cannot be sent, so their IMU samples go to the next replayed frame, like those
+ * of rows skipped by --start / --stride / --fps. The recorded mode, quality, hfov prior and date
+ * are the defaults. With live.jsonl, `result.recording` compares the replay's per-frame
+ * decisions with the device's.
  *
  * Every step is guarded: a failure is recorded in `errors` and the steps that depend on it are
  * skipped, so a partial result is always returned. Big outputs (PLY files) are streamed to
@@ -76,8 +79,7 @@ interface DatasetMeta {
   quality?: string;
   hfovPriorDeg?: number | null;
   createdAt?: number;
-  /** Recordings: frames the export left out (no pixels / unparseable rows). */
-  missingImages?: number;
+  /** Recordings: frames.jsonl lines the export could not parse (left out). */
   badLines?: number;
 }
 
@@ -96,12 +98,16 @@ interface Dataset {
   imu: ImuSample[];
   geo: GeoFix[] | null;
   headings: HeadingRow[] | null;
-  /** frames.jsonl rows with pixels, in the order they were sent (null: a synthetic dataset). */
+  /**
+   * frames.jsonl rows the device engine got, in the order they were sent — rows without pixels
+   * included (not in `frames`: their IMU goes to the next replayed one). Null: a synthetic dataset.
+   */
   recorded: RecordedFrame[] | null;
   /** live.jsonl rows by `seq` (null: none). */
   device: Map<number, RecordedLive> | null;
-  /** frames.jsonl rows left out (unparseable / without pixels). */
+  /** frames.jsonl rows not replayed as frames (unparseable, without pixels, not sent) / of those, not sent. */
   recordedSkipped: number;
+  recordedNotSent: number;
 }
 
 function joinUrl(base: string, rel: string): string {
@@ -150,18 +156,26 @@ async function loadDataset(baseUrl: string): Promise<Dataset> {
   let recorded: RecordedFrame[] | null = null;
   let device: Map<number, RecordedLive> | null = null;
   let recordedSkipped = 0;
+  let recordedNotSent = 0;
   let list = frames;
   if (jsonl !== null) {
     const p = parseJsonl(jsonl, decodeFrameRow);
-    recorded = p.rows.filter((r) => r.image).sort((a, b) => a.seq - b.seq);
-    // left out here, and already by the export (rows without pixels: meta.json counts them)
-    recordedSkipped = p.bad + p.rows.length - recorded.length + (meta?.missingImages ?? 0) + (meta?.badLines ?? 0);
-    const idx = datasetIndices(recorded);
-    list = recorded.map((r, pos) => ({ index: idx[pos], file: r.image!.file, t: r.input.t, pos }));
     if (live !== null) device = new Map(parseJsonl(live, decodeLiveRow).rows.map((r) => [r.seq, r]));
+    const all = p.rows.sort((a, b) => a.seq - b.seq);
+    // the device engine never got a not-sent row: left out with its IMU
+    recorded = all.filter((r) => !r.notSent && !device?.get(r.seq)?.notSent);
+    recordedNotSent = all.length - recorded.length;
+    const idx = datasetIndices(recorded);
+    const replayable: DatasetFrame[] = [];
+    recorded.forEach((r, pos) => {
+      if (r.image) replayable.push({ index: idx[pos], file: r.image.file, t: r.input.t, pos });
+    });
+    list = replayable;
+    // lines unparseable here or already by the export (meta.json counts those)
+    recordedSkipped = p.bad + (meta?.badLines ?? 0) + all.length - list.length;
   }
   if (!list) throw new Error(`fetch ${joinUrl(baseUrl, 'frames.json')}: missing (and no frames.jsonl)`);
-  return { baseUrl, meta: meta!, frames: list, imu: byT(imu) ?? [], geo: byT(geo), headings: byT(headings), recorded, device, recordedSkipped };
+  return { baseUrl, meta: meta!, frames: list, imu: byT(imu) ?? [], geo: byT(geo), headings: byT(headings), recorded, device, recordedSkipped, recordedNotSent };
 }
 
 // ------------------------------------------------------------------ helpers
@@ -339,8 +353,9 @@ function recordingSummary(ds: Dataset, verbatim: boolean, a: Agreement): Recordi
   }
   return {
     verbatim,
-    rows: ds.recorded?.length ?? 0,
+    rows: ds.frames.length,
     skipped: ds.recordedSkipped,
+    notSent: ds.recordedNotSent,
     device,
     agreement: verbatim && a.compared ? { ...a, rate: round(a.same / a.compared, 4) } : null,
   };
@@ -524,7 +539,7 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
     log(`[harness] replaying ${plan.length} of ${ds.frames.length} frames (start ${cfg.startFrame}, stride ${cfg.frameStride}${cfg.fps ? `, ${cfg.fps} Hz pump` : ''})`);
     if (ds.recorded) {
       const how = recorded ? `verbatim FrameInputs (${cfg.replaySize} size)` : 'FrameInputs synthesized from frames.json / imu.json (verbatim: false)';
-      log(`[harness] raw capture recording: ${how}${ds.recordedSkipped ? `, ${ds.recordedSkipped} frames.jsonl rows left out (no pixels / unparseable)` : ''}`);
+      log(`[harness] raw capture recording: ${how}${ds.recordedSkipped ? `, ${ds.recordedSkipped} frames.jsonl rows not replayed (no pixels / not sent / unparseable)` : ''}`);
     }
     /** FrameInput.index sent -> dataset frame index (a held keyframe names its source by FrameInput.index). */
     const datasetIndexOf = new Map<number, number>();
@@ -559,7 +574,8 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
     let pending: Promise<Decoded> | null = plan.length ? decode(plan[0]) : null;
     pending?.catch(() => undefined);
     let prevT = -Infinity;
-    let prevPos = Math.max(0, cfg.startFrame) - 1;
+    // verbatim: the first replayed frame also gets the IMU of every row before it (--start, rows without pixels)
+    let prevPos = -1;
     // compass north reference: the datasets store TRUE-north headings (feed.ts HeadingNorthMode)
     const northEmu = new HeadingNorthEmulator(cfg.headingNorth, ds.meta.originLatLonAlt ?? null, cfg.captureDateMs);
     cfg.headingNorth = northEmu.mode; // 'true' when the dataset has no location
@@ -615,7 +631,7 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
       }
       prevT = t;
       const rec: FrameRecord = {
-        i: k,
+        i: sentIndex,
         index: f.index,
         t,
         frameIndex: null,

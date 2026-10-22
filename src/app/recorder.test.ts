@@ -1,15 +1,15 @@
 /**
  * CaptureRecorder (./recorder.ts) in Node against a scripted fake recorder worker: what it posts
- * per frame (the FrameInput verbatim + a COPY of the pixels), back-pressure, the storage floor,
- * stalls, worker errors and stop. The real worker / OPFS / IndexedDB / JPEG path:
- * recorder.gpu.test.ts.
+ * per frame (the FrameInput verbatim + a COPY of the pixels), not-sent frames, back-pressure, the
+ * storage floor, stalls (and the hidden page), worker errors, the sensor log and stop. The real
+ * worker / OPFS / IndexedDB / JPEG path: recorder.gpu.test.ts.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { RGBAImage } from '../core/types';
-import { frameMeta } from '../io/recording';
+import type { GeoFix, RGBAImage } from '../core/types';
+import { frameMeta, type RecordedSensorRow } from '../io/recording';
 import { pumpFrame } from '../io/recording-testdata';
 import type { LiveUpdate } from '../workers/protocol';
-import { CaptureRecorder, cameraSummary, type CaptureRecorderOptions, type RecorderWorkerEvent, type RecorderWorkerRequest } from './recorder';
+import { CaptureRecorder, cameraSummary, type CaptureRecorderOptions, type RecorderWorkerEvent, type RecorderWorkerRequest, type VisibilitySource } from './recorder';
 
 class FakeRecorderWorker {
   readonly posted: { req: RecorderWorkerRequest; transfer: Transferable[] }[] = [];
@@ -33,6 +33,25 @@ class FakeRecorderWorker {
   }
   ack(seq: number, bytes = 100): void {
     this.emit({ type: 'frame', seq, ok: true, bytes });
+  }
+}
+
+/** A document's visibility, switchable. */
+class FakeVisibility implements VisibilitySource {
+  hidden = false;
+  private cbs = new Set<() => void>();
+  get listeners(): number {
+    return this.cbs.size;
+  }
+  addEventListener(_type: 'visibilitychange', cb: () => void): void {
+    this.cbs.add(cb);
+  }
+  removeEventListener(_type: 'visibilitychange', cb: () => void): void {
+    this.cbs.delete(cb);
+  }
+  set(hidden: boolean): void {
+    this.hidden = hidden;
+    for (const cb of [...this.cbs]) cb();
   }
 }
 
@@ -106,15 +125,29 @@ describe('CaptureRecorder', () => {
     expect(worker.posted.find((p) => p.req.type === 'frame')!.transfer).toEqual([img.data.buffer]);
     // maxSide 1280 of a 64 × 48 frame: recorded at its size
     expect([m.width, m.height]).toEqual([64, 48]);
-    rec.after(f, update, null, { ms: 31.26, waitMs: 0 });
+    rec.after(f, update, null, { ms: 31.26, waitMs: 0, sent: true });
     const live = worker.posted.at(-1)!.req as Extract<RecorderWorkerRequest, { type: 'live' }>;
     expect(live.row).toEqual({ seq: 0, index: 3, ms: 31.3, waitMs: 0, update: { frameIndex: 0, decision: 'keyframe', guidance: 'good', tracking: 'tracking', numKeyframes: 1, numRegistered: 0, numPoints: 0, timings: { total: 30 } }, error: null });
-    rec.after(pumpFrame(9), null, new Error('x'), { ms: 1, waitMs: 0 }); // a frame it never saw
+    rec.after(pumpFrame(9), null, new Error('x'), { ms: 1, waitMs: 0, sent: false }); // a frame it never saw
     expect(worker.posted.at(-1)!.req.type).toBe('live');
     expect((worker.posted.at(-1)!.req as Extract<RecorderWorkerRequest, { type: 'live' }>).row.seq).toBe(0);
   });
 
-  it('back-pressure: beyond maxPending frames in the worker, before() waits for its acknowledgement', async () => {
+  it('a frame the engine client rejected before posting it is flagged notSent in live.jsonl', async () => {
+    const rec = await start();
+    const f = pumpFrame(0);
+    rec.before(f);
+    rec.after(f, null, Object.assign(new Error('Engine disposed'), { name: 'EngineCrashedError' }), { ms: 0.1, waitMs: 0, sent: false });
+    const live = worker.posted.at(-1)!.req as Extract<RecorderWorkerRequest, { type: 'live' }>;
+    expect(live.row).toMatchObject({ seq: 0, update: null, error: 'EngineCrashedError: Engine disposed', notSent: true });
+    // a frame posted that failed in the engine is not
+    const g = pumpFrame(1);
+    rec.before(g);
+    rec.after(g, null, new Error('engine crashed'), { ms: 5, waitMs: 0, sent: true });
+    expect((worker.posted.at(-1)!.req as Extract<RecorderWorkerRequest, { type: 'live' }>).row).not.toHaveProperty('notSent');
+  });
+
+  it('back-pressure: the frame that makes more than maxPending in the worker waits for an acknowledgement (≤ maxPending + 1 in it)', async () => {
     const rec = await start({ maxPending: 2 });
     expect(rec.before(pumpFrame(0))).toBeUndefined();
     expect(rec.before(pumpFrame(1))).toBeUndefined();
@@ -156,6 +189,61 @@ describe('CaptureRecorder', () => {
     await hold; // released by the stop, not by an ack
     await vi.waitFor(() => expect(rec.state).toBe('stopped'));
     expect(stops[0]).toEqual([expect.stringMatching(/fell behind by 1 frames for 0.0 s/), true]);
+  });
+
+  it('the stall clock does not run while the page is hidden and restarts on return', async () => {
+    const page = new FakeVisibility();
+    const rec = await start({ maxPending: 0, stallMs: 40, visibility: page });
+    const hold = rec.before(pumpFrame(0)) as Promise<void>;
+    page.set(true); // the user switches apps: iOS suspends the page and the worker
+    await new Promise((r) => setTimeout(r, 120));
+    expect(rec.state).toBe('recording');
+    page.set(false);
+    await new Promise((r) => setTimeout(r, 15)); // a fresh 40 ms from the return
+    expect(rec.state).toBe('recording');
+    worker.ack(0); // the worker caught up
+    await hold;
+    expect(rec.state).toBe('recording');
+    // still behind after a full stallMs of visible time: stops
+    const hold2 = rec.before(pumpFrame(1)) as Promise<void>;
+    await hold2;
+    await vi.waitFor(() => expect(rec.state).toBe('stopped'));
+    expect(stops[0]).toEqual([expect.stringMatching(/fell behind/), true]);
+    expect(page.listeners).toBe(0); // removed by the stop
+  });
+
+  it('sensor log: raw motion / orientation events and every GPS fix, batched; listeners removed at stop', async () => {
+    const target = new EventTarget();
+    const fixes = new Set<(f: GeoFix) => void>();
+    const geo = { onFix: (cb: (f: GeoFix) => void) => (fixes.add(cb), () => void fixes.delete(cb)) };
+    const rec = await CaptureRecorder.start(
+      { name: 'x', sessionId: null, engine: { mode: 'object', quality: 'fast' }, geo },
+      { createWorker: () => (worker = new FakeRecorderWorker()) as unknown as Worker, available: async () => null, sensorTarget: target, sensorFlushMs: 10, visibility: null },
+    );
+    const motion = Object.assign(new Event('devicemotion'), { interval: 16, rotationRate: { alpha: 1.5, beta: -0, gamma: null }, acceleration: null, accelerationIncludingGravity: { x: 0.1, y: -9.8, z: 0.2 } });
+    target.dispatchEvent(motion);
+    target.dispatchEvent(Object.assign(new Event('deviceorientation'), { alpha: 10, beta: 80, gamma: -2, absolute: false, webkitCompassHeading: 271.5, webkitCompassAccuracy: 15 }));
+    target.dispatchEvent(Object.assign(new Event('deviceorientationabsolute'), { alpha: 11, beta: 80, gamma: -2, absolute: true }));
+    const fix: GeoFix = { t: 900, lat: 47.6, lon: -122.3, alt: 50, accuracy: 5, altitudeAccuracy: 3 };
+    for (const cb of fixes) cb(fix);
+    const batches = (): RecordedSensorRow[][] => worker.posted.map((p) => p.req).filter((r): r is Extract<RecorderWorkerRequest, { type: 'sensors' }> => r.type === 'sensors').map((r) => r.rows);
+    await vi.waitFor(() => expect(batches().flat()).toHaveLength(4));
+    const [m, o, a, g] = batches().flat();
+    expect(m).toMatchObject({ k: 'motion', interval: 16, rot: [1.5, -0, null], acc: null, accG: [0.1, -9.8, 0.2], ts: motion.timeStamp });
+    expect(o).toMatchObject({ k: 'orientation', absolute: false, alpha: 10, beta: 80, gamma: -2, absoluteFlag: false, compassHeading: 271.5, compassAccuracy: 15 });
+    expect(a).toMatchObject({ k: 'orientation', absolute: true, alpha: 11, absoluteFlag: true, compassHeading: null });
+    expect(g).toEqual({ k: 'geo', t: expect.any(Number), fix });
+    // stop: the rest flushed before the close, then nothing is listened to any more
+    target.dispatchEvent(motion);
+    const h = await rec.stop();
+    const types = worker.posted.map((p) => p.req.type);
+    expect(types.lastIndexOf('sensors')).toBeLessThan(types.indexOf('close'));
+    expect(h?.summary).toMatchObject({ sensorRows: 5, sensorDropped: 0 });
+    expect(fixes.size).toBe(0);
+    const n = worker.posted.length;
+    target.dispatchEvent(motion);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(worker.posted.length).toBe(n);
   });
 
   it('a fatal write error (quota) stops the recording', async () => {

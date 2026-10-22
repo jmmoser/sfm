@@ -8,7 +8,8 @@
  *  - Back-pressure: at most ONE frame in flight. `processFrame` resolves with the LiveUpdate;
  *    the caller (FramePump) sends the next frame only after that. A second concurrent call
  *    rejects with EngineBusyError (its bitmap is closed). A FrameTap (`setFrameTap`, the raw
- *    capture recorder) sees each frame sent and may hold back its resolution (./frame-tap.ts).
+ *    capture recorder) sees each frame accepted, may hold back its resolution, and is told
+ *    whether it was posted to the worker (./frame-tap.ts).
  *  - Timeouts: `init` (pipeline compilation can take a while on iOS), frames, short calls;
  *    long operations (LONG_RUNNING_METHODS: finishCapture / refine / densify / mesh / splat /
  *    export / loadSession) use an INACTIVITY timeout reset by progress.
@@ -353,8 +354,8 @@ export class EngineClient implements EngineLike {
     }
     this.frameBusy = true;
     try {
-      return await tapFrame(this.frameTap, frame, async (f) => {
-        const upd = await this.call('frame', f, { timeoutMs: this.opts.frameTimeoutMs, frame: true });
+      return await tapFrame(this.frameTap, frame, async (f, posted) => {
+        const upd = await this.call('frame', f, { timeoutMs: this.opts.frameTimeoutMs, frame: true, onPosted: posted });
         this.frameTimeouts = 0;
         this.live.emit(upd);
         return upd;
@@ -607,6 +608,8 @@ export class EngineClient implements EngineLike {
       bypassGate?: boolean;
       fatalOnTimeout?: boolean;
       frame?: boolean;
+      /** The request was posted to the worker (not rejected before: disposed / dead / no worker). */
+      onPosted?: () => void;
     } = {},
   ): Promise<EngineResult<M>> {
     if (this.disposed) {
@@ -658,7 +661,9 @@ export class EngineClient implements EngineLike {
           this.settle(id);
           if (o.frame) closeBitmap(params as FrameInput);
           reject(e instanceof Error ? e : new Error(String(e)));
+          return;
         }
+        o.onPosted?.();
       });
     if (o.bypassGate || FIRE_AND_FORGET.has(method)) return send();
     return this.waitGate().then(send);

@@ -4,13 +4,13 @@
  * "engine" got them, like a transfer) → the real recorder worker (JPEG via OffscreenCanvas,
  * OPFS sync access handles, or the IndexedDB fallback) → RecordingStore listing → the ZIP-part
  * export → the archive contents (meta, verbatim frames.jsonl, decodable JPEGs at the recorded
- * size and close to the original pixels) → a verbatim harness replay (runPipeline, stubbed fetch
- * over the extracted files, the MockEngine): the FrameInputs reaching the engine equal the
- * recorded ones. Then delete.
+ * size and close to the original pixels, the sensor log without its GPS rows) → a verbatim
+ * harness replay (runPipeline, stubbed fetch over the extracted files, the MockEngine): the
+ * FrameInputs reaching the engine equal the recorded ones. Then delete.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { RGBAImage } from '../core/types';
-import { decodeFrameRow, frameMeta, parseJsonl, type FrameMeta } from '../io/recording';
+import type { GeoFix, RGBAImage } from '../core/types';
+import { decodeFrameRow, decodeSensorRow, frameMeta, parseJsonl, type FrameMeta } from '../io/recording';
 import { RecordingStore, prepareRecordingExport } from '../io/recording-store';
 import { pumpFrame } from '../io/recording-testdata';
 import { readZip } from '../io/zip';
@@ -62,11 +62,20 @@ afterEach(() => {
 describe.each(['opfs', 'idb'] as const)('raw capture recording through the real worker (%s)', (prefer) => {
   it('records, lists, exports in ZIP parts, replays verbatim, deletes', async () => {
     const idbName = `sfm-recordings-test-${Math.random().toString(36).slice(2)}`;
+    const sensors = new EventTarget();
+    const onFix = new Set<(f: GeoFix) => void>();
+    const geo = { onFix: (cb: (f: GeoFix) => void) => (onFix.add(cb), () => void onFix.delete(cb)) };
     const rec = await CaptureRecorder.start(
-      { name: `Test ${prefer}`, sessionId: null, engine: { mode: 'object', quality: 'fast', hfovPriorDeg: 66 }, camera: null, pumpStats: () => ({ skippedBusy: 1 }) },
-      { prefer, idbName, available: async () => null },
+      { name: `Test ${prefer}`, sessionId: null, engine: { mode: 'object', quality: 'fast', hfovPriorDeg: 66 }, camera: null, pumpStats: () => ({ skippedBusy: 1 }), geo },
+      { prefer, idbName, available: async () => null, sensorTarget: sensors, sensorFlushMs: 5 },
     );
     expect(rec.sink).toBe(prefer);
+    const MOTION = 25;
+    for (let k = 0; k < MOTION; k++) {
+      sensors.dispatchEvent(Object.assign(new Event('devicemotion'), { interval: 16, rotationRate: { alpha: k, beta: -0, gamma: 0.5 }, acceleration: null, accelerationIncludingGravity: { x: 0, y: -9.81, z: 0.1 } }));
+      if (k % 10 === 0) await new Promise((r) => setTimeout(r, 10)); // several batches
+    }
+    for (const cb of onFix) cb({ t: 5, lat: 47.6, lon: -122.3, alt: 50, accuracy: 5, altitudeAccuracy: null });
     const originals: FrameInput[] = [];
     const sizes: [number, number][] = [];
     for (let i = 0; i < KINDS.length; i++) {
@@ -82,7 +91,7 @@ describe.each(['opfs', 'idb'] as const)('raw capture recording through the real 
       });
     }
     const h = await rec.stop();
-    expect(h?.summary).toMatchObject({ frames: KINDS.length, failedImages: 0, pump: { skippedBusy: 1 } });
+    expect(h?.summary).toMatchObject({ frames: KINDS.length, failedImages: 0, sensorRows: MOTION + 1, pump: { skippedBusy: 1 } });
 
     const store = await RecordingStore.open({ idbName });
     try {
@@ -99,8 +108,11 @@ describe.each(['opfs', 'idb'] as const)('raw capture recording through the real 
         expect(blob.size).toBe(p.bytes);
         for (const e of readZip(new Uint8Array(await blob.arrayBuffer()))) files.set(e.name, e.data.slice());
       }
-      for (const name of ['meta.json', 'recording.json', 'frames.json', 'frames.jsonl', 'imu.json', 'heading.json', 'live.jsonl']) expect(files.has(name), name).toBe(true);
+      for (const name of ['meta.json', 'recording.json', 'frames.json', 'frames.jsonl', 'imu.json', 'heading.json', 'live.jsonl', 'sensors.jsonl']) expect(files.has(name), name).toBe(true);
       expect(files.has('geo.json')).toBe(false); // location stripped by default
+      const sensorRows = parseJsonl(new TextDecoder().decode(files.get('sensors.jsonl')!), decodeSensorRow);
+      expect(sensorRows.bad).toBe(0);
+      expect(sensorRows.rows.map((r) => (r.k === 'motion' ? r.rot![0] : r.k))).toEqual(Array.from({ length: MOTION }, (_, k) => k)); // in order, GPS row stripped
       const rows = parseJsonl(new TextDecoder().decode(files.get('frames.jsonl')!), decodeFrameRow).rows;
       expect(rows).toHaveLength(KINDS.length);
       for (let i = 0; i < rows.length; i++) {

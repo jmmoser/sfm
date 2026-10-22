@@ -4,7 +4,9 @@
  * the e2e dataset in ZIP parts (planZipParts → createZip → the Node importer's reader
  * e2e/lib/zip-read.mjs), served to runPipeline by a stubbed fetch, and replayed into a stub
  * engine: the FrameInputs that reach it must be IDENTICAL to the recorded ones (every field,
- * typed arrays, −∞ / −0 / NaN), in the recorded order, with the recorded EngineOptions.
+ * typed arrays, −∞ / −0 / NaN), in the recorded order, with the recorded EngineOptions — except
+ * where the device engine's input cannot be replayed: a frame recorded without pixels (its IMU
+ * goes to the next frame) and a frame the device engine never got (left out, IMU included).
  * The pixels are a fake "JPEG" (a size + tag header) decoded by a stubbed createImageBitmap.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -24,8 +26,10 @@ vi.mock('./engines', () => ({ createHarnessEngine: async () => h.engine }));
 import { runPipeline } from './pipeline';
 
 const N = 9;
-/** The frame whose pixels "failed" on the device (no image: left out of the replay). */
+/** The frame whose pixels "failed" on the device (no image: not replayed, its IMU goes to the next frame). */
 const NO_PIXELS = 4;
+/** The frame the engine client rejected before posting it (the device engine never got it). */
+const NOT_SENT = 6;
 const decision = (i: number): LiveUpdate['decision'] => (i % 3 === 0 ? 'keyframe' : 'skip');
 
 /** Fake JPEG: 0xFF 0xD8, width, height (u16 BE), tag. */
@@ -85,7 +89,8 @@ async function recordAndExport(maxPartBytes: number): Promise<{ files: Map<strin
     const img = i === NO_PIXELS ? Promise.reject(new Error('convertToBlob failed')) : fakeJpeg(rgba.width - i, rgba.height, i);
     await w.writeFrame({ seq: i, sentAt: 10_000 + i, input: frameMeta(f), kind: 'RGBAImage', srcWidth: rgba.width, srcHeight: rgba.height }, img);
     const upd: LiveUpdate = { frameIndex: i, decision: decision(i), guidance: 'good', tracking: 'tracking', numKeyframes: 1 + Math.floor(i / 3), numRegistered: Math.floor(i / 3), numPoints: 5 * i, timings: { total: 40 } };
-    await w.writeLive({ seq: i, index: i, ms: 40 + i, waitMs: i === 7 ? 12 : 0, update: upd, error: null });
+    if (i === NOT_SENT) await w.writeLive({ seq: i, index: i, ms: 0.1, waitMs: 0, update: null, error: 'EngineCrashedError: Engine disposed', notSent: true });
+    else await w.writeLive({ seq: i, index: i, ms: 40 + i, waitMs: i === 7 ? 12 : 0, update: upd, error: null });
   }
   await w.close(header({ state: 'complete', stoppedAt: 1, stopReason: 'capture ended', summary: { frames: 0, imageBytes: 0, failedImages: 0, waitMs: 12, durationMs: 900, pump: { skippedBusy: 3 } } }));
   const b = buildDatasetFiles(JSON.parse(sink.header), sink.text('frames.jsonl'), sink.text('live.jsonl'), { stripLocation: false });
@@ -127,17 +132,24 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+/** The frames a replay sends: the device engine got them, with pixels. */
+const replayed = (originals: FrameInput[]): FrameInput[] => originals.filter((_, i) => i !== NO_PIXELS && i !== NOT_SENT);
+
 describe('raw capture recording → verbatim replay', () => {
   it('the engine receives exactly the recorded FrameInputs, in order, with the recorded EngineOptions', async () => {
     const { result, received, inits, originals, parts } = await replay();
     expect(parts).toBeGreaterThan(2); // the export really went through several ZIP parts
-    const kept = originals.filter((_, i) => i !== NO_PIXELS);
+    const kept = replayed(originals);
     expect(received).toHaveLength(kept.length);
     for (let k = 0; k < kept.length; k++) {
-      expect(received[k].meta).toStrictEqual(frameMeta(kept[k]));
       const i = kept[k].index!;
+      // the frame after the one without pixels also gets that frame's IMU (the device engine had it)
+      const want = i === NO_PIXELS + 1 ? { ...frameMeta(kept[k]), imu: [...originals[NO_PIXELS].imu, ...kept[k].imu] } : frameMeta(kept[k]);
+      expect(received[k].meta).toStrictEqual(want);
       expect([received[k].width, received[k].height, received[k].tag]).toEqual([64 - i, 48, i]);
     }
+    // the not-sent frame's IMU is nowhere: the device engine never got it
+    expect(received.find((r) => r.meta.index === NOT_SENT + 1)!.meta.imu).toEqual(originals[NOT_SENT + 1].imu);
     // the awkward values survived the whole path
     expect(received[0].meta.screenAngleSince).toBe(-Infinity);
     expect(received[0].meta.gravityDevice).toBeInstanceOf(Float64Array);
@@ -148,30 +160,38 @@ describe('raw capture recording → verbatim replay', () => {
     expect(result.config).toMatchObject({ verbatim: true, mode: 'object', quality: 'balanced', hfovPriorDegUsed: 67.3, captureDateMs: header().createdAt });
     expect(result.dataset.recording).toBe(true);
     // the device's answers (live.jsonl) against the replay's: identical stub decisions
-    expect(result.recording).toMatchObject({ verbatim: true, rows: N - 1, skipped: 1, agreement: { compared: N - 1, same: N - 1, rate: 1 } });
-    expect(result.recording?.device).toMatchObject({ frames: N, keyframes: 1 + Math.floor((N - 1) / 3), errors: 0 });
+    expect(result.recording).toMatchObject({ verbatim: true, rows: kept.length, skipped: 2, notSent: 1, agreement: { compared: kept.length, same: kept.length, rate: 1 } });
+    expect(result.recording?.device).toMatchObject({ frames: N, keyframes: 1 + Math.floor((N - 1) / 3), errors: 1 });
     expect(result.recording?.device?.waitMs.max).toBe(12);
     // frame records / keyframe indices use the recorded indices
     expect(result.frames.map((f) => f.index)).toEqual(kept.map((f) => f.index));
+    expect(result.frames.map((f) => f.i)).toEqual(kept.map((f) => f.index));
     expect(result.live.keyframeIndices).toEqual(kept.filter((f) => decision(f.index!) === 'keyframe').map((f) => f.index));
     // GT-free scoring of the (refine-less) result does not crash
     const m = computeSelfMetrics(result, { name: 'rec', scene: 'recording' });
     expect(m.groundTruth).toBe(false);
-    expect(m.registration.delivered).toBe(N - 1);
+    expect(m.registration.delivered).toBe(kept.length);
     expect(m.agreement?.rate).toBe(1);
   });
 
   it('with a stride the skipped rows’ IMU samples go to the next replayed frame (like the FramePump drains them)', async () => {
     const { received, originals } = await replay({ frameStride: 2 });
-    const kept = originals.filter((_, i) => i !== NO_PIXELS);
-    // positions 0, 2, 4, 6 of the 8 frames with pixels
-    expect(received.map((r) => r.meta.index)).toEqual([0, 2, 4, 6].map((p) => kept[p].index));
-    expect(received[1].meta.imu).toEqual([...kept[1].imu, ...kept[2].imu]);
-    expect(received[2].meta.imu).toEqual([...kept[3].imu, ...kept[4].imu]);
+    const kept = replayed(originals); // originals 0 1 2 3 5 7 8
+    expect(received.map((r) => r.meta.index)).toEqual([0, 2, 5, 8]);
+    expect(received[1].meta.imu).toEqual([...originals[1].imu, ...originals[2].imu]);
+    // frame 4 (no pixels) is the device's too; frame 6 (not sent) never was
+    expect(received[2].meta.imu).toEqual([...originals[3].imu, ...originals[4].imu, ...originals[5].imu]);
+    expect(received[3].meta.imu).toEqual([...originals[7].imu, ...originals[8].imu]);
     // everything else of the frame verbatim
     const { imu: _i, ...rest } = received[1].meta;
     const { imu: _j, ...orig } = frameMeta(kept[2]);
     expect(rest).toStrictEqual(orig);
+  });
+
+  it('--start: the first replayed frame also gets the IMU of every row before it', async () => {
+    const { received, originals } = await replay({ startFrame: 3 });
+    expect(received.map((r) => r.meta.index)).toEqual([3, 5, 7, 8]);
+    expect(received[0].meta.imu).toEqual(originals.slice(0, 4).flatMap((f) => f.imu));
   });
 
   it('withholding a sensor clears it the way the app would without it', async () => {

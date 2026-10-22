@@ -12,20 +12,32 @@
  * ImageBitmap (≈ a GPU blit), an RGBAImage's pixels are copied; that copy and the metadata go to
  * the recorder worker (src/workers/recorder.worker.ts), which converts (closing VideoFrames at
  * once), encodes and writes — OPFS through sync access handles, IndexedDB where OPFS is missing.
+ * The engine's answer follows in live.jsonl, flagged `notSent` when the engine client rejected
+ * the frame before posting it (the engine never got it: replays leave it out).
  *
- * Bounds: at most `maxPending` (3) frames are in the worker at a time; beyond that the frame's
- * processFrame resolves only when the worker caught up (back-pressure: the FramePump then skips
- * camera frames as when the engine is busy, so the recording still equals the engine's input). A
- * worker that does not catch up within `stallMs` stops the recording (never the scan). Storage:
- * recording needs `floorBytes` (1 GB) of free origin quota to start and stops itself when less is
- * left (checked every 2 s) or on any write error — the capture screen warns at 300 MB, so the
- * scan's own keyframes keep their room. Both stop only the recording.
+ * Sensor log (sensors.jsonl): the raw DeviceMotion / DeviceOrientation events (own listeners on
+ * the window, added after the capture's sensors started and removed when the recording stops,
+ * before they stop: never the page's last motion listener, whose removal restarts CoreMotion on
+ * iOS) and every GPS fix (`RecorderStartInfo.geo`, the capture's GeoSensor), buffered on the main
+ * thread and posted every `sensorFlushMs` (500 ms) as one batch — an estimated 10–20 KB/s (not
+ * measured on an iPhone) next to the 1–3 MB/s of JPEGs; at most 20 000 rows wait (more are
+ * dropped and counted).
+ *
+ * Bounds: when more than `maxPending` (3) frames are in the worker, the frame just sent holds
+ * back its processFrame resolution until the worker caught up, so at most `maxPending` + 1 are
+ * in it (back-pressure: the FramePump then skips camera frames as when the engine is busy, so the
+ * recording still equals the engine's input). A worker that does not catch up within `stallMs`
+ * stops the recording (never the scan); like EngineClient's timeouts, that clock does not run
+ * while the page is hidden (iOS suspends the page and the worker) and restarts on return.
+ * Storage: recording needs `floorBytes` (1 GB) of free origin quota to start and stops itself
+ * when less is left (checked every 2 s) or on any write error — the capture screen warns at
+ * 300 MB, so the scan's own keyframes keep their room. Both stop only the recording.
  *
  * Recording perturbs what it measures (main-thread clone / blit, a worker encoding ≈ 10–30 ms per
  * frame next to the engine): `live.jsonl` keeps the back-pressure wait per frame, and the
  * recording's header says that it was recorded.
  */
-import type { RGBAImage } from '../core/types';
+import type { GeoFix, RGBAImage } from '../core/types';
 import {
   RECORDING_FORMAT,
   RECORDING_JPEG_QUALITY,
@@ -36,6 +48,7 @@ import {
   recordedSize,
   type RecordedImageKind,
   type RecordedLive,
+  type RecordedSensorRow,
   type RecorderFrameMessage,
   type RecordingHeader,
   type RecordingWriterStats,
@@ -53,6 +66,7 @@ export type RecorderWorkerRequest =
   /** `width` × `height`: the size to record (≤ maxSide); `image` null when it could not be copied. */
   | { type: 'frame'; msg: RecorderFrameMessage; image: VideoFrame | ImageBitmap | RGBAImage | null; width: number; height: number }
   | { type: 'live'; row: RecordedLive }
+  | { type: 'sensors'; rows: RecordedSensorRow[] }
   | { type: 'close'; header: RecordingHeader };
 
 export type RecorderWorkerEvent =
@@ -74,6 +88,20 @@ export interface RecorderStartInfo {
   capture?: Record<string, unknown> | null;
   /** FramePump statistics, read when the recording stops. */
   pumpStats?: () => object | null;
+  /** Every GPS fix for sensors.jsonl (the capture's GeoSensor; null: no location). */
+  geo?: GeoFixSource | null;
+}
+
+/** Where the recorder gets every GPS fix (GeoSensor.onFix). */
+export interface GeoFixSource {
+  onFix(cb: (f: GeoFix) => void): () => void;
+}
+
+/** The page visibility (document). */
+export interface VisibilitySource {
+  readonly hidden: boolean;
+  addEventListener(type: 'visibilitychange', cb: () => void): void;
+  removeEventListener(type: 'visibilitychange', cb: () => void): void;
 }
 
 export interface CaptureRecorderOptions {
@@ -89,6 +117,12 @@ export interface CaptureRecorderOptions {
   available?: () => Promise<number | null>;
   checkEveryMs?: number;
   stallMs?: number;
+  /** Where DeviceMotion / DeviceOrientation events arrive (default the window; null: no sensor log). */
+  sensorTarget?: EventTarget | null;
+  /** Sensor rows are posted to the worker in batches this often (ms). */
+  sensorFlushMs?: number;
+  /** Page visibility (default the document; null: always visible). */
+  visibility?: VisibilitySource | null;
   /** The recording ended (`auto`: by itself — low storage, a write error, a stalled worker). */
   onStop?: (reason: string, auto: boolean) => void;
 }
@@ -103,7 +137,12 @@ export interface RecorderStats {
   imageBytes: number;
   /** Total back-pressure wait (ms). */
   waitMs: number;
+  /** sensors.jsonl rows posted / dropped (the buffer was full). */
+  sensorRows: number;
+  sensorDropped: number;
 }
+
+const SENSOR_BUFFER_ROWS = 20_000;
 
 const CAMERA_KEYS = ['label', 'width', 'height', 'frameRate', 'hfovPriorDeg', 'focalPriorPx', 'lens', 'facing', 'aspect', 'lensMaySwitch', 'apple', 'frameMaxSide', 'requested', 'minFocusDistanceM', 'torchAvailable'];
 
@@ -159,13 +198,52 @@ function isImageBitmap(x: unknown): x is ImageBitmap {
   return typeof ImageBitmap !== 'undefined' && x instanceof ImageBitmap;
 }
 
+// ---- sensor log -------------------------------------------------------------------------------
+
+type Triple = [number | null, number | null, number | null];
+const num = (v: unknown): number | null => (typeof v === 'number' ? v : null);
+const xyz = (o: { x?: unknown; y?: unknown; z?: unknown } | null | undefined): Triple | null => (o ? [num(o.x), num(o.y), num(o.z)] : null);
+const abg = (o: { alpha?: unknown; beta?: unknown; gamma?: unknown } | null | undefined): Triple | null => (o ? [num(o.alpha), num(o.beta), num(o.gamma)] : null);
+
+/** A DeviceMotionEvent as a sensors.jsonl row (every field the platform gave, verbatim). */
+export function motionRow(e: Event, t: number): RecordedSensorRow {
+  const m = e as Partial<DeviceMotionEvent>;
+  return { k: 'motion', t, ts: e.timeStamp, interval: num(m.interval), rot: abg(m.rotationRate), acc: xyz(m.acceleration), accG: xyz(m.accelerationIncludingGravity) };
+}
+
+/** A DeviceOrientationEvent as a sensors.jsonl row (iOS `webkitCompassHeading` / `webkitCompassAccuracy` included). */
+export function orientationRow(e: Event, t: number, absolute: boolean): RecordedSensorRow {
+  const o = e as Partial<DeviceOrientationEvent> & { webkitCompassHeading?: unknown; webkitCompassAccuracy?: unknown };
+  return {
+    k: 'orientation',
+    t,
+    ts: e.timeStamp,
+    absolute,
+    alpha: num(o.alpha),
+    beta: num(o.beta),
+    gamma: num(o.gamma),
+    absoluteFlag: typeof o.absolute === 'boolean' ? o.absolute : null,
+    compassHeading: num(o.webkitCompassHeading),
+    compassAccuracy: num(o.webkitCompassAccuracy),
+  };
+}
+
+function defaultSensorTarget(): EventTarget | null {
+  return typeof window !== 'undefined' && typeof window.addEventListener === 'function' ? window : null;
+}
+
+function defaultVisibility(): VisibilitySource | null {
+  const d = (globalThis as { document?: Document }).document;
+  return d && typeof d.addEventListener === 'function' ? (d as unknown as VisibilitySource) : null;
+}
+
 export class CaptureRecorder implements FrameTap {
   readonly id: string;
-  readonly stats: RecorderStats = { sent: 0, acked: 0, stored: 0, imageBytes: 0, waitMs: 0 };
+  readonly stats: RecorderStats = { sent: 0, acked: 0, stored: 0, imageBytes: 0, waitMs: 0, sensorRows: 0, sensorDropped: 0 };
   private st: RecorderState = 'recording';
   private header: RecordingHeader;
   private readonly worker: Worker;
-  private readonly o: Required<Omit<CaptureRecorderOptions, 'createWorker' | 'onStop' | 'idbName'>> & Pick<CaptureRecorderOptions, 'onStop' | 'idbName'>;
+  private readonly o: Required<Omit<CaptureRecorderOptions, 'createWorker' | 'onStop' | 'idbName' | 'sensorTarget' | 'visibility'>> & Pick<CaptureRecorderOptions, 'onStop' | 'idbName'>;
   private readonly info: RecorderStartInfo;
   private seq = 0;
   private readonly seqOf = new WeakMap<FrameInput, number>();
@@ -180,6 +258,13 @@ export class CaptureRecorder implements FrameTap {
   private stallTimer: ReturnType<typeof setTimeout> | null = null;
   /** Settles start(): the worker opened its sink, or failed to. */
   private openWait: { resolve: () => void; reject: (e: Error) => void } | null = null;
+  private readonly sensorTarget: EventTarget | null;
+  private readonly visibility: VisibilitySource | null;
+  private hidden = false;
+  private sensorRows: RecordedSensorRow[] = [];
+  private sensorTimer: ReturnType<typeof setInterval> | null = null;
+  /** Removes the sensor / visibility listeners (begin()). */
+  private readonly offs: (() => void)[] = [];
 
   /** Worker, OffscreenCanvas and some storage (OPFS or IndexedDB) exist. */
   static isSupported(): boolean {
@@ -201,6 +286,7 @@ export class CaptureRecorder implements FrameTap {
       rec.worker.terminate();
       throw e;
     }
+    rec.begin();
     return rec;
   }
 
@@ -216,8 +302,11 @@ export class CaptureRecorder implements FrameTap {
       available: opts.available ?? defaultAvailable,
       checkEveryMs: opts.checkEveryMs ?? 2000,
       stallMs: opts.stallMs ?? 8000,
+      sensorFlushMs: opts.sensorFlushMs ?? 500,
       onStop: opts.onStop,
     };
+    this.sensorTarget = opts.sensorTarget === undefined ? defaultSensorTarget() : opts.sensorTarget;
+    this.visibility = opts.visibility === undefined ? defaultVisibility() : opts.visibility;
     const now = Date.now();
     this.id = newId(now);
     const nav = globalThis.navigator as (Navigator & { standalone?: boolean }) | undefined;
@@ -282,6 +371,63 @@ export class CaptureRecorder implements FrameTap {
     this.worker.postMessage(req, transfer);
   }
 
+  /** The recording runs: sensor log and visibility listeners (removed by finish()). */
+  private begin(): void {
+    const on = (target: { addEventListener(t: string, cb: (e: Event) => void): void; removeEventListener(t: string, cb: (e: Event) => void): void }, type: string, cb: (e: Event) => void): void => {
+      target.addEventListener(type, cb);
+      this.offs.push(() => target.removeEventListener(type, cb));
+    };
+    const vis = this.visibility;
+    if (vis) {
+      this.hidden = vis.hidden;
+      on(vis as unknown as EventTarget, 'visibilitychange', () => this.onVisibility());
+    }
+    const tgt = this.sensorTarget;
+    if (tgt) {
+      on(tgt, 'devicemotion', (e) => this.pushSensor(motionRow(e, performance.now())));
+      on(tgt, 'deviceorientation', (e) => this.pushSensor(orientationRow(e, performance.now(), false)));
+      on(tgt, 'deviceorientationabsolute', (e) => this.pushSensor(orientationRow(e, performance.now(), true)));
+    }
+    const geo = this.info.geo;
+    if (geo) this.offs.push(geo.onFix((f) => this.pushSensor({ k: 'geo', t: performance.now(), fix: { ...f } })));
+    if (tgt || geo) this.sensorTimer = setInterval(() => this.flushSensors(), Math.max(1, this.o.sensorFlushMs));
+  }
+
+  private pushSensor(row: RecordedSensorRow): void {
+    if (this.st !== 'recording') return;
+    if (this.sensorRows.length >= SENSOR_BUFFER_ROWS) {
+      this.stats.sensorDropped++;
+      return;
+    }
+    this.sensorRows.push(row);
+  }
+
+  private flushSensors(): void {
+    if (!this.sensorRows.length) return;
+    const rows = this.sensorRows;
+    this.sensorRows = [];
+    try {
+      this.post({ type: 'sensors', rows });
+      this.stats.sensorRows += rows.length;
+    } catch {
+      this.stats.sensorDropped += rows.length;
+    }
+  }
+
+  /** Hidden: iOS suspends the page and the worker, so the stall clock stops; it restarts on return. */
+  private onVisibility(): void {
+    const hidden = !!this.visibility?.hidden;
+    if (hidden === this.hidden) return;
+    this.hidden = hidden;
+    if (hidden) {
+      if (this.stallTimer) clearTimeout(this.stallTimer);
+      this.stallTimer = null;
+      return;
+    }
+    this.lastAck = performance.now();
+    if (this.waiters.length && this.st === 'recording') this.armStall();
+  }
+
   private onWorker(ev: RecorderWorkerEvent): void {
     switch (ev.type) {
       case 'opened':
@@ -334,13 +480,13 @@ export class CaptureRecorder implements FrameTap {
     });
   }
 
-  /** While frames wait: no acknowledgement for `stallMs` stops the recording. */
+  /** While frames wait (and the page is visible): no acknowledgement for `stallMs` stops the recording. */
   private armStall(): void {
-    if (this.stallTimer) return;
+    if (this.stallTimer || this.hidden) return;
     const left = Math.max(1, this.o.stallMs - (performance.now() - this.lastAck));
     this.stallTimer = setTimeout(() => {
       this.stallTimer = null;
-      if (!this.waiters.length) return;
+      if (!this.waiters.length || this.hidden) return;
       // timers may fire a little early against performance.now(): 1 ms of slack
       if (performance.now() - this.lastAck >= this.o.stallMs - 1) this.autoStop(`the recorder fell behind by ${this.pending} frames for ${(this.o.stallMs / 1000).toFixed(1)} s`);
       else this.armStall();
@@ -410,7 +556,7 @@ export class CaptureRecorder implements FrameTap {
     return this.waitForRoom();
   }
 
-  after(frame: FrameInput, result: LiveUpdate | null, error: unknown, t: { ms: number; waitMs: number }): void {
+  after(frame: FrameInput, result: LiveUpdate | null, error: unknown, t: { ms: number; waitMs: number; sent: boolean }): void {
     const seq = this.seqOf.get(frame);
     if (seq === undefined || this.st === 'stopped') return;
     const row: RecordedLive = {
@@ -421,6 +567,8 @@ export class CaptureRecorder implements FrameTap {
       update: result ? liveSummary(result) : null,
       error: error ? errorText(error) : null,
     };
+    // the engine never got it (rejected before posting): replays leave it out
+    if (!t.sent) row.notSent = true;
     try {
       this.post({ type: 'live', row });
     } catch {
@@ -459,6 +607,11 @@ export class CaptureRecorder implements FrameTap {
 
   private finish(reason: string, auto: boolean): Promise<RecordingHeader | null> {
     if (this.stopping) return this.stopping;
+    // synchronously: the sensor listeners go before the capture stops its own sensors
+    for (const off of this.offs.splice(0)) off();
+    if (this.sensorTimer) clearInterval(this.sensorTimer);
+    this.sensorTimer = null;
+    this.flushSensors();
     this.st = 'stopping';
     this.release();
     this.stopping = (async () => {
@@ -483,6 +636,8 @@ export class CaptureRecorder implements FrameTap {
           failedImages: this.stats.acked - this.stats.stored,
           waitMs: Math.round(this.stats.waitMs),
           durationMs: Date.now() - this.header.createdAt,
+          sensorRows: this.stats.sensorRows,
+          sensorDropped: this.stats.sensorDropped,
           pump: pump ? { ...pump } : null,
         },
       };

@@ -6,7 +6,9 @@ import {
   buildDatasetFiles,
   datasetIndices,
   decodeFrameRow,
+  decodeSensorRow,
   encodeFrameRow,
+  encodeSensorRow,
   frameMeta,
   parseJsonl,
   partFileName,
@@ -15,6 +17,7 @@ import {
   zipEntryBytes,
   type EncodedImage,
   type RecordedFrame,
+  type RecordedSensorRow,
   type RecorderFrameMessage,
   type RecordingHeader,
 } from './recording';
@@ -113,6 +116,22 @@ describe('RecordingWriter', () => {
     expect(sink.closed).toBe(true);
   });
 
+  it('writeSensors appends a batch as one write of JSON-safe lines', async () => {
+    const sink = new MemorySink();
+    const w = new RecordingWriter(sink);
+    const rows: RecordedSensorRow[] = [
+      { k: 'motion', t: 1.5, ts: 1.25, interval: 16, rot: [1, -0, NaN], acc: null, accG: [0, -9.8, 0] },
+      { k: 'geo', t: 2, fix: { t: 1.9, lat: 47.6, lon: -122.3, alt: null, accuracy: 5, altitudeAccuracy: null } },
+    ];
+    await w.writeSensors(rows);
+    await w.writeSensors([]);
+    expect(sink.lines['sensors.jsonl']).toHaveLength(1);
+    const back = parseJsonl(sink.text('sensors.jsonl'), decodeSensorRow).rows;
+    expect(back).toEqual(rows);
+    expect(Object.is((back[0] as Extract<RecordedSensorRow, { k: 'motion' }>).rot![1], -0)).toBe(true);
+    expect(() => decodeSensorRow('{"t":1}')).toThrow();
+  });
+
   it('close writes the final header with the writer counts (frames still queued at stop included)', async () => {
     const sink = new MemorySink();
     const w = new RecordingWriter(sink);
@@ -145,25 +164,61 @@ describe('buildDatasetFiles', () => {
     const names = b.texts.map((t) => t.name);
     expect(names).toEqual(['meta.json', 'recording.json', 'frames.json', 'frames.jsonl', 'imu.json', 'geo.json', 'heading.json', 'live.jsonl']);
     const m = b.meta;
-    expect(m).toMatchObject({ scene: 'recording', source: 'sfm-raw-capture', mode: 'object', quality: 'balanced', hfovPriorDeg: 67.3, gt: null, intrinsics: null, numFrames: 5, missingImages: 1, badLines: 0, width: 64, height: 48, screenAngle: 0, locationStripped: false });
+    expect(m).toMatchObject({ scene: 'recording', source: 'sfm-raw-capture', mode: 'object', quality: 'balanced', hfovPriorDeg: 67.3, gt: null, intrinsics: null, numFrames: 5, missingImages: 1, notSent: 0, badLines: 0, width: 64, height: 48, screenAngle: 0, locationStripped: false });
     expect(m.originLatLonAlt).toEqual([47.6, -122.3, 56.5]);
     expect(m.duration).toBeCloseTo(0.5, 6);
     const text = (n: string): string => b.texts.find((t) => t.name === n)!.text;
     const frames = JSON.parse(text('frames.json')) as { index: number; file: string; t: number }[];
     expect(frames.map((f) => f.index)).toEqual([0, 1, 3, 4, 5]);
     expect(frames[2]).toEqual({ index: 3, file: 'frames/000003.jpg', t: pumpFrame(3).t });
-    // frames.jsonl: verbatim inputs, the store reference dropped
+    // frames.jsonl: every row (the one without pixels too), verbatim inputs, the store reference dropped
     const rows = parseJsonl(text('frames.jsonl'), decodeFrameRow).rows;
-    expect(rows.map((r) => r.seq)).toEqual([0, 1, 3, 4, 5]);
+    expect(rows.map((r) => r.seq)).toEqual([0, 1, 2, 3, 4, 5]);
     expect(rows[0].image).not.toHaveProperty('store');
+    expect(rows[2]).toMatchObject({ image: null, error: 'no image' });
     const { bitmap: _b, ...in3 } = pumpFrame(3);
-    expect(rows[2].input).toStrictEqual(in3);
-    // derived streams: what the engine got
-    expect((JSON.parse(text('imu.json')) as unknown[]).length).toBe(10);
-    expect((JSON.parse(text('geo.json')) as unknown[]).length).toBe(2); // frames 0 and 4 (2 has no pixels)
+    expect(rows[3].input).toStrictEqual(in3);
+    // derived streams: what the engine got — frame 2's IMU and fix too (its pixels are what is missing)
+    expect((JSON.parse(text('imu.json')) as unknown[]).length).toBe(12);
+    expect((JSON.parse(text('geo.json')) as { t: number }[]).map((g) => g.t)).toEqual([0, 2, 4].map((i) => pumpFrame(i).geo!.t));
     expect(JSON.parse(text('heading.json'))[0]).toEqual({ t: pumpFrame(0).t, heading: 123.4, accuracy: 12, north: 'magnetic', declinationDeg: null });
     expect(b.images.map((i) => i.name)).toEqual(frames.map((f) => f.file));
     expect(b.images[0].image.store).toEqual({ key: '0' });
+  });
+
+  it('frames live.jsonl marks notSent are flagged and give nothing to the derived files', async () => {
+    const sink = await recorded(4);
+    sink.lines['live.jsonl'][1] = JSON.stringify({ seq: 1, index: 1, ms: 0, waitMs: 0, update: null, error: 'EngineCrashedError: Engine disposed', notSent: true });
+    const b = buildDatasetFiles(header(), sink.text('frames.jsonl'), sink.text('live.jsonl'));
+    const text = (n: string): string => b.texts.find((t) => t.name === n)!.text;
+    const rows = parseJsonl(text('frames.jsonl'), decodeFrameRow).rows;
+    expect(rows.map((r) => [r.seq, !!r.notSent])).toEqual([
+      [0, false],
+      [1, true],
+      [2, false],
+      [3, false],
+    ]);
+    expect(rows[0]).not.toHaveProperty('notSent');
+    expect((JSON.parse(text('frames.json')) as { index: number }[]).map((f) => f.index)).toEqual([0, 3]); // 1 not sent, 2 without pixels
+    expect((JSON.parse(text('imu.json')) as unknown[]).length).toBe(6);
+    expect(b.meta).toMatchObject({ numFrames: 2, missingImages: 1, notSent: 1 });
+    // its JPEG is still exported (nothing recorded is dropped)
+    expect(b.images.map((i) => i.name)).toEqual(['frames/000000.jpg', 'frames/000001.jpg', 'frames/000003.jpg']);
+  });
+
+  it('sensors.jsonl is exported as recorded, without its GPS rows when the location is stripped', () => {
+    const rows: RecordedSensorRow[] = [
+      { k: 'motion', t: 1, ts: 1, interval: 16, rot: [1, 2, 3], acc: null, accG: [0, -9.8, 0] },
+      { k: 'geo', t: 2, fix: { t: 2, lat: 47.6, lon: -122.3, alt: 5, accuracy: 4, altitudeAccuracy: null } },
+    ];
+    const sensorsText = rows.map(encodeSensorRow).join('\n');
+    const keep = buildDatasetFiles(header(), '', null, { sensorsText });
+    expect(keep.texts.find((t) => t.name === 'sensors.jsonl')!.text).toBe(`${sensorsText}\n`);
+    const strip = buildDatasetFiles(header(), '', null, { sensorsText, stripLocation: true });
+    const out = strip.texts.find((t) => t.name === 'sensors.jsonl')!.text;
+    expect(parseJsonl(out, decodeSensorRow).rows).toEqual([rows[0]]);
+    expect(out).not.toContain('47.6');
+    expect(buildDatasetFiles(header(), '', null, { sensorsText: '' }).texts.map((t) => t.name)).not.toContain('sensors.jsonl');
   });
 
   it('stripLocation drops every GPS fix and the origin', async () => {

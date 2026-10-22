@@ -3,7 +3,8 @@ import type { ImuSample } from '../../core/types';
 import { declination } from '../../sensors/wmm';
 import { frameMeta, type RecordedFrame } from '../../io/recording';
 import { pumpFrame } from '../../io/recording-testdata';
-import { HeadingNorthEmulator, cleanGeoFix, compassHeading, gravityDownAt, hfovLongSideDeg, latestAtOrBefore, numStats, planFrames, samplesBetween, upperBound, verbatimInput } from './feed';
+import { CompassSensor } from '../../sensors/orientation';
+import { HeadingNorthEmulator, appliedDeclinationDeg, cleanGeoFix, compassHeading, gravityDownAt, hfovLongSideDeg, latestAtOrBefore, numStats, planFrames, samplesBetween, upperBound, verbatimInput } from './feed';
 
 const frames = (n: number, fps: number, t0 = 10_000): { index: number; t: number }[] =>
   Array.from({ length: n }, (_, i) => ({ index: i, t: t0 + (1000 * i) / fps }));
@@ -192,5 +193,50 @@ describe('verbatimInput', () => {
     // a field the frame never had stays absent
     const bare: RecordedFrame[] = [{ seq: 0, sentAt: 0, input: { t: 1, screenAngle: 0, imu: [] }, image: null }];
     expect(Object.keys(verbatimInput(bare, 0, -1, { imu: false, gps: false, heading: false, gravity: false })).sort()).toEqual(['imu', 'screenAngle', 't']);
+  });
+
+  it('without GPS the compass goes back to magnetic north: what a CompassSensor that never got a fix reports', () => {
+    // one compass, two recordings of the same readings: before and after it learned the declination from a fix
+    const ev = { alpha: 30, beta: 80, gamma: 0, webkitCompassHeading: 200, webkitCompassAccuracy: 10 };
+    const magnetic = new CompassSensor({ target: null });
+    const corrected = new CompassSensor({ target: null });
+    for (const c of [magnetic, corrected]) {
+      c.handleOrientation({ ...ev, timeStamp: 100 });
+      c.handleOrientation({ alpha: 40, beta: 80, gamma: 0, timeStamp: 100 }, true); // the absolute attitude
+    }
+    expect(corrected.setLocationFromFix({ lat: 47.6, lon: -122.3, alt: 50, accuracy: 10 }, Date.UTC(2026, 9, 1))).toBe(true);
+    const d = corrected.declinationDeg;
+    expect(Math.abs(d)).toBeGreaterThan(5); // Seattle ≈ 15° E
+    const input = (c: CompassSensor): RecordedFrame['input'] => {
+      const h = c.headingAt(100)!;
+      const a = c.attitudeAt(100)!;
+      return { t: 100, screenAngle: 0, imu: [], geo: { t: 90, lat: 47.6, lon: -122.3, alt: 50, accuracy: 10, altitudeAccuracy: null }, heading: { heading: h.heading, accuracy: h.accuracy, north: h.north ?? 'magnetic', declinationDeg: h.declinationDeg ?? null }, attitude: { t: a.t, R_world_device: a.R_world_device, absolute: a.absolute, yawAccuracyDeg: a.yawAccuracyDeg } };
+    };
+    const rows: RecordedFrame[] = [
+      { seq: 0, sentAt: 0, input: input(corrected), image: null },
+      { seq: 1, sentAt: 0, input: { ...input(corrected), heading: null }, image: null }, // attitude only
+    ];
+    expect(rows[0].input.heading).toMatchObject({ north: 'true', declinationDeg: d });
+    expect(rows[0].input.attitude!.absolute).toBe(true);
+    expect(Math.abs(rows[0].input.attitude!.R_world_device[0] - input(magnetic).attitude!.R_world_device[0])).toBeGreaterThan(0.01);
+    const noGps = { imu: true, gps: false, heading: true, gravity: true };
+    const v = verbatimInput(rows, 0, -1, noGps);
+    const want = input(magnetic);
+    expect(v.geo).toBeNull();
+    expect(v.heading).toMatchObject({ north: 'magnetic', declinationDeg: 0 });
+    expect(v.heading!.heading).toBeCloseTo(want.heading!.heading, 9);
+    expect(want.heading).toMatchObject({ north: 'magnetic', declinationDeg: 0 });
+    for (let k = 0; k < 9; k++) expect(v.attitude!.R_world_device[k]).toBeCloseTo(want.attitude!.R_world_device[k], 12);
+    // a frame without a heading: the declination of the newest earlier one
+    expect(appliedDeclinationDeg(rows, 1)).toBe(d);
+    const v1 = verbatimInput(rows, 1, 0, noGps);
+    for (let k = 0; k < 9; k++) expect(v1.attitude!.R_world_device[k]).toBeCloseTo(want.attitude!.R_world_device[k], 12);
+    // the recorded rows are untouched, and with GPS everything stays verbatim
+    expect(rows[0].input.heading).toMatchObject({ north: 'true' });
+    expect(verbatimInput(rows, 0, -1, { ...noGps, gps: true })).toStrictEqual(rows[0].input);
+    // already magnetic (no fix on the device): unchanged
+    const mag: RecordedFrame[] = [{ seq: 0, sentAt: 0, input: input(magnetic), image: null }];
+    expect(verbatimInput(mag, 0, -1, noGps).heading).toStrictEqual(mag[0].input.heading);
+    expect(appliedDeclinationDeg(mag, 0)).toBe(0);
   });
 });
