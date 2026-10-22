@@ -19,6 +19,19 @@
  * recorder) sees every accepted frame before the mock closes its pixels, like on EngineClient
  * (every accepted frame counts as posted).
  *
+ * Frame pixels: every ImageBitmap / VideoFrame is READ (drawn into a 1×1 canvas and sampled,
+ * `lastFrameSample`) before it is closed, as the engine reads every frame. Chromium's
+ * createImageBitmap(<video>) resolves before the GPU process has made the copy, so a consumer that
+ * closes the bitmap unread never waits for the GPU and the FramePump (≤ 10 Hz) queues copies
+ * without back-pressure. Headless on SwiftShader (fake camera, 1920×1080 frames, 4 shared cores)
+ * that made ≈ 10 copies/s against ≈ 2–3 executed: the GPU process grew by 100–230 MB/s to 5–8 GB
+ * (then crashed) and every later readback — page screenshots — waited minutes (2026-10-22: the
+ * e2e/ui/states.mjs coverage screenshot timeouts). The capture screen's 3D thumbnail only masked
+ * it: while it draws, the page's WebGL calls block on the GPU (13–20 s round trips) and throttle
+ * the pump to ≈ 2 frames/s. Reading the pixels paces delivery to the GPU like the real engine:
+ * GPU memory stays flat (≈ 300 MB), WebGL round trips take milliseconds, the same screenshots
+ * ≈ 1 s. Production capture is unaffected (the engine reads every frame).
+ *
  * Resume state survives a reload like the real engine's stored `dense/progress` and splat
  * checkpoints: a persistent session's record gets `stats.denseResumablePass` / `denseResumableQuality`
  * once its densify stored a "depth map" (the first depth-map tick), `splatResumableIteration` /
@@ -139,6 +152,10 @@ export class MockEngine implements EngineLike {
   private pendingSetup: { id: string | null; closed: boolean } | null = null;
   private busy = false;
   private frameTap: FrameTap | null = null;
+  /** 1×1 canvas the frames are read into (undefined: not created yet; null: no OffscreenCanvas, e.g. Node). */
+  private sampler: OffscreenCanvasRenderingContext2D | null | undefined = undefined;
+  /** RGB of the last frame's 1×1 sample (null: not read — a fake bitmap, raw RGBA, no canvas). */
+  private lastSample: [number, number, number] | null = null;
   private hidden = false;
   private cancelled = false;
   /** finishEarly() during the running long operation (only the splat stage reacts). */
@@ -343,6 +360,28 @@ export class MockEngine implements EngineLike {
     this.frameTap = tap;
   }
 
+  /**
+   * Read the frame's pixels (a 1×1 sample of the whole frame) before it is closed, as the engine
+   * reads every frame: this waits for the GPU copy behind a grabbed ImageBitmap / VideoFrame (see
+   * the header, "Frame pixels"). Fake bitmaps (unit tests) and raw RGBA frames are not read.
+   */
+  private sampleFrame(bitmap: FrameInput['bitmap']): void {
+    this.lastSample = null;
+    const image =
+      (typeof ImageBitmap === 'function' && bitmap instanceof ImageBitmap) || (typeof VideoFrame === 'function' && bitmap instanceof VideoFrame) ? bitmap : null;
+    if (!image) return;
+    if (this.sampler === undefined) this.sampler = typeof OffscreenCanvas === 'function' ? new OffscreenCanvas(1, 1).getContext('2d', { willReadFrequently: true }) : null;
+    const ctx = this.sampler;
+    if (!ctx) return;
+    try {
+      ctx.drawImage(image, 0, 0, 1, 1);
+      const d = ctx.getImageData(0, 0, 1, 1).data;
+      this.lastSample = [d[0], d[1], d[2]];
+    } catch {
+      /* closed / detached: processed without its pixels */
+    }
+  }
+
   private async mockFrame(f: FrameInput): Promise<LiveUpdate> {
     const b = f.bitmap as { close?: () => void };
     if (this.busy) {
@@ -352,6 +391,8 @@ export class MockEngine implements EngineLike {
     this.busy = true;
     try {
       const { w, h } = frameSize(f);
+      // read the pixels like the engine does (back-pressure on the GPU copy: see the header)
+      this.sampleFrame(f.bitmap);
       try {
         b.close?.();
       } catch {
@@ -1223,6 +1264,10 @@ export class MockEngine implements EngineLike {
   }
   get captureFinished(): boolean {
     return this.captureDone;
+  }
+  /** Test helper: RGB of the last frame's 1×1 pixel sample (null: the frame was not read). */
+  get lastFrameSample(): readonly [number, number, number] | null {
+    return this.lastSample;
   }
 }
 

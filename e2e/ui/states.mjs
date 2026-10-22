@@ -135,9 +135,16 @@ const { close, consoleErrors, base } = launched;
 let current = null;
 /** Scenarios whose pages showed the "run interrupted" card. */
 const runCardSeen = new Set();
+/**
+ * Contexts the running scenario opened: closed after it, also when it failed. A failed scenario
+ * used to leave its page running (a capture kept grabbing frames into the shared GPU process),
+ * which failed the next one (killed-dense after a timed-out coverage screenshot).
+ */
+const scenarioContexts = [];
 /** launched.newPage + a watcher that reports Home's "run interrupted" card (no false positives). */
 async function newPage(opts) {
   const r = await launched.newPage(opts);
+  if (current) scenarioContexts.push(r.context);
   const name = current;
   await r.context.exposeFunction('__sfmRunCardShown', () => {
     if (name) runCardSeen.add(name);
@@ -186,6 +193,9 @@ async function scenario(name, fn) {
   } catch (e) {
     failures.push(`${name}: ${e?.message ?? e}`);
     console.error(e);
+  } finally {
+    // (a context the scenario closed itself: no-op)
+    for (const c of scenarioContexts.splice(0)) await c.close().catch(() => {});
   }
   current = null;
   if (!EXPECTS_RUN_CARD.has(name)) check(!runCardSeen.has(name), `${name}: no "run interrupted" card`);
@@ -1328,10 +1338,10 @@ await scenario('coverage', async () => {
   await audit(page, 'coverage-cloud');
   await by(page, 'cloud-toggle').tap();
   await page.waitForFunction(() => !document.querySelector('.capture.cloud-view'));
-  // Headless only: SwiftShader's WebGL draw of the 3D thumbnail starves the frame grabs once the
-  // mock cloud is fully revealed (measured: 0–2 frames per 5 s with it, 29–46 without), so the
-  // two loops would take minutes. Hide it for the rest of the capture.
-  await page.addStyleTag({ content: '.mini-view { display: none !important; }' });
+  // The 3D thumbnail stays shown. It once seemed to starve the frame grabs here, and hiding it made
+  // the last screenshot time out: both were the GPU queue of frame copies the MockEngine closed
+  // unread (its header, "Frame pixels"; hidden, the pump ran at 10 Hz and the queue grew by
+  // ≈ 100 MB/s). The mock reads every frame now: ≈ 3 frames/s with the thumbnail, screenshots ≈ 1 s.
   const flat = await page.evaluate(() => document.querySelector('.coverage')?.classList.contains('flat'));
   if (flat) {
     // no motion sensor in this browser: azimuth only, one loop completes it
