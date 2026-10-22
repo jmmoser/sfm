@@ -70,7 +70,7 @@ interface LiveUpdate {
 
 class PhotogrammetryEngine {
   constructor(opts: EngineOptions, config?: EngineConfig)   // EngineConfig: tuning knobs (harness / tests)
-  init(): Promise<InitResult>   // { gpu, adapter?, fallbackReason?, resumedKeyframes?, captureMemory?: { usedMB, capMB } }
+  init(): Promise<InitResult>   // { gpu, adapter?, fallbackReason?, resumedKeyframes?, captureMemory?: { usedMB, capMB }, storedModel? }
   processFrame(f: FrameInput): Promise<LiveUpdate>
   finishCapture(progress?, cancel?): Promise<void>
   refine(progress?, cancel?): Promise<SparseResult>
@@ -131,14 +131,25 @@ picks object vs scene after initialisation from the scene depth / baseline.
 features, pairs, vocabulary, IMU, GPS, θ₀ / R_cam_device, time offset, gyro bias; the live model is
 rebuilt in the mapping queue) and reopens it (`LiveSession.reopenCapture`), also after finishCapture /
 refine: tracking restarts, so the first sharp frame becomes a keyframe that relocalises through the
-mapping queue's sequential, retrieval and spatial candidates. The stored mode and quality are kept; only
-the sparse model is loaded (the dense cloud / mesh stay in the store, outside the capture's memory cap,
-which applies from the first frame: `InitResult.captureMemory`). Times: performance.now() restarts with
+mapping queue's sequential, retrieval and spatial candidates. A missing or unreadable stored state, or
+a failed restore, rejects the init before anything is written (a scan is never continued from
+scratch). The stored mode and quality are kept; only the sparse model is loaded (the dense cloud /
+mesh stay in the store, outside the capture's memory cap, which applies from the first frame:
+`InitResult.captureMemory`) and previewed (`InitResult.storedModel`, decimated, no camera times).
+The live model rebuild is one mapping job (≈ 190 ms per keyframe on SwiftShader / CPU features — a
+minute for a large scan on a phone is plausible): frames are not held back by it — the back-pressure
+counts keyframe jobs only and never waits on it, at most `maxMappingBacklog` new keyframes queue
+behind it (later keyframe decisions are skipped, `timings.rebuildLimited`), and every LiveUpdate
+reports its progress (`modelRebuild: { done, total }`). Times: performance.now() restarts with
 every page load, so the engine keeps a capture on its SESSION time base — FrameInput time + the capture
 segment's shift (`EngineStateRecord.timeSegments`). The first frame of a continued capture starts a
 segment ≥ 10 s (`EXTEND_TIME_GAP_MS`) after everything stored (frame, IMU, GPS and attitude times shifted
 alike; lower frame indices offset): the gyro never integrates across the gap, the inertial scale splits
-its segments there and the gravity skips the gap (`estimateGravity`). LiveUpdate times stay on the page's base. The first new keyframe marks the stored
+its segments there and the gravity skips the gap (`estimateGravity`). The segment is decided by the
+frame's own streams (frame, IMU, attitude), not its GPS fix, and a fix at or before the stored capture's
+end is dropped (the FramePump re-attaches the nearest fix for up to 30 s: after a same-page respawn often
+a stored one). LiveUpdate times stay on the page's base; model updates sent before the first frame
+decided the segment carry no keyframe times. The first new keyframe marks the stored
 results stale (`resultsStale`: `loadSession` then opens the scan with its sparse model only, status
 'capturing' / 'captured') until the next `refine`, which covers every keyframe and invalidates the dense
 cloud, mesh and splats as always (a cancelled or failed refine keeps the previous model). No multi-map
@@ -252,11 +263,16 @@ Home (sessions, new scan, diagnostics) → Setup (mode, quality) → Permissions
 view, counters, finish) → Processing (stages + progress + cancel) → Viewer
 (splats / points / mesh layer pill, cameras, EDL, measure, export, run dense / mesh / photoreal).
 "Add more views" (viewer Build sheet, the viewer's "N photos could not be connected" card, Home's
-session actions; "Continue scanning" for an interrupted capture) confirms that processing runs again
-and the later stages are rebuilt, then opens Capture on the stored session (`EXTEND_CAPTURE`: init with
-`resume` + `extend`, the stored mode / quality, the existing sparse model shown until the live model is
-rebuilt); the first new keyframe sets the session status back to 'capturing'. Finish re-runs refine
-(+ densify with auto-dense); stopping without new views returns to the stored model unchanged. The splat
+session actions; "Continue scanning" for an interrupted capture) confirms that processing runs again,
+which stages are rebuilt and that a photoreal model is removed (built again from Build), then opens
+Capture on the stored session (`EXTEND_CAPTURE`: init with `resume` + `extend`, the stored mode /
+quality, the stored sparse model — `InitResult.storedModel` — shown until the live model is rebuilt,
+"Loading the scan's model n / N" while `modelRebuild` is reported); the first new keyframe sets the
+session status back to 'capturing'. Finish re-runs refine and the stages the scan had (densify, mesh;
+densify also with auto-dense); stopping waits for the frame in flight and without new views returns
+to the stored model unchanged. A scan whose record missed new views (killed before the status change, a
+frame answered after Stop) loads as a capture to process (`loadSession` status 'capturing' /
+'captured'): App.ensureSessionLoaded sets the record back and the viewer hands it to processing. The splat
 stage runs from the viewer itself ("Photoreal model" in the Build sheet → `splat` with a progress card fed by
 `SplatTrainingDetail`, Cancel, Resume after an interruption), the model is fetched with `splatModel` into the
 viewer's WebGPU splat layer and shown by default, and the export sheet offers 'ply-splat' (src/viewer/splat-layer.ts,

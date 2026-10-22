@@ -152,4 +152,36 @@ describe('App.ensureSessionLoaded', () => {
     expect(app.loadedSessionId).toBeNull();
     expect(app.results.sessionId).toBeNull();
   });
+
+  it("the engine's status wins: a continued capture the record still calls 'meshed' is set back to a capture to process", async () => {
+    const { engine, loads } = fakeEngine();
+    const app = fakeApp(engine);
+    const metas = new Map([
+      ['A', { id: 'A', status: 'meshed' }],
+      ['B', { id: 'B', status: 'meshed' }],
+    ]);
+    const updateSession = vi.fn((id: string, patch: { status?: string }) => {
+      metas.set(id, { ...metas.get(id)!, ...(patch.status ? { status: patch.status } : {}) });
+      return Promise.resolve();
+    });
+    Object.assign(app, { sessionsP: Promise.resolve({ getSession: (id: string) => Promise.resolve(metas.get(id) ?? null), updateSession }) });
+    const sparse = { points: { count: 1, positions: new Float32Array(3), colors: new Uint8Array(3) }, cameras: [], metric: {}, stats: {} };
+    // new keyframes stored (results stale): the engine reports the capture, with the old sparse model only
+    const a = app.ensureSessionLoaded('A');
+    loads[0].resolve({ ...summary('A'), status: 'capturing', numFrames: 12, sparse } as unknown as SessionSummary);
+    expect(await a).toBe(true);
+    expect(app.results.toProcess).toEqual({ status: 'capturing', numFrames: 12 });
+    // its old model is the preview, not the scan's model (processing does not offer to open it)
+    expect(app.results.sparse).toBeNull();
+    expect(app.results.liveSparse!.positions).toBe(sparse.points.positions);
+    expect(updateSession).toHaveBeenCalledWith('A', { status: 'capturing' });
+    expect(metas.get('A')!.status).toBe('capturing');
+    // a scan as built: nothing changes
+    const b = app.ensureSessionLoaded('B');
+    loads[1].resolve({ ...summary('B'), status: 'meshed', numFrames: 12, sparse } as unknown as SessionSummary);
+    expect(await b).toBe(true);
+    expect(app.results.toProcess).toBeUndefined();
+    expect(app.results.sparse).toBe(sparse);
+    expect(updateSession).toHaveBeenCalledTimes(1);
+  });
 });

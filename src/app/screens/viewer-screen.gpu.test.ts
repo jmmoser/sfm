@@ -6,7 +6,8 @@
  * trainer runs and shown again when the build stops; a build settling after the screen was left
  * does not take the wake lock / busy flag of the next screen. "Add more views": the card for
  * photos refine could not connect (dismissed per refine) and the Build sheet item open the confirm
- * sheet, whose button requests the capture permissions inside its tap.
+ * sheet (saying which stages Finish rebuilds), whose button requests the capture permissions
+ * inside its tap.
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import { getGPU } from '../../gpu/device';
@@ -96,6 +97,7 @@ function fakeApp(engine: FakeEngine, splat: SplatResult | null) {
     wakeLock,
     busy: false,
     loadedSessionId: 's1' as string | null,
+    config: { mode: 'object', quality: 'fast', autoDense: true },
     env: { webgpu: 'available', webgl: true, share: false },
     debug: {} as { viewer?: unknown },
     navigate: (): void => undefined,
@@ -304,6 +306,8 @@ describe('viewer screen: add more views', () => {
     await tap('unconnected-extend');
     await waitFor(() => !!q('sheet-extend'));
     expect(q('sheet-extend')!.textContent).toMatch(/processed again/);
+    // what Finish rebuilds: the refine and (auto-dense) the dense cloud — said as it is
+    expect(q('sheet-extend')!.textContent).toMatch(/the 3D model and the dense cloud are rebuilt/);
     q('extend-start')!.click();
     // the capture permissions are requested synchronously inside the tap, then the capture opens
     expect(perms).toBe(1);

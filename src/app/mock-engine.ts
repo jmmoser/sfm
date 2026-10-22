@@ -10,7 +10,8 @@
  *
  * `init` with `resume` + `extend` continues a scan like the engine ("Add more views"): the scan held
  * in memory, else the stored one rebuilt from its session record as `loadSession` does; the
- * trajectory goes on after its last keyframe and `InitResult.resumedKeyframes` reports them.
+ * trajectory goes on after its last keyframe and `InitResult.resumedKeyframes` reports them
+ * (`storedModel`: its sparse model); an unknown scan rejects.
  * `unconnectedImages` makes refine report keyframes it could not connect (the viewer's card).
  */
 import type { MetricInfo, PointCloud, ProgressCallback, ProgressEvent, TriangleMesh } from '../core/types';
@@ -241,6 +242,12 @@ export class MockEngine implements EngineLike {
       const store = extendId ? await this.sessionsSrc() : null;
       const meta = store ? await store.getSession(extendId!).catch(() => null) : null;
       if (setup.closed) throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');
+      if (extendId && !meta) {
+        // like the engine: a scan without a stored capture is not continued from scratch
+        const e = new Error(`Session ${extendId} has no stored capture to continue`);
+        this.setState('idle', e.message);
+        throw e;
+      }
       this.options = { ...options };
       this.sessionId = options.sessionId ?? null;
       if (meta) {
@@ -261,6 +268,8 @@ export class MockEngine implements EngineLike {
     if (resumed > 0) {
       res.resumedKeyframes = resumed;
       res.captureMemory = { usedMB: Math.round(20 + resumed * 1.5), capMB: 420 };
+      const sp = extendId ? this.sparse : null;
+      if (sp) res.storedModel = { sparse: { positions: sp.points.positions, colors: sp.points.colors }, cameras: sp.cameras.map((c) => ({ pose: c.pose, intrinsics: c.intrinsics })) };
     }
     this.setState('ready', undefined, res);
     this.log(`mock init ${options.mode}/${options.quality}`);

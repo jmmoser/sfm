@@ -20,13 +20,17 @@
  *
  * Continued capture (`route.extendFrom`: "Add more views" / "Continue scanning", src/app/extend-scan.ts):
  * the engine init has `resume` + `extend` with the STORED session's mode and quality (the session
- * record is not created again, its thumbnail kept); the stored sparse model is shown until the
- * rebuilt live model arrives; counters start at the restored keyframes and Finish needs a new one
- * (then it re-runs refine, + densify with auto-dense, like a new scan). The first new keyframe sets
- * the session status back to 'capturing' (a kill leaves a scan Home offers to process, not new
- * photos behind a 'meshed' status). Stopping without new views returns where it came from with the
- * scan as it was (the engine lets go of the reopened capture); with new views they are kept and
- * the scan is processed from Home. A continued capture never deletes the session.
+ * record is not created again, its thumbnail kept); the stored sparse model (InitResult.storedModel,
+ * else the one the page holds) is shown until the rebuilt live model arrives, and the guidance says
+ * while the engine still rebuilds it (LiveUpdate.modelRebuild: it adds few keyframes meanwhile);
+ * counters start at the restored keyframes and Finish needs a new one (then it re-runs refine and
+ * the stages the scan had — dense cloud, mesh; densify also with auto-dense: rebuildSteps). The
+ * first new keyframe sets the session status back to 'capturing' (a kill leaves a scan Home offers
+ * to process, not new photos behind a 'meshed' status; a keyframe the page never heard of is caught
+ * when the scan is loaded: App.ensureSessionLoaded). Stopping waits for the frame in flight, then
+ * without new views returns where it came from with the scan as it was (the engine lets go of the
+ * reopened capture); with new views they are kept and the scan is processed from Home. A continued
+ * capture never deletes the session.
  */
 import type { PumpFrame } from '../../sensors/frame-pump';
 import { CameraCapture, type CameraStartResult, type CameraState } from '../../sensors/camera';
@@ -53,6 +57,7 @@ import { FrameOrientationTracker, mapOverlay } from '../overlay-map';
 import { createDebugOverlay } from '../debug-overlay';
 import { coverFovDeg, FollowView, medianDistance, quarterTurned, splatRadii } from '../follow-view';
 import { MIN_KEYFRAMES, type Route } from '../router';
+import { rebuildSteps } from '../extend-scan';
 
 type Phase = 'starting' | 'running' | 'paused' | 'interrupted' | 'error' | 'finishing' | 'closed';
 
@@ -117,6 +122,8 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   let gyroBias: [number, number, number] | null = null;
   /** Bitmap size / UI rotation of the frame being processed and the θ its pixels are upright for. */
   let inFlight: FrameMeta | null = null;
+  /** Settles once the frame in flight was answered (its LiveUpdate applied); null when none is. */
+  let frameSettled: Promise<void> | null = null;
   /** Raw sensor buffers vs upright frames — the engine's rule, to turn overlays onto the preview. */
   const orientation = new FrameOrientationTracker();
   let frameErrors = 0;
@@ -600,8 +607,12 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       statusPill.dataset.state = u.tracking;
       trackLabel.textContent = trackingLabel(u.tracking);
     }
-    const g = guidanceInfo(u.guidance, cfg.mode);
-    const gkey = `${u.guidance}`;
+    // a restored capture whose live model is still rebuilt adds few keyframes meanwhile: say so
+    const rb = u.modelRebuild;
+    const g = rb
+      ? { title: 'Loading the scan’s model…', detail: `${Math.min(rb.done, rb.total)} / ${rb.total} views — keep the camera on the part you already scanned.`, tone: 'info' as const }
+      : guidanceInfo(u.guidance, cfg.mode);
+    const gkey = rb ? `rebuild:${rb.done}/${rb.total}` : `${u.guidance}`;
     if (gkey !== lastGuidance && phase === 'running') {
       lastGuidance = gkey;
       guidance.hidden = !g.title;
@@ -722,6 +733,8 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     };
     const upright = orientation.observe({ width: f.width, height: f.height, screenAngle: f.screenAngle, t: f.t, raw: f.rawBuffer, screenAngleSince: f.screenAngleSince });
     inFlight = { width: f.width, height: f.height, screenAngle: f.screenAngle, upright };
+    let settle = (): void => undefined;
+    frameSettled = new Promise<void>((r) => (settle = r));
     try {
       await app.engine.processFrame(input);
       frameErrors = 0;
@@ -729,6 +742,8 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       onFrameError(e);
     } finally {
       inFlight = null;
+      frameSettled = null;
+      settle();
     }
   }
 
@@ -962,7 +977,8 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       if (closed) return;
       const msg = (e as Error)?.message ?? String(e);
       errorCard(
-        'Processing engine unavailable',
+        // (a continued scan whose stored capture cannot be read is not started over)
+        extend ? 'This scan cannot be continued' : 'Processing engine unavailable',
         (e as { name?: string })?.name === ENGINE_ERRORS.notImplemented ? `${msg}. Open the app with ?mock=1 to try the demo engine.` : msg,
         () => void initEngine(),
       );
@@ -1015,10 +1031,14 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     kfCount.textContent = String(numKeyframes);
     const m = res.captureMemory;
     if (m && m.capMB > 0 && m.usedMB > 0.85 * m.capMB) toast('This scan is close to the memory limit of this device — only a few more views fit.', { tone: 'warn', durationMs: 7000 });
+    // the stored model (the engine's preview; else the one the page holds, opened from the viewer)
     const sp = app.results.sessionId === sessionId ? app.results.sparse : null;
-    if (sp && !latestSparse && sp.points.count > 0) {
-      latestSparse = { positions: sp.points.positions, colors: sp.points.colors };
-      latestCameras = sp.cameras.map((c) => ({ pose: c.pose, intrinsics: c.intrinsics, ...(c.upCam ? { upCam: c.upCam } : {}) }));
+    const preview =
+      res.storedModel ??
+      (sp ? { sparse: { positions: sp.points.positions, colors: sp.points.colors }, cameras: sp.cameras.map((c) => ({ pose: c.pose, intrinsics: c.intrinsics, ...(c.upCam ? { upCam: c.upCam } : {}) })) } : null);
+    if (preview && !latestSparse && preview.sparse.positions.length > 0) {
+      latestSparse = preview.sparse;
+      latestCameras = preview.cameras;
       viewerDirty = true;
       scheduleViewer(true);
     }
@@ -1194,7 +1214,8 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     await saveCaptured(durationMs);
     if (closed) return;
     closed = true;
-    app.navigate({ type: 'FINISH_CAPTURE', steps: cfg.autoDense ? ['densify'] : [] });
+    // a continued scan rebuilds the stages it had (the refine removes them)
+    app.navigate({ type: 'FINISH_CAPTURE', steps: extend ? rebuildSteps(stored?.status, cfg.autoDense) : cfg.autoDense ? ['densify'] : [] });
   }
 
   async function saveCaptured(durationMs: number): Promise<void> {
@@ -1308,12 +1329,21 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     app.navigate({ type: 'CANCEL' });
   }
 
+  let leaving = false;
   /**
-   * Leave a continued capture (never deleting the scan). Without new views the scan is as it was:
-   * the engine lets go of the reopened capture (the scan is loaded again where it is shown) and the
-   * route goes back. With new views they are kept: the scan is a capture to process (Home).
+   * Leave a continued capture (never deleting the scan), after the frame in flight was answered
+   * (≤ FINISH_ABORT_GRACE_MS). Without new views the scan is as it was: the engine lets go of the
+   * reopened capture (the scan is loaded again where it is shown) and the route goes back. With new
+   * views they are kept: the scan is a capture to process (Home).
    */
   async function leaveExtended(): Promise<void> {
+    if (leaving || closed) return;
+    leaving = true;
+    // the engine's view wins: the frame in flight may have made a keyframe (its update raises
+    // numKeyframes; a frame not answered by then is caught when the scan is loaded again)
+    pump?.stop();
+    const pending = frameSettled;
+    if (pending) await Promise.race([pending, new Promise<void>((r) => setTimeout(r, FINISH_ABORT_GRACE_MS))]);
     closed = true;
     stopSensors();
     void app.wakeLock.release();

@@ -350,14 +350,16 @@ describe('MockEngine: continue a stored scan (init with resume + extend)', () =>
     expect(s2.stats.images).toBeGreaterThanOrEqual(second.last.numKeyframes);
   });
 
-  it('rebuilds a stored scan from its session record and reports nothing for an unknown one', async () => {
+  it('rebuilds a stored scan from its session record and rejects an unknown one', async () => {
     const meta = { id: 's3', name: 'Vase', createdAt: 1, updatedAt: 2, mode: 'object' as const, status: 'meshed' as const, numFrames: 0, stats: { keyframes: 14, quality: 'fast' } };
     const e = new MockEngine({ speed: 50, sessions: async () => ({ getSession: async (id: string) => (id === 's3' ? meta : null) }) as never });
     const init = await e.init({ mode: 'object', quality: 'balanced', sessionId: 's3', persist: true, resume: true, extend: true });
     expect(init.resumedKeyframes).toBe(14);
+    // the stored model for the capture view (the engine's InitResult.storedModel)
+    expect(init.storedModel!.cameras).toHaveLength(14);
+    expect(init.storedModel!.sparse.positions.length).toBeGreaterThan(0);
     const { last } = await capture(e, 100, 16);
     expect(last.numKeyframes).toBe(16);
-    const fresh = await e.init({ mode: 'object', quality: 'fast', sessionId: 'gone', persist: true, resume: true, extend: true });
-    expect(fresh.resumedKeyframes).toBeUndefined();
+    await expect(e.init({ mode: 'object', quality: 'fast', sessionId: 'gone', persist: true, resume: true, extend: true })).rejects.toThrow(/no stored capture/);
   });
 });

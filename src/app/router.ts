@@ -9,6 +9,7 @@
  *   home ──OPEN_SESSION──▶ viewer (sparse/dense/meshed) | processing (captured)
  *   home/viewer ──EXTEND_CAPTURE──▶ capture (extend: the stored session) ──FINISH_CAPTURE──▶ processing (refine…)
  *                                          └──BACK (stopped, nothing added)──▶ (where it came from)
+ *   viewer ──OPEN_SESSION (its scan is a capture to process: new views the record missed)──▶ processing
  *   home/setup/viewer ──OPEN_DIAGNOSTICS──▶ diagnostics ──BACK──▶ (where it came from)
  */
 import type { SessionStatus } from '../io/storage';
@@ -110,6 +111,10 @@ export function nextRoute(cur: Route, ev: NavEvent): Route | null {
         return steps.length ? { screen: 'processing', sessionId: cur.sessionId, steps } : null;
       }
       if (ev.type === 'EXTEND_CAPTURE' && cur.sessionId === ev.sessionId) return { screen: 'capture', sessionId: ev.sessionId, extendFrom: 'viewer' };
+      // its scan turned out to be a capture to process (new views the record missed): processing
+      if (ev.type === 'OPEN_SESSION' && cur.sessionId === ev.sessionId && (ev.status === 'capturing' || ev.status === 'captured')) {
+        return routeForSession(ev.sessionId, ev.status, ev.numFrames);
+      }
       return null;
     case 'diagnostics':
       if (ev.type === 'BACK' || ev.type === 'HOME') {

@@ -6,7 +6,7 @@
  *   card, layer pill Splats / Points / Mesh) → Export (prepare + save → download, incl. the
  *   Gaussian-splat PLY) → Home → reopen (the splats are back) → Add more views (Build sheet →
  *   confirm sheet → Capture continues at the stored keyframes → Finish → Processing re-runs
- *   refine → Viewer) → Diagnostics
+ *   refine and the dense cloud + mesh the scan had → Viewer) → Diagnostics
  * Asserts no console errors / page exceptions and writes screenshots of every screen to
  * e2e/out/ui/. The splat layer needs a hardware WebGPU adapter: with E2E_GPU=host the splats must
  * be shown; on SwiftShader the viewer refuses the software adapter and keeps the points.
@@ -300,7 +300,10 @@ try {
   await byTest('sheet-build').waitFor();
   await byTest('build-extend').tap();
   await byTest('sheet-extend').waitFor();
-  check(/processed again/.test((await byTest('sheet-extend').textContent()) ?? ''), 'the sheet says the scan is processed again');
+  const extendSheet = (await byTest('sheet-extend').textContent()) ?? '';
+  check(/processed again/.test(extendSheet), 'the sheet says the scan is processed again');
+  check(/the dense cloud and the mesh are rebuilt/.test(extendSheet), 'the sheet names the stages Finish rebuilds');
+  check(/photoreal model is removed/.test(extendSheet), 'the sheet says the photoreal model is removed');
   await sleep(400);
   await shot(page, '19b-extend-sheet');
   await byTest('extend-start').tap();
@@ -315,7 +318,8 @@ try {
   await byTest('finish').tap();
   await page.waitForSelector('.processing', { timeout: 20000 });
   await page.waitForSelector('[data-testid="stage-matching"][data-status="active"], [data-testid="stage-reconstruction"][data-status="active"]', { timeout: 20000 });
-  check((await page.locator('[data-testid="stage-meshing"]').getAttribute('data-status')) !== 'done', 'the mesh of the previous model is not shown as built');
+  const meshStage = await page.locator('[data-testid="stage-meshing"]').getAttribute('data-status');
+  check(meshStage !== 'done' && meshStage !== 'skipped', `the mesh the scan had is built again (stage ${meshStage})`);
   await page.waitForSelector('.viewer-screen', { timeout: 120000 });
   await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
   const extendedSub = (await page.locator('.viewer-sub').textContent()) ?? '';

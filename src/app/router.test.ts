@@ -72,6 +72,15 @@ describe('router state machine', () => {
     expect(nextRoute({ screen: 'setup' }, { type: 'EXTEND_CAPTURE', sessionId: 'y' })).toBeNull();
   });
 
+  it("the viewer hands its scan to processing when it turns out to be a capture to process", () => {
+    const v: Route = { screen: 'viewer', sessionId: 'x' };
+    expect(nextRoute(v, { type: 'OPEN_SESSION', sessionId: 'x', status: 'capturing', numFrames: 12 })).toEqual({ screen: 'processing', sessionId: 'x', steps: ['refine'] });
+    expect(nextRoute(v, { type: 'OPEN_SESSION', sessionId: 'x', status: 'captured', numFrames: 12 })).toEqual({ screen: 'processing', sessionId: 'x', steps: ['refine'] });
+    // not another scan, not a built one
+    expect(nextRoute(v, { type: 'OPEN_SESSION', sessionId: 'y', status: 'capturing', numFrames: 12 })).toBeNull();
+    expect(nextRoute(v, { type: 'OPEN_SESSION', sessionId: 'x', status: 'meshed', numFrames: 12 })).toBeNull();
+  });
+
   it('diagnostics returns where it came from', () => {
     for (const from of [home, { screen: 'setup' } as Route, { screen: 'viewer', sessionId: 'q' } as Route]) {
       const d = nextRoute(from, { type: 'OPEN_DIAGNOSTICS' });

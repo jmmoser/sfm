@@ -308,6 +308,7 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
           app.results.dense = null;
           app.results.mesh = null;
           app.results.splat = null;
+          delete app.results.toProcess;
           clearSplatResume(app.results.stats);
           completeStep('refine');
           showPreview();

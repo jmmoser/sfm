@@ -13,7 +13,9 @@
  * "Resume dense reconstruction" (HUD + Build sheet): the engine continues from its stored maps.
  * "Add more views" (Build sheet; src/app/extend-scan.ts) continues the scan's capture — processing
  * then runs again —, also offered by a card when refine could not connect some photos
- * (stats.unconnectedImages; dismissed per refine: stats.unconnectedNoticeRefineMs).
+ * (stats.unconnectedImages; dismissed per refine: stats.unconnectedNoticeRefineMs). A scan that
+ * loads as a capture to process (results.toProcess: new views its record missed) goes on to
+ * processing instead of showing the model that leaves them out.
  */
 import { saveFile } from '../../io/download';
 import type { SplatDisplayState, Viewer } from '../../viewer';
@@ -941,6 +943,14 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       app.loadedSessionId = app.loadedSessionId === route.sessionId ? null : app.loadedSessionId;
       if (!(await app.ensureSessionLoaded(route.sessionId))) {
         if (!closed) app.navigate({ type: 'BACK' });
+        return;
+      }
+      // new views its record missed (a continued capture killed, or answered after Stop): the
+      // scan is processed, not shown with the model that leaves them out
+      const tp = app.results.toProcess;
+      if (tp && !closed) {
+        toast('This scan has new photos that are not processed yet — processing it again.', { tone: 'info' });
+        if (!app.navigate({ type: 'OPEN_SESSION', sessionId: route.sessionId!, status: tp.status, numFrames: tp.numFrames })) app.navigate({ type: 'BACK' });
         return;
       }
     }
