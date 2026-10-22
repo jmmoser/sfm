@@ -27,6 +27,12 @@ describe('parseConfig', () => {
     expect(parseConfig(JSON.stringify({ ...defaultConfig(true), cloudView: 'yes' }), true).cloudView).toBe(false);
   });
 
+  it('"Record raw capture" is off by default and remembered', () => {
+    expect(parseConfig(null, true).recordRaw).toBe(false);
+    expect(parseConfig(JSON.stringify({ ...defaultConfig(true), recordRaw: true }), true).recordRaw).toBe(true);
+    expect(parseConfig(JSON.stringify({ ...defaultConfig(true), recordRaw: 1 }), true).recordRaw).toBe(false);
+  });
+
   it('invalid values fall back to the defaults and the torch never starts on', () => {
     expect(parseConfig('{not json', true)).toEqual(defaultConfig(true));
     expect(parseConfig('null', false)).toEqual(defaultConfig(false));

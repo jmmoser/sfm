@@ -22,6 +22,10 @@ All heavy work runs in the worker: the UI thread only shows video, the viewer an
 the UI. WebGPU is used from the worker. The engine class itself is
 thread-agnostic so the test harness can run it on the main thread.
 
+With the developer option "Record raw capture" a third worker records what the engine gets
+(§5): `src/workers/recorder.worker.ts` (JPEG encode + OPFS / IndexedDB writes), fed by a FrameTap
+on the main thread.
+
 ## 2. `PhotogrammetryEngine` (`src/engine/engine.ts`)
 
 ```ts
@@ -245,6 +249,11 @@ Request/response RPC with ids, plus unsolicited events:
   updates sent when a keyframe is mapped: no `overlay` / `framePose`, the `frameIndex` of the frame
   in flight and the previous frame's `guidance` — per-frame consumers use the `frame` responses.
 * large typed arrays and ImageBitmaps are transferred, never copied.
+* App side, not a worker message: `EngineLike.setFrameTap(tap)` (EngineClient and MockEngine,
+  `src/app/frame-tap.ts`) lets an observer see every FrameInput just before it is sent — after
+  the busy check, while the pixels are still the caller's — and the answer afterwards, with
+  `sent: false` when the client rejected it before posting it to the worker (disposed, dead, no
+  worker); the tap may hold back `processFrame`'s resolution (back-pressure), never the engine.
 
 ### Splat protocol (for the viewer / app UI)
 
@@ -266,7 +275,8 @@ MockEngine implements the same calls (a fast fake run whose model is one Gaussia
 
 ## 4. UI flow (`src/app`)
 
-Home (sessions, new scan, diagnostics, the "run interrupted" card below) → Setup (mode, quality) → Permissions
+Home (sessions, new scan, diagnostics, the "run interrupted" card below) → Setup (mode, quality, options; developer:
+debug overlay, VideoFrame grab, record raw capture — §5) → Permissions
 (one tap: motion → camera → location) → Capture (video, guidance, coverage ring, live sparse
 view, counters, finish) → Processing (stages + progress + cancel) → Viewer
 (splats / points / mesh layer pill, cameras, EDL, measure, export, run dense / mesh / photoreal).
@@ -331,3 +341,30 @@ scan with a dense cloud. The engine's memory plan is unchanged, so splat checkpo
 `memoryBudgetMB` after a second kill is a later step). The MockEngine mirrors the engine's stored progress
 in the session record's stats, so e2e/ui/states.mjs kills runs with a page reload (`killed-dense`,
 `killed-splat`, `evicted-refine`, `killed-splat-early`).
+
+## 5. Raw capture recorder (developer option)
+
+Setup › Options › "Record raw capture" (off by default; `CaptureConfig.recordRaw`) records a
+capture for replay on a computer (format: `src/io/recording.ts`; replay and scoring: e2e/README.md
+"Raw capture recordings").
+
+* Capture → `App.startRecording` after the engine's init, before the FramePump starts; stopped
+  with the sensors (finish, cancel, leaving the screen; a start still opening then is stopped once
+  open, never installed). It installs `CaptureRecorder` (`src/app/recorder.ts`) as the engine's
+  FrameTap: per frame sent, a VideoFrame `clone()`, an ImageBitmap blitted at ≤ 1280 px, or an
+  RGBAImage copy goes with the FrameInput metadata to the recorder worker, which writes a
+  ≤ 1280 px JPEG and a `frames.jsonl` line (every FrameInput field verbatim) to OPFS
+  (`sfm-recordings/<id>/`, sync access handles, JPEGs in 64 MB packs) or to the IndexedDB
+  database `sfm-recordings`; the engine's answer goes to `live.jsonl` (`notSent` when the client
+  never posted the frame). The raw DeviceMotion / DeviceOrientation events (the recorder's own
+  window listeners, removed before the capture's sensors stop) and every GeoSensor fix go to
+  `sensors.jsonl` in 500 ms batches.
+* Bounds: when more than 3 frames are in the recorder worker, the frame just sent resolves its
+  processFrame only when the worker caught up (≤ 4 in it; the FramePump skips frames as when the
+  engine is busy, so the recording still equals the engine input); 1 GB of free origin quota to
+  start, checked every 2 s; low storage, a write error or a worker stuck for 8 s of visible time
+  stop the recording (a toast), never the scan.
+* Diagnostics › "Raw capture recordings" (`src/app/screens/recordings.ts`, shown whether or not
+  the diagnostics probes succeed): each recording with its frames, duration and size; Export = ZIP
+  parts of ≤ 200 MB (each: Prepare, then Share / Save through `saveFile` in the tap), GPS left out
+  unless "Include location"; Delete.

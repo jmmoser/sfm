@@ -1,4 +1,5 @@
 import type { Metrics } from './metrics-core.mjs';
+import type { SelfMetrics } from './self-metrics.mjs';
 
 export interface MetricsInput {
   intrinsics: { f: number; cx: number; cy: number; k1: number; k2: number; width: number; height: number } | null;
@@ -19,8 +20,9 @@ export function metricsInput(r: unknown, opts?: { pointsFile?: string | null }):
 export function resolveThresholds(spec: unknown, scene: string, name: string): Thresholds;
 export const CHECKS: Record<string, { label: string; when: 'always' | 'dense' | 'metric' | 'gravity' | 'north'; value: (m: Metrics) => number | null }>;
 export function runChecks(metrics: Metrics, thresholds: Thresholds, ctx: CheckContext): CheckResult[];
+export function skipChecks(thresholds: Thresholds, reason: string): CheckResult[];
 export function formatChecks(checks: CheckResult[]): string;
 export function table(rows: (string | number)[][], alignLeft?: number[]): string;
-export function summaryRow(name: string, r: unknown, m: Metrics | null, checks: CheckResult[]): string[];
+export function summaryRow(name: string, r: unknown, m: Metrics | SelfMetrics | null, checks: CheckResult[]): string[];
 export const SUMMARY_HEADER: string[];
 export function fmtNum(v: unknown, d?: number): string;

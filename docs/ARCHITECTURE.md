@@ -113,10 +113,11 @@ src/
   splat/                 3D Gaussian Splatting: WebGPU trainer + renderer, CPU reference,
                          splat PLY, point-cloud initialisation, MCMC densification
   sensors/               camera capture, motion, compass, geolocation, wake lock, frame orientation
-  io/                    PLY / GLB / COLMAP export, ZIP writer, IndexedDB session storage, share/download
+  io/                    PLY / GLB / COLMAP export, ZIP writer, IndexedDB session storage, share/download,
+                         raw capture recordings (format, OPFS / IndexedDB store, dataset export)
   viewer/                three.js viewer (points as splats + EDL, mesh, cameras, measure tool)
   engine/                PhotogrammetryEngine (pipeline orchestration, runs in a worker)
-  workers/               engine.worker.ts + typed message protocol
+  workers/               engine.worker.ts + typed message protocol, recorder.worker.ts (raw capture)
   app/                   mobile UI (vanilla TS + CSS), screens, state machine
   harness/               test harness pages: synthetic dataset generator, engine e2e, dense GT,
                          splat GT, novel-view evaluation
@@ -508,6 +509,18 @@ exportColmapText(model: ColmapModelInput): { name: string; data: string }[]   //
 createZip(files: { name: string; data: Uint8Array | string }[]): Uint8Array   // STORE, CRC32, UTF-8
 class SessionStore { static open(): Promise<SessionStore>; … IndexedDB sessions, frame JPEG blobs, JSON & binary blobs }
 saveFile(data: Blob, filename: string): Promise<'shared' | 'downloaded'>    // Web Share (files) or <a download>
+// recording.ts — raw capture recordings (developer option; docs/ENGINE.md §5, e2e/README.md)
+interface RecordedFrame { seq: number; sentAt: number; input: Omit<FrameInput, 'bitmap'> /* verbatim */;
+  image: { file: string; width: number; height: number; srcWidth: number; srcHeight: number;
+           kind: 'VideoFrame' | 'ImageBitmap' | 'RGBAImage'; bytes: number } | null /* engine got it, pixels not recorded */;
+  error?: string; notSent?: boolean /* the engine never got it */ }
+encodeFrameRow(r: RecordedFrame): string; decodeFrameRow(line: string): RecordedFrame   // frames.jsonl, exact (JSON-safe)
+type RecordedSensorRow = { k: 'motion' | 'orientation' | 'geo'; t: number; … }          // sensors.jsonl, raw readings
+buildDatasetFiles(header, framesJsonl, liveJsonl, { stripLocation?, sensorsText? }): { meta, texts, images }   // e2e dataset, no GT
+planZipParts(entries: { name; size }[], maxBytes = 200e6): { part; names; bytes }[]
+// recording-store.ts
+class RecordingStore { static open(); list(): Promise<StoredRecording[]>; reader(info); delete(info) }
+prepareRecordingExport(store, info, { stripLocation? = true, maxPartBytes? }): Promise<{ meta; parts: { fileName; bytes; build(): Promise<Blob> }[] }>
 ```
 
 ### 4.9 `src/viewer`

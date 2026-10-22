@@ -21,17 +21,24 @@
  *   nvs/nvs.json  with --nvs: novel-view evaluation of the output (e2e/nvs.mjs; informational)
  * Exit code: 0 when every pipeline finished without errors and every enforced check passed,
  * 1 otherwise, 2 for usage errors. Thresholds are not enforced for --engine mock unless --enforce.
+ *
+ * A dataset without ground truth — a raw capture recording imported with
+ * e2e/import-recording.mjs (meta.source 'sfm-raw-capture'), or any whose frames lack `pose` — is
+ * replayed verbatim and scored GT-free: metrics.json holds the self-consistency metrics of
+ * e2e/lib/self-metrics.mjs (registered fraction, reprojection error, track length, gyro breaks,
+ * scale source, device vs replay decisions) and every GT check is skipped ('no ground truth').
  */
 import { access, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { loadDataset } from './lib/dataset.mjs';
+import { loadDataset, loadJSONIfExists } from './lib/dataset.mjs';
 import { computeMetrics, formatTable } from './lib/metrics-core.mjs';
 import { parsePoints } from './lib/points.mjs';
 import { ArgError, USAGE, parseArgs } from './lib/e2e-args.mjs';
 import { startHarnessBrowser } from './lib/e2e-browser.mjs';
 import { plyFromBase64 } from './lib/e2e-ply.mjs';
-import { SUMMARY_HEADER, fmtNum, formatChecks, metricsInput, resolveThresholds, runChecks, summaryRow, table } from './lib/e2e-checks.mjs';
+import { SUMMARY_HEADER, fmtNum, formatChecks, metricsInput, resolveThresholds, runChecks, skipChecks, summaryRow, table } from './lib/e2e-checks.mjs';
+import { computeSelfMetrics, formatSelfTable, isGtFree } from './lib/self-metrics.mjs';
 import { parseNvsArgs } from './lib/nvs-args.mjs';
 import { runNvs } from './nvs.mjs';
 
@@ -175,6 +182,8 @@ async function runDataset(browser, name, opts, outRoot, thresholdsSpec) {
   const input = metricsInput(r, { pointsFile });
   await writeFile(join(dir, 'result.json'), JSON.stringify({ ...input, ...r, runner: { wallSeconds: wall, error: res.error } }, null, 1));
   printTimings(r, log);
+  const dsMeta = JSON.parse(await readFile(join(dsDir, 'meta.json'), 'utf8'));
+  if (isGtFree(dsMeta, await loadJSONIfExists(join(dsDir, 'frames.json')))) return scoreGtFree({ name, runName, dir, cfg, r, meta: dsMeta, wall, opts, thresholdsSpec, log });
 
   // ---- metrics ----
   const tm = Date.now();
@@ -245,6 +254,26 @@ async function runDataset(browser, name, opts, outRoot, thresholdsSpec) {
   log(`wrote ${dir}/{result.json, metrics.json${r.files?.length ? ', ' + r.files.map((f) => f.split('/').pop()).join(', ') : ''}} (${wall.toFixed(1)} s)`);
   const checkFail = enforced && checks.some((c) => c.status === 'fail');
   return { name: runName, result: r, metrics, checks, enforced, failed: !r.ok || checkFail };
+}
+
+/** GT-free scoring (a raw capture recording): self-consistency metrics, every GT check skipped. */
+async function scoreGtFree({ name, runName, dir, cfg, r, meta, wall, opts, thresholdsSpec, log }) {
+  let metrics = null;
+  try {
+    metrics = computeSelfMetrics(r, meta);
+    log(`metrics (no ground truth: self-consistency only):\n${formatSelfTable(metrics)}`);
+  } catch (e) {
+    log(`metrics failed: ${e.stack ?? e.message}`);
+  }
+  const checks = skipChecks(resolveThresholds(thresholdsSpec, meta.scene, name), 'no ground truth');
+  log(`checks: ${checks.length} skipped (no ground truth)`);
+  if (opts.nvs) log('nvs skipped: it needs ground-truth poses');
+  await writeFile(
+    join(dir, 'metrics.json'),
+    JSON.stringify({ dataset: name, run: runName, engine: cfg.engine, pipelineOk: !!r.ok, groundTruth: false, errors: r.errors ?? [], metrics, checks, thresholdsEnforced: false, ...(r.recording ? { recording: r.recording } : {}), ...(r.splat ? { splat: r.splat } : {}) }, null, 2),
+  );
+  log(`wrote ${dir}/{result.json, metrics.json${r.files?.length ? ', ' + r.files.map((f) => f.split('/').pop()).join(', ') : ''}} (${wall.toFixed(1)} s)`);
+  return { name: runName, result: r, metrics, checks, enforced: false, failed: !r.ok };
 }
 
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);

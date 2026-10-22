@@ -52,9 +52,9 @@ export interface HarnessConfig {
   baseUrl?: string;
   /** 'worker' (EngineClient over src/workers/engine.worker.ts, default), 'inline' (src/engine on the page) or 'mock'. */
   engine?: HarnessEngineKind;
-  /** Default: 'object' for object datasets, 'scene' otherwise. */
+  /** Default: 'object' for object datasets, 'scene' otherwise; a recording's recorded mode. */
   mode?: CaptureMode;
-  /** Default 'fast'. */
+  /** Default 'fast'; a recording's recorded preset. */
   quality?: QualityPreset;
   /** First dataset frame (position in time order, default 0). */
   startFrame?: number;
@@ -80,14 +80,26 @@ export interface HarnessConfig {
    * the dataset has a location and GPS is fed, else 'true'.
    */
   headingNorth?: 'magnetic' | 'app' | 'true';
-  /** Capture date (epoch ms) for the magnetic declination of the replayed headings (default: the run's start). */
+  /** Capture date (epoch ms) for the magnetic declination of the replayed headings (default: the run's start; a recording's own date). */
   captureDateMs?: number;
+  /**
+   * Raw capture recordings (frames.jsonl, src/io/recording.ts): replay the recorded FrameInputs
+   * verbatim (default true when the dataset is a recording). false = synthesize them from
+   * frames.json / imu.json / geo.json / heading.json like a synthetic dataset.
+   */
+  verbatim?: boolean;
+  /**
+   * Verbatim replay: 'recorded' (default) = the recorded JPEG as is (≤ 1280 px); 'original' =
+   * resized back to the size the engine got on the device (a VideoFrame's display size fitted to
+   * its `maxSide`, else the bitmap size).
+   */
+  replaySize?: 'recorded' | 'original';
   /** Pass `gravityDevice` (FramePump metadata, from the IMU; default = useImu). */
   useGravity?: boolean;
   /**
    * EngineOptions.hfovPriorDeg (FOV across the long side). Default 67.3 (what CameraCapture
-   * reports for an iPhone main camera; the synthetic datasets use 65°). 'gt' = exact value from
-   * the dataset intrinsics, 'none' = no prior.
+   * reports for an iPhone main camera; the synthetic datasets use 65°), for a recording the
+   * recorded prior. 'gt' = exact value from the dataset intrinsics, 'none' = no prior.
    */
   hfovPriorDeg?: number | 'gt' | 'none';
   /** Run densify (default false). */
@@ -180,7 +192,7 @@ export interface IntrinsicsJSON {
 }
 
 export interface FrameRecord {
-  /** Delivered-frame counter (FrameInput.index). */
+  /** FrameInput.index sent: the delivered-frame counter, or in a verbatim replay the recorded index. */
   i: number;
   /** Dataset frame index (frames.json `index`). */
   index: number;
@@ -340,6 +352,34 @@ export interface LogRecord {
   message: string;
 }
 
+/** A raw capture recording's replay (`HarnessResult.recording`). */
+export interface RecordingSummary {
+  /** The recorded FrameInputs were replayed verbatim. */
+  verbatim: boolean;
+  /**
+   * frames.jsonl rows replayed as frames (the engine got them, with pixels) / not replayed
+   * (unparseable, no pixels — their IMU goes to the next frame —, not sent) / of those, rows the
+   * device engine never got (left out, IMU included).
+   */
+  rows: number;
+  skipped: number;
+  notSent: number;
+  /** What the engine answered on the device (live.jsonl; null without it). */
+  device: {
+    frames: number;
+    decisions: Record<string, number>;
+    /** Counts of the device's last answer. */
+    keyframes: number | null;
+    registered: number | null;
+    /** processFrame wall time / recorder back-pressure wait on the device (ms). */
+    frameMs: NumStats;
+    waitMs: NumStats;
+    errors: number;
+  } | null;
+  /** Per-frame decisions of the replay vs the device's (same recorded frame). */
+  agreement: { compared: number; same: number; rate: number | null; keyframesDevice: number; keyframesReplay: number; confusion: Record<string, number> } | null;
+}
+
 export interface HarnessResult {
   ok: boolean;
   aborted: boolean;
@@ -356,7 +396,11 @@ export interface HarnessResult {
     hasGeo: boolean;
     hasHeading: boolean;
     imuSamples: number;
+    /** A raw capture recording (frames.jsonl). */
+    recording?: boolean;
   };
+  /** Raw capture recordings: verbatim replay and the device comparison. */
+  recording?: RecordingSummary;
   engine: { kind: HarnessEngineKind; init: InitResult | null; respawns: number; statusChanges: { ms: number; state: string; reason?: string }[] };
   /** Harness steps (ms): load, init, capture, finishCapture, refine, densify, mesh, splat, export, total. */
   timings: Record<string, number>;

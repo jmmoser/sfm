@@ -9,7 +9,7 @@ export const CONFIG_VERSION = 2;
 
 /** Defaults for this platform (`apple` = iOS / iPadOS WebKit). */
 export function defaultConfig(apple: boolean): CaptureConfig {
-  return { mode: 'object', quality: 'balanced', useGps: false, torch: false, autoDense: true, debugOverlay: false, videoFrameGrab: apple, cloudView: false, configVersion: CONFIG_VERSION };
+  return { mode: 'object', quality: 'balanced', useGps: false, torch: false, autoDense: true, debugOverlay: false, videoFrameGrab: apple, cloudView: false, recordRaw: false, configVersion: CONFIG_VERSION };
 }
 
 /** Stored options (JSON or null) → a valid config; invalid / missing values take the defaults. */
@@ -34,6 +34,7 @@ export function parseConfig(raw: string | null, apple: boolean): CaptureConfig {
     // saved while the option was opt-in (default off): take the current default once
     videoFrameGrab: current && typeof c.videoFrameGrab === 'boolean' ? c.videoFrameGrab : d.videoFrameGrab,
     cloudView: typeof c.cloudView === 'boolean' ? c.cloudView : d.cloudView,
+    recordRaw: typeof c.recordRaw === 'boolean' ? c.recordRaw : d.recordRaw,
     configVersion: CONFIG_VERSION,
   };
 }

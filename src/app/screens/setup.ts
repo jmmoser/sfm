@@ -1,6 +1,7 @@
 /**
  * Setup: capture mode (object / large area / auto) with tips, quality preset with time and
- * memory notes, toggles (GPS, torch, dense model after capture) and ONE "Start" button whose
+ * memory notes, toggles (GPS, torch, dense model after capture; developer: debug overlay,
+ * VideoFrame grab, "Record raw capture" — src/app/recorder.ts) and ONE "Start" button whose
  * tap handler synchronously requests motion (iOS: must happen inside the gesture), then the
  * camera — then navigates to Capture.
  */
@@ -110,6 +111,18 @@ export function createSetupScreen(app: App): Screen {
       app.saveConfig({ videoFrameGrab: v });
     },
   });
+  const recordRow = switchRow({
+    label: 'Record raw capture',
+    description:
+      'For testers and developers: saves every camera frame and sensor reading the engine gets, for replay on a computer. Uses a lot of storage (about 1–3 MB per second); export or delete recordings in Diagnostics.',
+    icon: 'storage',
+    checked: cfg.recordRaw,
+    testId: 'toggle-record',
+    onChange: (v) => {
+      cfg.recordRaw = v;
+      app.saveConfig({ recordRaw: v });
+    },
+  });
   const denseRow = switchRow({
     label: 'Dense model after capture',
     description: 'Build the detailed point cloud right away',
@@ -207,7 +220,7 @@ export function createSetupScreen(app: App): Screen {
       { class: 'content content-cta' },
       section('What are you scanning?', modeList, tipsHost),
       section('Quality', quality.el, qualityNote),
-      section('Options', group(gpsRow.el, torchRow.el, denseRow.el, debugRow.el, grabRow.el)),
+      section('Options', group(gpsRow.el, torchRow.el, denseRow.el, debugRow.el, grabRow.el, recordRow.el)),
     ),
     h(
       'div',

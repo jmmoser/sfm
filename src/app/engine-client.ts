@@ -7,7 +7,9 @@
  *    events go to subscribers.
  *  - Back-pressure: at most ONE frame in flight. `processFrame` resolves with the LiveUpdate;
  *    the caller (FramePump) sends the next frame only after that. A second concurrent call
- *    rejects with EngineBusyError (its bitmap is closed).
+ *    rejects with EngineBusyError (its bitmap is closed). A FrameTap (`setFrameTap`, the raw
+ *    capture recorder) sees each frame accepted, may hold back its resolution, and is told
+ *    whether it was posted to the worker (./frame-tap.ts).
  *  - Timeouts: `init` (pipeline compilation can take a while on iOS), frames, short calls;
  *    long operations (LONG_RUNNING_METHODS: finishCapture / refine / densify / mesh / splat /
  *    export / loadSession) use an INACTIVITY timeout reset by progress.
@@ -50,6 +52,7 @@ import {
   type SplatOptions,
   type SplatResult,
 } from '../workers/protocol';
+import { tapFrame, type FrameTap } from './frame-tap';
 
 // ---------------------------------------------------------------------------------------------
 // EngineLike: what the UI needs (implemented by EngineClient and MockEngine)
@@ -86,6 +89,11 @@ export interface EngineLike {
   /** Start (or restart) an engine session. */
   init(options: EngineOptions): Promise<InitResult>;
   processFrame(frame: FrameInput): Promise<LiveUpdate>;
+  /**
+   * Observe the frames sent to the engine (null removes it): the raw capture recorder
+   * (./frame-tap.ts, ./recorder.ts). Frames rejected as busy never reach the tap.
+   */
+  setFrameTap(tap: FrameTap | null): void;
   finishCapture(): Promise<void>;
   refine(onProgress?: ProgressCallback): Promise<SparseResult>;
   densify(options?: DenseOptions, onProgress?: ProgressCallback): Promise<PointCloud>;
@@ -251,6 +259,7 @@ export class EngineClient implements EngineLike {
   private gpuFailures = 0;
   private frameBusy = false;
   private frameTimeouts = 0;
+  private frameTap: FrameTap | null = null;
   /**
    * Pending long operations, oldest first. Several can run at once (an export started during a
    * splat build): one finishing must not hide the others from `cancel` / `abortLongOperation`.
@@ -346,13 +355,19 @@ export class EngineClient implements EngineLike {
     }
     this.frameBusy = true;
     try {
-      const upd = await this.call('frame', frame, { timeoutMs: this.opts.frameTimeoutMs, frame: true });
-      this.frameTimeouts = 0;
-      this.live.emit(upd);
-      return upd;
+      return await tapFrame(this.frameTap, frame, async (f, posted) => {
+        const upd = await this.call('frame', f, { timeoutMs: this.opts.frameTimeoutMs, frame: true, onPosted: posted });
+        this.frameTimeouts = 0;
+        this.live.emit(upd);
+        return upd;
+      });
     } finally {
       this.frameBusy = false;
     }
+  }
+
+  setFrameTap(tap: FrameTap | null): void {
+    this.frameTap = tap;
   }
 
   async finishCapture(): Promise<void> {
@@ -608,6 +623,8 @@ export class EngineClient implements EngineLike {
       bypassGate?: boolean;
       fatalOnTimeout?: boolean;
       frame?: boolean;
+      /** The request was posted to the worker (not rejected before: disposed / dead / no worker). */
+      onPosted?: () => void;
     } = {},
   ): Promise<EngineResult<M>> {
     if (this.disposed) {
@@ -659,7 +676,9 @@ export class EngineClient implements EngineLike {
           this.settle(id);
           if (o.frame) closeBitmap(params as FrameInput);
           reject(e instanceof Error ? e : new Error(String(e)));
+          return;
         }
+        o.onPosted?.();
       });
     if (o.bypassGate || FIRE_AND_FORGET.has(method)) return send();
     return this.waitGate().then(send);
