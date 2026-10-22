@@ -10,10 +10,11 @@
  * PatchMatchGPU; between views the engine waits while the page is hidden.
  *
  * CPU/GPU overlap (`DenseDeps.createHelpers`, the memory plan's `overlap`; `EngineConfig.denseOverlap`
- * or `DenseOptions.overlap` false = serial): on a real GPU the PatchMatch kernels were only ≈ 18–33 % of the depth-map stage,
- * the rest serial CPU work on this thread between GPU passes (e2e/README "Dense on the real GPU":
- * object-real fast 37.7 s = view loads 7.5, PatchMatch 14.8 of which 6.6 s GPU, halo filter 9.9,
- * store 4.1). With CPU helper workers (src/engine/cpu-pool.ts) while the GPU computes view i:
+ * or `DenseOptions.overlap` false = serial): on a real GPU the PatchMatch kernels were only ≈ 18–33 %
+ * of the depth-map stage, the rest serial CPU work on this thread between GPU passes (e2e/README
+ * "Dense on the real GPU": object-real fast 37.7 s = view loads 7.5, PatchMatch 14.8 of which 6.6 s
+ * GPU, halo filter 9.9, store 4.1). With CPU helper workers (src/engine/cpu-pool.ts) while the GPU
+ * computes view i:
  *  - the next view's missing images (ref + sources, at most `overlap.decodes` at a time; only when
  *    the image LRU holds both views' images) are decoded, undistorted and rolling-shutter corrected
  *    on the workers (`decodeDenseView`, src/engine/dense-jobs.ts);
@@ -29,9 +30,12 @@
  * complete maps. A failing worker job falls back to this thread.
  *
  * Limits: cancel is seen between views, so its latency is one PatchMatch view (estimated 4–15 s
- * per 1600 px view on an iPhone). Stored depth maps peak at ≈ 2.2 × views × px × 12 B of
- * IndexedDB (≈ 6 GB at `max`); iOS does not expose free disk, so a quota error mid-dense is not
- * predicted — it rejects densify, which then resumes from `dense/progress`.
+ * per 1600 px view on an iPhone), plus the writes in flight. Stored depth maps peak at ≈ 2.2 ×
+ * views × px × 12 B of IndexedDB (≈ 6 GB at `max`); iOS does not expose free disk, so a quota error
+ * mid-dense is not predicted — it rejects densify, which then resumes from `dense/progress`. The
+ * overlap is unmeasured on a device: an iPhone has 2 helper workers (maybe on efficiency cores), the
+ * plan's worker memory is an estimate, and keyframe decoding (createImageBitmap + OffscreenCanvas)
+ * in a nested worker on iOS is unverified (a failure falls back to this thread).
  */
 import type { CameraIntrinsics, CancelToken, PointCloud, Pose, ProgressCallback, RGBAImage, TriangleMesh } from '../core/types';
 import { applyDepthHaloMask, removeDepthHalos, worldUpInCamera } from '../dense/depth-filter';
