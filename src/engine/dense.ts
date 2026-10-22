@@ -21,7 +21,9 @@
  *    worker (`haloStoreJob` on a copy: this thread keeps its map) and are written to the store,
  *    at most `overlap.maps` maps behind the GPU (without workers, only the store write overlaps).
  * The jobs run the same code as the serial path and the maps are put in view order, so the depth
- * maps and the fused cloud are bit-identical (src/engine/dense-overlap.test.ts, .gpu.test.ts).
+ * maps and the fused cloud are bit-identical (src/engine/dense-overlap.test.ts, .gpu.test.ts; e2e
+ * object-real A/B on one model: docs/research/dense-tuning.md "CPU/GPU overlap", where SwiftShader's
+ * CPU-run kernels hide the gain; not yet measured on a real GPU or an iPhone).
  * Every pass drains its writes before the next pass reads them and before `dense/progress`
  * advances, and a failed / cancelled run waits for the writes in flight, so resume sees only
  * complete maps. A failing worker job falls back to this thread.

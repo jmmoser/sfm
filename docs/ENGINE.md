@@ -157,12 +157,13 @@ PatchMatchGPU's upload caches stay warm. A fused cloud above the preset's `maxPo
 with a footprint-adaptive LOD (cells ∝ each point's radius). Details: research/dense-tuning.md "Dense on a
 real GPU".
 
-CPU/GPU overlap (`EngineConfig.denseOverlap`, default on; `src/engine/dense.ts`): while the GPU computes a
-view, the CPU helper workers decode, undistort and rolling-shutter correct the next view's missing images
-and halo-filter + serialise the final maps of earlier views, whose store writes complete in the background
-(≤ `DensePlan.overlap.maps` maps behind the GPU; put in view order). The memory plan grants one map and
-one decode in flight before the image LRU grows, more only from the remaining headroom; every pass drains
-its writes before the next reads them or `dense/progress` advances. Bit-identical to the serial path.
+CPU/GPU overlap (`src/engine/dense.ts`; `EngineConfig.denseOverlap`, default on, per run
+`DenseOptions.overlap`): while the GPU computes a view, the CPU helper workers decode, undistort and
+rolling-shutter correct the next view's missing images and halo-filter + serialise the final maps of
+earlier views, whose store writes complete in the background (≤ `DensePlan.overlap.maps` maps behind the
+GPU; put in view order). The memory plan grants one map and one decode in flight before the image LRU
+grows, more only from the remaining headroom; every pass drains its writes before the next reads them or
+`dense/progress` advances. Bit-identical to the serial path (research/dense-tuning.md "CPU/GPU overlap").
 
 ### Splat
 Gaussian splatting (`src/engine/splat.ts` over `src/splat`, research/splat-tuning.md "Engine splat stage"), after

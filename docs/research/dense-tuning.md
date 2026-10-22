@@ -11,6 +11,7 @@ Contents:
 2. [Dense tuning results](#dense-tuning-results)
 3. [Sky / low-texture halo removal](#sky--low-texture-halo-removal)
 4. [Dense on a real GPU](#dense-on-a-real-gpu)
+5. [CPU/GPU overlap of the depth-map stage](#cpugpu-overlap-of-the-depth-map-stage)
 
 ## Unit-test measurements (synthetic scenes)
 
@@ -473,3 +474,63 @@ worker or overlap them with the next view's GPU passes (needs a cooperative halo
 RS warp in one GPU resampling, GPU fusion. The error-scope round trip of `compute()`'s set-up and the
 ~100 band submissions per call cost 20–30 % over the GPU execution time under contention. Timings on
 Apple mobile GPUs (iPhone) are still unmeasured.
+
+## CPU/GPU overlap of the depth-map stage
+
+2026-10-22. Code: `src/engine/dense.ts` (module comment), `src/engine/dense-jobs.ts`, `planDense` overlap
+(`src/engine/memory.ts`).
+
+### Where the depth-map time went (before)
+
+From the code at `18d73c9` and the M4 / Metal tables above (e2e/README.md "Dense on the real GPU", "after"
+rows). Every step ran on the engine thread, one after another:
+
+| step (per view) | cost | object-real fast (40 × 800 px) | object-real balanced (80 × 960 px) |
+|---|---|---|---|
+| view loads: JPEG decode (createImageBitmap + drawImage / getImageData at the undistorted size), undistortion (area filter + RADIAL remap), rolling-shutter remap, colour thumbnail | ≈ 94 ms per decode; each view decoded once at ½ and once at full size when the image LRU holds every view | 7.5 s | 22.6 s |
+| pass inputs: prior and source depth maps read back from IndexedDB | — | ≈ 1.4 s | — |
+| PatchMatch: upload, GPU bands (the thread waits on the GPU), readback | — | 14.8 s (GPU 6.6 s) | 61.6 s (GPU 39.8 s) |
+| halo / sky filter of the final maps | ≈ 250 ms per 0.5 MP map | 9.9 s | 23.6 s |
+| store: float16 serialisation + an awaited IndexedDB write | ≈ 34 ms per map | 4.1 s | 10.2 s |
+| fusion (after every final map; CPU, not overlapped) | — | 12.2 s | 24.7 s |
+
+So 21.5 of 37.7 s (57 %) at fast and 56.4 of 122.2 s (46 %) at balanced were CPU steps that can run while the
+GPU computes the next view. If the helper workers keep up, the stage is bounded by PatchMatch + pass inputs:
+≈ 16 s at fast (−55 %) and ≈ 63 s at balanced (−48 %). At fast on the M4 the halo filter (≈ 250 ms per map)
+takes longer than a view's PatchMatch (≈ 120 ms wall), hence up to two maps in flight on two workers. These
+projections are not measured: no `E2E_GPU=host` run of the overlap exists yet, and nothing on an iPhone
+(2 helper workers, possibly on efficiency cores, a 2–3× slower GPU: the CPU steps should hide more easily there).
+
+### Measured (SwiftShader, e2e object-real, 480 px)
+
+`node e2e/run-e2e.mjs object-real --dense-size 480 --no-mesh --no-export --set
+'engineConfig={"featureBackend":"cpu","mapping":"inline"}'`, worker engine, headless Chromium on SwiftShader,
+4 cores shared with three other engineers' jobs and an e2e run (load 3–10); base `18d73c9` then the overlap
+branch, back to back. SwiftShader executes the "GPU" on the same CPU cores, so PatchMatch is 99 % of the stage
+and its time follows the host load; the overlap can only remove the engine thread's own CPU steps.
+
+| run | depth maps s | engine thread: view loads / pass inputs / PatchMatch / halo / store s | helper workers busy: decodes / halo + serialise s | fusion s | fused points | dense P / C / F | acc p50 |
+|---|---|---|---|---|---|---|---|
+| before (`18d73c9`) | 961.7 | 2.7 / 1.0 / 952.5 / 3.9 / 1.5 | — | 3.7 | 1 269 875 | 0.9995 / 0.9923 / 0.9959 | 0.326 mm |
+| after (overlap, 2 maps / 2 decodes in flight) | 819.2 | 0.2 / 1.6 / 816.5 / 0.0 / 0.1 | 5.2 / 3.3 | 4.2 | 1 269 989 | 0.9994 / 0.9921 / 0.9958 | 0.326 mm |
+
+* The −142 s is SwiftShader PatchMatch time (host load), not the overlap. What the overlap took off the engine
+  thread: view loads + halo + store 8.1 → 0.3 s (the workers spent 8.5 s on them in parallel).
+* The two clouds differ (114 points, P / C / F in the 4th decimal) because the sparse models differ: the two
+  captures already diverge at the live initialisation (frame 10: 700 vs 750 points; refine 12 079 vs 12 094
+  points) — in code this change does not touch. Same-model comparison: below.
+
+Same model, back to back in one run (`--set 'densifyRepeat={"overlap":false}'`: the e2e harness densifies the
+refined model with the overlap, then again with `DenseOptions.overlap: false`, and compares the clouds bit for
+bit; load 2.5 → 13):
+
+| densify of the same model | depth maps s | engine thread: view loads / pass inputs / PatchMatch / halo / store s | helper workers busy: decodes / halo + serialise s | fusion s | fused points |
+|---|---|---|---|---|---|
+| overlap on | 1143.6 | 0.2 / 2.6 / 1139.6 / 0.0 / 0.2 | 5.9 / 5.2 | 5.3 | 1 269 253 |
+| overlap off | 1037.4 | 2.8 / 1.2 / 1027.1 / 4.6 / 1.7 | — | 8.4 | 1 269 253, **bit-identical** |
+
+(dense P / C / F 0.9995 / 0.9928 / 0.9961, accuracy p50 0.324 mm; every check passes.) The wall times again
+follow SwiftShader's PatchMatch under a changing host load: the 'off' stage is 106 s shorter because its GPU
+passes took 112 s less for the same work. The engine thread's view loads + halo + store fell 9.1 → 0.4 s. Whether that becomes wall time depends on a GPU that does not share the CPU: the M4 /
+Metal projection above (fast −55 %, balanced −48 % at best) is the case to measure next (`E2E_GPU=host`,
+`--quality balanced`, the same `densifyRepeat` A/B), then an iPhone.

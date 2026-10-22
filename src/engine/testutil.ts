@@ -6,6 +6,7 @@
  * and sway; frames are rendered upright for a UI angle θ (R = R_cam_device(θ)·R_wdᵀ), and an
  * exact IMU (gyro = ω_dev, accelG = R_wdᵀ(a − g), 60 Hz) is sampled from the same trajectory.
  * Frames report t = tTrue + timeOffsetMs (IMU on the true clock), like the e2e datasets.
+ * `denseFixture`: a tiny dense-stage input (renders + exact sparse model) for runDensify tests.
  */
 import type { CameraIntrinsics, ImuSample, Mat3, Pose, RGBAImage } from '../core/types';
 import { lookAt, pinholeIntrinsics, renderSynthetic, type SynthScene } from '../dense/synthetic';
