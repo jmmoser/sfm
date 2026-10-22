@@ -2,7 +2,7 @@
  * Exports (src/engine/export.ts buildExport): 'ply-points' and points-only GLB use the dense
  * cloud when it has points, else the sparse cloud — an empty dense cloud (a degenerate densify)
  * does not hide the sparse one; 'usdz' simplifies to the AR budget, bakes the atlas and puts the
- * origin at the AR pivot.
+ * origin at the AR pivot, warns when a mesh stays above the budget, and stops on cancel.
  */
 import { describe, expect, it } from 'vitest';
 import type { MetricInfo, PointCloud, TriangleMesh } from '../core/types';
@@ -117,6 +117,42 @@ describe('buildExport: usdz', () => {
     // sphere x ∈ [0.7, 1.3] − 1.1, bottom z 0.2 − planeZ 0.1
     expect(minX).toBeCloseTo(-0.4, 2);
     expect(minY).toBeCloseTo(0.1, 2);
+  });
+
+  it('stops on cancel (before the atlas, and after the texture encode)', async () => {
+    await expect(buildExport('usdz', { ...sources(null, null), mesh: sphere() }, { cancelled: true })).rejects.toMatchObject({ name: 'CancelledError' });
+    const token = { cancelled: false };
+    const src: ExportSources = {
+      ...sources(null, null),
+      mesh: sphere(),
+      encodeTexture: async () => {
+        token.cancelled = true;
+        return new Blob([new Uint8Array(4)], { type: 'image/jpeg' });
+      },
+    };
+    await expect(buildExport('usdz', src, token)).rejects.toMatchObject({ name: 'CancelledError', message: 'export: cancelled' });
+  });
+
+  it('warns when the simplifier cannot reach the AR budget, and still exports', async () => {
+    // 26 000 closed tetrahedra (104 k triangles): no edge collapse passes the link condition
+    const N = 26_000;
+    const corners = [0, 0, 0, 0.01, 0, 0, 0, 0.01, 0, 0, 0, 0.01];
+    const faces = [0, 2, 1, 0, 1, 3, 1, 2, 3, 0, 3, 2];
+    const mesh: TriangleMesh = { vertexCount: 4 * N, triangleCount: 4 * N, positions: new Float32Array(12 * N), normals: new Float32Array(12 * N), colors: new Uint8Array(12 * N).fill(90), indices: new Uint32Array(12 * N) };
+    for (let i = 0; i < N; i++) {
+      for (let k = 0; k < 4; k++) mesh.positions.set([corners[3 * k] + 0.05 * (i % 160), corners[3 * k + 1] + 0.05 * Math.floor(i / 160), corners[3 * k + 2]], 12 * i + 3 * k);
+      for (let k = 0; k < 12; k++) mesh.indices[12 * i + k] = 4 * i + faces[k];
+    }
+    const logs: string[] = [];
+    const src: ExportSources = {
+      ...sources(null, null),
+      mesh,
+      encodeTexture: async () => new Blob([new Uint8Array(4)], { type: 'image/jpeg' }),
+      log: (level, message) => logs.push(`${level}: ${message}`),
+    };
+    const usda = textEntry(await bytes(await buildExport('usdz', src)));
+    expect(usdArray(usda, 'int[] faceVertexCounts').length).toBe(4 * N);
+    expect(logs).toEqual([`warn: usdz: ${4 * N} triangles after simplifying (AR budget ${USDZ_MAX_TRIANGLES})`]);
   });
 
   it('needs a mesh and an image encoder', async () => {

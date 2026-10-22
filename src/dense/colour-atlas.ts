@@ -6,6 +6,11 @@
  * texture, so the 5–6× QEM decimation does not blur them (the simplifier's own vertex colours are
  * averages along each collapsed edge):
  *
+ *  - Budget: the simplifier stops above its target when no valid collapse remains (link
+ *    condition, folds, boundaries — e.g. a fragment-heavy mesh of many small closed pieces). A
+ *    second, relaxed pass then runs on its output (`RELAXED_SIMPLIFY`: faces may turn up to 90°,
+ *    weak boundary planes); what that cannot remove stays (`stats.overBudget`: the USDZ exceeds
+ *    the soft AR budget but still opens).
  *  - Layout (no general UV unwrap — xatlas measured 20 s for 40 k triangles): triangles are
  *    greedily paired with an edge neighbour of similar area (in mesh order, which follows the
  *    marching-cubes block order, so consecutive cells are spatial neighbours). A pair fills an
@@ -22,6 +27,9 @@
  *    evenly over the original colour samples (≈ 13 page texels per original vertex at 600 k →
  *    100 k triangles in 2048²). Equal-size cells would starve the large flat triangles QEM
  *    leaves on planar (often printed) surfaces.
+ *  - Fit: when the cells do not fit the page even at the minimum size (5×5 texels with the
+ *    gutter: ≈ 167 k cells in 2048²), the gutter is dropped (3×3), then the minimum side becomes
+ *    1 texel (2×2 per cell, ≈ 1 M cells); beyond that it throws. `stats.gutter` / `minSide` tell.
  *  - Fill: each texel's 3-D point on the simplified surface (barycentric in its triangle;
  *    across the diagonal in the pair partner's) → the closest point of the ORIGINAL mesh →
  *    barycentric interpolation of its vertex colours. The closest triangle is found by a walk
@@ -42,10 +50,14 @@
  * per texel); 0.37/255 mean colour error at random surface points vs 2.6/255 for the simplified
  * mesh's own vertex colours (colour-atlas.test.ts). The simplifier is ≈ 4–5 µs per input
  * triangle on fused (noisy) meshes but 60–120 µs on exactly planar synthetic faces (zero-cost
- * collapses). Synchronous: run it in a worker. Memory: the 16 MB RGBA page, the original mesh's
- * vertex → triangle lists (≈ 16 B per triangle) and a k-d tree (≈ 16 B per vertex).
+ * collapses). `buildColourAtlas` is synchronous; `buildColourAtlasAsync` (the engine worker's)
+ * yields to the event loop about every 40 ms between phases and fill cells and rejects with a
+ * CancelledError once its token is set — a worker sees a cancel message only while it yields;
+ * the simplifier runs in one piece (≈ 3 s for 600 k triangles). Memory: the 16 MB RGBA page, the
+ * original mesh's vertex → triangle lists (≈ 16 B per triangle) and a k-d tree (≈ 16 B per vertex).
  */
-import type { RGBAImage, TriangleMesh } from '../core/types';
+import type { CancelToken, RGBAImage, TriangleMesh } from '../core/types';
+import { Yielder } from './dense-util';
 import { KdTree3 } from './kdtree';
 import { simplifyMesh, type SimplifyOptions } from './simplify';
 
@@ -63,9 +75,15 @@ export interface ColourAtlasOptions {
 export interface ColourAtlasStats {
   inputTriangles: number;
   triangles: number;
+  /** More than `maxTriangles` remain: the simplifier found no valid collapse left, even relaxed. */
+  overBudget: boolean;
+  /** The first simplification pass stopped above the budget and the relaxed one ran. */
+  relaxedSimplify: boolean;
   /** Cells holding an edge-sharing triangle pair / a single triangle. */
   pairs: number;
   singles: number;
+  /** Gutter used: the option's, or 0 when the cells did not fit the page with it. */
+  gutter: number;
   /** Texel side L of the triangle squares: min / mean / max. */
   minSide: number;
   meanSide: number;
@@ -94,18 +112,57 @@ const MIN_SIDE = 2;
 const MAX_SIDE = 128;
 /** Target fraction of the page covered by cells (shelf packing wastes a few %). */
 const PAGE_FILL = 0.92;
+/** Second simplification pass when the first stops above the budget (see the file header). */
+const RELAXED_SIMPLIFY: SimplifyOptions = { minNormalCos: 0, boundaryWeight: 1 };
+/** Fill texels between two yield points of `atlasSteps` (≈ 6 closest-triangle tests each). */
+const YIELD_TEXELS = 1 << 14;
 
 /** Simplify `mesh` to the AR budget and bake its full-resolution vertex colours into one texture page. */
 export function buildColourAtlas(mesh: TriangleMesh, opts: ColourAtlasOptions = {}): ColourAtlas {
+  const steps = atlasSteps(mesh, opts);
+  for (;;) {
+    const r = steps.next();
+    if (r.done) return r.value;
+  }
+}
+
+/**
+ * `buildColourAtlas` that keeps a worker responsive: yields to the event loop about every 40 ms
+ * (between phases and fill cells; the simplifier runs in one piece) and rejects with a
+ * CancelledError once `cancel` is set.
+ */
+export async function buildColourAtlasAsync(mesh: TriangleMesh, opts: ColourAtlasOptions = {}, cancel?: CancelToken): Promise<ColourAtlas> {
+  const y = new Yielder('colour atlas', cancel);
+  const steps = atlasSteps(mesh, opts);
+  for (;;) {
+    await y.tick();
+    const r = steps.next();
+    if (r.done) return r.value;
+  }
+}
+
+/** The atlas build; each `yield` is a point where the async driver may yield / stop. */
+function* atlasSteps(mesh: TriangleMesh, opts: ColourAtlasOptions): Generator<void, ColourAtlas, void> {
   const maxTriangles = opts.maxTriangles ?? 100_000;
   const W = opts.size ?? 2048;
-  const g = opts.gutter ?? 1;
+  const g0 = opts.gutter ?? 1;
   if (!(Number.isInteger(W) && W >= 8 && W <= 16384)) throw new RangeError(`colour atlas: invalid page size ${W}`);
-  if (!(Number.isInteger(g) && g >= 0 && g <= 8)) throw new RangeError(`colour atlas: invalid gutter ${g}`);
+  if (!(Number.isInteger(g0) && g0 >= 0 && g0 <= 8)) throw new RangeError(`colour atlas: invalid gutter ${g0}`);
   if (!(mesh.vertexCount > 0 && mesh.triangleCount > 0)) throw new RangeError('colour atlas: empty mesh');
   const t0 = performance.now();
-  const dec = mesh.triangleCount > maxTriangles ? simplifyMesh(mesh, maxTriangles, opts.simplify) : mesh;
+  let dec = mesh;
+  let relaxed = false;
+  if (mesh.triangleCount > maxTriangles) {
+    dec = simplifyMesh(mesh, maxTriangles, opts.simplify);
+    if (dec.triangleCount > maxTriangles) {
+      // stalled above the budget (no valid collapse left): once more, relaxed
+      yield;
+      relaxed = true;
+      dec = simplifyMesh(dec, maxTriangles, { ...opts.simplify, ...RELAXED_SIMPLIFY });
+    }
+  }
   const t1 = performance.now();
+  yield;
 
   const T = dec.triangleCount;
   const P = dec.positions;
@@ -146,47 +203,28 @@ export function buildColourAtlas(mesh: TriangleMesh, opts: ColourAtlasOptions = 
   const C = cellA.length;
   const cellArea = new Float64Array(C);
   for (let c = 0; c < C; c++) cellArea[c] = Math.max(area[cellA[c]], cellB[c] >= 0 ? area[cellB[c]] : 0);
+  yield;
 
-  // ---- cell sizes (L ∝ √area at the density that fills the page) and shelf packing
-  const maxSide = Math.max(MIN_SIDE, Math.min(MAX_SIDE, Math.floor(W / 4) - 1 - 2 * g));
-  const sideOf = (rho: number, c: number): number => {
-    const L = Math.round(Math.sqrt(2 * rho * cellArea[c]));
-    return L < MIN_SIDE ? MIN_SIDE : L > maxSide ? maxSide : L;
-  };
-  const budget = PAGE_FILL * W * W;
-  const pageUse = (rho: number): number => {
-    let s = 0;
-    for (let c = 0; c < C; c++) {
-      const S = sideOf(rho, c) + 1 + 2 * g;
-      s += S * S;
-    }
-    return s;
-  };
-  if (pageUse(0) > W * W) {
-    throw new RangeError(`colour atlas: ${T} triangles do not fit a ${W}² page (simplify further)`);
-  }
-  let totalArea = 0;
-  for (let c = 0; c < C; c++) totalArea += cellArea[c];
-  let lo = 0;
-  let hi = totalArea > 0 ? (16 * W * W) / totalArea : 1;
-  while (pageUse(hi) < budget && hi < 1e300 && totalArea > 0) hi *= 4;
-  for (let it = 0; it < 48; it++) {
-    const mid = lo === 0 ? hi / 1024 : Math.sqrt(lo * hi);
-    if (pageUse(mid) <= budget) lo = mid;
-    else hi = mid;
-    if (hi / Math.max(lo, 1e-300) < 1.002) break;
-  }
+  // ---- cell sizes and shelf packing: with the gutter, else the smaller layouts (file header)
   const side = new Int32Array(C);
   const cellX = new Int32Array(C);
   const cellY = new Int32Array(C);
-  let rho = lo;
-  for (let attempt = 0; ; attempt++) {
-    for (let c = 0; c < C; c++) side[c] = sideOf(rho, c);
-    if (shelfPack(side, 1 + 2 * g, W, cellX, cellY)) break;
-    if (attempt >= 40 || rho === 0) throw new RangeError(`colour atlas: packing ${C} cells into ${W}² failed`);
-    rho *= 0.93;
+  const layouts: [number, number][] = [
+    [g0, MIN_SIDE],
+    [0, MIN_SIDE],
+    [0, 1],
+  ];
+  let g = -1;
+  for (const [i, [lg, minSide]] of layouts.entries()) {
+    if (i === 1 && g0 === 0) continue; // (the first layout already had no gutter)
+    if (packCells(cellArea, W, lg, minSide, side, cellX, cellY)) {
+      g = lg;
+      break;
+    }
   }
+  if (g < 0) throw new RangeError(`colour atlas: ${T} triangles (${C} cells) do not fit a ${W}² page (simplify further)`);
   const t2 = performance.now();
+  yield;
 
   // ---- UVs (texel coordinates → image-convention UV)
   const uvs = new Float32Array(6 * T);
@@ -236,56 +274,20 @@ export function buildColourAtlas(mesh: TriangleMesh, opts: ColourAtlasOptions = 
     tex[4 * i + 2] = mean[2];
     tex[4 * i + 3] = 255;
   }
+  yield;
   const finder = new ClosestTriangleFinder(mesh);
+  yield;
   const rgb = new Float64Array(3);
+  let texels = 0;
   for (let c = 0; c < C; c++) {
     const L = side[c];
-    const pair = cv[4 * c + 3] >= 0;
-    const vj = cv[4 * c];
-    const vk = cv[4 * c + 1];
-    const vk1 = cv[4 * c + 2];
-    const vb = cv[4 * c + 3];
-    const x0 = cellX[c] + g;
-    const y0 = cellY[c] + g;
-    finder.reset();
-    for (let y = 0; y <= L; y++) {
-      for (let s = 0; s <= L; s++) {
-        const x = y & 1 ? L - s : s; // serpentine: consecutive texels are neighbours
-        let px: number;
-        let py: number;
-        let pz: number;
-        if (x + y <= L || !pair) {
-          let ux = x;
-          let uy = y;
-          if (x + y > L) {
-            // single triangle: the empty half takes the closest hypotenuse point (bilinear
-            // sampling along the hypotenuse reads the texels next to it)
-            ux = (x - y + L) / 2;
-            uy = L - ux;
-          }
-          const wk = ux / L;
-          const wk1 = uy / L;
-          const wj = 1 - wk - wk1;
-          px = wj * P[3 * vj] + wk * P[3 * vk] + wk1 * P[3 * vk1];
-          py = wj * P[3 * vj + 1] + wk * P[3 * vk + 1] + wk1 * P[3 * vk1 + 1];
-          pz = wj * P[3 * vj + 2] + wk * P[3 * vk + 2] + wk1 * P[3 * vk1 + 2];
-        } else {
-          // partner triangle: third vertex at (L, L), shared vertices at (L, 0) and (0, L)
-          const wb = (x + y) / L - 1;
-          const wk = 1 - y / L;
-          const wk1 = 1 - x / L;
-          px = wb * P[3 * vb] + wk * P[3 * vk] + wk1 * P[3 * vk1];
-          py = wb * P[3 * vb + 1] + wk * P[3 * vk + 1] + wk1 * P[3 * vk1 + 1];
-          pz = wb * P[3 * vb + 2] + wk * P[3 * vk + 2] + wk1 * P[3 * vk1 + 2];
-        }
-        finder.colourAt(px, py, pz, rgb);
-        const o = 4 * ((y0 + y) * W + x0 + x);
-        tex[o] = rgb[0];
-        tex[o + 1] = rgb[1];
-        tex[o + 2] = rgb[2];
-      }
-    }
+    fillCell(tex, W, cellX[c] + g, cellY[c] + g, L, P, cv[4 * c], cv[4 * c + 1], cv[4 * c + 2], cv[4 * c + 3], finder, rgb);
     if (g > 0) dilateCell(tex, W, cellX[c], cellY[c], L + 1 + 2 * g, g);
+    texels += (L + 1) * (L + 1);
+    if (texels >= YIELD_TEXELS) {
+      texels = 0;
+      yield;
+    }
   }
   const t3 = performance.now();
 
@@ -308,8 +310,11 @@ export function buildColourAtlas(mesh: TriangleMesh, opts: ColourAtlasOptions = 
     stats: {
       inputTriangles: mesh.triangleCount,
       triangles: T,
+      overBudget: T > maxTriangles,
+      relaxedSimplify: relaxed,
       pairs,
       singles: C - pairs,
+      gutter: g,
       minSide: minL,
       meanSide: sumL / C,
       maxSide: maxL,
@@ -319,6 +324,96 @@ export function buildColourAtlas(mesh: TriangleMesh, opts: ColourAtlasOptions = 
       fillMs: t3 - t2,
     },
   };
+}
+
+/**
+ * Cell sides for one layout (`g` gutter texels, sides ≥ `minSide`): L ∝ √area at the density ρ
+ * whose cells fill PAGE_FILL of the page (bisection), shelf-packed; ρ shrinks until the shelves
+ * fit, down to every cell at `minSide`. Writes `side` / `cellX` / `cellY`; false when even that
+ * does not fit.
+ */
+function packCells(cellArea: Float64Array, W: number, g: number, minSide: number, side: Int32Array, cellX: Int32Array, cellY: Int32Array): boolean {
+  const C = cellArea.length;
+  const maxSide = Math.max(minSide, Math.min(MAX_SIDE, Math.floor(W / 4) - 1 - 2 * g));
+  const sideOf = (rho: number, c: number): number => {
+    const L = Math.round(Math.sqrt(2 * rho * cellArea[c]));
+    return L < minSide ? minSide : L > maxSide ? maxSide : L;
+  };
+  const budget = PAGE_FILL * W * W;
+  const pageUse = (rho: number): number => {
+    let s = 0;
+    for (let c = 0; c < C; c++) {
+      const S = sideOf(rho, c) + 1 + 2 * g;
+      s += S * S;
+    }
+    return s;
+  };
+  if (pageUse(0) > W * W) return false;
+  let totalArea = 0;
+  for (let c = 0; c < C; c++) totalArea += cellArea[c];
+  let lo = 0;
+  let hi = totalArea > 0 ? (16 * W * W) / totalArea : 1;
+  while (pageUse(hi) < budget && hi < 1e300 && totalArea > 0) hi *= 4;
+  for (let it = 0; it < 48; it++) {
+    const mid = lo === 0 ? hi / 1024 : Math.sqrt(lo * hi);
+    if (pageUse(mid) <= budget) lo = mid;
+    else hi = mid;
+    if (hi / Math.max(lo, 1e-300) < 1.002) break;
+  }
+  let rho = lo;
+  for (let attempt = 0; ; attempt++) {
+    for (let c = 0; c < C; c++) side[c] = sideOf(rho, c);
+    if (shelfPack(side, 1 + 2 * g, W, cellX, cellY)) return true;
+    if (rho === 0) return false;
+    // shrink; the last try puts every cell at the minimum side
+    rho = attempt < 40 ? rho * 0.93 : 0;
+  }
+}
+
+/**
+ * Fill the (L + 1)² texels of one cell, top-left texel (x0, y0), from the original mesh (see the
+ * file header: Fill). Square corners: vj (0, 0), vk (L, 0), vk1 (0, L), vb (L, L) (−1: single).
+ */
+function fillCell(tex: Uint8Array, W: number, x0: number, y0: number, L: number, P: Float32Array, vj: number, vk: number, vk1: number, vb: number, finder: ClosestTriangleFinder, rgb: Float64Array): void {
+  const pair = vb >= 0;
+  finder.reset();
+  for (let y = 0; y <= L; y++) {
+    for (let s = 0; s <= L; s++) {
+      const x = y & 1 ? L - s : s; // serpentine: consecutive texels are neighbours
+      let px: number;
+      let py: number;
+      let pz: number;
+      if (x + y <= L || !pair) {
+        let ux = x;
+        let uy = y;
+        if (x + y > L) {
+          // single triangle: the empty half takes the closest hypotenuse point (bilinear
+          // sampling along the hypotenuse reads the texels next to it)
+          ux = (x - y + L) / 2;
+          uy = L - ux;
+        }
+        const wk = ux / L;
+        const wk1 = uy / L;
+        const wj = 1 - wk - wk1;
+        px = wj * P[3 * vj] + wk * P[3 * vk] + wk1 * P[3 * vk1];
+        py = wj * P[3 * vj + 1] + wk * P[3 * vk + 1] + wk1 * P[3 * vk1 + 1];
+        pz = wj * P[3 * vj + 2] + wk * P[3 * vk + 2] + wk1 * P[3 * vk1 + 2];
+      } else {
+        // partner triangle: third vertex at (L, L), shared vertices at (L, 0) and (0, L)
+        const wb = (x + y) / L - 1;
+        const wk = 1 - y / L;
+        const wk1 = 1 - x / L;
+        px = wb * P[3 * vb] + wk * P[3 * vk] + wk1 * P[3 * vk1];
+        py = wb * P[3 * vb + 1] + wk * P[3 * vk + 1] + wk1 * P[3 * vk1 + 1];
+        pz = wb * P[3 * vb + 2] + wk * P[3 * vk + 2] + wk1 * P[3 * vk1 + 2];
+      }
+      finder.colourAt(px, py, pz, rgb);
+      const o = 4 * ((y0 + y) * W + x0 + x);
+      tex[o] = rgb[0];
+      tex[o + 1] = rgb[1];
+      tex[o + 2] = rgb[2];
+    }
+  }
 }
 
 function triangleArea(P: Float32Array, a: number, b: number, c: number): number {

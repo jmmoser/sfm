@@ -29,8 +29,8 @@ geo-referenced point cloud and mesh that you can measure and export.
   view with eye-dome lighting, an unlit mesh view, camera frustums, and a tap-to-measure tool
   (metric when scale is known).
 * **Exports**: PLY (points, mesh, and Gaussian splats in the common 3DGS layout), GLB, USDZ (the
-  textured mesh for AR Quick Look: "View in AR" places it at its measured size on iPhone / iPad),
-  and a COLMAP text model with images in a ZIP. Exports go through the iOS share sheet.
+  textured mesh for AR Quick Look: "View in AR" places it at its measured size in iPhone / iPad
+  Safari), and a COLMAP text model with images in a ZIP. Exports go through the iOS share sheet.
 * **Robust on iPhone**:
   * Memory planner that keeps the tab within ≤ 1.2 GB (iOS kills it at ~1.5–2 GB), with resume
     after the tab is killed.

@@ -1,15 +1,18 @@
 /**
  * Colour atlas (src/dense/colour-atlas.ts): layout invariants and the colour transfer from the
- * undecimated mesh, on a TSDF mesh of a synthetic textured scene (src/dense/testutil-scene.ts).
+ * undecimated mesh, on a TSDF mesh of a synthetic textured scene (src/dense/testutil-scene.ts);
+ * a mesh the simplifier cannot reduce (over budget, smaller cell layouts); the cooperative build
+ * (same result, stops on cancel).
  */
 import { describe, expect, it } from 'vitest';
 import type { Pose, RGBAImage, TriangleMesh } from '../core/types';
 import { Rng } from '../math/random';
-import { buildColourAtlas, ClosestTriangleFinder } from './colour-atlas';
+import { buildColourAtlas, buildColourAtlasAsync, ClosestTriangleFinder } from './colour-atlas';
 import { KdTree3 } from './kdtree';
+import { marchingCubes } from './marching-cubes';
 import { orbitPoses, pinholeIntrinsics, textureLuminance, type SynthScene } from './synthetic';
 import { distanceToScene, renderGtViews } from './testutil-scene';
-import { tsdfMesh } from './tsdf';
+import { tsdfMesh, TsdfVolume } from './tsdf';
 
 const log = (...a: unknown[]): void => console.log('[colour-atlas]', ...a);
 
@@ -273,6 +276,71 @@ describe('buildColourAtlas', () => {
       indices: Uint32Array.from({ length: 6000 }, (_, i) => i),
     };
     expect(() => buildColourAtlas(many, { size: 64 })).toThrow(/do not fit/);
+    // … but a 160² page holds them without gutters (3×3 texels), a 96² page at 1-texel sides (2×2)
+    const noGutter = buildColourAtlas(many, { size: 160 });
+    expect([noGutter.stats.gutter, noGutter.stats.minSide >= 2]).toEqual([0, true]);
+    const tiny = buildColourAtlas(many, { size: 96 });
+    expect([tiny.stats.gutter, tiny.stats.minSide]).toEqual([0, 1]);
+    expect(buildColourAtlas(many, { size: 256 }).stats.gutter).toBe(1);
+  });
+
+  it('keeps what the simplifier cannot remove (over budget) and still fits the page', () => {
+    // 500 closed tetrahedra 2 m apart: no edge collapse passes the link condition, relaxed or not
+    const N = 500;
+    const corners = [0, 0, 0, 0.1, 0, 0, 0, 0.1, 0, 0, 0, 0.1];
+    const positions = new Float32Array(12 * N);
+    const colors = new Uint8Array(12 * N);
+    const indices = new Uint32Array(12 * N);
+    const faces = [0, 2, 1, 0, 1, 3, 1, 2, 3, 0, 3, 2];
+    const colourOf = (i: number): number[] => [(37 * i) % 256, (101 * i) % 256, (173 * i) % 256];
+    for (let i = 0; i < N; i++) {
+      for (let k = 0; k < 4; k++) {
+        positions.set([corners[3 * k] + 2 * (i % 25), corners[3 * k + 1] + 2 * Math.floor(i / 25), corners[3 * k + 2]], 12 * i + 3 * k);
+        colors.set(colourOf(i), 12 * i + 3 * k);
+      }
+      for (let k = 0; k < 12; k++) indices[12 * i + k] = 4 * i + faces[k];
+    }
+    const mesh: TriangleMesh = { vertexCount: 4 * N, triangleCount: 4 * N, positions, normals: new Float32Array(12 * N), colors, indices };
+    // 1000 cells (2 pairs per tetrahedron) need the 2×2-texel layout in 72²
+    const atlas = buildColourAtlas(mesh, { maxTriangles: 500, size: 72 });
+    const st = atlas.stats;
+    expect(st.triangles).toBe(4 * N);
+    expect(st.overBudget).toBe(true);
+    expect(st.relaxedSimplify).toBe(true);
+    expect([st.gutter, st.minSide, st.pairs, st.singles]).toEqual([0, 1, 2 * N, 0]);
+    // every triangle's centre samples its tetrahedron's colour
+    const got = new Float64Array(3);
+    const P = atlas.mesh.positions;
+    for (let t = 0; t < atlas.mesh.triangleCount; t++) {
+      const u = (atlas.uvs[6 * t] + atlas.uvs[6 * t + 2] + atlas.uvs[6 * t + 4]) / 3;
+      const v = (atlas.uvs[6 * t + 1] + atlas.uvs[6 * t + 3] + atlas.uvs[6 * t + 5]) / 3;
+      sampleBilinear(atlas.texture, u, v, got);
+      const a = atlas.mesh.indices[3 * t];
+      expect([...got].map(Math.round)).toEqual(colourOf(Math.round(P[3 * a] / 2) + 25 * Math.round(P[3 * a + 1] / 2)));
+    }
+    // a page too small even for 2×2 cells
+    expect(() => buildColourAtlas(mesh, { maxTriangles: 500, size: 56 })).toThrow(/2000 triangles \(1000 cells\) do not fit a 56² page/);
+  });
+
+  it('cooperative build: the same atlas, and a cancel stops it at the next step', async () => {
+    const vol = TsdfVolume.fromFunction((x, y, z) => Math.hypot(x, y, z) - 0.3, [-0.35, -0.35, -0.35], [0.35, 0.35, 0.35], 0.02);
+    const mesh = marchingCubes(vol);
+    for (let i = 0; i < mesh.vertexCount; i++) mesh.colors.fill(Math.round(127 + 400 * mesh.positions[3 * i + 2]), 3 * i, 3 * i + 3);
+    const opts = { maxTriangles: Math.round(mesh.triangleCount / 3), size: 256 };
+    const sync = buildColourAtlas(mesh, opts);
+    const co = await buildColourAtlasAsync(mesh, opts, { cancelled: false });
+    expect(co.mesh.triangleCount).toBe(sync.mesh.triangleCount);
+    expect(co.uvs).toEqual(sync.uvs);
+    expect(co.texture.data).toEqual(sync.texture.data);
+    // cancelled before / after a few steps
+    await expect(buildColourAtlasAsync(mesh, opts, { cancelled: true })).rejects.toMatchObject({ name: 'CancelledError' });
+    let reads = 0;
+    const token = {
+      get cancelled(): boolean {
+        return ++reads > 5;
+      },
+    };
+    await expect(buildColourAtlasAsync(mesh, opts, token)).rejects.toThrow(/colour atlas: cancelled/);
   });
 });
 

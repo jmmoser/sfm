@@ -6,17 +6,23 @@
  * into one 2048² JPEG atlas — src/dense/colour-atlas.ts —, Y-up metres, origin at the AR pivot:
  * `selectArPivot`, which switches to the object ROI once `objectRoi` is supplied; ≈ 10–11 MB).
  *
+ * Cancel: the USDZ build is seconds of CPU (4.1 s for a 571 k-triangle mesh on a desktop core:
+ * colour-atlas.ts), so it runs cooperatively (`buildColourAtlasAsync` yields ≈ every 40 ms; the
+ * simplification itself is one piece) and stops with a CancelledError at the next yield / step
+ * once `cancel` is set; the COLMAP ZIP checks it per image. The other formats are fast and ignore
+ * it. A mesh the simplifier cannot bring to the AR budget is still exported, with a `log` warning.
+ *
  * Privacy: no export carries a location — there is no geo input here, coordinates are local
  * (ENU metres when aligned) and the keyframe JPEGs are canvas re-encodes (no EXIF). Keep it so.
  */
-import type { FeatureSet, MetricInfo, PointCloud, RGBAImage, TriangleMesh } from '../core/types';
-import { buildColourAtlas } from '../dense/colour-atlas';
+import type { CancelToken, FeatureSet, MetricInfo, PointCloud, RGBAImage, TriangleMesh } from '../core/types';
+import { buildColourAtlasAsync } from '../dense/colour-atlas';
 import { createColmapZipBlob, type ColmapArchiveImage, type ColmapModelInput } from '../io/colmap';
 import { encodeGLB } from '../io/glb';
 import { encodeMeshPLY, encodePLY } from '../io/ply';
 import { encodeUSDZ, selectArPivot, type ArPivotRoi } from '../io/usdz';
 import { encodeSplatPLY } from '../splat/ply';
-import type { ExportFormat, SplatModelPayload } from '../workers/protocol';
+import { ENGINE_ERRORS, namedError, type ExportFormat, type SplatModelPayload } from '../workers/protocol';
 import { encodeJpegRGBA } from './frame-ingest';
 import { isRGBAImage, type EngineStore } from './persistence';
 import type { SparseModel } from './types';
@@ -40,6 +46,8 @@ export interface ExportSources {
   objectRoi?: ArPivotRoi | null;
   /** Texture encoder of the USDZ atlas (default: JPEG through OffscreenCanvas; tests inject one). */
   encodeTexture?: (img: RGBAImage) => Promise<Blob | null>;
+  /** Warnings (e.g. a USDZ above the AR budget). */
+  log?: (level: 'info' | 'warn', message: string) => void;
 }
 
 /** AR Quick Look budget (Apple: ≈ 100 k polygons and one 2048² texture set per model). */
@@ -133,8 +141,8 @@ export async function colmapModel(src: ExportSources, ext: (id: number) => strin
   return { cameras: [...m.cameras.entries()].map(([id, cam]) => ({ id, cam })), images, points };
 }
 
-/** Build the export Blob. */
-export async function buildExport(format: ExportFormat, src: ExportSources): Promise<Blob> {
+/** Build the export Blob (`cancel`: see the file header). */
+export async function buildExport(format: ExportFormat, src: ExportSources, cancel?: CancelToken): Promise<Blob> {
   const comments = src.comments ?? [`sfm on-device photogrammetry: ${src.name}`];
   // an empty dense cloud (fusion kept no point) falls back to the sparse one
   const dense = src.dense && src.dense.count > 0 ? src.dense : null;
@@ -161,6 +169,7 @@ export async function buildExport(format: ExportFormat, src: ExportSources): Pro
       const files = new Map<number, Blob | Uint8Array>();
       if (src.store) {
         for (const im of src.model.images) {
+          if (cancel?.cancelled) throw namedError(ENGINE_ERRORS.cancelled, 'export: cancelled');
           const s = await src.store.getFrameImage(im.id);
           if (!s) continue;
           files.set(im.id, isRGBAImage(s) ? encodeBMP(s) : s);
@@ -189,9 +198,14 @@ export async function buildExport(format: ExportFormat, src: ExportSources): Pro
       if (!mesh || mesh.triangleCount === 0) throw new Error('No mesh yet (run mesh first)');
       // the pivot from the undecimated mesh (about uniform vertex density: see selectArPivot)
       const pivot = selectArPivot(mesh, src.objectRoi);
-      const atlas = buildColourAtlas(mesh, { maxTriangles: USDZ_MAX_TRIANGLES, size: USDZ_TEXTURE_SIZE });
+      const atlas = await buildColourAtlasAsync(mesh, { maxTriangles: USDZ_MAX_TRIANGLES, size: USDZ_TEXTURE_SIZE }, cancel);
+      const st = atlas.stats;
+      if (st.overBudget || st.gutter === 0) {
+        src.log?.('warn', `usdz: ${st.triangles} triangles after simplifying (AR budget ${USDZ_MAX_TRIANGLES})${st.gutter === 0 ? `, atlas cells without gutter (≥ ${st.minSide} texels)` : ''}`);
+      }
       const img = await (src.encodeTexture ?? ((t: RGBAImage) => encodeJpegRGBA(t, USDZ_JPEG_QUALITY)))(atlas.texture);
       if (!img) throw new Error('USDZ export needs OffscreenCanvas (JPEG encoding), which this browser lacks');
+      if (cancel?.cancelled) throw namedError(ENGINE_ERRORS.cancelled, 'export: cancelled');
       const usdz = encodeUSDZ({
         mesh: atlas.mesh,
         uvs: atlas.uvs,

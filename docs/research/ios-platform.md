@@ -180,7 +180,7 @@ Status: researched 2026-10-16. Scope: iOS/iPadOS Safari 26.0–26.6 and 27.0 (sh
 | `<a href=blobURL download="scan.glb">` | **Works.** A prompt appears, then Files ▸ Downloads. Bug 216918 confirmed blob downloads work on iOS Safari (17.3) [24]. | **Unreliable.** It shows a preview instead of saving (275288, closed as Safari UI [24]), or leaves a "navigation-less state" that needs a force-quit (290847, NEW, iOS 18.4 [24]; 236943 MOVED [24]). | 26.2 fixed "service worker downloads not being saved to Downloads" (154501503) [6]. 26.5 fixed wrong or missing file extensions (173705083, 173945210) [8]. Set a correct `Blob.type` and an explicit extension. |
 | `navigator.share({files})` | Works (iOS 14+) [21] | **Works. Preferred in standalone mode.** | Details below. |
 | `showSaveFilePicker()` | **No** [21] | No | `createWritable` (26.0) applies to OPFS handles only. |
-| AR Quick Look (`<a rel="ar" href="x.usdz">`) | [U] with blob URLs | [U] | Optional iOS-native viewer. Test it before relying on it (§8 item 11: the app's "View in AR" uses it, with Share / Save as the fallback). |
+| AR Quick Look (`<a rel="ar" href="x.usdz">`) | [U] with blob URLs | [U] | Optional iOS-native viewer. Test it before relying on it (§8 item 11: the app's "View in AR" uses it in a tab, with Share / Save as the fallback; hidden in standalone until measured). |
 
 ### Web Share Level 2 details [S][22][23]
 
@@ -377,8 +377,9 @@ Status: researched 2026-10-16. Scope: iOS/iPadOS Safari 26.0–26.6 and 27.0 (sh
 8. **Camera re-prompt.** In a Home Screen app, record the prompt count across launches, and whether `track.enabled=false` avoids the 10-min re-prompt in a tab.
 9. **Motion permission.** Check whether the grant survives relaunch, both in a tab and standalone.
 10. **IndexedDB.** Background the app for 5 min mid-transaction on 26.x and 27.0, and verify that the reconnect wrapper recovers.
-11. **AR Quick Look (added 2026-10-21 with the USDZ export).** The app's "View in AR" (Export sheet, USDZ row) clicks a hidden `<a rel="ar" href="blob:…" download="…usdz"><img></a>` (src/app/ar-quicklook.ts); it is shown only when `relList.supports('ar')` on iPhone / iPad. On iOS 26 with a metric object scan, record:
-    - Does AR Quick Look open from a Safari tab, and from the Home Screen app? (the §3 row's two [U]s)
+11. **AR Quick Look (added 2026-10-21 with the USDZ export).** The app's "View in AR" (Export sheet, USDZ row) clicks a hidden `<a rel="ar" href="blob:…" download="…usdz"><img></a>` (src/app/ar-quicklook.ts); it is shown only when `relList.supports('ar')` on iPhone / iPad (the UA check rules out macOS only: WKWebView in-app browsers pass both checks, WebKit 239135), and not in the Home Screen app: there an un-routed rel="ar" click would be the broken standalone `<a download href=blob:>` (WebKit 275288 / 290847). For the standalone check, opt in from the Web Inspector console with `localStorage.setItem('sfm.arQuickLookStandalone', '1')` and reopen the viewer. When the page neither blurs nor hides within 2 s of the click, a hint toast ("AR Quick Look didn't open here …") follows. On iOS 26 with a metric object scan, record:
+    - Does AR Quick Look open from a Safari tab, and from the Home Screen app? (the §3 row's two [U]s) If it does not open in standalone, what does the click do (preview sheet, stuck state, nothing)?
+    - Does the page get `blur` / `visibilitychange` (hidden) when AR Quick Look opens? If not, the hint toast shows behind every working AR view: drop it or find another signal. Does an in-app browser (Instagram, Gmail) show the hint?
     - Does Share / Save → Save to Files → open in Files show it in every case?
     - Does AR Quick Look's own Share button share the file or the blob id (WebKit 263878)?
     - Are the colours visible (texture path)? For comparison, is a `displayColor`-only USDZ still grey?

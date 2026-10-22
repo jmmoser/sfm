@@ -453,7 +453,8 @@ tsdfMesh(views: DenseView[], store: DepthMapStore, opts?: { voxelSize?: number; 
 filterPointCloud(pc: PointCloud, opts?: { voxelSize?: number; statistical?: { k: number; std: number } }): PointCloud
 buildColourAtlas(mesh: TriangleMesh, opts?: { maxTriangles?: number /*100 000*/; size?: number /*2048*/; gutter?: number /*1*/ })
   : { mesh: TriangleMesh /* simplified */; uvs: Float32Array /* 6 per triangle, (0,0) = texture top-left, v down */;
-      texture: RGBAImage /* colours of the UNSIMPLIFIED mesh */; stats }
+      texture: RGBAImage /* colours of the UNSIMPLIFIED mesh */; stats /* overBudget, gutter, … */ }
+buildColourAtlasAsync(mesh, opts?, cancel?): Promise<same>   // yields ≈ every 40 ms; CancelledError on cancel
 ```
 
 ### 4.7 `src/sensors`

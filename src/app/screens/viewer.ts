@@ -7,7 +7,8 @@
  * mesh, GLB, USDZ for AR, Gaussian splats PLY, COLMAP + images ZIP: the first tap builds the file
  * through the engine and shows its size, a second tap "Share / Save" calls saveFile directly in
  * the tap handler — iOS allows navigator.share only within ~5 s of a user activation; a prepared
- * USDZ also gets "View in AR" where AR Quick Look exists: src/app/ar-quicklook.ts), Info sheet
+ * USDZ also gets "View in AR" where AR Quick Look exists: src/app/ar-quicklook.ts; leaving the
+ * screen cancels the exports still being prepared), Info sheet
  * (scale source and uncertainty, gravity / north alignment with the yaw source — the compass
  * gives MAGNETIC north —, counts, reprojection error, engine memory, timings). A densify that
  * was interrupted (stats.denseResumablePass from loadSession, or cancelled / failed here) offers
@@ -95,8 +96,10 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   let cancelling = false;
   /** Splats cannot be built here (no WebGPU in this browser; the engine would reject). */
   const webgpuMissing = (): boolean => app.env.webgpu === 'unsupported' || app.env.webgpu === 'no-adapter';
-  /** "View in AR" for a prepared USDZ (iPhone / iPad Safari only). */
-  const arQuickLook = arQuickLookAvailable(app.env) ? createARQuickLook() : null;
+  /** "View in AR" for a prepared USDZ (an iPhone / iPad Safari tab only: src/app/ar-quicklook.ts). */
+  const arQuickLook = arQuickLookAvailable(app.env)
+    ? createARQuickLook({ onNotOpened: () => toast(`AR Quick Look didn’t open here. Use ${app.env.share ? 'Share / Save' : 'Save'}, then open the file in Files.`, { tone: 'warn', durationMs: 6000 }) })
+    : null;
 
   const canvasHost = h('div', { class: 'viewer-canvas', 'data-testid': 'viewer-canvas' });
   const loading = h('div', { class: 'viewer-loading' }, spinner('lg'), h('span', { text: 'Loading model…' }));
@@ -709,6 +712,20 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       exports.set(format, { status: 'error', error: (e as Error)?.message ?? String(e) });
     }
     if (!closed) renderExports?.();
+    else cancelExports();
+  }
+
+  /**
+   * Cancel the exports still being prepared once the screen is gone (the USDZ takes seconds of
+   * engine time and its file would be dropped). `cancel('export')` stops the newest one; each that
+   * settles after leave() cancels the next (prepare).
+   */
+  function cancelExports(): void {
+    for (const st of exports.values()) {
+      if (st.status !== 'building') continue;
+      app.engine.cancel('export');
+      return;
+    }
   }
 
   function openInfo(): void {
@@ -907,6 +924,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
         void app.wakeLock.release();
       }
       if (app.debug.viewer === viewer) app.debug.viewer = undefined;
+      cancelExports();
       arQuickLook?.dispose();
       viewer?.dispose();
       viewer = null;

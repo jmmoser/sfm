@@ -46,7 +46,7 @@ export {
   type MarchingCubesOptions,
 } from './marching-cubes';
 export { simplifyMesh, type SimplifyOptions } from './simplify';
-export { buildColourAtlas, ClosestTriangleFinder, type ColourAtlas, type ColourAtlasOptions, type ColourAtlasStats } from './colour-atlas';
+export { buildColourAtlas, buildColourAtlasAsync, ClosestTriangleFinder, type ColourAtlas, type ColourAtlasOptions, type ColourAtlasStats } from './colour-atlas';
 export {
   filterPointCloud,
   voxelDownsample,

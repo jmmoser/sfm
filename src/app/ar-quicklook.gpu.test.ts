@@ -1,9 +1,10 @@
 /**
  * "View in AR" (src/app/ar-quicklook.ts) in Chromium: availability (Apple mobile WebKit with
- * rel="ar" support only), the launch anchor (<a rel="ar" download><img></a> on a blob URL that is
- * reused for the same Blob and revoked when replaced / disposed), the Export sheet's USDZ row
- * (createViewerScreen with a fake engine; no WebGL viewer), and the MockEngine's browser USDZ
- * (JPEG atlas through OffscreenCanvas, 64-byte aligned package).
+ * rel="ar" support, not in a Home Screen app unless opted in), the launch anchor (<a rel="ar"
+ * download><img></a> on a blob URL that is reused for the same Blob and revoked when replaced /
+ * disposed), the not-opened hint (no blur / hide within failMs), the Export sheet's USDZ row
+ * (createViewerScreen with a fake engine; no WebGL viewer; leaving cancels a USDZ being prepared),
+ * and the MockEngine's browser USDZ (JPEG atlas through OffscreenCanvas, 64-byte aligned package).
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import type { TriangleMesh } from '../core/types';
@@ -12,7 +13,7 @@ import { TsdfVolume } from '../dense/tsdf';
 import { readZip } from '../io/zip';
 import type { ExportFormat, SparseResult } from '../workers/protocol';
 import type { App, Results } from './app';
-import { arQuickLookAvailable, createARQuickLook } from './ar-quicklook';
+import { AR_STANDALONE_KEY, arQuickLookAvailable, createARQuickLook } from './ar-quicklook';
 import { closeAllModals } from './components/layers';
 import { MockEngine } from './mock-engine';
 import { createViewerScreen } from './screens/viewer';
@@ -62,12 +63,47 @@ afterEach(async () => {
 });
 
 describe('AR Quick Look link', () => {
-  it('is available only on Apple mobile WebKit with rel="ar" support', () => {
-    expect(arQuickLookAvailable({ apple: true })).toBe(false); // Chromium: no rel="ar"
+  it('is available only on Apple mobile WebKit with rel="ar" support, in a Home Screen app only when opted in', () => {
+    expect(arQuickLookAvailable({ apple: true, standalone: false })).toBe(false); // Chromium: no rel="ar"
     cleanups.push(stubRelAr(true));
-    expect(arQuickLookAvailable({ apple: true })).toBe(true);
-    // relList.supports('ar') alone is not trusted (macOS Safari, in-app browsers: WebKit 239135)
-    expect(arQuickLookAvailable({ apple: false })).toBe(false);
+    expect(arQuickLookAvailable({ apple: true, standalone: false })).toBe(true);
+    // `apple` only rules out macOS Safari (rel="ar" without AR); in-app browsers (WKWebView) pass
+    // both checks without opening AR Quick Look (WebKit 239135): the not-opened hint covers them
+    expect(arQuickLookAvailable({ apple: false, standalone: false })).toBe(false);
+    // Home Screen app: unverified, and a rel="ar" that is not honoured is a broken <a download> there
+    expect(arQuickLookAvailable({ apple: true, standalone: true })).toBe(false);
+    localStorage.setItem(AR_STANDALONE_KEY, '1');
+    cleanups.push(() => localStorage.removeItem(AR_STANDALONE_KEY));
+    expect(arQuickLookAvailable({ apple: true, standalone: true })).toBe(true);
+  });
+
+  it('hints when the page neither blurs nor hides after a launch', async () => {
+    const cap = captureArClicks();
+    cleanups.push(cap.stop);
+    const blob = new Blob([new Uint8Array([1])], { type: 'model/vnd.usdz+zip' });
+    let hints = 0;
+    const ql = createARQuickLook({ onNotOpened: () => hints++, failMs: 60 });
+    cleanups.push(() => ql.dispose());
+    const wait = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+    // nothing took the page over (Chromium, or an in-app browser): one hint
+    ql.open(blob, 'a.usdz');
+    await wait(200);
+    expect(hints).toBe(1);
+    // AR Quick Look took the focus: no hint
+    ql.open(blob, 'a.usdz');
+    window.dispatchEvent(new Event('blur'));
+    await wait(200);
+    expect(hints).toBe(1);
+    // a second launch replaces the first one's watch; dispose drops a pending one
+    ql.open(blob, 'a.usdz');
+    ql.open(blob, 'a.usdz');
+    await wait(200);
+    expect(hints).toBe(2);
+    ql.open(blob, 'a.usdz');
+    ql.dispose();
+    await wait(200);
+    expect(hints).toBe(2);
+    expect(cap.anchors.length).toBe(5);
   });
 
   it('clicks a hidden <a rel="ar" download><img></a> on a reused blob URL; revokes replaced and disposed URLs', async () => {
@@ -106,12 +142,20 @@ describe('Export sheet: USDZ row', () => {
   }
   const mesh: TriangleMesh = { vertexCount: 3, triangleCount: 1, positions: new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), normals: new Float32Array(9), colors: new Uint8Array(9), indices: new Uint32Array([0, 1, 2]) };
 
-  function mountViewer(apple: boolean): { exports: ExportFormat[] } {
+  /** `hold`: exports do not finish until the engine's cancel('export') rejects them. */
+  function mountViewer(apple: boolean, opts: { standalone?: boolean; hold?: boolean } = {}): { exports: ExportFormat[]; cancels: string[]; leave(): void } {
     const exports: ExportFormat[] = [];
+    const cancels: string[] = [];
+    const held: ((e: Error) => void)[] = [];
     const engine = {
       async exportModel(format: ExportFormat): Promise<Blob> {
         exports.push(format);
+        if (opts.hold) await new Promise<never>((_, reject) => held.push(reject));
         return new Blob([format], { type: format === 'usdz' ? 'model/vnd.usdz+zip' : 'application/octet-stream' });
+      },
+      cancel(method?: string): void {
+        cancels.push(method ?? '');
+        if (method === 'export') held.pop()?.(Object.assign(new Error('export: cancelled'), { name: 'CancelledError' }));
       },
     };
     const results: Results = { sessionId: 's1', name: 'Mug', mode: 'object', quality: 'fast', sparse: sparse(), dense: null, mesh, splat: null, liveSparse: null, liveCameras: null, stats: {} };
@@ -120,7 +164,7 @@ describe('Export sheet: USDZ row', () => {
       engine,
       busy: false,
       loadedSessionId: 's1',
-      env: { webgpu: 'available', webgl: false, share: false, apple },
+      env: { webgpu: 'available', webgl: false, share: false, apple, standalone: !!opts.standalone },
       debug: {},
       navigate: (): void => undefined,
       ensureSessionLoaded: async (): Promise<boolean> => true,
@@ -128,11 +172,17 @@ describe('Export sheet: USDZ row', () => {
     const screen = createViewerScreen(app as unknown as App, { screen: 'viewer', sessionId: 's1' });
     document.body.appendChild(screen.el);
     screen.enter?.();
-    cleanups.push(() => {
+    let left = false;
+    const leave = (): void => {
+      if (left) return;
+      left = true;
       screen.leave();
+    };
+    cleanups.push(() => {
+      leave();
       screen.el.remove();
     });
-    return { exports };
+    return { exports, cancels, leave };
   }
 
   const q = (id: string): HTMLElement | null => document.querySelector<HTMLElement>(`[data-testid="${id}"]`);
@@ -143,14 +193,15 @@ describe('Export sheet: USDZ row', () => {
       await new Promise((r) => setTimeout(r, 20));
     }
   }
-  async function prepareUsdz(): Promise<void> {
+  async function prepareUsdz(wait = true): Promise<void> {
     await waitFor(() => !!q('tool-export'));
     q('tool-export')!.click();
     await waitFor(() => !!q('export-prepare-usdz'));
     expect(q('export-usdz')!.textContent).toContain('true size');
     q('export-prepare-usdz')!.click();
-    await waitFor(() => !!q('export-save-usdz'));
+    if (wait) await waitFor(() => !!q('export-save-usdz'));
   }
+  const toastText = (): string => [...document.querySelectorAll('.toast-text')].map((e) => e.textContent).join(' | ');
 
   it('offers "View in AR" next to Save on iPhone / iPad Safari and opens AR Quick Look on the prepared file', async () => {
     cleanups.push(stubRelAr(true));
@@ -167,6 +218,32 @@ describe('Export sheet: USDZ row', () => {
     expect(cap.anchors.length).toBe(1);
     expect(cap.anchors[0].download).toBe('Mug_ar.usdz');
     expect(await (await fetch(cap.anchors[0].href)).text()).toBe('usdz');
+    // the click was swallowed (as in an in-app browser): after 2 s the hint points to Save
+    expect(toastText()).not.toContain('AR Quick Look');
+    await waitFor(() => toastText().includes('AR Quick Look didn’t open here. Use Save, then open the file in Files.'));
+  });
+
+  it('has no "View in AR" in the Home Screen app (unverified there)', async () => {
+    cleanups.push(stubRelAr(true));
+    mountViewer(true, { standalone: true });
+    await prepareUsdz();
+    expect(q('export-ar-usdz')).toBeNull();
+  });
+
+  it('cancels the exports still being prepared when the screen is left, one after the other', async () => {
+    const v = mountViewer(true, { hold: true });
+    await prepareUsdz(false);
+    await waitFor(() => !!q('export-prepare-glb'));
+    q('export-prepare-glb')!.click();
+    await waitFor(() => v.exports.length === 2);
+    expect(v.exports).toEqual(['usdz', 'glb']);
+    expect(v.cancels).toEqual([]);
+    v.leave();
+    // cancel('export') stops the newest (glb); once it settles, the USDZ is cancelled too
+    expect(v.cancels).toEqual(['export']);
+    await waitFor(() => v.cancels.length === 2);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(v.cancels).toEqual(['export', 'export']);
   });
 
   it('has no "View in AR" elsewhere (Share / Save only)', async () => {
