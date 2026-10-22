@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest';
 import type { Pose } from '../core/types';
 import { Rng } from '../math/random';
 import { lookAt } from '../splat/testutil';
-import { buildFlythrough, easedProgress, flythroughCamera, flythroughTimestampUs, rotationDistance, type FlythroughCamera, type FlythroughPath } from './flythrough';
+import { buildFlythrough, easedProgress, flythroughCamera, flythroughTimestampUs, rotationDistance, viewingDepth, type FlythroughCamera, type FlythroughPath } from './flythrough';
 import { OBJECT_REAL, YARD_REAL, type PoseFixture } from './flythrough.testdata';
 
 const DEG = Math.PI / 180;
@@ -117,7 +117,8 @@ describe('fly-through path', () => {
 
   it('yard-real (e2e run poses): a smoothed replay of the walk', () => {
     const cams = fixtureCams(YARD_REAL);
-    const p = buildFlythrough(cams, { depth: 10 })!;
+    // depth: viewingDepth of the run's sparse.ply (8.47 m)
+    const p = buildFlythrough(cams, { depth: 8.5 })!;
     const s = stats(p, cams);
     log('yard-real', p, s);
     expect(p.mode).toBe('scene');
@@ -212,6 +213,23 @@ describe('fly-through path', () => {
     const last = Math.atan2(p.poses[p.poses.length - 1].R[7], p.poses[p.poses.length - 1].R[6]) / DEG;
     expect(last - first).toBeGreaterThan(70);
     expect(buildFlythrough(cams.slice(0, 1))).toBeNull();
+  });
+
+  it('viewingDepth: the median depth of the points the photos see', () => {
+    const cams = orbit(24, 360, 4, 0);
+    // points on a 0.2 m sphere around the orbit centre: seen at ≈ the camera distance (0.54 m) − 0.2 m … + 0.2 m
+    const rng = new Rng(8);
+    const pos = new Float32Array(3 * 3000);
+    for (let i = 0; i < 3000; i++) {
+      const v = [rng.gaussian(), rng.gaussian(), rng.gaussian()];
+      const l = Math.hypot(v[0], v[1], v[2]);
+      pos.set([(0.2 * v[0]) / l, (0.2 * v[1]) / l, 0.1 + (0.2 * v[2]) / l], 3 * i);
+    }
+    const d = viewingDepth(cams, pos)!;
+    const dist = Math.hypot(0.45, 0.3);
+    expect(d).toBeGreaterThan(dist - 0.2);
+    expect(d).toBeLessThan(dist + 0.05);
+    expect(viewingDepth(cams, new Float32Array(30))).toBeNull();
   });
 
   it('easedProgress ramps smoothly from 0 to 1', () => {

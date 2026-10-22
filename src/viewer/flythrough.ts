@@ -23,8 +23,9 @@
  *
  * Timing: each piece of path costs the time it needs at the speed limits, and the clip plays it
  * at that rate. The limits are: translation ≤ 0.2 · depth per s (scene; depth = the typical viewing
- * distance), view rotation ≤ 30 °/s, and orbit ≤ 40 °/s (object; the view rotation then counts only
- * beyond the orbit's own turning). The duration is clamped to 6–10 s. A
+ * distance, `viewingDepth`), view rotation ≤ 30 °/s (scene: ≤ 1.8× the clip's typical turning rate,
+ * ≥ 10 °/s, so quick pans in the capture do not jerk), and orbit ≤ 40 °/s (object; the view rotation
+ * then counts only beyond the orbit's own turning). The duration is clamped to 6–10 s. A
  * longer capture is cropped to its middle part (`coverage`); a shorter one plays slower. The start
  * and end ease in and out over ≤ 0.6 s (smoothstep speed ramps), so frame steps never exceed the
  * cruise step.
@@ -47,6 +48,14 @@ const DEG = Math.PI / 180;
  * from the keyframes there: yard-real swings 34° between keyframes 0.39 m apart.
  */
 const ROT_SIGMA_KEYFRAMES = 0.7;
+/**
+ * Scene mode: the view-rotation limit is lowered to PAN_FACTOR × the shown part's median turning
+ * rate (at the translation limit), but not below MIN_TURN (rad/s). Quick pans then turn at most ~2×
+ * as fast as the rest of the clip: 1.8 leaves room for the eased start and end, which lower the
+ * per-frame median.
+ */
+const PAN_FACTOR = 1.8;
+const MIN_TURN = 10 * DEG;
 
 export type FlythroughMode = 'object' | 'scene';
 
@@ -110,6 +119,35 @@ export interface FlythroughPath {
 export function flythroughCamera(p: FlythroughPath, i: number): SplatCamera {
   const pose = p.poses[i];
   return { width: p.width, height: p.height, fx: p.fx, fy: p.fy, cx: p.cx, cy: p.cy, R: pose.R, t: pose.t, near: p.near };
+}
+
+/**
+ * Typical viewing distance of the cameras (the `depth` option): the median, over up to 40 evenly
+ * spread cameras, of the median depth of the points (flat xyz, up to `maxPoints` evenly spread)
+ * inside their photo (principal point at the image centre). Null with fewer than 20 such points.
+ */
+export function viewingDepth(cams: readonly FlythroughCamera[], positions: ArrayLike<number>, maxPoints = 4000): number | null {
+  const np = Math.floor(positions.length / 3);
+  const stride = Math.max(1, Math.floor(np / maxPoints));
+  const camStride = Math.max(1, Math.floor(cams.length / 40));
+  const perCam: number[] = [];
+  for (let c = 0; c < cams.length; c += camStride) {
+    const { R, t } = cams[c].pose;
+    const { width: W, height: H, f } = cams[c].intrinsics;
+    const zs: number[] = [];
+    for (let i = 0; i < np; i += stride) {
+      const X = positions[3 * i];
+      const Y = positions[3 * i + 1];
+      const Z = positions[3 * i + 2];
+      const z = R[6] * X + R[7] * Y + R[8] * Z + t[2];
+      if (!(z > 0)) continue;
+      const u = (f * (R[0] * X + R[1] * Y + R[2] * Z + t[0])) / z;
+      const v = (f * (R[3] * X + R[4] * Y + R[5] * Z + t[1])) / z;
+      if (Math.abs(u) <= W / 2 && Math.abs(v) <= H / 2) zs.push(z);
+    }
+    if (zs.length >= 20) perCam.push(median(zs));
+  }
+  return perCam.length ? median(perCam) : null;
 }
 
 /** Presentation timestamp of frame `i` (µs), as VideoFrame / EncodedVideoChunk timestamps. */
@@ -298,8 +336,14 @@ function interp(xs: ArrayLike<number>, ys: ArrayLike<number>, x: number): number
 interface DensePath {
   /** Cumulative cost (s at the speed limits) per sample. */
   cost: Float64Array;
-  /** Path parameter per sample (scene: arc length; object: unwrapped azimuth). */
+  /** Path parameter per sample, ascending (scene: arc length; object: sweep fraction). */
   param: Float64Array;
+  /**
+   * Scene mode: the cost table with view-rotation limit `w` (rad/s), and the rotation rate of each
+   * sample step when played at the translation limit (rad/s; NaN where nothing moves).
+   */
+  costWith?: (w: number) => Float64Array;
+  rates?: Float64Array;
   /** Position at a parameter value. */
   position(x: number): V3;
   /** Smoothed, levelled world-to-camera rotation at a parameter value. */
@@ -338,13 +382,31 @@ export function buildFlythrough(cams: readonly FlythroughCamera[], o: Flythrough
 
   // timing: the middle of the path when it needs more than maxS, eased start and end
   // (T − 0.6 s plays the path at the limits: shorter paths play slower over minS, longer ones are cropped)
-  const total = path.cost[path.cost.length - 1];
   const rampSec = 0.6;
-  const T = Math.min(maxS, Math.max(minS, total + rampSec));
-  const r = Math.min(0.15, rampSec / T);
-  const window = Math.min(total, T * (1 - r));
-  const a = 0.5 * (total - window);
-  const b = a + window;
+  const timing = (cost: Float64Array): { T: number; r: number; a: number; b: number } => {
+    const total = cost[cost.length - 1];
+    const T = Math.min(maxS, Math.max(minS, total + rampSec));
+    const r = Math.min(0.15, rampSec / T);
+    const window = Math.min(total, T * (1 - r));
+    const a = 0.5 * (total - window);
+    return { T, r, a, b: a + window };
+  };
+  let tm = timing(path.cost);
+  if (path.costWith && path.rates) {
+    // scene: pans turn at most PAN_FACTOR times as fast as the shown part's typical turning (≥ MIN_TURN)
+    let w = turn;
+    for (let it = 0; it < 3; it++) {
+      const lo = upperIndex(path.cost, tm.a);
+      const hi = upperIndex(path.cost, tm.b);
+      const shown = Array.from(path.rates.subarray(lo, hi + 1)).filter(Number.isFinite);
+      const w2 = shown.length ? Math.min(turn, Math.max(MIN_TURN, PAN_FACTOR * median(shown))) : turn;
+      if (Math.abs(w2 - w) < 1e-6) break;
+      w = w2;
+      path.cost = path.costWith(w);
+      tm = timing(path.cost);
+    }
+  }
+  const { T, r, a, b } = tm;
   const N = Math.max(2, Math.round(T * fps));
   const out: Pose[] = [];
   for (let i = 0; i < N; i++) {
@@ -475,30 +537,38 @@ function upperIndex(xs: Float64Array, x: number): number {
 }
 
 /**
- * Cost table of a parameterised path: ~2000 samples between the parameter ends; each step costs
- * max(translation / vmax, rotation / turn) seconds (vmax 0: rotation only).
+ * Cost table of a parameterised path: 2000 samples between the parameter ends; each step costs
+ * max(translation / vmax, rotation / ω) seconds (vmax 0: rotation only), ω = `turn` here and
+ * lowered by `buildFlythrough` through `costWith`.
  */
 function densify(param: ArrayLike<number>, position: (x: number) => V3, rotation: (x: number) => Float64Array, vmax: number, turn: number): DensePath {
   const x0 = param[0];
   const x1 = param[param.length - 1];
   const S = 2000;
   const xs = new Float64Array(S + 1);
-  const cost = new Float64Array(S + 1);
+  const dl = new Float64Array(S + 1);
+  const dr = new Float64Array(S + 1);
   let prevP = position(x0);
   let prevR = rotation(x0);
+  xs[0] = x0;
   for (let i = 1; i <= S; i++) {
     const x = x0 + ((x1 - x0) * i) / S;
     xs[i] = x;
     const P = position(x);
     const R = rotation(x);
-    const dl = norm(sub(P, prevP));
-    const dr = rotationDistance(R, prevR);
-    cost[i] = cost[i - 1] + Math.max(vmax > 0 ? dl / vmax : 0, dr / turn, 1e-12);
+    dl[i] = norm(sub(P, prevP));
+    dr[i] = rotationDistance(R, prevR);
     prevP = P;
     prevR = R;
   }
-  xs[0] = x0;
-  return { cost, param: xs, position, rotation };
+  const costWith = (w: number): Float64Array => {
+    const cost = new Float64Array(S + 1);
+    for (let i = 1; i <= S; i++) cost[i] = cost[i - 1] + Math.max(vmax > 0 ? dl[i] / vmax : 0, dr[i] / w, 1e-12);
+    return cost;
+  };
+  if (!(vmax > 0)) return { cost: costWith(turn), param: xs, position, rotation };
+  const rates = Float64Array.from(dl, (l, i) => (l > 0 ? (dr[i] * vmax) / l : NaN));
+  return { cost: costWith(turn), param: xs, position, rotation, costWith, rates };
 }
 
 /**
