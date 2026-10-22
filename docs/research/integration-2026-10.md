@@ -33,7 +33,7 @@ mesh has one.
 |---|---|---|
 | registered / ATE ÷ extent / rotation p50 | 89 / 89, 2.73e-4, 0.049° | 81 / 81, 5.29e-4, 0.102° |
 | scale error (source) / gravity / heading | +0.27 % (IMU) / 0.02° / −0.74° | +1.13 % (IMU + GPS) / 0.04° / −0.82° |
-| dense accuracy p50 / completeness / F | 3.25e-4 rel, 0.993, 0.996 | 9.5 mm, 0.344, 0.506 |
+| dense accuracy p50 / completeness / F | 0.33 mm, 0.993, 0.996 | 9.5 mm, 0.344, 0.506 |
 | object box | plane tilt 0.03°, confidence 0.94; IoU with `meta.focus` 0.72, contains focus − 1 cm | off (scene mode) |
 | live coverage at the end | 50 %: mid band 12 / 12, high 0 / 12, prompt "look down" | not shown (scene) |
 | exports | ply-points 42.4 MB, ply-mesh 2.2 MB, GLB 2.5 MB, COLMAP 19.1 MB, USDZ 8.8 MB | USDZ 10.8 MB |
