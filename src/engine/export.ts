@@ -22,8 +22,9 @@ export interface ExportSources {
   dense: PointCloud | null;
   mesh: TriangleMesh | null;
   /**
-   * Object box the mesh was bounded to (object mode), null when none. Exports that stand the object
-   * on the ground (USDZ / GLB for AR) put its bottom centre `objectRoiPivot(roi)` at the origin.
+   * Object box the mesh was bounded to (object mode), null when none: for exports that will stand
+   * the object on the ground (USDZ / GLB for AR) with its bottom centre `objectRoiPivot(roi)` at the
+   * origin. No export reads it yet (GLB and PLY are written in world coordinates).
    */
   objectRoi?: ObjectRoi | null;
   store: EngineStore | null;

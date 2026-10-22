@@ -16,33 +16,48 @@
  *     ±3-bin residual band (a gravity error of a few degrees still gives one plane). Rejected
  *     with fewer than 30 points, under 20 % of the annulus points (the peak's share; a peak /
  *     median-bin ratio is undefined on a sparse histogram whose median bin is empty) or a tilt
- *     above 5°.
+ *     above 2° (see MAX_TILT).
  *  3. Object: the points within 0.6 × ringRadius of the axis, above the plane + clearance
  *     (max(3σ of the plane residuals, `minClearance`; runMesh passes 2 TSDF voxels at d)) and below
- *     P.z + 1.5 d. No connectivity test: the parts of a multi-part object (or an object and its
- *     stand) connect only through the plane. The lowest points (2nd percentile) must lie within
- *     0.25 d of the plane, else the object does not rest on it (hand-held, hanging).
- *  4. Box: 0.2 / 99.8 percentiles per axis + a max(10 % of the extent, 0.03 d) margin (sparse
- *     points cover the extremes thinly; see MARGIN). The bottom is the plane height under the box
- *     centre + clearance, which keeps the support out of the box.
- *     confidence = the plane's share of the annulus points × min(1, object points / 200).
+ *     P.z + 1.5 d. Two filters drop the points that would stretch the box: weak points (seen in
+ *     < 3 images, when the input has tracks) and isolated ones (6th-nearest object neighbour
+ *     farther than max(3 × its median, 0.02 d): floaters, and the thin noise of a placemat or the
+ *     table just above the clearance, which otherwise spreads the box over the whole 0.6 × ring
+ *     disc). No connectivity test: the parts of a multi-part object (or an object and its stand)
+ *     connect only through the plane. At least 100 points must remain, and the lowest (2nd
+ *     percentile) must lie within 0.25 d of the plane, else the object does not rest on it
+ *     (hand-held, hanging).
+ *  4. Box: 0.2 / 99.8 percentiles per axis + a max(12 % of the extent, 0.03 d) margin (sparse
+ *     points cover the extremes thinly; see MARGIN). The bottom is flat at the plane's highest
+ *     point under the box (a bottom corner; the plane may be tilted by up to 2°) + clearance, so
+ *     the support stays out of the box; `planeZ` is the plane height under the box centre.
+ *     confidence = the plane's share of the annulus points × min(1, object points / 200); below
+ *     `minConfidence` (default 0.3) there is no box.
  *
  * The result is null (`reason` says why) when the model is not gravity-aligned, the cameras do
  * not orbit a point (axes spread < 10°, orbit test failed, cameras look straight down), there is
- * no plane, or the object does not rest on it. Callers then keep the whole scene; runMesh keeps
- * the 2 × median depth cut alone.
+ * no plane, the object does not rest on it, or the confidence is low. Callers then keep the whole
+ * scene; runMesh keeps the 2 × median depth cut alone.
  *
  * Limits: the box is axis-aligned in the world frame, so its yaw is the world's (north when
  * known). Objects wider than ~0.6 × the camera ring are trimmed, and clutter within that radius
  * is kept. White, glossy or glass supports give few sparse points, hence no plane and no box.
- * Validated on synthetic data only: object-roi.test.ts, mesh-roi.test.ts and a 40-frame e2e
- * 'object' run (worker engine, 240 px dense): no mesh vertex outside the GT object box ± 2 cm
- * (61 % unbounded), its completeness within 0.004 of the unbounded mesh. object-real is pending.
+ * On a tilted plane the flat bottom cuts the low side of the object's base (see MAX_TILT).
+ * Validated on synthetic data only: object-roi.test.ts, mesh-roi.test.ts, a 40-frame e2e 'object'
+ * run (worker engine, 240 px dense, the box before the point filters): no mesh vertex outside the
+ * GT object box ± 2 cm (61 % unbounded), its completeness within 0.004 of the unbounded mesh; and
+ * offline on the stored sparse models of 6 object-real runs (7–12 k points; sparse.ply has no
+ * tracks, so without the track filter) and of that e2e run, at the clearances of 240, 800 (fast)
+ * and 1280 px (balanced) dense: the box contains meta.focus − 1 cm at IoU 0.70–0.79 (object-real
+ * at fast / balanced 0.73–0.77), unchanged with 1–3 % floaters added in the object cylinder.
+ * Without the isolation filter: IoU 0.31–0.39 at fast / balanced (placemat noise above the 3.4 mm
+ * clearance spread the box over the 0.6 × ring disc), 0.13–0.18 with 1–3 % floaters.
  */
 import type { ObjectRoi, Pose } from '../core/types';
 import { opticalAxisConvergence } from '../geometry/convergence';
 import { solveSPD } from '../math/decomp';
 import { mad, median, percentile } from '../math/stats';
+import { KdTree3 } from './kdtree';
 
 /** What the proposal reads: the registered cameras and the sparse points (a SparseModel fits). */
 export interface ObjectRoiInput {
@@ -50,6 +65,11 @@ export interface ObjectRoiInput {
   /** 3 per point, world frame. */
   xyz: ArrayLike<number>;
   numPoints: number;
+  /**
+   * CSR track offsets (`SparseModel.trackOffsets`: point i is seen in trackOffsets[i + 1] −
+   * trackOffsets[i] images). Given, object points seen in fewer than 3 images are dropped.
+   */
+  trackOffsets?: ArrayLike<number>;
 }
 
 export interface ObjectRoiOptions {
@@ -61,6 +81,8 @@ export interface ObjectRoiOptions {
    * or 2 × a given voxel size). Default 0.008 d (2 histogram bins).
    */
   minClearance?: number | { perDistance: number };
+  /** No box below this confidence (default 0.3, see MIN_CONFIDENCE). */
+  minConfidence?: number;
 }
 
 /** Result of `proposeObjectRoi`: the box or why there is none, and the numbers behind it. */
@@ -78,9 +100,18 @@ export interface ObjectRoiProposal {
   /** Plane tilt from horizontal (rad) and robust σ of its residuals (NaN without a plane). */
   planeTiltRad: number;
   planeSigma: number;
+  /** Plane slopes (a, b) of z = a x + b y + c (NaN without a plane). */
+  planeSlope: [number, number];
   /** Clearance of the box bottom above the plane (NaN without a plane). */
   clearance: number;
+  /** Object points the box is taken from (after the two filters below). */
   objectPoints: number;
+  /** Object candidates dropped as weak (seen in < 3 images; 0 without tracks). */
+  weakPoints: number;
+  /** Object candidates dropped as isolated (floaters, near-plane noise). */
+  isolatedPoints: number;
+  /** The box's confidence, also when it is below `minConfidence` (0 before the box step). */
+  confidence: number;
 }
 
 const DEG = Math.PI / 180;
@@ -96,22 +127,44 @@ const BAND_BINS = 3;
 const PLANE_REFITS = 3;
 const MIN_PLANE_POINTS = 30;
 const MIN_PLANE_FRACTION = 0.2;
-const MAX_TILT = 5 * DEG;
+/**
+ * The box bottom is flat, so a tilted plane costs the low side of the object's base 2 (|a| hx +
+ * |b| hy) of height (≈ 1 cm for a 15 cm half-width at 2°); beyond that there is no box.
+ */
+const MAX_TILT = 2 * DEG;
 /** Object points: within 0.6 × ringRadius of the axis, below P.z + 1.5 d. */
 const OBJECT_RADIUS = 0.6;
 const OBJECT_ABOVE = 1.5;
-const MIN_OBJECT_POINTS = 20;
+/** Object points need a track of ≥ 3 images (two-view points are the usual SfM floaters). */
+const MIN_TRACK = 3;
+/**
+ * Isolation filter: a point's distance to its 6th-nearest object neighbour must be ≤ max(3 × the
+ * median of that distance, 0.02 d). Floaters (alone or in clusters of up to 6), and the thin noise
+ * of a placemat or the table just above the clearance, lie much farther from their neighbours
+ * than surface samples of the object. On the 6 object-real sparse models of the header it drops
+ * 3–4 % of the 2.3–4.6 k candidates; a 4× or 5× limit let the placemat noise through (IoU down to
+ * 0.53), 4 neighbours instead of 6 gave the same boxes.
+ */
+const ISOLATION_K = 6;
+const ISOLATION_FACTOR = 3;
+const ISOLATION_MIN = 0.02;
+/** Object points needed after both filters (fewer: a box from a handful of points). */
+const MIN_OBJECT_POINTS = 100;
+/** No box below this confidence: a weak plane or few object points crop the mesh wrongly. */
+const MIN_CONFIDENCE = 0.3;
 /** The 2nd-percentile object point lies at most 0.25 d above the plane. */
 const MAX_GAP = 0.25;
 /**
- * Box: percentiles 0.2 / 99.8 per axis + max(10 % of the extent, 0.03 d). Sparse points cover an
+ * Box: percentiles 0.2 / 99.8 per axis + max(12 % of the extent, 0.03 d). Sparse points cover an
  * object's extremes thinly: on a 40-frame e2e object run (856 object points) 0.5 / 99.5 + max(5 %,
- * 0.02 d) left the box 0.9–1.3 cm inside the GT object box (79 % of it covered); these values cover
- * 94.5 % (the rest is the bottom cut) at IoU 0.78.
+ * 0.02 d) left the box 0.9–1.3 cm inside the GT object box (79 % of it covered); 10 % covered
+ * 94.5 % (the rest is the bottom cut) at IoU 0.78, but once the isolation filter drops the odd
+ * extreme point it no longer contains the GT box − 1 cm there; 12 % does, on that run and the 6
+ * object-real models (IoU 0.73–0.79 there).
  */
 const PCT_LO = 0.2;
 const PCT_HI = 99.8;
-const MARGIN = 0.1;
+const MARGIN = 0.12;
 const MIN_MARGIN = 0.03;
 /** Cameras closer than 0.25 d to the axis (horizontally) look straight down: no ring. */
 const MIN_RING = 0.25;
@@ -129,8 +182,12 @@ export function proposeObjectRoi(model: ObjectRoiInput, opts: ObjectRoiOptions):
     planePoints: 0,
     planeTiltRad: NaN,
     planeSigma: NaN,
+    planeSlope: [NaN, NaN],
     clearance: NaN,
     objectPoints: 0,
+    weakPoints: 0,
+    isolatedPoints: 0,
+    confidence: 0,
   };
   const fail = (reason: string): ObjectRoiProposal => {
     out.reason = reason;
@@ -228,6 +285,7 @@ export function proposeObjectRoi(model: ObjectRoiInput, opts: ObjectRoiOptions):
   out.planePoints = inliers.length;
   const tilt = Math.atan(Math.hypot(pa, pb));
   out.planeTiltRad = tilt;
+  out.planeSlope = [pa, pb];
   const sigma = 1.4826 * mad(inliers.map(residual));
   out.planeSigma = sigma;
   if (inliers.length < MIN_PLANE_POINTS || inliers.length < MIN_PLANE_FRACTION * cand.length) {
@@ -242,21 +300,35 @@ export function proposeObjectRoi(model: ObjectRoiInput, opts: ObjectRoiOptions):
   // ---- 3. object points
   const ro = OBJECT_RADIUS * ring;
   const zTop = P[2] + OBJECT_ABOVE * d;
-  const ox: number[] = [];
-  const oy: number[] = [];
-  const oz: number[] = [];
-  const above: number[] = [];
+  const tracks = model.trackOffsets && model.trackOffsets.length > n ? model.trackOffsets : null;
+  const objCand: number[] = [];
   for (let i = 0; i < n; i++) {
     const x = X[3 * i] - P[0];
     const y = X[3 * i + 1] - P[1];
     const z = X[3 * i + 2];
     if (!(Math.hypot(x, y) <= ro && z <= zTop)) continue;
-    const h = z - (pa * x + pb * y + pc);
-    if (!(h > clearance)) continue;
+    if (!(z - (pa * x + pb * y + pc) > clearance)) continue;
+    if (tracks && tracks[i + 1] - tracks[i] < MIN_TRACK) {
+      out.weakPoints++;
+      continue;
+    }
+    objCand.push(i);
+  }
+  const keep = isolationMask(X, objCand, P, ISOLATION_MIN * d);
+  const ox: number[] = [];
+  const oy: number[] = [];
+  const oz: number[] = [];
+  const above: number[] = [];
+  for (let j = 0; j < objCand.length; j++) {
+    if (!keep[j]) {
+      out.isolatedPoints++;
+      continue;
+    }
+    const i = objCand[j];
     ox.push(X[3 * i]);
     oy.push(X[3 * i + 1]);
-    oz.push(z);
-    above.push(h);
+    oz.push(X[3 * i + 2]);
+    above.push(X[3 * i + 2] - (pa * (X[3 * i] - P[0]) + pb * (X[3 * i + 1] - P[1]) + pc));
   }
   out.objectPoints = oz.length;
   if (oz.length < MIN_OBJECT_POINTS) return fail(`no object on the support plane (${oz.length} points above it)`);
@@ -274,11 +346,41 @@ export function proposeObjectRoi(model: ObjectRoiInput, opts: ObjectRoiOptions):
     max[k] = hi[k] + m;
   }
   const planeZ = pa * (0.5 * (min[0] + max[0]) - P[0]) + pb * (0.5 * (min[1] + max[1]) - P[1]) + pc;
-  min[2] = planeZ + clearance;
+  // the plane's highest point under the box (a bottom corner) + clearance
+  min[2] = planeZ + 0.5 * (Math.abs(pa) * (max[0] - min[0]) + Math.abs(pb) * (max[1] - min[1])) + clearance;
   if (!(max[2] > min[2])) return fail('empty box');
   const confidence = Math.min(1, inliers.length / cand.length) * Math.min(1, oz.length / FULL_SUPPORT_POINTS);
+  out.confidence = confidence;
+  const minConfidence = opts.minConfidence ?? MIN_CONFIDENCE;
+  if (!(confidence >= minConfidence)) return fail(`low confidence (${confidence.toFixed(2)} < ${minConfidence})`);
   out.roi = { min, max, planeZ, centre: [P[0], P[1], P[2]], confidence };
   return out;
+}
+
+/**
+ * Isolation filter of the object candidates `idx` (see ISOLATION_K): 1 = keep. Positions relative
+ * to the orbit centre `P`, so Float32 keeps sub-mm precision far from the world origin.
+ */
+function isolationMask(X: ArrayLike<number>, idx: readonly number[], P: ArrayLike<number>, minRadius: number): Uint8Array {
+  const m = idx.length;
+  const keep = new Uint8Array(m).fill(1);
+  if (m <= ISOLATION_K) return keep;
+  const pts = new Float32Array(3 * m);
+  for (let j = 0; j < m; j++) for (let k = 0; k < 3; k++) pts[3 * j + k] = X[3 * idx[j] + k] - P[k];
+  const tree = new KdTree3(pts, m);
+  const d2 = new Float64Array(ISOLATION_K);
+  const ii = new Int32Array(ISOLATION_K);
+  // distance to the K-th nearest neighbour, per input index
+  const rk = new Float64Array(m);
+  for (let o = 0; o < m; o++) {
+    const got = tree.knnAt(o, ISOLATION_K, d2, ii);
+    let r2 = 0;
+    for (let j = 0; j < got; j++) r2 = Math.max(r2, d2[j]);
+    rk[tree.perm[o]] = got < ISOLATION_K ? Infinity : Math.sqrt(r2);
+  }
+  const limit = Math.max(ISOLATION_FACTOR * median(rk), minRadius);
+  for (let j = 0; j < m; j++) if (!(rk[j] <= limit)) keep[j] = 0;
+  return keep;
 }
 
 /** Bottom centre of the box on the support plane: the origin of exports that stand the object on the ground. */

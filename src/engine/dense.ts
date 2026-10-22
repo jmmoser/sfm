@@ -766,10 +766,11 @@ function formatObjectRoi(r: ObjectRoi): string {
  * gravity-aligned model, `MeshOptions.objectRoi` not false): the TSDF is bounded to the automatic
  * object box (`proposeObjectRoi` on the sparse model), which keeps the table and room out of the
  * mesh, gives the block budget to the object and takes the auto voxel from the depths inside the
- * box; the box bottom clears the support plane by ≥ 2 such voxels. Without a box the 2 × median
- * depth cut alone applies. The dense cloud and splats are never cropped. Stats: voxelSize,
- * tsdfAutoVoxelSize, tsdfCoarsenLevels, tsdfBlocks, tsdfMaxBlocks, objectRoi (the box,
- * 'none: <reason>' or 'off'), objectRoiConfidence.
+ * box; the box bottom clears the support plane by ≥ 2 such voxels. Without a box (none found, or
+ * its confidence below the proposal's 0.3 gate) the 2 × median depth cut alone applies. The dense
+ * cloud and splats are never cropped. Stats: voxelSize, tsdfAutoVoxelSize, tsdfCoarsenLevels,
+ * tsdfBlocks, tsdfMaxBlocks, objectRoi (the box, 'none: <reason>' or 'off'), objectRoiConfidence
+ * (also of a box rejected as low-confidence; 0 when none was computed).
  */
 export async function runMesh(
   deps: MeshDeps,
@@ -799,12 +800,13 @@ export async function runMesh(
     const p = proposeObjectRoi(deps.model, { gravityAligned: !!deps.gravityAligned, minClearance });
     objectRoi = p.roi;
     stats.objectRoi = objectRoi ? formatObjectRoi(objectRoi) : `none: ${p.reason}`;
-    stats.objectRoiConfidence = objectRoi ? Math.round(objectRoi.confidence * 1000) / 1000 : 0;
+    stats.objectRoiConfidence = Math.round(p.confidence * 1000) / 1000;
     deps.log?.(
       'info',
       `mesh object box: ${stats.objectRoi}` +
         ` (ring ${p.ringRadius.toPrecision(3)}, camera distance ${p.distMedian.toPrecision(3)}, plane ${p.planePoints}/${p.annulusPoints} points, ` +
-        `tilt ${((p.planeTiltRad * 180) / Math.PI).toFixed(2)}°, σ ${p.planeSigma.toPrecision(2)}, clearance ${p.clearance.toPrecision(2)}, object ${p.objectPoints} points, confidence ${stats.objectRoiConfidence})`,
+        `tilt ${((p.planeTiltRad * 180) / Math.PI).toFixed(2)}°, σ ${p.planeSigma.toPrecision(2)}, clearance ${p.clearance.toPrecision(2)}, ` +
+        `object ${p.objectPoints} points (${p.weakPoints} weak and ${p.isolatedPoints} isolated dropped), confidence ${stats.objectRoiConfidence})`,
     );
   }
   // block budget scaled to the memory budget (≈ 5.6 KB per block)

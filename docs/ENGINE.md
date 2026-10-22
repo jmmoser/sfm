@@ -156,14 +156,17 @@ Mesh: TSDF over the fusion-filtered depth maps (2 × median sparse depth cut in 
 with a gravity-aligned model (`MeshOptions.objectRoi` not false) the TSDF is bounded to the automatic object
 box (`proposeObjectRoi`, src/dense/object-roi.ts: optical-axis convergence centre, support plane from a
 z-histogram of the sparse points in an annulus around the orbit axis, object = points above the plane within
-0.6 × the camera ring), so the table and room stay out of the mesh, the block budget goes to the object and the
-auto voxel follows the object's depth. No box (not gravity-aligned, no orbit, no plane, hand-held): the whole
-scene within the depth cut, as before. The dense cloud and splats are never cropped. The box is returned as
+0.6 × the camera ring, without weak and isolated points), so the table and room stay out of the mesh, the block
+budget goes to the object and the auto voxel follows the object's depth. No box (not gravity-aligned, no orbit,
+no plane, hand-held, fewer than 100 object points or confidence below 0.3): the whole scene within the depth cut,
+as before. The dense cloud and splats are never cropped. The app has no "mesh the full scene" action yet
+(`MeshOptions.objectRoi: false` is used by the e2e `--no-object-roi` baseline only). The box is returned as
 `MeshResult.objectRoi`, persisted in `mesh/meta` (cleared with the mesh and by refine: it is in the refined
-world frame), reported as `SessionSummary.objectRoi` and handed to exports as `ExportSources.objectRoi` (USDZ /
-GLB put its bottom centre `objectRoiPivot` at the origin). Stats: `objectRoi` (the box, `none: <reason>` or
-`off`), `objectRoiConfidence`, `voxelSize`, `tsdfAutoVoxelSize`, `tsdfCoarsenLevels`, `tsdfBlocks`,
-`tsdfMaxBlocks`.
+world frame), reported as `SessionSummary.objectRoi` and passed to exports as `ExportSources.objectRoi`, for
+exports that will stand the object on the ground with its bottom centre `objectRoiPivot` at the origin (USDZ /
+GLB for AR). No export reads it yet: GLB and PLY are written in world coordinates. Stats: `objectRoi` (the box,
+`none: <reason>` or `off`), `objectRoiConfidence`, `voxelSize`, `tsdfAutoVoxelSize`, `tsdfCoarsenLevels`,
+`tsdfBlocks`, `tsdfMaxBlocks`.
 
 ### Splat
 Gaussian splatting (`src/engine/splat.ts` over `src/splat`, research/splat-tuning.md "Engine splat stage"), after

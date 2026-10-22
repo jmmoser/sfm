@@ -25,7 +25,7 @@ const scene: SynthScene = {
 /** AABB of the 2-part object (sphere + yawed box). */
 const OBJECT = { min: [-0.15, -0.15, 0], max: [0.285, 0.189, 0.3] };
 
-/** Sparse model: surface samples of the scene (0.5 mm noise), each observed by a camera in front of it. */
+/** Sparse model: surface samples of the scene (0.5 mm noise), each observed by the 3 cameras that face it most. */
 function sparseModel(poses: Pose[], cam: ReturnType<typeof pinholeIntrinsics>): SparseModel {
   const rng = new Rng(3);
   const xyz: number[] = [];
@@ -56,21 +56,15 @@ function sparseModel(poses: Pose[], cam: ReturnType<typeof pinholeIntrinsics>): 
   }
   for (let i = 0; i < 400; i++) add(3 * (2 * rng.next() - 1), 2.2, 2 * rng.next());
   const n = xyz.length / 3;
+  const TRACK = 3;
   const trackOffsets = new Uint32Array(n + 1);
-  const trackImages = new Uint32Array(n);
+  const trackImages = new Uint32Array(TRACK * n);
   for (let i = 0; i < n; i++) {
-    trackOffsets[i + 1] = i + 1;
-    // the camera that sees the point most head-on (largest depth along its axis)
-    let best = 0;
-    let bestZ = -Infinity;
-    poses.forEach((p, k) => {
-      const z = p.R[6] * xyz[3 * i] + p.R[7] * xyz[3 * i + 1] + p.R[8] * xyz[3 * i + 2] + p.t[2];
-      if (z > bestZ) {
-        bestZ = z;
-        best = k;
-      }
-    });
-    trackImages[i] = best;
+    trackOffsets[i + 1] = TRACK * (i + 1);
+    // the cameras that see the point most head-on (largest depth along their axis), best first
+    const z = poses.map((p) => p.R[6] * xyz[3 * i] + p.R[7] * xyz[3 * i + 1] + p.R[8] * xyz[3 * i + 2] + p.t[2]);
+    const order = poses.map((_, k) => k).sort((a, b) => z[b] - z[a] || a - b);
+    for (let k = 0; k < TRACK; k++) trackImages[TRACK * i + k] = order[k];
   }
   return {
     cameras: new Map([[0, cam]]),
@@ -81,7 +75,7 @@ function sparseModel(poses: Pose[], cam: ReturnType<typeof pinholeIntrinsics>): 
     errors: new Float32Array(n),
     trackOffsets,
     trackImages,
-    trackFeatures: new Uint32Array(n),
+    trackFeatures: new Uint32Array(TRACK * n),
   };
 }
 
@@ -147,5 +141,41 @@ describe('runMesh object box', () => {
     const sc = await runMesh(deps({ mode: 'scene' }), gt.views, gt.store);
     expect(sc.objectRoi).toBeNull();
     expect(sc.stats.objectRoi).toBe('off');
+  });
+
+  it('no box from too few object points (a textureless object): the whole scene, not a crop', async () => {
+    // keep 60 of the object's sparse points (the 2-part object: above the ground, near the axis)
+    const keep: number[] = [];
+    let objectKept = 0;
+    for (let i = 0; i < model.numPoints; i++) {
+      const [x, y, z] = [model.xyz[3 * i], model.xyz[3 * i + 1], model.xyz[3 * i + 2]];
+      const onObject = z > 0.005 && Math.hypot(x, y) < 0.4;
+      if (onObject && objectKept++ >= 60) continue;
+      keep.push(i);
+    }
+    const n = keep.length;
+    const trackOffsets = new Uint32Array(n + 1);
+    const trackImages: number[] = [];
+    keep.forEach((i, j) => {
+      for (let k = model.trackOffsets[i]; k < model.trackOffsets[i + 1]; k++) trackImages.push(model.trackImages[k]);
+      trackOffsets[j + 1] = trackImages.length;
+    });
+    const thin: SparseModel = {
+      ...model,
+      numPoints: n,
+      xyz: Float64Array.from(keep.flatMap((i) => [model.xyz[3 * i], model.xyz[3 * i + 1], model.xyz[3 * i + 2]])),
+      colors: new Uint8Array(3 * n),
+      errors: new Float32Array(n),
+      trackOffsets,
+      trackImages: Uint32Array.from(trackImages),
+      trackFeatures: new Uint32Array(trackImages.length),
+    };
+    const r = await runMesh(deps({ model: thin }), gt.views, gt.store);
+    expect(r.objectRoi).toBeNull();
+    expect(String(r.stats.objectRoi)).toMatch(/^none: no object on the support plane/);
+    // (the depth cut follows the thin model's median depth)
+    const off = await runMesh(deps({ model: thin }), gt.views, gt.store, { objectRoi: false });
+    expect(r.mesh.vertexCount).toBe(off.mesh.vertexCount);
+    expect(r.mesh.vertexCount).toBeGreaterThan(10_000);
   });
 });

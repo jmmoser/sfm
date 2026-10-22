@@ -9,6 +9,8 @@ import { lookAt } from './synthetic';
  * a table top at z = 0.75 in a 5 × 5 × 2.6 m room, a 3-part object (pedestal + knot, a globe, a box —
  * connected only through the table), a magazine, and a mug at the camera-ring radius. Sparse points
  * are surface samples with 0.5 mm noise plus 1 % outliers in the room; cameras orbit the object.
+ * Variants add floaters in the object cylinder, a noisy placemat, 2-view tracks, a tilted world and
+ * clutter around the object.
  */
 type Group = 'table' | 'flat' | 'floor' | 'wall' | 'object' | 'mug' | 'outlier';
 
@@ -19,19 +21,18 @@ class Cloud {
     readonly rng: Rng,
     readonly noise = 0.0005,
   ) {}
-  add(g: Group, x: number, y: number, z: number): void {
-    const s = this.noise;
+  add(g: Group, x: number, y: number, z: number, s = this.noise): void {
     this.xyz.push(x + s * this.rng.gaussian(), y + s * this.rng.gaussian(), z + s * this.rng.gaussian());
     this.group.push(g);
   }
   /** Horizontal rectangle centred at (cx, cy) with half sizes hx, hy, rotated by yaw. */
-  rect(g: Group, n: number, cx: number, cy: number, z: number, hx: number, hy: number, yaw = 0): void {
+  rect(g: Group, n: number, cx: number, cy: number, z: number, hx: number, hy: number, yaw = 0, noise = this.noise): void {
     const c = Math.cos(yaw);
     const s = Math.sin(yaw);
     for (let i = 0; i < n; i++) {
       const u = (2 * this.rng.next() - 1) * hx;
       const v = (2 * this.rng.next() - 1) * hy;
-      this.add(g, cx + c * u - s * v, cy + s * u + c * v, z);
+      this.add(g, cx + c * u - s * v, cy + s * u + c * v, z, noise);
     }
   }
   /** Box surface (all faces but the bottom). */
@@ -81,6 +82,14 @@ class Cloud {
   outliers(n: number): void {
     for (let i = 0; i < n; i++) this.add('outlier', 5 * this.rng.next() - 2.5, 5 * this.rng.next() - 2.5, 2.6 * this.rng.next());
   }
+  /** Floaters uniform in the vertical cylinder of radius r around the z axis, z in [z0, z1]. */
+  floaters(n: number, r: number, z0: number, z1: number): void {
+    for (let i = 0; i < n; i++) {
+      const a = 2 * Math.PI * this.rng.next();
+      const q = r * Math.sqrt(this.rng.next());
+      this.add('outlier', q * Math.cos(a), q * Math.sin(a), z0 + (z1 - z0) * this.rng.next());
+    }
+  }
   /** Rigid transform of every point: p ← R (p − o) + o. */
   rotate(R: number[], o: number[]): void {
     for (let i = 0; i < this.xyz.length; i += 3) {
@@ -92,11 +101,12 @@ class Cloud {
 
 const TABLE_Z = 0.75;
 
-const log = (p: ReturnType<typeof proposeObjectRoi>): void => {
+const log = (p: ReturnType<typeof proposeObjectRoi>, label = ''): void => {
   const f = (v: number[]): string => `[${v.map((x) => x.toFixed(3)).join(', ')}]`;
   console.log(
-    `[object-roi] ${p.roi ? `box ${f(p.roi.min)} – ${f(p.roi.max)}, plane ${p.roi.planeZ.toFixed(4)}, confidence ${p.roi.confidence.toFixed(2)}` : `none (${p.reason})`}; ` +
-      `ring ${p.ringRadius.toFixed(3)}, d ${p.distMedian.toFixed(3)}, plane ${p.planePoints}/${p.annulusPoints} pts, tilt ${((p.planeTiltRad * 180) / Math.PI).toFixed(2)}°, σ ${(1000 * p.planeSigma).toFixed(2)} mm, clearance ${(1000 * p.clearance).toFixed(1)} mm, object ${p.objectPoints} pts`,
+    `[object-roi]${label ? ` ${label}:` : ''} ${p.roi ? `box ${f(p.roi.min)} – ${f(p.roi.max)}, plane ${p.roi.planeZ.toFixed(4)}, confidence ${p.roi.confidence.toFixed(2)}` : `none (${p.reason})`}; ` +
+      `ring ${p.ringRadius.toFixed(3)}, d ${p.distMedian.toFixed(3)}, plane ${p.planePoints}/${p.annulusPoints} pts, tilt ${((p.planeTiltRad * 180) / Math.PI).toFixed(2)}°, σ ${(1000 * p.planeSigma).toFixed(2)} mm, clearance ${(1000 * p.clearance).toFixed(1)} mm, ` +
+      `object ${p.objectPoints} pts (${p.weakPoints} weak, ${p.isolatedPoints} isolated dropped)`,
   );
 };
 
@@ -122,6 +132,19 @@ function orbit(rng: Rng, n: number, r: number, h: number, target: number[], up =
 
 function model(c: Cloud, poses: Pose[]): ObjectRoiInput {
   return { images: poses.map((pose) => ({ pose })), xyz: Float64Array.from(c.xyz), numPoints: c.group.length };
+}
+
+/** Rotation by t about the x axis through o (a gravity error / a tilted support). */
+function tiltX(t: number, o: number[]): { R: number[]; apply: (v: number[]) => number[] } {
+  const R = [1, 0, 0, 0, Math.cos(t), -Math.sin(t), 0, Math.sin(t), Math.cos(t)];
+  return { R, apply: (v) => [0, 1, 2].map((k) => R[3 * k] * (v[0] - o[0]) + R[3 * k + 1] * (v[1] - o[1]) + R[3 * k + 2] * (v[2] - o[2]) + o[k]) };
+}
+
+/** Largest change of a box face between two boxes. */
+function maxFaceShift(a: ObjectRoi, b: ObjectRoi): number {
+  let m = 0;
+  for (let k = 0; k < 3; k++) m = Math.max(m, Math.abs(a.min[k] - b.min[k]), Math.abs(a.max[k] - b.max[k]));
+  return m;
 }
 
 /** The e2e layout: table, magazine, mug at the camera radius (0.45 m), room, 3-part object. */
@@ -205,13 +228,17 @@ describe('proposeObjectRoi', () => {
     const { cloud, poses } = tableScene(2);
     const p = proposeObjectRoi(model(cloud, poses), { gravityAligned: true, minClearance: 0.006 });
     expect(p.clearance).toBeCloseTo(0.006, 9);
-    expect(p.roi!.min[2] - p.roi!.planeZ).toBeCloseTo(0.006, 9);
+    // the bottom: the plane's highest point under the box (a corner) + clearance
+    const r = p.roi!;
+    const rise = 0.5 * (Math.abs(p.planeSlope[0]) * (r.max[0] - r.min[0]) + Math.abs(p.planeSlope[1]) * (r.max[1] - r.min[1]));
+    expect(rise).toBeLessThan(0.0005);
+    expect(r.min[2] - r.planeZ - rise).toBeCloseTo(0.006, 9);
     // relative to the orbit distance d (runMesh: 2 voxels of 2 px at d)
     const q = proposeObjectRoi(model(cloud, poses), { gravityAligned: true, minClearance: { perDistance: 0.015 } });
     expect(q.clearance).toBeCloseTo(0.015 * q.distMedian, 9);
   });
 
-  it('is scale-invariant (non-metric model) and absorbs a 2° gravity error', () => {
+  it('is scale-invariant (non-metric model)', () => {
     const s = 3.7;
     const { cloud, poses } = tableScene(3);
     const scaled = model(cloud, poses);
@@ -224,24 +251,117 @@ describe('proposeObjectRoi', () => {
       expect(a.min[k] / s).toBeCloseTo(b.min[k], 6);
       expect(a.max[k] / s).toBeCloseTo(b.max[k], 6);
     }
-    // the world tilted by 2° about x (gravity error): one plane, the object still isolated
-    const t = (2 * Math.PI) / 180;
-    const R = [1, 0, 0, 0, Math.cos(t), -Math.sin(t), 0, Math.sin(t), Math.cos(t)];
+  });
+
+  it('a 1.5° gravity error: one plane, the table stays below the flat bottom, the object base is cut on the low side only', () => {
+    // the world tilted about x (cameras included): the table rises toward +y
+    const t = (1.5 * Math.PI) / 180;
     const o = [0, 0, TABLE_Z];
-    const tiltedCloud = tableScene(3).cloud;
-    tiltedCloud.rotate(R, o);
-    const rot = (v: number[]): number[] => [0, 1, 2].map((k) => R[3 * k] * (v[0] - o[0]) + R[3 * k + 1] * (v[1] - o[1]) + R[3 * k + 2] * (v[2] - o[2]) + o[k]);
-    const tp = orbit(new Rng(30), 30, 0.45, 0.2, rot([0, 0, 0.86]), rot([o[0], o[1], o[2] + 1]).map((v, k) => v - o[k]));
-    const q = proposeObjectRoi(model(tiltedCloud, tp), { gravityAligned: true });
-    expect(q.reason).toBe('');
-    expect(Math.abs(q.planeTiltRad - t)).toBeLessThan(0.1 * (Math.PI / 180));
+    const tilt = tiltX(t, o);
+    const cloud = tableScene(3).cloud;
+    cloud.rotate(tilt.R, o);
+    const up = tilt.apply([o[0], o[1], o[2] + 1]).map((v, k) => v - o[k]);
+    const poses = orbit(new Rng(30), 30, 0.45, 0.2, tilt.apply([0, 0, 0.86]), up);
+    const p = proposeObjectRoi(model(cloud, poses), { gravityAligned: true });
+    log(p, '1.5° tilt');
+    expect(p.reason).toBe('');
+    expect(Math.abs(p.planeTiltRad - t)).toBeLessThan(0.1 * (Math.PI / 180));
+    const roi = p.roi!;
+    // the support plane under the box centre; the bottom clears its highest corner
+    const rise = 0.5 * (Math.abs(p.planeSlope[0]) * (roi.max[0] - roi.min[0]) + Math.abs(p.planeSlope[1]) * (roi.max[1] - roi.min[1]));
+    expect(rise).toBeGreaterThan(0.003);
+    expect(roi.min[2]).toBeCloseTo(roi.planeZ + rise + p.clearance, 9);
+    let tableIn = 0;
+    let objN = 0;
     let objOut = 0;
-    for (let i = 0; i < tiltedCloud.group.length; i++) {
-      if (tiltedCloud.group[i] !== 'object') continue;
-      const [x, y, z] = [tiltedCloud.xyz[3 * i], tiltedCloud.xyz[3 * i + 1], tiltedCloud.xyz[3 * i + 2]];
-      if (z > q.roi!.min[2] + 0.008 && !inside(q.roi!, x, y, z)) objOut++;
+    let objCut = 0;
+    for (let i = 0; i < cloud.group.length; i++) {
+      const [x, y, z] = [cloud.xyz[3 * i], cloud.xyz[3 * i + 1], cloud.xyz[3 * i + 2]];
+      const g = cloud.group[i];
+      if (g === 'table' || g === 'flat') {
+        if (inside(roi, x, y, z)) tableIn++;
+      } else if (g === 'object') {
+        objN++;
+        if (z < roi.min[2]) objCut++;
+        else if (!inside(roi, x, y, z)) objOut++;
+      }
     }
+    expect(tableIn).toBe(0);
     expect(objOut).toBe(0);
+    // the base below the flat bottom (≤ 2 · rise + clearance at the low edge): 3.6 % of the samples
+    expect(objCut / objN).toBeLessThan(0.05);
+  });
+
+  it('no box on a support tilted by 3° (beyond MAX_TILT: the flat bottom would cut the base by > 1 cm)', () => {
+    // (the fit is exact to 2°, then underestimates: 2.4° here, still rejected)
+    const t = (3 * Math.PI) / 180;
+    const o = [0, 0, TABLE_Z];
+    const tilt = tiltX(t, o);
+    const cloud = tableScene(3).cloud;
+    cloud.rotate(tilt.R, o);
+    const up = tilt.apply([o[0], o[1], o[2] + 1]).map((v, k) => v - o[k]);
+    const p = proposeObjectRoi(model(cloud, orbit(new Rng(30), 30, 0.45, 0.2, tilt.apply([0, 0, 0.86]), up)), { gravityAligned: true });
+    expect(p.roi).toBeNull();
+    expect(p.reason).toMatch(/support plane tilted 2\.[1-9]°/);
+  });
+
+  it('floaters in the object cylinder (1 % and 3 % of the object points) do not stretch the box', () => {
+    const { cloud, poses } = tableScene(9);
+    const clean = proposeObjectRoi(model(cloud, poses), { gravityAligned: true });
+    const nObj = cloud.group.filter((g) => g === 'object').length;
+    for (const share of [0.01, 0.03]) {
+      const { cloud: c } = tableScene(9);
+      // uniform in r ≤ 0.6 × ring (0.27 m), from 1 cm above the table to 0.8 m above it
+      c.floaters(Math.round(share * nObj), 0.6 * clean.ringRadius, TABLE_Z + 0.01, TABLE_Z + 0.8);
+      const p = proposeObjectRoi(model(c, poses), { gravityAligned: true });
+      log(p, `${100 * share} % floaters`);
+      expect(p.reason).toBe('');
+      expect(maxFaceShift(p.roi!, clean.roi!)).toBeLessThan(0.01);
+      expectIsolates(p.roi!, c, TABLE_Z);
+      expect(p.isolatedPoints).toBeGreaterThanOrEqual(Math.round(0.8 * share * nObj));
+    }
+  });
+
+  it('noise of a placemat just above the clearance does not spread the box over the ring', () => {
+    const { cloud, poses } = tableScene(10);
+    const clean = proposeObjectRoi(model(cloud, poses), { gravityAligned: true });
+    // a placemat 1.5 mm above the table with 1.5 mm noise: ~10 % of its points lie above the
+    // 3.9 mm clearance, spread over the whole 0.6 × ring disc
+    const { cloud: c } = tableScene(10);
+    c.rect('flat', 3000, 0, 0, TABLE_Z + 0.0015, 0.25, 0.25, 0, 0.0015);
+    const p = proposeObjectRoi(model(c, poses), { gravityAligned: true });
+    log(p, 'noisy placemat');
+    expect(p.reason).toBe('');
+    let leaked = 0;
+    for (let i = 0; i < c.group.length; i++) {
+      if (c.group[i] === 'flat' && c.xyz[3 * i + 2] > p.roi!.min[2] && Math.hypot(c.xyz[3 * i], c.xyz[3 * i + 1]) < 0.6 * p.ringRadius) leaked++;
+    }
+    expect(leaked).toBeGreaterThan(80);
+    // those far from the object are dropped (the rest lie at its base, inside the box anyway)
+    expect(p.isolatedPoints).toBeGreaterThan(0.4 * leaked);
+    expect(maxFaceShift(p.roi!, clean.roi!)).toBeLessThan(0.01);
+    // every object sample above the bottom cut is inside
+    for (let i = 0; i < c.group.length; i++) {
+      if (c.group[i] !== 'object' || c.xyz[3 * i + 2] < p.roi!.min[2]) continue;
+      expect(inside(p.roi!, c.xyz[3 * i], c.xyz[3 * i + 1], c.xyz[3 * i + 2])).toBe(true);
+    }
+  });
+
+  it('weak points (tracks of < 3 images) are dropped: a dense 2-view floater cluster survives the isolation filter alone', () => {
+    const { cloud, poses } = tableScene(11);
+    const clean = proposeObjectRoi(model(cloud, poses), { gravityAligned: true });
+    const nClean = cloud.group.length;
+    // 12 points within 1 cm, 25 cm above the object's top
+    for (let i = 0; i < 12; i++) cloud.add('outlier', 0.05 + 0.005 * cloud.rng.gaussian(), 0.02 + 0.005 * cloud.rng.gaussian(), 1.25 + 0.005 * cloud.rng.gaussian());
+    const n = cloud.group.length;
+    const noTracks = proposeObjectRoi(model(cloud, poses), { gravityAligned: true });
+    expect(noTracks.roi!.max[2]).toBeGreaterThan(1.24);
+    // tracks: 5 images per point, 2 for the cluster
+    const trackOffsets = new Uint32Array(n + 1);
+    for (let i = 0; i < n; i++) trackOffsets[i + 1] = trackOffsets[i] + (i < nClean ? 5 : 2);
+    const p = proposeObjectRoi({ ...model(cloud, poses), trackOffsets }, { gravityAligned: true });
+    expect(p.weakPoints).toBe(12);
+    expect(p.roi).toEqual(clean.roi);
   });
 
   it('a flat 3 cm book still gets the table as its plane', () => {
@@ -285,6 +405,37 @@ describe('proposeObjectRoi', () => {
     const q = proposeObjectRoi(model(tilted, poses), { gravityAligned: true });
     expect(q.roi).toBeNull();
     expect(q.reason).toMatch(/tilted|no support plane/);
+  });
+
+  it('no box: too few object points, or a weak plane (low confidence; minConfidence lowers the gate)', () => {
+    // a small object: 80 sparse points
+    const rng = new Rng(12);
+    const c = new Cloud(rng);
+    c.rect('table', 4000, 0, 0, TABLE_Z, 0.6, 0.4);
+    c.room(2000);
+    c.ellipsoid('object', 80, [0, 0, TABLE_Z + 0.05], [0.05, 0.05, 0.05]);
+    const poses = orbit(rng, 30, 0.45, 0.2, [0, 0, TABLE_Z + 0.05]);
+    const few = proposeObjectRoi(model(c, poses), { gravityAligned: true });
+    expect(few.roi).toBeNull();
+    expect(few.reason).toMatch(/no object on the support plane \(\d+ points/);
+    // clutter around the object (3 × the table points of the annulus, spread in z): plane share ≈ 0.25
+    const { cloud, poses: tp } = tableScene(13);
+    const ok = proposeObjectRoi(model(cloud, tp), { gravityAligned: true });
+    const r0 = 0.6 * ok.ringRadius;
+    const r1 = 1.5 * ok.ringRadius;
+    for (let i = 0; i < 3 * ok.planePoints; i++) {
+      const a = 2 * Math.PI * cloud.rng.next();
+      const r = Math.sqrt(r0 * r0 + (r1 * r1 - r0 * r0) * cloud.rng.next());
+      cloud.add('outlier', r * Math.cos(a), r * Math.sin(a), 0.86 - ok.distMedian + 1.1 * ok.distMedian * cloud.rng.next());
+    }
+    const weak = proposeObjectRoi(model(cloud, tp), { gravityAligned: true });
+    log(weak, 'cluttered annulus');
+    expect(weak.roi).toBeNull();
+    expect(weak.reason).toMatch(/low confidence \(0\.2\d < 0\.3\)/);
+    expect(weak.confidence).toBeGreaterThan(0.2);
+    const lowered = proposeObjectRoi(model(cloud, tp), { gravityAligned: true, minConfidence: 0.2 });
+    expect(lowered.roi!.confidence).toBeCloseTo(weak.confidence, 12);
+    expectIsolates(lowered.roi!, cloud, TABLE_Z);
   });
 
   it('no box: cameras that do not orbit (a sideways walk) or look straight down', () => {

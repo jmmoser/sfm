@@ -199,7 +199,10 @@ export interface MetricInfo {
  * ((min[0] + max[0]) / 2, (min[1] + max[1]) / 2, planeZ) at the origin.
  */
 export interface ObjectRoi {
-  /** Lower corner; min[2] = planeZ + the clearance that keeps the support surface out. */
+  /**
+   * Lower corner; min[2] = the support plane's highest point under the box (≈ planeZ: the plane
+   * tilts ≤ 2°) + the clearance that keeps the support surface out.
+   */
   min: [number, number, number];
   max: [number, number, number];
   /** Height of the support plane (table, floor) under the box centre. */

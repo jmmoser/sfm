@@ -451,10 +451,10 @@ tsdfMesh(views: DenseView[], store: DepthMapStore, opts?: { voxelSize?: number; 
   bounds?: { min: ArrayLike<number>; max: ArrayLike<number> } /* world AABB: no vertex outside */ }, progress?, cancel?): Promise<TriangleMesh>
 filterPointCloud(pc: PointCloud, opts?: { voxelSize?: number; statistical?: { k: number; std: number } }): PointCloud
 // object-roi.ts — object box of an orbit capture (gravity-aligned world): orbit centre + support plane
-proposeObjectRoi(model: { images: { pose: Pose }[]; xyz: ArrayLike<number>; numPoints: number },
-  opts: { gravityAligned: boolean; minClearance?: number | { perDistance: number } })
+proposeObjectRoi(model: { images: { pose: Pose }[]; xyz: ArrayLike<number>; numPoints: number; trackOffsets?: ArrayLike<number> },
+  opts: { gravityAligned: boolean; minClearance?: number | { perDistance: number }; minConfidence?: number /* 0.3 */ })
   : { roi: ObjectRoi | null; reason: string; … }   // ObjectRoi {min, max, planeZ, centre, confidence} (core/types.ts)
-objectRoiPivot(roi: ObjectRoi): [x, y, planeZ]      // bottom centre: the export origin of an object on the ground
+objectRoiPivot(roi: ObjectRoi): [x, y, planeZ]      // bottom centre: the origin for exports that stand the object on the ground
 ```
 
 ### 4.7 `src/sensors`
@@ -584,7 +584,7 @@ PatchMatch at ½ resolution (multi-scale) → PatchMatch (photometric) for all v
 PatchMatch (geometric consistency) → halo / sky filter → fusion → filtered coloured
 point cloud → optional TSDF mesh (object mode with a gravity-aligned model: bounded to the automatic
 object box from the sparse model — orbit centre + support plane, `dense/object-roi.ts` — which the mesh
-result and `mesh/meta` carry for the exports; the dense cloud and splats are not cropped).
+result and `mesh/meta` carry for later ground-placed exports; the dense cloud and splats are not cropped).
 
 **Splat**: dense (else sparse) cloud → 3D Gaussians → WebGPU training against all keyframes
 (MCMC densification, depth supervision from the dense maps, per-view colour correction).
