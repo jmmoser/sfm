@@ -17,7 +17,13 @@ export interface SelfMetrics {
     deregisteredOutliers: number;
     rejectedPairs: number | null;
     rejectedPoses: number | null;
+    recoveredPoses: number | null;
+    /** Registrations with the gyro-predicted rotation ("<n> live, <n> in refine, <n> offline"; 'off' when not used). */
+    aidedRegistrations: string | null;
+    /** Of them, not counted in refine's model choice (the model showed an unclosed loop). */
+    aidedNotCounted: { live: number | null; offline: number | null };
   };
+  retriangulatedRegistrations: string | null;
   explained: { live: number | null; offline: number | null };
   offlineSfM: string | null;
   scale: {

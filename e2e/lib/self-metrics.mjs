@@ -78,7 +78,12 @@ export function computeSelfMetrics(r, meta = {}) {
       deregisteredOutliers: outliers,
       rejectedPairs: num(st.gyroRejectedPairs),
       rejectedPoses: num(st.gyroRejectedPoses),
+      recoveredPoses: num(st.gyroRecoveredPoses),
+      // registrations with the gyro-predicted rotation: "<n> live, <n> in refine, <n> offline" ('off' when not used)
+      aidedRegistrations: typeof st.gyroAidedRegistrations === 'string' ? st.gyroAidedRegistrations : null,
+      aidedNotCounted: { live: num(st.liveGyroAidedNotCounted), offline: num(st.offlineGyroAidedNotCounted) },
     },
+    retriangulatedRegistrations: typeof st.retriangulatedRegistrations === 'string' ? st.retriangulatedRegistrations : null,
     explained: { live: num(st.liveExplained), offline: num(st.offlineExplained) },
     offlineSfM: typeof st.offlineSfM === 'string' ? st.offlineSfM : null,
     scale: metric
@@ -139,6 +144,7 @@ export function formatSelfTable(m) {
   add('points', m.tracks.points);
   add(`gyro breaks (${m.gyro.model ?? '?'} model)`, m.gyro.breaks === null ? null : `${m.gyro.breaks} (+${m.gyro.breakOutliers} outliers, median ${fmt(m.gyro.medianErrDeg, 2)}°)`);
   if (m.gyro.deregisteredOutliers) add('gyro outliers deregistered', m.gyro.deregisteredOutliers);
+  if (m.gyro.aidedRegistrations) add('gyro-aided registrations', m.gyro.aidedRegistrations);
   add('explained correspondences (live / offline)', `${fmt(m.explained.live, 3)} / ${fmt(m.explained.offline, 3)}`);
   if (m.offlineSfM) add('offline SfM', m.offlineSfM);
   if (m.scale) {

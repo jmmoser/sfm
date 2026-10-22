@@ -17,6 +17,18 @@
  * `LiveMapper.addKeyframe`, vocabulary training / indexing, the R_cam_device hand-eye check,
  * 'auto' mode resolution, persistence and a `live` event with the decimated model.
  *
+ * Phone-rate capture: at 2–4 analysed frames per second a fast pan rotates 30°+ between frames
+ * and the first keyframe past the map sees a few dozen triangulated points; P3P's 30-inlier floor
+ * used to lose tracking there for the rest of the capture (e2e yard-real at stride 3: 19/48
+ * keyframes registered live before; docs/research/real-capture-robustness.md "Phone-rate
+ * capture"). LiveMapper re-triangulates the registered neighbours of such a keyframe, which gives
+ * P3P its points (48/48). Gyro-aided registration (`predictRotation`: the rotation the gyro
+ * propagates from the registered keyframe nearest in time, once R_cam_device is verified, also
+ * with the gyro gates off) is opt-in live (`EngineConfig.gyroAidedRegistration: 'all'`); by
+ * default refine's offline SfM uses it. Every registration that was not a plain P3P one is logged
+ * at debug level (visible points before / after re-triangulation, P3P and known-rotation inliers,
+ * why the known rotation refused it): `logRegistrations`.
+ *
  * Resume / extend: `restore` rebuilds the capture from the store (worker respawn; the live model in
  * its own gauge, in the mapping queue); `reopenCapture` continues a restored — also a finished —
  * capture (EngineOptions.extend, "Add more views"). While the live model is rebuilt (one mapping
@@ -62,9 +74,9 @@ import { FeatureDatabase, pairKey } from '../sfm/database';
 import { checkPairRotation, checkPoseRotation, GyroReference, IMU_MAX_GAP_MS, type GyroToleranceOptions, type TimedRotation } from '../sfm/gyro';
 import { estimateTimeOffset, type InertialKeyframe } from '../sfm/inertial';
 import { KeyframeSelector, rotationCompensatedParallax, type KeyframeCandidate } from '../sfm/keyframes';
-import { LiveMapper } from '../sfm/live';
+import { LiveMapper, type LiveKeyframeResult } from '../sfm/live';
 import { rsModelFromDevice, type RollingShutterModel } from '../sfm/rolling-shutter';
-import { intrinsicsFromFov, type MapperOptions } from '../sfm/mapper';
+import { intrinsicsFromFov, type KnownRotationRefusal, type MapperOptions } from '../sfm/mapper';
 import type { Reconstruction } from '../sfm/reconstruction';
 import { VocabularyIndex, type BowVector } from '../sfm/vocab';
 import type { CaptureMode, DecodedFrameInput as FrameInput, Guidance, LiveCamera, LiveDebug, LiveUpdate, QualityPreset, TrackingState } from '../workers/protocol';
@@ -478,9 +490,16 @@ export class LiveSession {
     handEye: null as HandEyeResult | null,
     /** Keyframes forced by the hard rotation limit (fast pans). */
     forcedKeyframes: 0,
-    /** Verified pairs / registrations / initial pairs rejected by the gyro check. */
+    /**
+     * Verified pairs / initial pairs, and poses (P3P or known-rotation candidates, live and in
+     * refine) rejected by the gyro check. `gyroRecoveredPoses`: rejected P3P poses of keyframes the
+     * same registration attempt then registered — by the gyro-predicted rotation, or by P3P on the
+     * re-triangulated map — (counted in gyroRejectedPoses too): the difference counts rejected
+     * poses of keyframes that stayed unregistered.
+     */
     gyroRejectedPairs: 0,
     gyroRejectedPoses: 0,
+    gyroRecoveredPoses: 0,
     /** Planar pairs whose two-fold ambiguity the gyro resolved (alternative branch taken). */
     gyroPlanarSwaps: 0,
     /** Live gyro calibrations (bias / time offset from the registered keyframes). */
@@ -511,6 +530,7 @@ export class LiveSession {
     this.mapper = new LiveMapper(this.state.db, this.state.graph, {
       hfovPriorDeg: deps.hfovPriorDeg ?? 69,
       rotationCheck: this.rotationCheck(),
+      ...(deps.config.gyroAidedRegistration === 'all' ? { predictRotation: (id: number, rec: Reconstruction) => this.predictRotation(id, rec) } : {}),
       reportReprojError: false, // never read here; a full reprojection per keyframe
       ...(deps.config.live ?? {}),
     });
@@ -554,14 +574,21 @@ export class LiveSession {
   }
 
   /**
-   * The gyro for consistency checks (pairs, registrations, models): only once the camera←device
-   * mapping is verified (hand-eye check) — a wrong R_cam_device would reject every correct pair —
-   * and unless disabled (`EngineConfig.gyroGate: false`). Null otherwise.
+   * The gyro once the camera←device mapping is verified (hand-eye check) and ≥ 2 IMU samples exist;
+   * null otherwise — a wrong R_cam_device would reject every correct pair and predict wrong rotations.
    */
-  gyroForChecks(): GyroReference | null {
-    if (this.deps.config.gyroGate === false || !this.state.cameraThetaVerified) return null;
+  verifiedGyro(): GyroReference | null {
+    if (!this.state.cameraThetaVerified) return null;
     const g = this.gyro();
     return g.numSamples >= 2 ? g : null;
+  }
+
+  /**
+   * The gyro for consistency checks (pairs, registrations, models): `verifiedGyro` unless the
+   * checks are disabled (`EngineConfig.gyroGate: false`). Null otherwise.
+   */
+  gyroForChecks(): GyroReference | null {
+    return this.deps.config.gyroGate === false ? null : this.verifiedGyro();
   }
 
   /**
@@ -616,7 +643,7 @@ export class LiveSession {
     const c = checkPoseRotation(gyro, r.t, pose.R, nbs, { tolerance: this.gyroTolerance() });
     if (!c || c.ok) return true;
     this.stats.gyroRejectedPoses++;
-    this.deps.log('debug', `registration of keyframe ${id} rejected by the gyro: rotation ${(c.errRad / DEG).toFixed(1)}° off (${c.disagree}/${c.agree + c.disagree} neighbours disagree)`);
+    this.deps.log('debug', `pose of keyframe ${id} rejected by the gyro: rotation ${(c.errRad / DEG).toFixed(1)}° off (${c.disagree}/${c.agree + c.disagree} neighbours disagree)`);
     return false;
   }
 
@@ -628,7 +655,83 @@ export class LiveSession {
         return g !== null;
       },
       pose: (id, pose, rec) => this.checkPoseGyro(id, pose, rec),
+      poseRecovered: () => void this.stats.gyroRecoveredPoses++,
     };
+  }
+
+  /**
+   * Debug log of the registration attempts of an `addKeyframe` call that were not a plain P3P
+   * registration (re-triangulated neighbours, the gyro-predicted rotation, or still pending), e.g.
+   * "keyframe 19 registered (P3P): 36 map points → 96 re-triangulated; P3P no pose (36
+   * correspondences), then P3P 84/99".
+   */
+  private logRegistrations(res: LiveKeyframeResult): void {
+    for (const a of res.registrations) {
+      if (a.registered && a.calls.length === 1 && a.calls[0].via === 'p3p' && Number.isNaN(a.visibleRetriangulated)) continue;
+      const calls = a.calls.map((c) => {
+        const parts: string[] = [];
+        const count = (k: number): string => (k > 0 ? `${k}/${c.correspondences}` : `no pose (${c.correspondences} correspondences)`);
+        if (!Number.isNaN(c.p3pInliers)) parts.push(`P3P ${count(c.p3pInliers)}${c.p3pRotationRejected ? ' rejected by the gyro' : ''}`);
+        if (!Number.isNaN(c.knownRotationInliers)) {
+          const notes: string[] = [];
+          if (Number.isFinite(c.rotationChangeDeg)) notes.push(`moved ${c.rotationChangeDeg.toFixed(2)}°`);
+          if (Number.isFinite(c.pairBaselineDeg)) notes.push(`baseline ${c.pairBaselineDeg.toFixed(1)}° off its best pair's`);
+          if (c.knownRotationRefused && c.knownRotationRefused !== 'noPose') notes.push(LiveSession.REFUSAL[c.knownRotationRefused]);
+          parts.push(`known rotation ${count(c.knownRotationInliers)}${notes.length ? ` (${notes.join(', ')})` : ''}`);
+        } else if (c.knownRotationRefused) parts.push(`known rotation not run: ${LiveSession.REFUSAL[c.knownRotationRefused]}`);
+        return parts.length ? parts.join(', ') : `${c.correspondences} correspondences`;
+      });
+      const via = a.calls[a.calls.length - 1]?.via;
+      const state = a.registered ? `registered (${via === 'knownRotation' ? 'gyro rotation' : 'P3P'})` : 'pending';
+      const retri = Number.isNaN(a.visibleRetriangulated) ? '' : ` → ${a.visibleRetriangulated} re-triangulated`;
+      this.deps.log('debug', `keyframe ${a.id} ${state}: ${a.visible} map points${retri}; ${calls.join(', then ')}`);
+    }
+  }
+
+  /** Why the known rotation refused a keyframe, for `logRegistrations`. */
+  private static readonly REFUSAL: Readonly<Record<KnownRotationRefusal, string>> = {
+    noPrediction: 'no gyro prediction (gyro not verified, no registered keyframe within 3 s, or an IMU gap)',
+    correspondences: 'too few correspondences',
+    noPose: 'no pose',
+    inlierRatio: 'too small an inlier share',
+    rotationChange: 'refined too far from the gyro rotation',
+    degenerate: 'degenerate pose',
+    spread: 'inliers not spread over the image',
+    noPair: 'no verified pair to check its baseline',
+    baseline: "baseline off its best pair's",
+    rotationCheck: 'rejected by the gyro',
+  };
+
+  /** Longest |Δt| (ms) over which `predictRotation` propagates a registered keyframe's rotation. */
+  private static readonly PREDICT_MAX_GAP_MS = 3000;
+
+  /**
+   * `MapperOptions.predictRotation` (gyro-aided registration; `EngineConfig.gyroAidedRegistration`):
+   * the rotation of keyframe `id` in `rec`'s frame, R̂ = R_c(t_n → t) · R_n from the registered
+   * keyframe n nearest in time (|Δt| ≤ 3 s, IMU-covered), with σ = 1° + 0.3°/s·|Δt| + 3 % of the
+   * gyro rotation (integration noise, the uncompensated bias and camera–IMU offset during capture,
+   * rolling shutter; the bias-compensated gyro is within 0.2–1.6° of the truth on the e2e captures).
+   * Null until R_cam_device is verified (`verifiedGyro`; independent of `EngineConfig.gyroGate`).
+   */
+  predictRotation(id: number, rec: Reconstruction): { R: Mat3; sigmaRad: number } | null {
+    const gyro = this.verifiedGyro();
+    const r = this.state.records.get(id);
+    if (!gyro || !r) return null;
+    const near: { t: number; R: Mat3; dt: number }[] = [];
+    for (const rid of rec.registeredImageIds()) {
+      const rr = rid === id ? undefined : this.state.records.get(rid);
+      const im = rec.images.get(rid);
+      if (!rr || !im) continue;
+      const dt = Math.abs(rr.t - r.t);
+      if (dt <= LiveSession.PREDICT_MAX_GAP_MS) near.push({ t: rr.t, R: im.pose.R, dt });
+    }
+    near.sort((a, b) => a.dt - b.dt);
+    for (const nb of near) {
+      const G = gyro.relative(nb.t, r.t);
+      if (!G) continue;
+      return { R: mat3Mul(G, nb.R), sigmaRad: (1 + 0.3e-3 * nb.dt) * DEG + 0.03 * rotationAngle(G) };
+    }
+    return null;
   }
 
   /**
@@ -1546,6 +1649,7 @@ export class LiveSession {
     // disposed while matching (e.g. a discarded scan, deleted next): nothing more is stored
     if (this.disposed) return;
     const res = this.mapper.addKeyframe(id);
+    this.logRegistrations(res);
     this.consecutiveUnregistered = res.registered ? 0 : this.consecutiveUnregistered + 1;
     this.modelVersion++;
     // vocabulary: train once enough keyframes exist, then index incrementally
@@ -1917,6 +2021,7 @@ export class LiveSession {
             if (st.graph.hasImage(other)) st.graph.addTwoView(sp.a, sp.b, sp.inliers);
           }
           const r = this.mapper.addKeyframe(id);
+          this.logRegistrations(r);
           this.consecutiveUnregistered = r.registered ? 0 : this.consecutiveUnregistered + 1;
           this.modelVersion++;
           if (!this.inline) await tick();

@@ -270,7 +270,7 @@ describe('GT-free scoring (raw capture recordings)', () => {
         numCameras: 28,
         pointsCount: 5000,
         metric: { metric: true, source: 'imu+gps', relativeUncertainty: 0.03, gravityAligned: true, northAligned: true },
-        stats: { images: 30, registeredImages: 28, meanReprojErrorPx: 0.61, meanTrackLength: 4.2, medianTrackLength: 3, model: 'offline', gyroBreaksLive: '4 (+2 outliers, median 0.90°)', gyroBreaksOffline: '1 (+0 outliers, median 0.30°)', gyroOutliers: '12,17', liveExplained: 0.91, offlineExplained: 0.95, yawSource: 'gps', timeOffsetMs: 21.5 },
+        stats: { images: 30, registeredImages: 28, meanReprojErrorPx: 0.61, meanTrackLength: 4.2, medianTrackLength: 3, model: 'offline', gyroBreaksLive: '4 (+2 outliers, median 0.90°)', gyroBreaksOffline: '1 (+0 outliers, median 0.30°)', gyroOutliers: '12,17', liveExplained: 0.91, offlineExplained: 0.95, yawSource: 'gps', timeOffsetMs: 21.5, gyroAidedRegistrations: 'off live, 2 offline', offlineGyroAidedNotCounted: 2 },
       },
       dense: { count: 123456 },
       recording: { device: { frames: 125, keyframes: 31 }, agreement: { compared: 120, same: 114, rate: 0.95, keyframesDevice: 31, keyframesReplay: 30, confusion: {} } },
@@ -282,12 +282,14 @@ describe('GT-free scoring (raw capture recordings)', () => {
     expect(m.reprojection.meanPx).toBe(0.61);
     expect(m.tracks).toEqual({ mean: 4.2, median: 3, points: 5000 });
     expect(m.gyro).toMatchObject({ model: 'offline', breaks: 1, breakOutliers: 0, medianErrDeg: 0.3, deregisteredOutliers: 2 });
+    expect(m.gyro).toMatchObject({ aidedRegistrations: 'off live, 2 offline', aidedNotCounted: { live: null, offline: 2 } });
     expect(m.scale).toMatchObject({ metric: true, source: 'imu+gps', gravityAligned: true, northAligned: true, yawSource: 'gps', timeOffsetMs: 21.5 });
     const fPrior = 960 / Math.tan((67.3 * Math.PI) / 360);
     expect(m.intrinsics!.fPrior).toBeCloseTo(fPrior, 9);
     expect(m.intrinsics!.focalVsPriorPct).toBeCloseTo((100 * (1600 - fPrior)) / fPrior, 9);
     expect(m.agreement?.rate).toBe(0.95);
     expect(formatSelfTable(m)).toMatch(/no ground truth[\s\S]*registered fraction[\s\S]*gyro breaks \(offline model\)\s+1 \(\+0 outliers/);
+    expect(formatSelfTable(m)).toMatch(/gyro-aided registrations\s+off live, 2 offline/);
     // the summary row of run-e2e takes it like computeMetrics output
     expect(summaryRow('rec', { ok: true, timings: { total: 1000 } }, m, [])).toEqual(['rec', 'ok', '28/30', '—', '—', '—', '—', '—', '—', '—', '—', '—', '1', '—']);
   });

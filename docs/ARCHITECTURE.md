@@ -260,6 +260,10 @@ refinePose(pose, X, xn, n, opts?: { iterations?: number; huberNormalized?: numbe
 solvePnPRansac(X: Float64Array /*3n*/, uv: Float64Array /*2n pixels*/, n, cam, opts?: {
   maxErrorPx?: number /*8*/; confidence?: number; maxIterations?: number; minInliers?: number; rng?: Rng })
   : { pose: Pose; inlierMask: Uint8Array; numInliers: number } | null
+translationKnownRotation(R, X, xn /*normalized 2n*/, count, idx?, w?): Vec3 | null   // linear, ≥ 2 points
+solvePnPKnownRotationRansac(X, uv, n, cam, R /*world-to-camera, e.g. gyro-predicted*/, opts?: { …solvePnPRansac's;
+  refineRotation?: boolean /*true: final 6-DOF refinement*/ })
+  : { pose: Pose; inlierMask: Uint8Array; numInliers: number; rotationChangeRad: number } | null   // 2-point LO-MSAC
 
 // triangulation.ts
 triangulateDLT(poses: Pose[], xn: Float64Array /*2n normalized*/, n, out?): Vec3 | null
@@ -603,14 +607,17 @@ and extra methods that keep the documented call working are not listed.
    rotation-compensated parallax → keyframe decision (`sfm/keyframes.ts`).
 4. Keyframe: store JPEG (IndexedDB), add to `FeatureDatabase`, match against the
    last N keyframes + retrieval candidates, verify (two-view geometry), update the
-   correspondence graph, then `LiveMapper` initialises / registers (PnP) /
-   triangulates / local BA. Emits live state: poses, sparse points, tracking
-   quality, user guidance.
+   correspondence graph, then `LiveMapper` initialises / registers (P3P PnP; at the edge of
+   the map — few map points, or P3P failed — the registered neighbours are re-triangulated
+   and P3P tried again; opt-in, only then PnP with the gyro-predicted rotation, checked
+   against the keyframe's best verified pair and refused without one) / triangulates / local
+   BA. Emits live state: poses, sparse points, tracking quality, user guidance.
 
 **Refine (after capture)**: extra pairs (sequential window, vocabulary-tree
 retrieval for loop closure, spatial neighbours) → verify (pairs and vocabulary on CPU helper
 workers) → refined live model → only when it is unhealthy, a full incremental SfM from scratch
-on the enriched graph (keep the better of live/offline model) → global
+on the enriched graph (P3P, then gyro-aided registration where P3P fails on every candidate;
+keep the better of live/offline model) → global
 BA with self-calibration → retriangulate → final BA → inertial alignment (time
 offset, gravity, metric scale: band-pass regression, or keyframe-interval preintegration when
 that lacks excitation, docs/research/imu-scale.md), GPS Sim3 alignment, compass yaw → world

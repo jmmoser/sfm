@@ -26,7 +26,15 @@
  *    ≥ max(filterMinTriAngleDeg, ¼ of the level's angle). The relaxation levels apply to later
  *    models too; `initFallback` adds a last-resort level for forward motion.
  *  - registration: `absPoseMinNumInliers` AND `absPoseMinInlierRatio` gate acceptance (not only
- *    the RANSAC loop); degenerate poses are rejected (`poseIsUsable`).
+ *    the RANSAC loop); degenerate poses are rejected (`poseIsUsable`). With a rotation predictor
+ *    (`predictRotation`: the engine's gyro — by default only in refine's offline SfM,
+ *    EngineConfig.gyroAidedRegistration) an image P3P cannot register is registered with that
+ *    rotation known from ≥ 15 inliers when its baseline agrees with its best verified pair, and
+ *    refused without such a pair (`registerKnownRotation`); the batch SfM tries every candidate
+ *    with P3P before any with the known rotation (`registerOneOf`), `registerNextImage`'s
+ *    `solvers` lets a caller do the same (LiveMapper), `lastRegistration` reports what each call saw (why the
+ *    known rotation refused an image: `knownRotationRefused`); a P3P pose `rotationCheck` rejected
+ *    and the image then registered is reported (`numRotationRejectsRecovered`, `poseRecovered`).
  *  - local BA: `localBANumImages` neighbours BESIDES the new image (COLMAP's count includes it);
  *    observations of constant points subsampled to `localBAMaxConstantObsPerImage` per image
  *    (≈ 2.5× faster, accuracy unchanged in the tests); afterwards only the observations in the
@@ -57,7 +65,7 @@ import type { BACameraRefine, BALinearSolverType, BALossType, BAProblem, BAResul
 import { bundleAdjust, BundleAdjuster } from '../ba/solver';
 import { scaleIntrinsics } from '../geometry/camera';
 import { projectToEssential, recoverPose } from '../geometry/essential';
-import { solvePnPRansac } from '../geometry/pnp';
+import { solvePnPKnownRotationRansac, solvePnPRansac } from '../geometry/pnp';
 import { estimateTwoViewGeometry } from '../geometry/twoview';
 import { Rng } from '../math/random';
 import { CorrespondenceGraph } from './correspondence-graph';
@@ -66,6 +74,45 @@ import { hasBogusParams, Reconstruction } from './reconstruction';
 import { DEFAULT_TRIANGULATOR_OPTIONS, IncrementalTriangulator, type TriangulatorOptions } from './triangulator';
 
 const DEG = Math.PI / 180;
+
+/** What one `registerNextImage` call saw (diagnostics: `IncrementalMapper.lastRegistration`). */
+export interface RegistrationDiagnostics {
+  id: number;
+  /** 2D–3D correspondences with registered points. */
+  correspondences: number;
+  /** P3P / known-rotation RANSAC inliers (NaN: not run; 0: no pose with the minimum number of inliers). */
+  p3pInliers: number;
+  knownRotationInliers: number;
+  /** How far the known-rotation refinement moved the predicted rotation (deg; NaN: not run). */
+  rotationChangeDeg: number;
+  /** Known-rotation pose: angle (deg) between its baseline and the verified pair's (NaN: not checked). */
+  pairBaselineDeg: number;
+  /** `rotationCheck.pose` rejected the P3P / the known-rotation pose of this call. */
+  p3pRotationRejected: boolean;
+  knownRotationRejected: boolean;
+  /** Why the known rotation did not register the image (null: not tried, or it registered it). */
+  knownRotationRefused: KnownRotationRefusal | null;
+  /** The solver that registered the image; null: not registered. */
+  via: 'p3p' | 'knownRotation' | null;
+}
+
+/**
+ * Why `registerKnownRotation` did not register an image: no rotation prediction, too few
+ * correspondences, no pose with knownRotationMinNumInliers inliers, too small an inlier share, a
+ * refined rotation too far from the prediction, a degenerate pose, too little inlier spread, no
+ * verified pair to check the baseline against, a baseline off that pair's, `rotationCheck.pose`.
+ */
+export type KnownRotationRefusal =
+  | 'noPrediction'
+  | 'correspondences'
+  | 'noPose'
+  | 'inlierRatio'
+  | 'rotationChange'
+  | 'degenerate'
+  | 'spread'
+  | 'noPair'
+  | 'baseline'
+  | 'rotationCheck';
 
 /** Options of the incremental mapper (COLMAP names in comments where they differ). */
 export interface MapperOptions {
@@ -183,12 +230,43 @@ export interface MapperOptions {
    * Optional checks of rotations against an independent sensor (the engine passes the gyro,
    * src/sfm/gyro.ts): `pair` vets the relative rotation x_b = R x_a of a candidate initial pair,
    * `pose` the absolute pose of an image about to be registered (PnP). Returning false rejects
-   * the pair / registration (the image stays unregistered and can be retried later).
+   * the pair / pose (the image stays unregistered and can be retried later — or, with
+   * `predictRotation`, a rejected P3P pose is followed by the known-rotation solver in the same
+   * call). When the image is registered after all — in the same call, or in a later call of the
+   * caller's attempt (LiveMapper: `IncrementalMapper.poseRecovered`) — `poseRecovered(id)` is called
+   * once per rejected P3P pose, so that the caller's count of rejected poses minus the recovered
+   * ones counts poses of images that stayed unregistered.
    */
   rotationCheck?: {
     pair?(a: number, b: number, R_ba: Mat3): boolean;
     pose?(id: number, pose: Pose, rec: Reconstruction): boolean;
+    poseRecovered?(id: number): void;
   };
+  /**
+   * Optional rotation prediction for registration (the engine passes the gyro once it is verified):
+   * the world-to-camera rotation of image `id` in `rec`'s frame, propagated from a registered image
+   * close in time, and its expected error σ (rad); null = no prediction. When P3P registration fails
+   * (too few correspondences or inliers, a degenerate pose, a rotation the check rejects), the image
+   * is registered with this rotation known (`solvePnPKnownRotationRansac`) at the relaxed
+   * `knownRotation*` thresholds, then `rotationCheck.pose` as usual — never without a verified pair
+   * that checks its baseline (`knownRotationPairMaxDeg`).
+   */
+  predictRotation?(id: number, rec: Reconstruction): { R: Mat3; sigmaRad: number } | null;
+  /** Known-rotation registration: minimum inliers (default 15) and inlier ratio (default 0.5). */
+  knownRotationMinNumInliers: number;
+  knownRotationMinInlierRatio: number;
+  /** The refined rotation may move at most this many σ away from the prediction (default 3). */
+  knownRotationMaxSigmas: number;
+  /** Minimum RMS spread of the inliers around their centroid, as a fraction of the long image side (default 0.05). */
+  knownRotationMinSpread: number;
+  /**
+   * The baseline to the registered neighbour with the most verified inliers (among its calibrated
+   * pairs with a median triangulation angle ≥ knownRotationPairMinTriAngleDeg, default 1.5) may be at
+   * most knownRotationPairMaxDeg (default 30) off the direction that pair's two-view geometry gives.
+   * Without such a pair the known rotation is refused (fails closed: nothing checks the translation).
+   */
+  knownRotationPairMaxDeg: number;
+  knownRotationPairMinTriAngleDeg: number;
   // ---- misc
   triangulation: TriangulatorOptions;
   seed: number;
@@ -252,6 +330,12 @@ export const DEFAULT_MAPPER_OPTIONS: Readonly<MapperOptions> = Object.freeze({
   maxNumModels: 50,
   minModelSize: 10,
   maxModelOverlap: 20,
+  knownRotationMinNumInliers: 15,
+  knownRotationMinInlierRatio: 0.5,
+  knownRotationMaxSigmas: 3,
+  knownRotationMinSpread: 0.05,
+  knownRotationPairMaxDeg: 30,
+  knownRotationPairMinTriAngleDeg: 1.5,
   triangulation: DEFAULT_TRIANGULATOR_OPTIONS,
   seed: 0x5f3d,
   yieldIntervalMs: 25,
@@ -442,6 +526,11 @@ function largestRelTranslationAxis(a: Pose, b: Pose): number {
 function poseIsUsable(pose: Pose, inlierMask: Uint8Array, uv: Float64Array, n: number, maxErrorPx: number): boolean {
   for (let k = 0; k < 9; k++) if (!Number.isFinite(pose.R[k])) return false;
   for (let k = 0; k < 3; k++) if (!Number.isFinite(pose.t[k])) return false;
+  return inlierSpreadPx(inlierMask, uv, n) >= maxErrorPx;
+}
+
+/** RMS distance (px) of the inlier observations from their centroid (0 without inliers). */
+function inlierSpreadPx(inlierMask: Uint8Array, uv: Float64Array, n: number): number {
   let mu = 0,
     mv = 0,
     m = 0;
@@ -451,7 +540,7 @@ function poseIsUsable(pose: Pose, inlierMask: Uint8Array, uv: Float64Array, n: n
       mv += uv[2 * k + 1];
       m++;
     }
-  if (m === 0) return false;
+  if (m === 0) return 0;
   mu /= m;
   mv /= m;
   let s2 = 0;
@@ -461,7 +550,7 @@ function poseIsUsable(pose: Pose, inlierMask: Uint8Array, uv: Float64Array, n: n
         dv = uv[2 * k + 1] - mv;
       s2 += du * du + dv * dv;
     }
-  return Math.sqrt(s2 / m) >= maxErrorPx;
+  return Math.sqrt(s2 / m);
 }
 
 /**
@@ -494,8 +583,22 @@ export class IncrementalMapper {
   private readonly numRegPerCamera = new Map<number, number>();
   /** Registered images of this model that are also registered in other models. */
   numSharedRegImages = 0;
-  /** Registrations / initial pairs rejected by `rotationCheck`. */
+  /** Poses (P3P or known-rotation candidates) and initial pairs rejected by `rotationCheck`. */
   numRotationRejects = 0;
+  /**
+   * Of them, P3P poses of images then registered in the same call (by the known rotation) or, as
+   * the caller reports it (`poseRecovered`: LiveMapper), in the same registration attempt.
+   */
+  numRotationRejectsRecovered = 0;
+  /** Images registered with the predicted rotation (`predictRotation`) after P3P failed. */
+  numKnownRotationRegistrations = 0;
+  /**
+   * The images registered that way (ids; an image a later BA filtered out may be left in it): their
+   * rotation agrees with the gyro by construction, so the gyro checks are no evidence for them.
+   */
+  readonly knownRotationImages = new Set<number>();
+  /** Diagnostics of the last `registerNextImage` call (null before the first one). */
+  lastRegistration: RegistrationDiagnostics | null = null;
 
   constructor(
     readonly db: FeatureDatabase,
@@ -882,7 +985,7 @@ export class IncrementalMapper {
       other: [number, number][] = [];
     for (const img of this.rec.images.values()) {
       if (img.registered) continue;
-      if (img.numVisiblePoints3D < this.opts.absPoseMinNumInliers) continue;
+      if (!this.registrable(img.id, img.numVisiblePoints3D)) continue;
       const trials = this.numRegTrials.get(img.id) ?? 0;
       if (trials >= this.opts.maxRegTrials) continue;
       const rank = img.visibilityScore;
@@ -901,27 +1004,73 @@ export class IncrementalMapper {
   }
 
   /**
+   * True when a registration of image `id` with `numPoints` visible 3-D points is worth attempting:
+   * ≥ absPoseMinNumInliers (P3P), or ≥ knownRotationMinNumInliers with a rotation prediction for it
+   * (unless `knownRotation` is false).
+   */
+  registrable(id: number, numPoints: number, knownRotation = true): boolean {
+    const o = this.opts;
+    if (numPoints >= o.absPoseMinNumInliers) return true;
+    return knownRotation && !!o.predictRotation && numPoints >= o.knownRotationMinNumInliers && o.predictRotation(id, this.rec) !== null;
+  }
+
+  /**
    * Registers an image by PnP against the triangulated points visible through its
    * correspondences; adds the inlier observations to their points. Returns success.
+   * P3P LO-RANSAC first (≥ absPoseMinNumInliers inliers and ≥ absPoseMinInlierRatio of the
+   * correspondences, a usable pose, `rotationCheck.pose`); when that fails and `predictRotation`
+   * gives a rotation, the known-rotation solver (`registerKnownRotation`). `solvers` turns either
+   * off for this call (LiveMapper tries P3P alone before it re-triangulates the neighbours).
    */
-  registerNextImage(id: number): boolean {
+  registerNextImage(id: number, solvers: { p3p?: boolean; knownRotation?: boolean } = {}): boolean {
+    return this.register(id, solvers, true);
+  }
+
+  /**
+   * A P3P pose `rotationCheck.pose` rejected in an earlier call of the caller's registration attempt
+   * of image `id`, which a later call then registered (LiveMapper): counted as recovered
+   * (`numRotationRejectsRecovered`, `rotationCheck.poseRecovered`) as within one call.
+   */
+  poseRecovered(id: number): void {
+    this.numRotationRejectsRecovered++;
+    this.opts.rotationCheck?.poseRecovered?.(id);
+  }
+
+  /** `registerNextImage`; `countTrial` false: a further solver on an image already tried this round. */
+  private register(id: number, solvers: { p3p?: boolean; knownRotation?: boolean }, countTrial: boolean): boolean {
     const t0 = now();
+    this.lastRegistration = {
+      id,
+      correspondences: 0,
+      p3pInliers: NaN,
+      knownRotationInliers: NaN,
+      rotationChangeDeg: NaN,
+      pairBaselineDeg: NaN,
+      p3pRotationRejected: false,
+      knownRotationRejected: false,
+      knownRotationRefused: null,
+      via: null,
+    };
     try {
-      return this.registerNextImageImpl(id);
+      return this.registerNextImageImpl(id, solvers.p3p !== false, solvers.knownRotation !== false && !!this.opts.predictRotation, countTrial);
     } finally {
       this.timings.register += now() - t0;
     }
   }
 
-  private registerNextImageImpl(id: number): boolean {
+  private registerNextImageImpl(id: number, useP3P: boolean, useKnownRotation: boolean, countTrial: boolean): boolean {
     const o = this.opts;
+    const diag = this.lastRegistration!;
     const img = this.rec.images.get(id);
     if (!img || img.registered) return false;
-    this.numRegTrials.set(id, (this.numRegTrials.get(id) ?? 0) + 1);
-    if (img.numVisiblePoints3D < o.absPoseMinNumInliers && this.rec.correspondenceGraph) {
+    if (countTrial) this.numRegTrials.set(id, (this.numRegTrials.get(id) ?? 0) + 1);
+    if (!this.registrable(id, img.numVisiblePoints3D, useKnownRotation) && this.rec.correspondenceGraph) {
       // the counts can be stale when the graph grew after the image was added
       this.rec.syncVisibility(id);
-      if (img.numVisiblePoints3D < o.absPoseMinNumInliers) return false;
+      if (!this.registrable(id, img.numVisiblePoints3D, useKnownRotation)) {
+        if (useKnownRotation) diag.knownRotationRefused = img.numVisiblePoints3D < o.knownRotationMinNumInliers ? 'correspondences' : 'noPrediction';
+        return false;
+      }
     }
     const cid = img.cameraId;
     if ((this.numRegPerCamera.get(cid) ?? 0) === 0 || this.bogus(cid)) {
@@ -958,7 +1107,11 @@ export class IncrementalMapper {
       }
     }
     const n = pids.length;
-    if (n < o.absPoseMinNumInliers) return false;
+    diag.correspondences = n;
+    if (!(useP3P && n >= o.absPoseMinNumInliers) && !(useKnownRotation && n >= o.knownRotationMinNumInliers)) {
+      if (useKnownRotation) diag.knownRotationRefused = 'correspondences';
+      return false;
+    }
     const X = new Float64Array(3 * n),
       uv = new Float64Array(2 * n);
     for (let k = 0; k < n; k++) {
@@ -969,18 +1122,30 @@ export class IncrementalMapper {
       uv[2 * k] = kp[4 * feats[k]];
       uv[2 * k + 1] = kp[4 * feats[k] + 1];
     }
-    const res = solvePnPRansac(X, uv, n, cam, {
-      maxErrorPx: o.absPoseMaxErrorPx,
-      minInliers: o.absPoseMinNumInliers,
-      confidence: 0.99999,
-      maxIterations: 10000,
-      rng: this.rng,
-    });
-    if (!res || res.numInliers < o.absPoseMinNumInliers || res.numInliers < o.absPoseMinInlierRatio * n) return false;
-    if (!poseIsUsable(res.pose, res.inlierMask, uv, n, o.absPoseMaxErrorPx)) return false;
-    if (o.rotationCheck?.pose && !o.rotationCheck.pose(id, res.pose, this.rec)) {
-      this.numRotationRejects++;
-      return false;
+    let res: { pose: Pose; inlierMask: Uint8Array } | null = null;
+    if (useP3P && n >= o.absPoseMinNumInliers) {
+      const p3 = solvePnPRansac(X, uv, n, cam, {
+        maxErrorPx: o.absPoseMaxErrorPx,
+        minInliers: o.absPoseMinNumInliers,
+        confidence: 0.99999,
+        maxIterations: 10000,
+        rng: this.rng,
+      });
+      diag.p3pInliers = p3?.numInliers ?? 0;
+      if (p3 && p3.numInliers >= o.absPoseMinNumInliers && p3.numInliers >= o.absPoseMinInlierRatio * n && poseIsUsable(p3.pose, p3.inlierMask, uv, n, o.absPoseMaxErrorPx)) {
+        if (!o.rotationCheck?.pose || o.rotationCheck.pose(id, p3.pose, this.rec)) res = p3;
+        else {
+          this.numRotationRejects++;
+          diag.p3pRotationRejected = true;
+        }
+      }
+      if (res) diag.via = 'p3p';
+    }
+    if (!res && useKnownRotation) res = this.registerKnownRotation(id, X, uv, n, cam);
+    if (!res) return false;
+    if (diag.p3pRotationRejected) {
+      this.numRotationRejectsRecovered++;
+      o.rotationCheck?.poseRecovered?.(id);
     }
     this.rec.registerImage(id, res.pose);
     this.onRegistered(id);
@@ -995,6 +1160,115 @@ export class IncrementalMapper {
       this.triangulator.addModifiedPoint(pid);
     }
     return true;
+  }
+
+  /**
+   * Registration with the predicted rotation known (P3P failed): the 2-point known-rotation
+   * LO-RANSAC + 6-DOF refinement (`solvePnPKnownRotationRansac`) on the n 2D–3D correspondences,
+   * accepted with ≥ knownRotationMinNumInliers inliers that are ≥ knownRotationMinInlierRatio of
+   * the correspondences and spread over ≥ knownRotationMinSpread of the image, a refined rotation
+   * within knownRotationMaxSigmas σ of the prediction, a usable pose, a baseline that agrees with the
+   * best verified pair (`pairBaselineError`) and `rotationCheck.pose`. An image without such a pair
+   * (a calibrated one with a registered neighbour at ≥ knownRotationPairMinTriAngleDeg) is refused
+   * before the solver runs: nothing would check its translation (fails closed).
+   * Why: after a fast pan analysed at a phone's 2–4 frames per second, the first keyframe beyond
+   * the map sees only a few dozen triangulated points (e2e yard-real at stride 3: 36, of which P3P
+   * found 27 correct inliers < 30) — rejected, it never triangulates, the next keyframes see even
+   * fewer points and tracking is lost for good. Lowering the P3P floor instead registers wrong poses
+   * (12–13-inlier P3P poses of the keyframes after it were 83–87° off): the gyro is what makes a
+   * low-inlier pose trustworthy (docs/research/real-capture-robustness.md "Phone-rate capture").
+   * The pair check: far points (houses 18–47 m away, 0.4–0.9 m baselines) couple rotation and
+   * translation, and a 26-inlier pose whose refinement moved the rotation 1.9° had its baseline 154°
+   * off — inside every other gate, it lost tracking for the rest of that capture; the keyframe's
+   * pairs (≈ 200 inliers) have the right baseline direction. Low-parallax pairs (the typical case
+   * past a pan towards far scenery) give no reliable direction, hence the refusal without one.
+   * Not checked: a centre shifted ALONG the pair's baseline, e.g. by false matches on structure that
+   * repeats in the walking direction (translational aliasing; the direction check cannot see it) —
+   * one reason the engine uses this path only in refine's offline SfM by default
+   * (EngineConfig.gyroAidedRegistration).
+   */
+  private registerKnownRotation(id: number, X: Float64Array, uv: Float64Array, n: number, cam: CameraIntrinsics): { pose: Pose; inlierMask: Uint8Array } | null {
+    const o = this.opts;
+    const diag = this.lastRegistration;
+    const refuse = (why: KnownRotationRefusal): null => {
+      if (diag) diag.knownRotationRefused = why;
+      return null;
+    };
+    if (n < o.knownRotationMinNumInliers) return refuse('correspondences');
+    const pred = o.predictRotation?.(id, this.rec);
+    if (!pred) return refuse('noPrediction');
+    const pair = this.bestVerifiedPair(id);
+    if (!pair) return refuse('noPair');
+    const res = solvePnPKnownRotationRansac(X, uv, n, cam, pred.R, {
+      maxErrorPx: o.absPoseMaxErrorPx,
+      minInliers: o.knownRotationMinNumInliers,
+      confidence: 0.99999,
+      maxIterations: 2000,
+      rng: this.rng,
+    });
+    if (diag) {
+      diag.knownRotationInliers = res?.numInliers ?? 0;
+      diag.rotationChangeDeg = res ? (res.rotationChangeRad * 180) / Math.PI : NaN;
+    }
+    if (!res) return refuse('noPose');
+    if (res.numInliers < o.knownRotationMinInlierRatio * n) return refuse('inlierRatio');
+    if (!(res.rotationChangeRad <= o.knownRotationMaxSigmas * pred.sigmaRad)) return refuse('rotationChange');
+    if (!poseIsUsable(res.pose, res.inlierMask, uv, n, o.absPoseMaxErrorPx)) return refuse('degenerate');
+    if (inlierSpreadPx(res.inlierMask, uv, n) < o.knownRotationMinSpread * Math.max(cam.width, cam.height)) return refuse('spread');
+    const pairDeg = this.pairBaselineError(pair, res.pose);
+    if (diag) diag.pairBaselineDeg = pairDeg;
+    if (!(pairDeg <= o.knownRotationPairMaxDeg)) return refuse('baseline');
+    if (o.rotationCheck?.pose && !o.rotationCheck.pose(id, res.pose, this.rec)) {
+      this.numRotationRejects++;
+      if (diag) diag.knownRotationRejected = true;
+      return refuse('rotationCheck');
+    }
+    this.numKnownRotationRegistrations++;
+    this.knownRotationImages.add(id);
+    if (diag) diag.via = 'knownRotation';
+    return res;
+  }
+
+  /**
+   * The verified pair of image `id` with a registered neighbour n that can check a baseline: the
+   * one with the most inliers among the calibrated pairs (with a translation) at a median
+   * triangulation angle ≥ knownRotationPairMinTriAngleDeg; its t is x_id = R x_n + t. Null: none.
+   */
+  private bestVerifiedPair(id: number): { n: number; t: ArrayLike<number> } | null {
+    const minTri = this.opts.knownRotationPairMinTriAngleDeg * DEG;
+    let best: { n: number; t: ArrayLike<number> } | null = null,
+      most = 0;
+    for (const nb of this.graph.neighbours(id).keys()) {
+      const im = this.rec.images.get(nb);
+      if (!im?.registered) continue;
+      const g = this.db.getTwoView(nb, id);
+      if (!g || g.config !== 'calibrated' || !g.t || !((g.triAngle ?? 0) >= minTri)) continue;
+      const m = g.inliers.length >> 1;
+      if (m > most) {
+        most = m;
+        best = { n: nb, t: g.t };
+      }
+    }
+    return best;
+  }
+
+  /**
+   * Angle (deg) between the baseline of an image at `pose` to the registered neighbour of its
+   * verified `pair` (`bestVerifiedPair`) and that pair's translation direction; 180 for a zero
+   * baseline.
+   */
+  private pairBaselineError(best: { n: number; t: ArrayLike<number> }, pose: Pose): number {
+    // the model's relative translation: t_rel = t_id − R_id R_nᵀ t_n
+    const Rn = this.rec.images.get(best.n)!.pose.R,
+      tn = this.rec.images.get(best.n)!.pose.t;
+    const R = pose.R;
+    const c = [Rn[0] * tn[0] + Rn[3] * tn[1] + Rn[6] * tn[2], Rn[1] * tn[0] + Rn[4] * tn[1] + Rn[7] * tn[2], Rn[2] * tn[0] + Rn[5] * tn[1] + Rn[8] * tn[2]];
+    const tr = [0, 1, 2].map((r) => pose.t[r] - (R[3 * r] * c[0] + R[3 * r + 1] * c[1] + R[3 * r + 2] * c[2]));
+    const nr = Math.hypot(tr[0], tr[1], tr[2]),
+      ng = Math.hypot(best.t[0], best.t[1], best.t[2]);
+    if (!(nr > 1e-12) || !(ng > 0)) return 180;
+    const cos = (tr[0] * best.t[0] + tr[1] * best.t[1] + tr[2] * best.t[2]) / (nr * ng);
+    return Math.acos(Math.max(-1, Math.min(1, cos))) / DEG;
   }
 
   /** Triangulates the observations of a (registered) image. */
@@ -1686,6 +1960,40 @@ export class IncrementalMapper {
   // ------------------------------------------------------------------ driver
 
   /**
+   * Registers the first of the ranked `candidates` (`findNextImages`) that registers and returns
+   * its id (-1: none; `maybeYield` runs between trials). With a rotation predictor every candidate
+   * is tried with P3P first and the predicted rotation only when none registers — the weaker
+   * evidence last: a P3P registration adds points, on which the other candidates often register by
+   * P3P too (as LiveMapper orders them); a candidate P3P already failed in this call is not counted
+   * as another trial. Without one, P3P alone. Each pass gives up after 31 failed candidates while
+   * the model is smaller than `minModelSize` (COLMAP).
+   */
+  async registerOneOf(candidates: readonly number[], maybeYield: () => Promise<void> = async () => {}): Promise<number> {
+    const o = this.opts;
+    const passes = o.predictRotation
+      ? [
+          { p3p: true, knownRotation: false },
+          { p3p: false, knownRotation: true },
+        ]
+      : [{ p3p: true, knownRotation: false }];
+    for (const [pass, solvers] of passes.entries()) {
+      for (let trial = 0; trial < candidates.length; trial++) {
+        const c = candidates[trial];
+        const img = this.rec.images.get(c);
+        if (!img) continue;
+        // P3P pass: the images with enough points for it; known-rotation pass: the others, and
+        // those P3P just failed (not counted again)
+        const forP3P = this.registrable(c, img.numVisiblePoints3D, false);
+        if (pass === 0 && passes.length > 1 && !forP3P) continue;
+        if (this.register(c, solvers, pass === 0 || !forP3P)) return c;
+        if (trial >= 30 && this.rec.numRegisteredImages < o.minModelSize) break;
+        await maybeYield();
+      }
+    }
+    return -1;
+  }
+
+  /**
    * Initialises from the given pair and grows the model (COLMAP ReconstructSubModel).
    * Returns false if the initial pair failed.
    */
@@ -1723,34 +2031,30 @@ export class IncrementalMapper {
       regSuccess = false;
       const next = this.findNextImages();
       if (next.length === 0) break;
-      for (let trial = 0; trial < next.length; trial++) {
-        const id = next[trial];
-        if (this.registerNextImage(id)) {
-          this.triangulateImage(id);
-          await maybeYield();
-          this.iterativeLocalRefinement(id);
-          await maybeYield();
-          const nImg = this.rec.numRegisteredImages,
-            nPts = this.rec.numPoints;
-          if (
-            nImg >= o.globalBAImagesRatio * prevImages ||
-            nImg >= o.globalBAImagesFreq + prevImages ||
-            nPts >= o.globalBAPointsRatio * prevPoints ||
-            nPts >= o.globalBAPointsFreq + prevPoints
-          ) {
-            await this.iterativeGlobalRefinement(undefined, cancel, false);
-            prevImages = this.rec.numRegisteredImages;
-            prevPoints = this.rec.numPoints;
-          }
-          progress?.({
-            stage: 'sfm',
-            progress: Math.min(1, this.rec.numRegisteredImages / Math.max(1, totalImages)),
-            message: `registered ${this.rec.numRegisteredImages}/${totalImages} images, ${this.rec.numPoints} points`,
-          });
-          regSuccess = true;
-          break;
-        } else if (trial >= 30 && this.rec.numRegisteredImages < o.minModelSize) break;
+      const id = await this.registerOneOf(next, maybeYield);
+      if (id >= 0) {
+        this.triangulateImage(id);
         await maybeYield();
+        this.iterativeLocalRefinement(id);
+        await maybeYield();
+        const nImg = this.rec.numRegisteredImages,
+          nPts = this.rec.numPoints;
+        if (
+          nImg >= o.globalBAImagesRatio * prevImages ||
+          nImg >= o.globalBAImagesFreq + prevImages ||
+          nPts >= o.globalBAPointsRatio * prevPoints ||
+          nPts >= o.globalBAPointsFreq + prevPoints
+        ) {
+          await this.iterativeGlobalRefinement(undefined, cancel, false);
+          prevImages = this.rec.numRegisteredImages;
+          prevPoints = this.rec.numPoints;
+        }
+        progress?.({
+          stage: 'sfm',
+          progress: Math.min(1, this.rec.numRegisteredImages / Math.max(1, totalImages)),
+          message: `registered ${this.rec.numRegisteredImages}/${totalImages} images, ${this.rec.numPoints} points`,
+        });
+        regSuccess = true;
       }
       if (this.numSharedRegImages >= o.maxModelOverlap) break;
       if (!regSuccess && prevRegSuccess) {
@@ -1769,8 +2073,8 @@ export class IncrementalMapper {
 
 /** Options accepted by `runIncrementalSfM` (mapper options + diagnostics hook). */
 export interface RunSfMOptions extends MapperOptions {
-  /** Called with per-model timings (diagnostics). */
-  onModel?: (rec: Reconstruction, timings: MapperTimings) => void;
+  /** Called with per-model timings and the model's mapper, e.g. its registration counters (diagnostics). */
+  onModel?: (rec: Reconstruction, timings: MapperTimings, mapper: IncrementalMapper) => void;
 }
 
 /**
@@ -1856,7 +2160,7 @@ export async function runIncrementalSfM(
         extractColors(rec, db);
         rec.updatePointErrors();
         models.push(rec);
-        opts.onModel?.(rec, mapper.timings);
+        opts.onModel?.(rec, mapper.timings, mapper);
       } else {
         // discard: release the registrations of this attempt
         for (const id of rec.registeredImageIds()) mapper.deregisterImage(id);

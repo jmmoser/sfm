@@ -5,6 +5,24 @@
  *    geometry has enough inliers and triangulation angle (baseline);
  *  - registration of every new keyframe by PnP against the current model,
  *    triangulation, time-bounded local BA;
+ *  - a keyframe at the edge of the map (fewer than `absPoseMinNumInliers` visible points, or a
+ *    failed P3P registration) has its registered neighbours triangulated again
+ *    (`triangulateNeighbours`), then registration is tried again. Why: a region seen by only two
+ *    registered keyframes is a set of two-view tracks, which the triangulator skips
+ *    (`ignoreTwoViewTracks`, as COLMAP); the batch SfM has every pair from the start, but here the
+ *    third view arrives later and nothing triangulates those tracks again before IT registers — on
+ *    them. After a fast pan analysed at 2 frames per second (e2e yard-real at stride 3) the
+ *    keyframe past the pan saw 36 map points, 97 after re-triangulation; without it tracking was
+ *    lost for the rest of the capture;
+ *  - with `predictRotation` (the engine's gyro, opt-in live: EngineConfig.gyroAidedRegistration
+ *    'all') a keyframe P3P cannot register on the re-triangulated map is registered with its
+ *    rotation known, from as few as `knownRotationMinNumInliers` inliers if a verified pair checks
+ *    its baseline (IncrementalMapper.registerKnownRotation) — only then: the order is P3P,
+ *    re-triangulation, P3P again, known rotation. A P3P pose the gyro check rejected in one call of
+ *    an attempt that a later call registered is reported as recovered (`poseRecovered`);
+ *  - every attempt is reported (`LiveKeyframeResult.registrations`: visible points before / after
+ *    re-triangulation, P3P and known-rotation inliers, why the known rotation refused it) for the
+ *    engine's debug log;
  *  - keyframes that fail to register stay pending and are retried (relocalisation)
  *    when more of their features see triangulated points;
  *  - periodic time-bounded global BA with self-calibration (more often early on).
@@ -21,7 +39,7 @@
 import type { Pose } from '../core/types';
 import type { CorrespondenceGraph } from './correspondence-graph';
 import { pairIds, pairKey, type FeatureDatabase } from './database';
-import { IncrementalMapper, resolveMapperOptions, type InitPairGeometry, type MapperOptions } from './mapper';
+import { IncrementalMapper, resolveMapperOptions, type InitPairGeometry, type MapperOptions, type RegistrationDiagnostics } from './mapper';
 import { Reconstruction } from './reconstruction';
 
 export interface LiveMapperOptions extends MapperOptions {
@@ -51,6 +69,12 @@ export interface LiveMapperOptions extends MapperOptions {
   /** Pending keyframes retried after a successful registration (default 4). */
   retryPendingPerKeyframe: number;
   /**
+   * A keyframe that sees fewer than `absPoseMinNumInliers` map points (before its registration) or
+   * fails to register (then retried once) has up to this many of its registered neighbours
+   * triangulated again (`triangulateNeighbours`; default 6, 0 = off).
+   */
+  retriangulateNeighbours: number;
+  /**
    * `addKeyframe` reports the model's mean reprojection error (default true). It reprojects
    * every observation per keyframe; the engine never reads it and turns it off (NaN then).
    */
@@ -70,6 +94,7 @@ export const DEFAULT_LIVE_OPTIONS: Readonly<
     | 'globalBAEvery'
     | 'globalBATimeMs'
     | 'retryPendingPerKeyframe'
+    | 'retriangulateNeighbours'
     | 'reportReprojError'
   >
 > = Object.freeze({
@@ -83,6 +108,7 @@ export const DEFAULT_LIVE_OPTIONS: Readonly<
   globalBAEvery: 15,
   globalBATimeMs: 800,
   retryPendingPerKeyframe: 4,
+  retriangulateNeighbours: 6,
   reportReprojError: true,
 });
 
@@ -92,6 +118,19 @@ export interface LiveKeyframeResult {
   numPoints: number;
   /** Mean reprojection error (px) of the model (0 before initialisation; NaN when not reported). */
   reprojError: number;
+  /** Registration attempts of this call: the new keyframe and the retried pending ones (diagnostics). */
+  registrations: LiveRegistrationAttempt[];
+}
+
+/** One registration attempt of a keyframe (`LiveKeyframeResult.registrations`). */
+export interface LiveRegistrationAttempt {
+  id: number;
+  /** Visible map points before, and after re-triangulating the neighbours (NaN: not re-triangulated). */
+  visible: number;
+  visibleRetriangulated: number;
+  /** The `registerNextImage` calls (1–2): P3P alone, then P3P and / or the known rotation. */
+  calls: RegistrationDiagnostics[];
+  registered: boolean;
 }
 
 export interface LiveSnapshot {
@@ -120,6 +159,10 @@ export class LiveMapper {
   private numRegAtGlobal = 0;
   /** Accumulated timings (ms) for diagnostics. */
   readonly timings = { init: 0, register: 0, localBA: 0, globalBA: 0, total: 0, keyframes: 0 };
+  /** Registration attempts that re-triangulated the neighbours first (`triangulateNeighbours`), and those that then registered. */
+  readonly retriangulation = { attempts: 0, registered: 0 };
+  /** Registration attempts of the current `addKeyframe` call. */
+  private attempts: LiveRegistrationAttempt[] = [];
 
   constructor(
     readonly db: FeatureDatabase,
@@ -157,6 +200,7 @@ export class LiveMapper {
     if (!this.db.frames.has(id)) throw new RangeError(`LiveMapper.addKeyframe: frame ${id} not in the database`);
     if (!this.graph.hasImage(id)) this.graph.addImage(id, this.db.features.get(id)!.count);
     const known = this.rec.images.has(id);
+    this.attempts = [];
     this.mapper.ensureImage(id);
     if (!known) this.keyframes.push(id);
     const img = this.rec.images.get(id)!;
@@ -176,16 +220,48 @@ export class LiveMapper {
       initialized: this.isInit,
       numPoints: this.rec.numPoints,
       reprojError: !this.isInit ? 0 : this.opts.reportReprojError ? this.rec.meanReprojectionError() : NaN,
+      registrations: this.attempts,
     };
   }
 
   private tryRegister(id: number): boolean {
     const t0 = now();
     this.rec.syncVisibility(id);
-    this.mapper.resetRegTrials(id);
-    const ok = this.mapper.registerNextImage(id);
+    const img = this.rec.images.get(id)!;
+    const att: LiveRegistrationAttempt = { id, visible: img.numVisiblePoints3D, visibleRetriangulated: NaN, calls: [], registered: false };
+    this.attempts.push(att);
+    // A keyframe at the edge of the map has its registered neighbours triangulated again: before the
+    // registration when it sees too few points for P3P, else after P3P failed. The gyro-predicted
+    // rotation (`predictRotation`) is tried only on the re-triangulated map: P3P on the points that
+    // re-triangulation gives is the stronger evidence (e2e yard-real at stride 3, the keyframe past
+    // the pan: 36 visible points, P3P 27 inliers < 30; re-triangulated 97, P3P registers it).
+    const canRetriangulate = this.opts.retriangulateNeighbours > 0;
+    let retriangulated = false;
+    const retriangulate = (): boolean => {
+      retriangulated = true;
+      this.retriangulation.attempts++;
+      const before = img.numVisiblePoints3D;
+      this.triangulateNeighbours(id);
+      att.visibleRetriangulated = img.numVisiblePoints3D;
+      return img.numVisiblePoints3D > before;
+    };
+    const register = (solvers: { p3p?: boolean; knownRotation?: boolean }): boolean => {
+      this.mapper.resetRegTrials(id);
+      const ok = this.mapper.registerNextImage(id, solvers);
+      if (this.mapper.lastRegistration) att.calls.push({ ...this.mapper.lastRegistration });
+      return ok;
+    };
+    if (canRetriangulate && img.numVisiblePoints3D < this.opts.absPoseMinNumInliers) retriangulate();
+    let ok = register({ knownRotation: retriangulated || !canRetriangulate });
+    // P3P failed on the map as it was: re-triangulate, then P3P again (when that gave points) and the known rotation
+    if (!ok && !retriangulated && canRetriangulate) ok = register(retriangulate() ? {} : { p3p: false });
+    att.registered = ok;
     this.timings.register += now() - t0;
     if (!ok) return false;
+    // P3P poses the gyro check rejected in an earlier call of this attempt did not end in a failed
+    // registration (the mapper reports those of the registering call itself)
+    for (const c of att.calls.slice(0, -1)) if (c.p3pRotationRejected) this.mapper.poseRecovered(id);
+    if (retriangulated) this.retriangulation.registered++;
     this.pending.delete(id);
     const t1 = now();
     this.mapper.triangulateImage(id);
@@ -193,6 +269,20 @@ export class LiveMapper {
     this.timings.localBA += now() - t1;
     this.regSinceGlobal++;
     return true;
+  }
+
+  /**
+   * Triangulates the registered keyframes keyframe `id` corresponds with again (most correspondences
+   * first, at most `retriangulateNeighbours`): its pairs turned their two-view tracks — features
+   * matched in one other image only, which the triangulator does not create points from
+   * (`ignoreTwoViewTracks`) — into multi-view tracks that now give points it can register on.
+   */
+  private triangulateNeighbours(id: number): void {
+    const nbs: [number, number][] = [];
+    for (const [b, n] of this.graph.neighbours(id)) if (n >= this.opts.minNumMatches && this.rec.images.get(b)?.registered) nbs.push([b, n]);
+    nbs.sort((x, y) => y[1] - x[1] || x[0] - y[0]);
+    for (const [b] of nbs.slice(0, this.opts.retriangulateNeighbours)) this.mapper.triangulateImage(b);
+    this.rec.syncVisibility(id);
   }
 
   /** Retries pending keyframes whose visible-point count increased (most recent first). */
@@ -210,7 +300,7 @@ export class LiveMapper {
       const img = this.rec.images.get(id)!;
       this.rec.syncVisibility(id);
       const last = this.pending.get(id) ?? -1;
-      if (img.numVisiblePoints3D < this.opts.absPoseMinNumInliers || img.numVisiblePoints3D <= last) continue;
+      if (img.numVisiblePoints3D <= last || !this.mapper.registrable(id, img.numVisiblePoints3D)) continue;
       tries++;
       if (!this.tryRegister(id)) this.pending.set(id, img.numVisiblePoints3D);
     }

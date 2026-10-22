@@ -64,6 +64,11 @@ export interface SyntheticSceneOptions {
   idOffset: number;
   /** Translation of the whole scene (world), e.g. to separate combined scenes. */
   offset: [number, number, number];
+  /**
+   * Explicit world-to-camera poses replacing the kind's trajectory (the kind still sets the
+   * primitives; `numImages` is ignored), e.g. a walk with a pan of a given angle (`lookPose`).
+   */
+  poses?: Pose[];
 }
 
 export interface SyntheticPair {
@@ -277,6 +282,14 @@ function lookRotation(fx: number, fy: number, fz: number, roll: number): Float64
   return Float64Array.of(rx2, ry2, rz2, dx, dy, dz, fx, fy, fz);
 }
 
+/**
+ * World-to-camera pose at centre C looking along yaw (rad, from +X towards +Y: π/2 looks north in
+ * the yard scenes) and pitch (rad, up positive), with a roll (rad): for `SyntheticSceneOptions.poses`.
+ */
+export function lookPose(C: ArrayLike<number>, yaw: number, pitch = 0, roll = 0): Pose {
+  return poseFrom(lookRotation(Math.cos(yaw) * Math.cos(pitch), Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), roll), C);
+}
+
 function poseFrom(R: Float64Array, C: ArrayLike<number>): Pose {
   return {
     R,
@@ -461,6 +474,7 @@ export function generateScene(opts: Partial<SyntheticSceneOptions> & { kind: Syn
   const rng = new Rng(o.seed * 7919 + kindIndex);
   const built =
     o.kind === 'orbit' ? buildOrbit(o, rng) : o.kind === 'walk' ? buildWalk(o, rng) : o.kind === 'loop' ? buildLoop(o, rng) : buildForward(o, rng);
+  if (o.poses) built.poses = o.poses.map((p) => ({ R: Float64Array.from(p.R), t: Float64Array.from(p.t) }));
   const { prims } = built;
   // offset the world
   const off = o.offset;

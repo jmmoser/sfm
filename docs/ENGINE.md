@@ -138,7 +138,15 @@ optical-axis convergence of ≥ 8 registered keyframes) and reports it as `LiveU
    previous 6 keyframes + retrieval candidates (+ spatial neighbours of the gyro-propagated
    pose of the last registered keyframe), verify, reject pairs whose rotation disagrees
    with the gyro, update the graph, `LiveMapper.addKeyframe` (registrations checked
-   against the gyro too).
+   against the gyro too). A keyframe at the edge of the map (after a fast pan at a phone's
+   2–4 analysed frames per second: it sees fewer than 30 map points, or P3P failed) has its
+   registered neighbours triangulated again — its pairs turned their two-view tracks
+   multi-view — and P3P is tried again. Opt-in (`EngineConfig.gyroAidedRegistration: 'all'`;
+   default 'offline': refine's offline SfM only): a keyframe P3P still cannot register (fewer
+   than 30 inliers, or a pose the gyro rejects) is registered with its gyro-predicted rotation
+   from ≥ 15 inliers if a verified pair (median triangulation angle ≥ 1.5°) checks its
+   baseline — refused without such a pair. Registrations other than a plain P3P one are logged
+   at debug level (points, inliers per solver, why the known rotation refused it).
 
 ### Extend (continue a stored capture)
 `init` with `{ sessionId, persist: true, resume: true, extend: true }` restores the capture (keyframes,
@@ -172,14 +180,19 @@ merging: refine keeps the largest offline model and reports the keyframes outsid
 
 ### Refine
 Train/extend the vocabulary → candidate pairs (sequential 10, retrieval 15,
-spatial 10) → match + verify (+ gyro gate) → refine the live model → gyro calibration
+spatial 10) → match + verify (+ gyro gate) → refine the live model (pending keyframes retried
+with the enriched graph, as during capture) → gyro calibration
 (bias, camera–IMU offset) → rolling-shutter estimation on the live model (gyro rotation +
 translation from the neighbouring keyframes × point depth; 2 passes) and keypoint
 correction → only when the live model is unhealthy (`liveModelHealth`: unregistered keyframes,
-no verified gyro, gyro breaks / outliers, few explained correspondences, an unclosed loop),
-`runIncrementalSfM` (gyro-checked registrations) and the better of live
-vs offline (gyro breaks, then registered images, then explained correspondences, then
-reprojection error; isolated gyro outliers deregistered) → final global BA (focal + principal point + k1 + k2) →
+no verified gyro, keyframes registered with the gyro-predicted rotation, gyro breaks / outliers,
+few explained correspondences, an unclosed loop — many split loop-like correspondences, or a
+loop-like split pair joining the two ends of the capture),
+`runIncrementalSfM` (gyro-checked registrations; gyro-aided after P3P failed on every candidate,
+unless the live model holds gyro-aided keyframes — then P3P only, their independent check) and
+the better of live vs offline (`liveModelBetter`: gyro breaks, then registered images —
+gyro-aided ones only for a model without an unclosed loop —, then explained correspondences,
+then reprojection error; isolated gyro outliers deregistered) → final global BA (focal + principal point + k1 + k2) →
 per-image focal lengths (focus breathing; kept only if they help) → world alignment
 (`sfm/world.ts`) → persist. Pair verification, vocabulary quantisation and the rolling-shutter
 hypotheses run on CPU helper workers (`EngineConfig.cpuWorkers`). Details: research/real-capture-robustness.md
