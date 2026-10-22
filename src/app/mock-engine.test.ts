@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { decodePLY, parseGLB, readZip } from '../io';
 import type { FrameInput, LiveUpdate } from '../workers/protocol';
+import { computeCoverage } from './coverage';
 import { MockEngine } from './mock-engine';
 import { MockScene, lookAt, poseCenter } from './mock-scene';
 
@@ -56,6 +57,75 @@ describe('mock scene', () => {
 });
 
 describe('MockEngine', () => {
+  it("auto resolves to 'object' after 8 keyframes; a level orbit, then the higher loop, fill the coverage ring", async () => {
+    const e = new MockEngine({ speed: 8, sessions: async () => null });
+    await e.init({ mode: 'auto', quality: 'fast' });
+    let t = 1000;
+    // the model comes in the standalone (background-mapping) updates
+    const model: { afterLoop: LiveUpdate | null; last: LiveUpdate | null } = { afterLoop: null, last: null };
+    e.onLive((u) => {
+      if (!u.cameras) return;
+      model.last = u;
+      if (e.scanProgress < 1.05) model.afterLoop = u;
+    });
+    const modes: string[] = [];
+    while (e.scanProgress < 2.3) {
+      t += 100;
+      const u = await e.processFrame(frame(t));
+      modes.push(`${u.numKeyframes}:${u.resolvedMode}`);
+    }
+    expect(modes[0]).toBe('1:auto'); // the first frame is a keyframe
+    expect(modes.find((m) => m.endsWith('object'))).toBe('8:object');
+    expect(modes.filter((m) => m.endsWith('auto')).every((m) => Number(m.split(':')[0]) < 8)).toBe(true);
+    // the mock cameras carry no upCam: up from the camera axes (the fallback path)
+    const loop = computeCoverage(model.afterLoop!.cameras!);
+    expect(loop.stable).toBe(true);
+    expect(loop.covered[1]).toBeGreaterThanOrEqual(11);
+    expect(loop.covered[2]).toBe(0);
+    expect(loop.prompt).toBe('look_down');
+    const both = computeCoverage(model.last!.cameras!);
+    expect(both.covered[1]).toBe(12);
+    expect(both.covered[2]).toBeGreaterThanOrEqual(10);
+    expect(both.prompt).toBe('done');
+    e.dispose();
+  });
+
+  it("sends a keyframe's model like background mapping: under the in-flight frame's index, before that frame's response", async () => {
+    const e = new MockEngine({ speed: 8, sessions: async () => null });
+    await e.init({ mode: 'object', quality: 'fast' });
+    const lives: LiveUpdate[] = [];
+    e.onLive((u) => lives.push(u));
+    const responses: LiveUpdate[] = [];
+    let t = 1000;
+    while (responses.filter((r) => r.decision === 'keyframe').length < 6) {
+      t += 100;
+      responses.push(await e.processFrame(frame(t)));
+    }
+    expect(responses.every((r) => !r.cameras && !r.sparse)).toBe(true);
+    const models = lives.filter((u) => !responses.includes(u));
+    expect(models.length).toBe(4); // keyframes 2–5 (the 6th is pending)
+    for (const m of models) {
+      const i = lives.indexOf(m);
+      const [prev, next] = [lives[i - 1], lives[i + 1]];
+      // the keyframe's own response, then the model, then the response of the frame in flight
+      expect(prev.decision).toBe('keyframe');
+      expect(responses).toContain(next);
+      expect(m.frameIndex).toBe(next.frameIndex);
+      expect([m.decision, m.guidance]).toEqual([prev.decision, prev.guidance]);
+      expect(m.cameras!.length).toBe(prev.numKeyframes);
+      expect(m.sparse!.positions.length).toBeGreaterThan(0);
+      expect(m.overlay).toBeUndefined();
+      expect(m.framePose).toBeUndefined();
+    }
+    // finishCapture flushes the pending one
+    await e.finishCapture();
+    const flushed = lives[lives.length - 1];
+    expect(responses).not.toContain(flushed);
+    expect(flushed.cameras!.length).toBe(6);
+    expect(flushed.frameIndex).toBe(responses[responses.length - 1].frameIndex);
+    e.dispose();
+  });
+
   it('runs capture → refine → densify → mesh → export with real data', async () => {
     const e = new MockEngine({ speed: 40, sessions: async () => null });
     const lives: LiveUpdate[] = [];
@@ -65,16 +135,20 @@ describe('MockEngine', () => {
     let t = 1000;
     let last: LiveUpdate | null = null;
     const bitmaps: ReturnType<typeof fakeBitmap>[] = [];
+    const responses: LiveUpdate[] = [];
     for (let i = 0; i < 60 && (last?.numKeyframes ?? 0) < 8; i++) {
       t += 100;
       const bm = fakeBitmap();
       bitmaps.push(bm);
       last = await e.processFrame(frame(t, bm));
+      responses.push(last);
     }
     expect(bitmaps.every((b) => b.closed)).toBe(true); // the engine owns (and closes) frames
     expect(last!.numKeyframes).toBeGreaterThanOrEqual(8);
     expect(last!.tracking).toBe('tracking');
-    expect(lives.length).toBe(bitmaps.length);
+    // every frame response is also a live event; the others are model updates
+    expect(responses.every((r) => lives.includes(r))).toBe(true);
+    expect(lives.filter((u) => !responses.includes(u)).every((u) => u.sparse && u.cameras)).toBe(true);
     const withSparse = lives.filter((u) => u.sparse);
     expect(withSparse.length).toBeGreaterThan(3);
     const sp = withSparse[withSparse.length - 1].sparse!;

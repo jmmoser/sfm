@@ -91,6 +91,12 @@ function printTimings(r, log) {
   log(
     `live: ${lv.delivered} frames → ${lv.keyframes} keyframes, ${lv.registered} registered, ${lv.points} points; init ${lv.timeToInit ? `after ${lv.timeToInit.delivered} frames (${fmtNum(lv.timeToInit.captureMs / 1000, 1)} s capture)` : 'never'}; frame ms p50 ${fmtNum(lv.frameMs?.median, 0)} p90 ${fmtNum(lv.frameMs?.p90, 0)} max ${fmtNum(lv.frameMs?.max, 0)}; decisions ${JSON.stringify(r.decisions)}`,
   );
+  const cv = lv.coverage;
+  if (cv) {
+    log(
+      `live coverage (${cv.cameras} cameras): ${cv.stable ? `${fmtNum(100 * cv.completeness, 0)} %, covered sectors low / mid / high ${cv.covered.join(' / ')} of 12${cv.elevation ? '' : ' (azimuth only: no gravity)'}, prompt ${cv.prompt}` : 'object not located'}`,
+    );
+  }
   if (r.sparse) {
     log(`sparse: ${r.sparse.numCameras} cameras (${r.sparse.images.length} mapped via ${r.sparse.mapping}), ${r.sparse.pointsCount} points, metric ${JSON.stringify(r.sparse.metric)}${r.sparse.intrinsicsNote ? `; NOTE ${r.sparse.intrinsicsNote}` : ''}`);
   }

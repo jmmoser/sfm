@@ -52,6 +52,11 @@
  *                    the export sheet the Gaussian-splat PLY; after a reload the scan reopens with its
  *                    splats (E2E_GPU=host: shown by default; SwiftShader: refused, points shown)
  *   splat-no-webgpu  no WebGPU in the browser: the photoreal build is disabled with an explanation
+ *   coverage         object mode: the coverage ring fills along the mock's level orbit ("Walk to the
+ *                    other side" → "Raise the phone, loop looking down" with the elevation bands, or
+ *                    "All sides covered" azimuth-only without motion), then its higher loop → "Done";
+ *                    the Finish hint shows "Coverage N %"; auto mode shows the ring only once the
+ *                    engine resolved 'object' (8 keyframes). Screenshots state-coverage-*.png
  * Usage: node e2e/ui/states.mjs [name ...] [--verbose]
  */
 import { launch, layoutAudit, shot, sleep } from './lib.mjs';
@@ -91,6 +96,7 @@ const SCENARIOS = [
   'empty-dense',
   'splat-build',
   'splat-no-webgpu',
+  'coverage',
 ];
 const args = process.argv.slice(2).filter((a) => !a.startsWith('--'));
 // A misspelled name would run nothing and still pass.
@@ -1116,6 +1122,66 @@ await scenario('splat-no-webgpu', async () => {
   check(await by(page, 'build-splat').isDisabled(), 'photoreal build disabled without WebGPU');
   check(/Needs WebGPU/.test((await by(page, 'sheet-build').textContent()) ?? ''), 'the item says it needs WebGPU');
   await context.close();
+});
+
+await scenario('coverage', async () => {
+  const { page, context } = await newPage();
+  await startCapture(page, `${base}?mock=1&mockSpeed=4`);
+  await page.waitForFunction(() => document.querySelector('.capture')?.getAttribute('data-phase') === 'running', null, { timeout: 45000 });
+  check(await by(page, 'coverage').isVisible(), 'object mode: the coverage ring is shown');
+  const prompt = () => page.evaluate(() => document.querySelector('[data-testid="coverage-prompt"]')?.textContent ?? '');
+  const covered = () => page.evaluate(() => document.querySelectorAll('.coverage-cell.c2').length);
+  const hint = () => page.evaluate(() => document.querySelector('.finish-hint:not([hidden])')?.textContent ?? '');
+  const waitPrompt = (re, timeout) =>
+    page.waitForFunction((src) => new RegExp(src).test(document.querySelector('[data-testid="coverage-prompt"]')?.textContent ?? ''), re.source, { timeout });
+  // part of the first loop
+  await waitPrompt(/other side/, 60000);
+  await page.waitForFunction(() => document.querySelectorAll('.coverage-cell.c2').length >= 4, null, { timeout: 30000 });
+  const part = await covered();
+  check(part >= 4 && part < 12, `partial orbit: some sectors covered (${part}), prompt "${await prompt()}"`);
+  check(/^Coverage \d+ % · sides missing$/.test(await hint()), `partial orbit: the Finish hint shows the coverage ("${await hint()}")`);
+  check((await page.evaluate(() => document.querySelector('.finish-hint')?.getAttribute('aria-live'))) === 'off', 'the readiness hint is not a live region (it changes per covered cell)');
+  check(await page.evaluate(() => document.querySelector('.coverage-marker')?.classList.contains('shown')), 'the phone is marked on the ring');
+  await holdShot(page, 'state-coverage-partial');
+  // the cloud view keeps the ring above the Overview / Follow buttons
+  await by(page, 'cloud-toggle').tap();
+  await page.waitForSelector('.capture.cloud-view');
+  const [ringBox, actionsBox] = await Promise.all([by(page, 'coverage').boundingBox(), page.locator('.cloud-actions').boundingBox()]);
+  check(!!ringBox && !!actionsBox && ringBox.y + ringBox.height <= actionsBox.y + 1, 'cloud view: the ring sits above the Overview button');
+  await audit(page, 'coverage-cloud');
+  await by(page, 'cloud-toggle').tap();
+  await page.waitForFunction(() => !document.querySelector('.capture.cloud-view'));
+  // Headless only: SwiftShader's WebGL draw of the 3D thumbnail starves the frame grabs once the
+  // mock cloud is fully revealed (measured: 0–2 frames per 5 s with it, 29–46 without), so the
+  // two loops would take minutes. Hide it for the rest of the capture.
+  await page.addStyleTag({ content: '.mini-view { display: none !important; }' });
+  const flat = await page.evaluate(() => document.querySelector('.coverage')?.classList.contains('flat'));
+  if (flat) {
+    // no motion sensor in this browser: azimuth only, one loop completes it
+    await waitPrompt(/All sides covered/, 90000);
+    check(true, 'azimuth only (no motion): one loop covers all sides');
+    await holdShot(page, 'state-coverage-full');
+  } else {
+    await waitPrompt(/Raise the phone/, 90000);
+    check(/top not captured/.test(await hint()), `after the level loop: "${await hint()}"`);
+    await waitPrompt(/^Done/, 120000);
+    check(/ready to finish/.test(await hint()), `after the higher loop: "${await hint()}"`);
+    await holdShot(page, 'state-coverage-full');
+  }
+  await audit(page, 'coverage');
+  await context.close();
+
+  // auto: no ring until the engine resolved 'object'
+  const a = await newPage();
+  await a.page.goto(`${base}?mock=1&mockSpeed=4`);
+  await by(a.page, 'new-scan').tap();
+  await by(a.page, 'mode-auto').tap();
+  await by(a.page, 'start-capture').tap();
+  await a.page.waitForFunction(() => document.querySelector('.capture')?.getAttribute('data-phase') === 'running', null, { timeout: 45000 });
+  check(!(await by(a.page, 'coverage').isVisible()), 'auto: no coverage ring before the mode is resolved');
+  await a.page.waitForFunction(() => Number(document.querySelector('[data-testid="kf-count"]')?.textContent) >= 9, null, { timeout: 60000 });
+  check(await by(a.page, 'coverage').isVisible(), "auto: the ring appears once the engine resolved 'object'");
+  await a.context.close();
 });
 
 const notRun = SCENARIOS.filter((n) => want(n) && !ran.has(n));

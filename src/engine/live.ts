@@ -7,7 +7,9 @@
  * to the last keyframe with the gyro rotation homography H = K R_c K⁻¹,
  * R_c = R_cam_device · R_{d(t)←d(t_kf)} · R_cam_deviceᵀ (generous radius; unguided fallback)
  * → two-view verification → rotation-compensated parallax → KeyframeSelector → LiveUpdate
- * (overlay in the frame's UI orientation).
+ * (overlay in the frame's UI orientation; guidance = the selector's code, overridden by
+ * 'tracking_lost' and by 'too_dark' from the recent frames' luma — frame-ingest.ts
+ * LowLightMonitor; `resolvedMode` = the mode in effect, 'auto' until resolved).
  *
  * Per keyframe (serial queue, `background` by default — the frame response does not wait):
  * matching against the previous keyframes, vocabulary-retrieval candidates and spatial
@@ -43,6 +45,7 @@ import type { Reconstruction } from '../sfm/reconstruction';
 import { VocabularyIndex, type BowVector } from '../sfm/vocab';
 import type { CaptureMode, DecodedFrameInput as FrameInput, Guidance, LiveCamera, LiveDebug, LiveUpdate, QualityPreset, TrackingState } from '../workers/protocol';
 import {
+  LowLightMonitor,
   OrientationTracker,
   closeSource,
   gravityDown,
@@ -361,6 +364,8 @@ export class LiveSession {
   private consecutiveUnregistered = 0;
   private lastFrameInliers = NaN;
   private lastGuidance: Guidance = 'initializing';
+  /** Luma of the recent frames: guidance 'too_dark'. */
+  private readonly lowLight = new LowLightMonitor();
   private lastDecision: LiveUpdate['decision'] = 'skip';
   private lastFrameIndex = -1;
   private modelVersion = 0;
@@ -594,6 +599,7 @@ export class LiveSession {
       decision,
       guidance,
       tracking: this.trackingState(),
+      resolvedMode: this.effectiveMode(),
       numKeyframes: this.state.order.length,
       numRegistered: rec.numRegisteredImages,
       numPoints: rec.numPoints,
@@ -601,7 +607,13 @@ export class LiveSession {
     };
   }
 
+  /**
+   * The frame's guidance for the UI: 'too_dark' first (in the dark, tracking is lost because of
+   * the light — the torch, not going back, fixes it), then 'tracking_lost', the selector's code,
+   * 'initializing' until the model exists.
+   */
   private mapGuidance(g: string | undefined): Guidance {
+    if (this.lowLight.dark) return 'too_dark';
     const tr = this.trackingState();
     if (tr === 'lost') return 'tracking_lost';
     const base: Guidance = g === 'move_slower' || g === 'more_texture' || g === 'translate_more' || g === 'tracking_lost' ? g : 'good';
@@ -638,6 +650,7 @@ export class LiveSession {
       this.selector.resetTracking();
       this.releaseHeld();
       this.ref = null;
+      this.lowLight.reset();
     }
     this.segment = seg;
     const verdict = this.orientation.classify({
@@ -704,6 +717,7 @@ export class LiveSession {
       const gate = this.selector.gate(cand);
       dbg.sharpnessRef = gate.reference;
       dbg.angularSpeed = angSpeed;
+      this.lowLight.push(lm.mean, gate.reject === 'reject_blur');
       if (gate.reject) {
         const d = this.selector.evaluate(cand);
         dbg.reason = `${d.decision}: ${d.reason}`;

@@ -4,6 +4,7 @@
  * Playwright's `page.evaluate` and can be written to disk as is.
  */
 import type { MetricInfo } from '../../core/types';
+import type { CoveragePrompt } from '../../app/coverage';
 import type { DebugKeyframe, DebugPair } from './debug-dump';
 import type {
   CaptureMode,
@@ -272,12 +273,36 @@ export interface LiveSummary {
   keyframeMs: NumStats;
   /** Last live cameras (LiveUpdate.cameras of the newest update carrying them). */
   cameras: { pose: PoseJSON; f: number }[];
+  /** Coverage of those cameras (what the capture screen's object-mode ring shows); null without cameras. */
+  coverage: LiveCoverage | null;
   /**
    * Last live cameras mapped to dataset frames by keyframe order (only when every keyframe of
    * that update is registered and each one was announced by a 'keyframe' frame response;
    * integrator must verify the ordering assumption).
    */
   images: { index: number; pose: PoseJSON }[] | null;
+}
+
+/**
+ * Object coverage of a set of live cameras (src/app/coverage.ts `computeCoverage`; elevation
+ * bands only when gravity is fed — the app's rule for a running motion sensor). Recorded for
+ * every capture: a scene capture usually stays `stable: false` (the cameras do not converge).
+ */
+export interface LiveCoverage {
+  stable: boolean;
+  /** Elevation bands in use (gravity fed). */
+  elevation: boolean;
+  /** Covered sectors of the level (low + mid) and high tiers / 24 (azimuth only: covered sectors / 12). */
+  completeness: number;
+  /** Covered cells (≥ 2 keyframes) of the 12 sectors per band: low −10–10°, mid 10–40°, high > 40°. */
+  covered: [number, number, number];
+  /** Covered sectors at any height. */
+  coveredSectors: number;
+  prompt: CoveragePrompt;
+  /** Keyframes per cell, [band][sector] (sector 0 = the first keyframe, counter-clockwise from above). */
+  counts: number[][];
+  /** Cameras the coverage was computed from. */
+  cameras: number;
 }
 
 export interface CloudSummary {
@@ -360,7 +385,16 @@ export interface HarnessResult {
    * model updates). `poses` are the registered keyframes' poses sorted by keyframe id; when
    * `registered === keyframes` the k-th pose is the k-th keyframe (`live.keyframeIndices[k]`).
    */
-  liveTrace?: { ms: number; frameIndex: number; keyframes: number; registered: number; points: number; poses: PoseJSON[] }[];
+  liveTrace?: {
+    ms: number;
+    frameIndex: number;
+    keyframes: number;
+    registered: number;
+    points: number;
+    poses: PoseJSON[];
+    /** The coverage ring of this update (LiveCoverage without the counts). */
+    coverage: Omit<LiveCoverage, 'counts'>;
+  }[];
   /** With `debugDump` (inline engine). */
   debug?: {
     keyframeTrace: { frameIndex: number; keyframes: DebugKeyframe[] }[];

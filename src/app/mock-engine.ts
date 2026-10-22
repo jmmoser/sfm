@@ -1,9 +1,16 @@
 /**
  * MockEngine: an in-page EngineLike for UI development and tests (`?mock=1`). It fakes the
- * live pipeline (keyframe decisions, tracking state, guidance, a growing sparse cloud and
- * camera trajectory, keypoint overlays that are projections of the scene into the current
- * mock camera), runs refine / densify / mesh / splat as timed stages with progress, and returns
- * REAL PointCloud / TriangleMesh / Gaussian-splat objects and export Blobs encoded with src/io.
+ * live pipeline (keyframe decisions, tracking state, guidance, the mode 'auto' resolves to after
+ * 8 keyframes, a growing sparse cloud and camera trajectory — for objects a level orbit, then a
+ * higher loop for the coverage ring —, keypoint overlays that are projections of the scene into
+ * the current mock camera), runs refine / densify / mesh / splat as timed stages with progress,
+ * and returns REAL PointCloud / TriangleMesh / Gaussian-splat objects and export Blobs encoded
+ * with src/io.
+ *
+ * Model updates are sent like the real engine's default background mapping: a keyframe's model
+ * (sparse cloud + cameras) is not in its frame response but in a standalone `live` update emitted
+ * while the NEXT frame is in flight — under that frame's index, with the previous frame's
+ * decision and guidance (LiveSession.emitModelUpdate) — and finishCapture flushes a pending one.
  *
  * Time base: the mock trajectory advances with the frame timestamps (`FrameInput.t`) times
  * `speed`, so pauses in frame delivery pause the scan.
@@ -112,6 +119,10 @@ export class MockEngine implements EngineLike {
   private lastKfS = -1;
   private revealedCount = 0;
   private lastSparseKf = -1;
+  /** Background mapping: the newest keyframe's model waits for the next frame (or finishCapture). */
+  private modelPending = false;
+  /** The last frame response's decision and guidance (a model update repeats them). */
+  private lastFrame: { decision: KeyframeDecision; guidance: Guidance } = { decision: 'skip', guidance: 'initializing' };
   private captureDone = false;
   private sparse: SparseResult | null = null;
   private denseCloud: PointCloud | null = null;
@@ -198,6 +209,8 @@ export class MockEngine implements EngineLike {
     this.lastKfS = -1;
     this.revealedCount = 0;
     this.lastSparseKf = -1;
+    this.modelPending = false;
+    this.lastFrame = { decision: 'skip', guidance: 'initializing' };
     this.captureDone = false;
     this.sparse = null;
     this.denseCloud = null;
@@ -265,6 +278,8 @@ export class MockEngine implements EngineLike {
       }
       this.lastT = f.t;
       await sleep((25 + rng.next() * 45) / Math.sqrt(this.speed));
+      // the previous keyframe's mapping job finishes while this frame is in flight
+      if (this.modelPending) this.emitModelUpdate(this.frameIndex);
 
       const s = this.progressS;
       const nKf = this.keyframes.length;
@@ -310,6 +325,7 @@ export class MockEngine implements EngineLike {
         decision,
         guidance,
         tracking,
+        resolvedMode: this.resolvedMode(k),
         numKeyframes: k,
         numRegistered: Math.max(0, k - (k > 6 ? 1 : 0)),
         numPoints: revealed,
@@ -319,16 +335,43 @@ export class MockEngine implements EngineLike {
       upd.overlay = this.overlay(pose, cam, rng);
       // the real engine poses every tracked frame (frame PnP in the live model)
       if (tracking === 'tracking' && decision !== 'reject_blur' && decision !== 'reject_motion') upd.framePose = { pose, t: f.t };
-      if (decision === 'keyframe' && k >= 2 && k !== this.lastSparseKf) {
-        this.lastSparseKf = k;
-        upd.sparse = this.liveSparse(k);
-        upd.cameras = this.keyframes.map((x) => x.pose);
-      }
+      if (decision === 'keyframe' && k >= 2 && k !== this.lastSparseKf) this.modelPending = true;
+      this.lastFrame = { decision, guidance };
       this.live.emit(upd);
       return upd;
     } finally {
       this.busy = false;
     }
+  }
+
+  private resolvedMode(k: number): LiveUpdate['resolvedMode'] {
+    const mode = this.options?.mode ?? 'auto';
+    return mode === 'auto' ? (k >= 8 && this.scene ? this.scene.kind : 'auto') : mode;
+  }
+
+  /**
+   * The live model after the newest keyframe, as LiveSession.emitModelUpdate sends it with
+   * background mapping: under `frameIndex` (the frame in flight, else the last one), with the last
+   * frame's decision and guidance, without overlay or frame pose.
+   */
+  private emitModelUpdate(frameIndex: number): void {
+    this.modelPending = false;
+    const k = this.keyframes.length;
+    if (!this.scene || !this.samples || k < 2) return;
+    this.lastSparseKf = k;
+    this.live.emit({
+      frameIndex,
+      decision: this.lastFrame.decision,
+      guidance: this.lastFrame.guidance,
+      tracking: 'tracking',
+      resolvedMode: this.resolvedMode(k),
+      numKeyframes: k,
+      numRegistered: Math.max(0, k - (k > 6 ? 1 : 0)),
+      numPoints: this.revealedCount,
+      timings: {},
+      sparse: this.liveSparse(k),
+      cameras: this.keyframes.map((x) => x.pose),
+    });
   }
 
   private noisyPose(pose: LiveCamera['pose'], rng: Rng, k: number): LiveCamera['pose'] {
@@ -364,6 +407,7 @@ export class MockEngine implements EngineLike {
 
   finishCapture(): Promise<void> {
     return this.longRun(async () => {
+      if (this.modelPending) this.emitModelUpdate(this.frameIndex - 1);
       if (this.stallOn.finishCapture) await this.stall('mapping 2 keyframes');
       await this.stage('matching', 200, undefined, 'finishing capture');
       this.captureDone = true;
