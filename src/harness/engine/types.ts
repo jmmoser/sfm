@@ -91,6 +91,13 @@ export interface HarnessConfig {
   hfovPriorDeg?: number | 'gt' | 'none';
   /** Run densify (default false). */
   densify?: boolean | DenseOptions;
+  /**
+   * Experiments: after densify, densify the SAME sparse model again with these options over the
+   * first run's (e.g. `{ overlap: false }`: the CPU/GPU overlap A/B on identical inputs) and compare
+   * the two clouds bit for bit (`result.denseRepeat`; its stage timings under step 'densifyRepeat').
+   * Default null (once).
+   */
+  densifyRepeat?: DenseOptions | null;
   /** Run mesh (default false; needs densify). */
   mesh?: boolean | MeshOptions;
   /** Run the Gaussian-splatting stage after mesh / densify / refine (default false). */
@@ -332,6 +339,8 @@ export interface HarnessResult {
   progress: ProgressRecord[];
   sparse: SparseSummary | null;
   dense: CloudSummary | null;
+  /** `densifyRepeat`: the second cloud vs the first (`difference`: the first mismatch, when not identical). */
+  denseRepeat?: { options: DenseOptions; count: number; ms: number; identical: boolean; difference?: string };
   /** Dense cloud as base64 (Float32 LE xyz + Uint8 rgb) when not streamed. */
   densePoints?: { count: number; xyz: string; rgb: string };
   mesh: { vertexCount: number; triangleCount: number; file: string | null; bboxMin: number[] | null; bboxMax: number[] | null } | null;

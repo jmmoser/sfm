@@ -157,6 +157,13 @@ describe('runDensify: CPU/GPU overlap', () => {
     expect(overlapped.stats.fusedPoints).toBe(serial.stats.fusedPoints);
     expect(serial.cloud.count).toBeGreaterThan(500);
 
+    // DenseOptions.overlap: false switches it off for one run (no helpers created)
+    let created = 0;
+    const off = await runDensify({ ...deps(store, slowBackend(new Rng(6), 1).backend, model, helpers), createHelpers: () => (created++, helpers) }, { ...opts, overlap: false });
+    expect(created).toBe(0);
+    expect(off.stats.denseHelperWorkers).toBe(0);
+    expectSameCloud(serial.cloud, off.cloud);
+
     // helpers whose jobs all fail: the engine thread decodes / filters instead, same output
     const fb = slowBackend(new Rng(4), 2);
     const failing = fakeHelpers(new Rng(5), { fail: true });

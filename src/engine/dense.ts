@@ -10,7 +10,7 @@
  * PatchMatchGPU; between views the engine waits while the page is hidden.
  *
  * CPU/GPU overlap (`DenseDeps.createHelpers`, the memory plan's `overlap`; `EngineConfig.denseOverlap`
- * false = serial): on a real GPU the PatchMatch kernels were only ≈ 18–33 % of the depth-map stage,
+ * or `DenseOptions.overlap` false = serial): on a real GPU the PatchMatch kernels were only ≈ 18–33 % of the depth-map stage,
  * the rest serial CPU work on this thread between GPU passes (e2e/README "Dense on the real GPU":
  * object-real fast 37.7 s = view loads 7.5, PatchMatch 14.8 of which 6.6 s GPU, halo filter 9.9,
  * store 4.1). With CPU helper workers (src/engine/cpu-pool.ts) while the GPU computes view i:
@@ -450,8 +450,8 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
     }
     return best;
   };
-  // CPU/GPU overlap (module comment): helper workers only with a factory
-  const overlapOn = deps.config.denseOverlap !== false;
+  // CPU/GPU overlap (module comment; per run: DenseOptions.overlap): helper workers only with a factory
+  const overlapOn = (opts.overlap ?? deps.config.denseOverlap) !== false;
   const workers = overlapOn && deps.createHelpers ? Math.max(0, Math.floor(deps.cpuWorkers ?? 0)) : 0;
   const planFor = (size: number): DensePlan => {
     const d = largest(size);
