@@ -32,7 +32,16 @@ export const USAGE = `usage: node e2e/run-e2e.mjs [object|yard|all|<dataset> ...
   --mock-speed X                MockEngine time multiplier (default 4)
   --set key=json                any other harness config field by dotted path (e.g. --set timeouts.frameMs=600000)
   --quiet                       log every 10th frame only     --verbose   page console + Vite logs
-  --headed                      show the browser`;
+  --headed                      show the browser
+  --device desktop|phone|local-bridge
+                                where the harness runs (default desktop: headless Chromium here).
+                                phone: serve Vite on 0.0.0.0 with the HTTP bridge, print the URL to
+                                open in Safari on the phone, wait for its result, score it like a
+                                desktop run (HTTPS from E2E_HTTPS_CERT / E2E_HTTPS_KEY, or --public-url).
+                                local-bridge: the same, with headless Chromium here opening the URL.
+                                Output tag defaults to the device name (e.g. <dataset>-phone)
+  --public-url URL              phone: HTTPS tunnel URL forwarding to --port (Vite then listens on 127.0.0.1)
+  --port N                      phone / local-bridge: dev server port (default 5180 for phone, free for local-bridge)`;
 
 export class ArgError extends Error {}
 
@@ -40,6 +49,7 @@ const ENGINES = ['worker', 'inline', 'mock'];
 const QUALITIES = ['fast', 'balanced', 'max'];
 const MODES = ['object', 'scene', 'auto'];
 const FORMATS = ['ply-points', 'ply-mesh', 'glb', 'colmap-zip', 'ply-splat'];
+const DEVICES = ['desktop', 'phone', 'local-bridge'];
 
 function setPath(obj, path, val) {
   const ks = path.split('.');
@@ -51,7 +61,7 @@ function setPath(obj, path, val) {
 
 /**
  * Parse argv → { datasets, config (harness config without `dataset`), nvs, nvsViews, timeoutMin,
- * out, tag, thresholds, noThresholds, enforce, quiet, verbose, headed, help }.
+ * out, tag, thresholds, noThresholds, enforce, quiet, verbose, headed, help, device, publicUrl, port }.
  */
 export function parseArgs(argv) {
   const o = {
@@ -77,6 +87,9 @@ export function parseArgs(argv) {
     headed: false,
     help: false,
     sets: [],
+    device: 'desktop',
+    publicUrl: null,
+    port: null,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -171,6 +184,26 @@ export function parseArgs(argv) {
       case '--quiet': o.quiet = true; break;
       case '--verbose': o.verbose = true; break;
       case '--headed': o.headed = true; break;
+      case '--device': o.device = oneOf(DEVICES); break;
+      case '--public-url': {
+        const v = next();
+        let u;
+        try {
+          u = new URL(v);
+        } catch {
+          throw new ArgError(`--public-url needs a URL, got ${v}`);
+        }
+        if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new ArgError(`--public-url must be http(s), got ${v}`);
+        // the harness and the bridge are served at the origin's root
+        if (u.pathname !== '/' || u.search || u.hash) throw new ArgError(`--public-url must be an origin (https://host[:port]), got ${v}`);
+        o.publicUrl = u.origin;
+        break;
+      }
+      case '--port': {
+        o.port = int(1);
+        if (o.port > 65535) throw new ArgError(`--port needs 1–65535, got ${o.port}`);
+        break;
+      }
       case '--help':
       case '-h': o.help = true; break;
       default:
@@ -182,6 +215,9 @@ export function parseArgs(argv) {
   if (o.datasets.includes('all')) o.datasets = [...new Set(o.datasets.flatMap((d) => (d === 'all' ? ['object', 'yard'] : [d])))];
   for (const d of o.datasets) if (!/^[\w.-]+$/.test(d)) throw new ArgError(`bad dataset name ${d}`);
   if (o.tag !== null && !/^[\w.-]+$/.test(o.tag)) throw new ArgError('--tag must be a plain name');
+  if (o.device === 'desktop' && (o.publicUrl !== null || o.port !== null)) throw new ArgError('--public-url / --port need --device phone or local-bridge');
+  if (o.device === 'local-bridge' && o.publicUrl !== null) throw new ArgError('--public-url is for --device phone');
+  if (o.device === 'phone' && o.headed) throw new ArgError('--headed has no effect with --device phone');
   if (!o.dense && o.mesh) o.mesh = false; // mesh needs the dense cloud
   o.config.densify = o.dense ? (Object.keys(o.denseOpts).length ? { ...o.denseOpts } : true) : false;
   o.config.mesh = o.mesh ? (Object.keys(o.meshOpts).length ? { ...o.meshOpts } : true) : false;

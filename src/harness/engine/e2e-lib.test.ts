@@ -61,6 +61,23 @@ describe('parseArgs', () => {
     expect(() => parseArgs(['--set', '__proto__.x=1'])).toThrow(/bad --set key/);
     expect(() => parseArgs(['--set', 'a=notjson'])).toThrow(/not JSON/);
   });
+
+  it('--device phone | local-bridge, --public-url, --port', () => {
+    expect(parseArgs([])).toMatchObject({ device: 'desktop', publicUrl: null, port: null });
+    const p = parseArgs(['object-real', '--device', 'phone', '--splat', '--public-url', 'https://abc.trycloudflare.com/', '--port', '5190']);
+    expect(p).toMatchObject({ datasets: ['object-real'], device: 'phone', publicUrl: 'https://abc.trycloudflare.com', port: 5190 });
+    expect(p.config.splat).toBe(true);
+    expect(parseArgs(['all', '--engine', 'mock', '--device', 'local-bridge'])).toMatchObject({ device: 'local-bridge', datasets: ['object', 'yard'] });
+    expect(() => parseArgs(['--device', 'ipad'])).toThrow(/desktop \| phone \| local-bridge/);
+    expect(() => parseArgs(['--public-url', 'https://x.example'])).toThrow(/need --device phone/);
+    expect(() => parseArgs(['--port', '5180'])).toThrow(/need --device phone/);
+    expect(() => parseArgs(['--device', 'local-bridge', '--public-url', 'https://x.example'])).toThrow(/for --device phone/);
+    expect(() => parseArgs(['--device', 'phone', '--public-url', 'nope'])).toThrow(/needs a URL/);
+    expect(() => parseArgs(['--device', 'phone', '--public-url', 'ftp://x.example'])).toThrow(/http\(s\)/);
+    expect(() => parseArgs(['--device', 'phone', '--public-url', 'https://x.example/sub'])).toThrow(/must be an origin/);
+    expect(() => parseArgs(['--device', 'phone', '--port', '70000'])).toThrow(/1–65535/);
+    expect(() => parseArgs(['--device', 'phone', '--headed'])).toThrow(/no effect/);
+  });
 });
 
 function fakeMetrics(over: Partial<Metrics> = {}): Metrics {

@@ -113,6 +113,12 @@ To test on a phone you need HTTPS. Either:
   workflow in `.github/workflows/pages.yml` deploys `dist/`, or
 * run `npm run dev` behind any HTTPS tunnel.
 
+To run the engine harness on an iPhone and score it on the computer, use
+`node e2e/run-e2e.mjs object-real --device phone --splat` with an mkcert certificate
+(`E2E_HTTPS_CERT` / `E2E_HTTPS_KEY`) or `--public-url` of a tunnel, and open the printed `/__e2e/go` link in
+Safari. Logs, PLY files and the result come back through a dev-server bridge, and the run is scored like a
+desktop run (e2e/README.md "On a real iPhone").
+
 Scans (photos, models, GPS fixes) live in the origin's IndexedDB. On a shared origin such as
 `<user>.github.io/<repo>/`, every other project of that user can read them, so give a real deployment its
 own origin (custom domain). The production build ships only the app (the e2e harness pages are dev-server

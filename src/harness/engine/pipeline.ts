@@ -8,8 +8,11 @@
  *   → finishCapture → refine (progress) → [densify] → [mesh] → [splat] → [exports, sizes only].
  *
  * Every step is guarded: a failure is recorded in `errors` and the steps that depend on it are
- * skipped, so a partial result is always returned. Big outputs (PLY files) are streamed to
- * Node through `window.__e2eWrite` when the runner installed it (e2e/run-e2e.mjs).
+ * skipped, so a partial result is always returned. Big outputs (PLY files) are streamed to the
+ * runner when it installed a writer: Playwright's exposed `window.__e2eWrite` (base64 strings;
+ * e2e/run-e2e.mjs), or the fetch bridge of a phone run (./bridge.ts), which installs
+ * `__e2eWrite` and the raw-bytes `__e2eWriteBlob` that writeBinary prefers. `result.device`
+ * records what the run ran on (./device.ts).
  */
 import type { GeoFix, ImuSample, PointCloud, ProgressEvent, TriangleMesh } from '../../core/types';
 import { encodeMeshPLY, encodePLY } from '../../io/ply';
@@ -28,7 +31,9 @@ import {
   type SplatOptions,
   type SplatResult,
 } from '../../workers/protocol';
+import type { WriteBlobFn, WriteFn } from './bridge';
 import { debugKeyframes, debugPairs } from './debug-dump';
+import { deviceInfo } from './device';
 import { dumpSession } from './replay';
 import { createHarnessEngine, type HarnessEngine } from './engines';
 import {
@@ -115,11 +120,12 @@ async function loadDataset(baseUrl: string): Promise<Dataset> {
 
 // ------------------------------------------------------------------ helpers
 
-type WriteFn = (path: string, data: string, encoding: 'base64' | 'utf8', append: boolean) => Promise<void>;
-
 declare global {
   interface Window {
+    /** Installed by the runner: Playwright's exposed function, or the fetch bridge (./bridge.ts). */
     __e2eWrite?: WriteFn;
+    /** Raw-bytes writer; only the fetch bridge has one (an exposed function cannot take a Blob). */
+    __e2eWriteBlob?: WriteBlobFn;
     __e2eLog?: (msg: string) => void;
   }
 }
@@ -136,11 +142,15 @@ function blobToBase64(b: Blob): Promise<string> {
   });
 }
 
-/** Stream a binary blob to Node in ≤ 6 MB base64 chunks. */
+/**
+ * Stream a binary blob to the runner: as raw bytes through `__e2eWriteBlob` when installed (the
+ * bridge chunks it), else in ≤ 6 MB base64 chunks through `__e2eWrite`.
+ */
 export async function writeBinary(path: string, data: ArrayBuffer | Blob): Promise<void> {
+  const blob = data instanceof Blob ? data : new Blob([data]);
+  if (window.__e2eWriteBlob) return window.__e2eWriteBlob(path, blob, false);
   const w = window.__e2eWrite;
   if (!w) throw new Error('window.__e2eWrite is not installed');
-  const blob = data instanceof Blob ? data : new Blob([data]);
   const CH = 6 << 20;
   if (blob.size === 0) return w(path, '', 'base64', false);
   for (let off = 0; off < blob.size; off += CH) {
@@ -266,6 +276,7 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
     config: resolveConfig(config, null),
     dataset: { name: config.dataset, scene: '', numFrames: 0, width: 0, height: 0, fps: 0, screenAngle: 0, sceneExtent: 0, hasGeo: false, hasHeading: false, imuSamples: 0 },
     engine: { kind: config.engine ?? 'worker', init: null, respawns: 0, statusChanges: [] },
+    device: null,
     timings: {},
     stageTimings: [],
     frames: [],
@@ -324,6 +335,10 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
   };
 
   const run = async (): Promise<HarnessResult> => {
+    // what the run runs on (page-side adapter query, no device), overlapped with the load
+    const device = deviceInfo().then((d) => {
+      result.device = d;
+    });
     // ---- load ----
     let ds: Dataset;
     let t0 = performance.now();
@@ -348,8 +363,10 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
       mark('load', t0);
     } catch (e) {
       fail('load', e);
+      await device;
       return finalize();
     }
+    await device;
     const cfg = result.config;
     log(`[harness] dataset ${ds.meta.name} (${ds.meta.scene}, ${ds.frames.length} frames ${ds.meta.width}x${ds.meta.height} θ=${ds.meta.screenAngle}), engine ${cfg.engine}, mode ${cfg.mode}, quality ${cfg.quality}`);
 

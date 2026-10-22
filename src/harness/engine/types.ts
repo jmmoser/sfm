@@ -1,7 +1,7 @@
 /**
  * Types of the dataset-driven engine harness (harness.html, `window.runPipeline(config)`).
  * Everything in {@link HarnessResult} is plain JSON (typed arrays are converted), so it survives
- * Playwright's `page.evaluate` and can be written to disk as is.
+ * Playwright's `page.evaluate` (or the bridge's POST of a phone run) and can be written to disk as is.
  */
 import type { MetricInfo } from '../../core/types';
 import type { DebugKeyframe, DebugPair } from './debug-dump';
@@ -110,7 +110,7 @@ export interface HarnessConfig {
   /** MockEngine time multiplier (default 4). */
   mockSpeed?: number;
   timeouts?: HarnessTimeouts;
-  /** Stream PLY files to Node through `window.__e2eWrite` (installed by e2e/run-e2e.mjs). */
+  /** Stream PLY files to the runner through `window.__e2eWrite` (Playwright or the fetch bridge, e2e/run-e2e.mjs). */
   output?: HarnessOutput;
   /** Embed the dense cloud as base64 in the result when it is not streamed (default true). */
   embedDensePoints?: boolean;
@@ -303,6 +303,31 @@ export interface LogRecord {
   message: string;
 }
 
+/** What the run ran on (./device.ts); queried while the dataset loads. */
+export interface HarnessDevice {
+  userAgent: string;
+  /** `navigator.platform` (deprecated, but 'iPhone' / 'MacIntel' / 'Linux x86_64' is useful here). */
+  platform: string | null;
+  /** Every iPhone reports 4 (docs/research/ios-platform.md). */
+  hardwareConcurrency: number | null;
+  devicePixelRatio: number;
+  /** CSS px. */
+  screen: [number, number] | null;
+  secureContext: boolean;
+  /** The page's WebGPU adapter (requested only, no device). */
+  adapter: {
+    vendor: string;
+    architecture: string;
+    device: string;
+    description: string;
+    features: string[];
+    /** maxBufferSize (≈ RAM class on Apple GPUs), maxStorageBufferBindingSize, … */
+    limits: Record<string, number>;
+  } | null;
+  /** Why `adapter` is null. */
+  adapterError?: string;
+}
+
 export interface HarnessResult {
   ok: boolean;
   aborted: boolean;
@@ -321,6 +346,7 @@ export interface HarnessResult {
     imuSamples: number;
   };
   engine: { kind: HarnessEngineKind; init: InitResult | null; respawns: number; statusChanges: { ms: number; state: string; reason?: string }[] };
+  device: HarnessDevice | null;
   /** Harness steps (ms): load, init, capture, finishCapture, refine, densify, mesh, splat, export, total. */
   timings: Record<string, number>;
   stageTimings: StageTiming[];
