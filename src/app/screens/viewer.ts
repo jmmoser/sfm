@@ -4,9 +4,11 @@
  * metric models; on the points / mesh also while the splats are shown), Build sheet (dense cloud
  * / mesh with a quality picker, and the photoreal model: `engine.splat()` runs HERE with a
  * progress card and Cancel, the model is shown when it finishes), Export sheet (PLY points, PLY
- * mesh, GLB, Gaussian splats PLY, COLMAP + images ZIP: the first tap builds the file through the
- * engine and shows its size, a second tap "Share / Save" calls saveFile directly in the tap
- * handler — iOS allows navigator.share only within ~5 s of a user activation), Info sheet
+ * mesh, GLB, USDZ for AR, Gaussian splats PLY, COLMAP + images ZIP: the first tap builds the file
+ * through the engine and shows its size, a second tap "Share / Save" calls saveFile directly in
+ * the tap handler — iOS allows navigator.share only within ~5 s of a user activation; a prepared
+ * USDZ also gets "View in AR" where AR Quick Look exists: src/app/ar-quicklook.ts; leaving the
+ * screen cancels the exports still being prepared), Info sheet
  * (scale source and uncertainty, gravity / north alignment with the yaw source — the compass
  * gives MAGNETIC north —, counts, reprojection error, engine memory, timings). A densify that
  * was interrupted (stats.denseResumablePass from loadSession, or cancelled / failed here) offers
@@ -34,6 +36,7 @@ import { formatDistance } from '../../viewer/helpers';
 import type { ProgressEvent } from '../../core/types';
 import { SPLAT_STAGES, isCancelledError, type ExportFormat, type QualityPreset } from '../../workers/protocol';
 import type { App, Results, Screen } from '../app';
+import { arQuickLookAvailable, createARQuickLook, withViewInAR } from '../ar-quicklook';
 import { button, chip, group, iconButton, kvRow, progressBar, section, segmented, setButtonLabel, spinner, switchRow } from '../components/controls';
 import { confirmDialog } from '../components/dialog';
 import { openSheet, type SheetHandle } from '../components/sheet';
@@ -83,6 +86,7 @@ const EXPORTS: { format: ExportFormat; title: string; icon: IconName; ext: strin
   { format: 'ply-points', title: 'Point cloud (PLY)', icon: 'points', ext: 'ply', suffix: 'points' },
   { format: 'ply-mesh', title: 'Mesh (PLY)', icon: 'mesh', ext: 'ply', suffix: 'mesh' },
   { format: 'glb', title: '3D model (GLB)', icon: 'cube', ext: 'glb', suffix: '' },
+  { format: 'usdz', title: 'AR model (USDZ)', icon: 'object', ext: 'usdz', suffix: 'ar' },
   { format: 'ply-splat', title: 'Gaussian splats (.ply)', icon: 'splats', ext: 'ply', suffix: 'splats' },
   { format: 'colmap-zip', title: 'COLMAP project (ZIP)', icon: 'zip', ext: 'zip', suffix: 'colmap' },
 ];
@@ -119,6 +123,10 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   const interrupted = app.journal.takeOpened(route.sessionId);
   /** Splats cannot be built here (no WebGPU in this browser; the engine would reject). */
   const webgpuMissing = (): boolean => app.env.webgpu === 'unsupported' || app.env.webgpu === 'no-adapter';
+  /** "View in AR" for a prepared USDZ (an iPhone / iPad Safari tab only: src/app/ar-quicklook.ts). */
+  const arQuickLook = arQuickLookAvailable(app.env)
+    ? createARQuickLook({ onNotOpened: () => toast(`AR Quick Look didn’t open here. Use ${app.env.share ? 'Share / Save' : 'Save'}, then open the file in Files.`, { tone: 'warn', durationMs: 6000 }) })
+    : null;
 
   const canvasHost = h('div', { class: 'viewer-canvas', 'data-testid': 'viewer-canvas' });
   const loading = h('div', { class: 'viewer-loading' }, spinner('lg'), h('span', { text: 'Loading model…' }));
@@ -824,6 +832,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
             });
         },
       });
+      if (e.format === 'usdz' && arQuickLook) action = withViewInAR(action, () => arQuickLook.open(blob, filename));
     } else
       action = button({
         label: st.status === 'error' ? 'Retry' : 'Prepare',
@@ -857,6 +866,20 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     // photoreal build replaced the model (the splat PLY may hold the previous one): discarded.
     if (exports.get(format) === pending) exports.set(format, done);
     if (!closed) renderExports?.();
+    else cancelExports();
+  }
+
+  /**
+   * Cancel the exports still being prepared once the screen is gone (the USDZ takes seconds of
+   * engine time and its file would be dropped). `cancel('export')` stops the newest one; each that
+   * settles after leave() cancels the next (prepare).
+   */
+  function cancelExports(): void {
+    for (const st of exports.values()) {
+      if (st.status !== 'building') continue;
+      app.engine.cancel('export');
+      return;
+    }
   }
 
   function openInfo(): void {
@@ -1074,6 +1097,8 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
         void app.wakeLock.release();
       }
       if (app.debug.viewer === viewer) app.debug.viewer = undefined;
+      cancelExports();
+      arQuickLook?.dispose();
       viewer?.dispose();
       viewer = null;
       d.dispose();
@@ -1093,9 +1118,12 @@ export function exportAvailability(r: Pick<Results, 'sparse' | 'dense' | 'mesh'>
     case 'ply-mesh':
       return r.mesh ? { ok: true, sub: `${formatCount(r.mesh.triangleCount)} triangles with vertex colours` } : { ok: false, sub: 'Build the mesh first' };
     case 'glb':
-      if (r.mesh) return { ok: true, sub: 'Coloured mesh — opens in most 3D apps and AR' };
+      if (r.mesh) return { ok: true, sub: 'Coloured mesh — opens in most 3D apps' };
       if (dense || r.sparse) return { ok: true, sub: 'Coloured point cloud (glTF binary)' };
       return { ok: false, sub: 'Nothing to export yet' };
+    case 'usdz':
+      if (!r.mesh) return { ok: false, sub: 'Build the mesh first' };
+      return { ok: true, sub: r.sparse?.metric?.metric ? 'For AR on iPhone and iPad · true size' : 'For AR on iPhone and iPad · no real-world scale' };
     case 'colmap-zip':
       return r.sparse ? { ok: true, sub: `Cameras, sparse model and ${r.sparse.cameras.length} photos` } : { ok: false, sub: 'No sparse model yet' };
     case 'ply-splat':

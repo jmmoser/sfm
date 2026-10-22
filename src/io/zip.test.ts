@@ -163,3 +163,55 @@ describe('createZip', () => {
     expect(readZip(zip)[1999].name).toBe('f/1999.txt');
   });
 });
+
+describe('createZip align (USDZ)', () => {
+  /** Data offset of every entry from its LOCAL header (what USDZ readers map). */
+  function dataOffsets(zip: Uint8Array): { name: string; offset: number; extra: number }[] {
+    const dv = new DataView(zip.buffer, zip.byteOffset, zip.byteLength);
+    const out: { name: string; offset: number; extra: number }[] = [];
+    let p = 0;
+    while (dv.getUint32(p, true) === 0x04034b50) {
+      const nameLen = dv.getUint16(p + 26, true);
+      const extra = dv.getUint16(p + 28, true);
+      const size = dv.getUint32(p + 18, true);
+      const name = new TextDecoder().decode(zip.subarray(p + 30, p + 30 + nameLen));
+      const offset = p + 30 + nameLen + extra;
+      out.push({ name, offset, extra });
+      p = offset + size;
+    }
+    return out;
+  }
+
+  // name lengths and sizes that hit every padding residue, incl. the 1–3-byte ones that need a whole extra block
+  const files: ZipEntryInput[] = [];
+  for (let i = 0; i < 70; i++) files.push({ name: `${'d/'.repeat(i % 5)}f${'x'.repeat(i % 7)}${i}.bin`, data: randomBytes((i * 37) % 131, i + 1) });
+
+  it('starts every entry’s data at a multiple of 64 and stays a valid archive', () => {
+    const zip = createZip(files, { align: 64 });
+    const offs = dataOffsets(zip);
+    expect(offs.length).toBe(files.length);
+    for (const o of offs) {
+      expect(o.offset % 64).toBe(0);
+      expect(o.extra === 0 || o.extra >= 4).toBe(true);
+    }
+    // the residues 1–3 occurred (padding of 64 + 1…3 bytes)
+    expect(offs.some((o) => o.extra > 64)).toBe(true);
+    const entries = readZip(zip);
+    expect(entries.map((e) => e.name)).toEqual(files.map((f) => f.name));
+    for (let i = 0; i < files.length; i++) expect(bytesEqual(entries[i].data, files[i].data as Uint8Array)).toBe(true);
+    const res = pythonInspect(zip, 'aligned');
+    expect(res.bad).toBeNull();
+    expect(res.infos.every((i) => i.method === 0)).toBe(true);
+  });
+
+  it('createZipBlob aligns identically; align 1 is the default layout', async () => {
+    const zip = createZip(files, { align: 64, comment: 'usdz' });
+    const blobFiles = files.map((f, i) => (i % 3 === 0 ? { ...f, data: new Blob([f.data as Uint8Array<ArrayBuffer>]) } : f));
+    const blob = await createZipBlob(blobFiles, { align: 64, comment: 'usdz' });
+    expect(new Uint8Array(await blob.arrayBuffer())).toEqual(zip);
+    expect(createZip(files, { align: 1 })).toEqual(createZip(files));
+    expect(dataOffsets(createZip(files)).every((o) => o.extra === 0)).toBe(true);
+    expect(() => createZip(files, { align: 0 })).toThrow(/alignment/);
+    expect(() => createZip(files, { align: 2.5 })).toThrow(/alignment/);
+  });
+});

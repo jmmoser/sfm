@@ -1309,29 +1309,42 @@ export class PhotogrammetryEngine {
     }
   }
 
-  /** Export the current model as a Blob. */
-  async exportModel(format: ExportFormat): Promise<Blob> {
+  /** Export the current model as a Blob (`cancel` stops a USDZ / COLMAP build: src/engine/export.ts; so does dispose). */
+  async exportModel(format: ExportFormat, cancel?: CancelToken): Promise<Blob> {
     if (this.disposed) throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');
     if (!this.model && this.store) await this.ensureModel().catch(() => null);
     // load only what this format needs (a 4 M-point cloud is ≈ 140 MB, a mesh similar), and drop
     // persisted results again afterwards: the page holds its own copy
-    const needMesh = format === 'ply-mesh' || format === 'glb';
+    const needMesh = format === 'ply-mesh' || format === 'glb' || format === 'usdz';
     const needDense = format === 'ply-points' || (format === 'glb' && !this.hasMesh);
     const hadDense = !!this.denseCloud;
     const hadMesh = !!this.meshModel;
     await this.reloadResults(needDense, needMesh);
+    // (a disposed engine — another session opened — stops its export too)
+    const disposed = (): boolean => this.disposed;
+    const token: CancelToken = {
+      get cancelled(): boolean {
+        return !!cancel?.cancelled || disposed();
+      },
+    };
     try {
-      return await buildExport(format, {
-        name: this.sessionName,
-        sparse: this.sparse?.points ?? (this.model ? modelPointCloud(this.model) : null),
-        model: this.model,
-        dense: needDense ? this.denseCloud : null,
-        mesh: needMesh ? this.meshModel : null,
-        objectRoi: this.objectRoi,
-        store: this.store,
-        features: (id) => this.featuresOf(id),
-        splat: () => this.splatModel(),
-      });
+      return await buildExport(
+        format,
+        {
+          name: this.sessionName,
+          sparse: this.sparse?.points ?? (this.model ? modelPointCloud(this.model) : null),
+          model: this.model,
+          dense: needDense ? this.denseCloud : null,
+          mesh: needMesh ? this.meshModel : null,
+          objectRoi: this.objectRoi,
+          store: this.store,
+          features: (id) => this.featuresOf(id),
+          splat: () => this.splatModel(),
+          metric: this.sparse?.metric ?? null,
+          log: (level, message) => this.log(level, message),
+        },
+        token,
+      );
     } finally {
       if (this.store?.persistent) {
         if (!hadDense) this.denseCloud = null;

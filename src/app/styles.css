@@ -2714,6 +2714,15 @@ h3 {
   color: var(--text-2);
 }
 
+/* USDZ row: "View in AR" above Share / Save (src/app/ar-quicklook.ts) */
+.export-actions {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  flex: none;
+}
+
 /* ---------------------------------------------------------------- diagnostics */
 
 .diag-body .section:first-child {

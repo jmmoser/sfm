@@ -4,7 +4,7 @@
  *   Home → Setup → Start (fake camera) → Capture (wait for keyframes) → Finish → Processing →
  *   Viewer (info, display, measure, build mesh, build the photoreal model in the viewer: progress
  *   card, layer pill Splats / Points / Mesh) → Export (prepare + save → download, incl. the
- *   Gaussian-splat PLY) → Home → reopen (the splats are back) → Add more views (Build sheet →
+ *   Gaussian-splat PLY and the USDZ) → Home → reopen (the splats are back) → Add more views (Build sheet →
  *   confirm sheet → Capture continues at the stored keyframes → Finish → Processing re-runs
  *   refine and the dense cloud + mesh the scan had → Viewer) → Diagnostics
  * Asserts no console errors / page exceptions and writes screenshots of every screen to
@@ -271,6 +271,17 @@ try {
   const [dl3] = await Promise.all([page.waitForEvent('download', { timeout: 15000 }), byTest('export-save-colmap-zip').tap()]);
   const zip = await readFile(await dl3.path());
   check(zip.readUInt32LE(0) === 0x04034b50, 'ZIP magic');
+  // USDZ (AR): the layer first, its data 64-byte aligned; no "View in AR" outside iOS Safari
+  await byTest('export-prepare-usdz').tap();
+  await byTest('export-save-usdz').waitFor({ timeout: 30000 });
+  check((await byTest('export-ar-usdz').count()) === 0, 'no View in AR without AR Quick Look');
+  const [dl5] = await Promise.all([page.waitForEvent('download', { timeout: 15000 }), byTest('export-save-usdz').tap()]);
+  const usdz = await readFile(await dl5.path());
+  check(dl5.suggestedFilename().endsWith('_ar.usdz'), 'USDZ filename');
+  const usdzName = usdz.subarray(30, 30 + usdz.readUInt16LE(26)).toString();
+  check(usdz.readUInt32LE(0) === 0x04034b50 && usdzName === 'model.usda', 'USDZ: model.usda first');
+  check((30 + usdz.readUInt16LE(26) + usdz.readUInt16LE(28)) % 64 === 0, 'USDZ: 64-byte aligned data');
+  step(`downloaded ${dl5.suggestedFilename()} (${usdz.length} bytes)`);
   await closeSheet();
 
   step('home with session');

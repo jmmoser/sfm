@@ -24,7 +24,8 @@ source file headers. Measurements behind the defaults are dated reports in `docs
 * Sensors: gyroscope (rotation priors, blur rejection, guided matching, time-offset
   calibration), accelerometer (gravity alignment, metric scale), compass (north),
   GPS (metric scale and geo-referencing at large scale).
-* Exports: PLY (points / mesh), GLB, COLMAP text model (+ images) in a ZIP.
+* Exports: PLY (points / mesh), GLB, USDZ for AR Quick Look ("View in AR" at true scale on
+  iPhone / iPad), COLMAP text model (+ images) in a ZIP.
 
 ## 2. Conventions (MUST follow)
 
@@ -113,7 +114,7 @@ src/
   splat/                 3D Gaussian Splatting: WebGPU trainer + renderer, CPU reference,
                          splat PLY, point-cloud initialisation, MCMC densification
   sensors/               camera capture, motion, compass, geolocation, wake lock, frame orientation
-  io/                    PLY / GLB / COLMAP export, ZIP writer, IndexedDB session storage, share/download,
+  io/                    PLY / GLB / USDZ / COLMAP export, ZIP writer, IndexedDB session storage, share/download,
                          raw capture recordings (format, OPFS / IndexedDB store, dataset export)
   viewer/                three.js viewer (points as splats + EDL, mesh, cameras, measure tool)
   engine/                PhotogrammetryEngine (pipeline orchestration, runs in a worker)
@@ -456,6 +457,10 @@ proposeObjectRoi(model: { images: { pose: Pose }[]; xyz: ArrayLike<number>; numP
   opts: { gravityAligned: boolean; minClearance?: number | { perDistance: number }; minConfidence?: number /* 0.3 */ })
   : { roi: ObjectRoi | null; reason: string; … }   // ObjectRoi {min, max, planeZ, centre, confidence} (core/types.ts)
 objectRoiPivot(roi: ObjectRoi): [x, y, planeZ]      // bottom centre: the origin for exports that stand the object on the ground
+buildColourAtlas(mesh: TriangleMesh, opts?: { maxTriangles?: number /*100 000*/; size?: number /*2048*/; gutter?: number /*1*/ })
+  : { mesh: TriangleMesh /* simplified */; uvs: Float32Array /* 6 per triangle, (0,0) = texture top-left, v down */;
+      texture: RGBAImage /* colours of the UNSIMPLIFIED mesh */; stats /* overBudget, gutter, … */ }
+buildColourAtlasAsync(mesh, opts?, cancel?): Promise<same>   // yields ≈ every 40 ms; CancelledError on cancel
 ```
 
 ### 4.7 `src/sensors`
@@ -507,11 +512,15 @@ class WakeLock { acquire(): Promise<void>; release(): Promise<void> }
 encodePLY(pc: PointCloud): ArrayBuffer;  encodeMeshPLY(mesh: TriangleMesh): ArrayBuffer   // binary_little_endian
 decodePLY(buf: ArrayBuffer): { points?: PointCloud; mesh?: TriangleMesh }
 encodeGLB(input: { mesh?: TriangleMesh; points?: PointCloud; yUp?: boolean }): ArrayBuffer
+encodeUSDZ(input: { mesh: TriangleMesh; uvs: Float32Array; texture: Uint8Array /* JPEG/PNG bytes */; pivot?: ArrayLike<number>;
+  metric?: boolean; name?: string; material?: 'diffuse' | 'emissive' }): Uint8Array   // USDA, Y-up, metres, (x,y,z) → (x,z,−y) about pivot
+selectArPivot(mesh, roi?: { centre; planeZ } | null): Float64Array   // AR origin: ROI centre on its plane, else footprint centre at the 2nd-percentile z
 interface ColmapModelInput { cameras: { id: number; cam: CameraIntrinsics }[];
   images: { id: number; cameraId: number; name: string; pose: Pose; points2D: { x: number; y: number; point3D: number }[] }[];
   points: { id: number; xyz: ArrayLike<number>; color: ArrayLike<number>; error: number; track: { image: number; point2D: number }[] }[] }
 exportColmapText(model: ColmapModelInput): { name: string; data: string }[]   // cameras.txt, images.txt, points3D.txt
-createZip(files: { name: string; data: Uint8Array | string }[]): Uint8Array   // STORE, CRC32, UTF-8
+createZip(files: { name: string; data: Uint8Array | string }[], opts?: { comment?: string; align?: number }): Uint8Array
+  // STORE, CRC32, UTF-8; align: every entry's data at a multiple of `align` bytes (USDZ: 64)
 class SessionStore { static open(): Promise<SessionStore>; … IndexedDB sessions, frame JPEG blobs, JSON & binary blobs }
 saveFile(data: Blob, filename: string): Promise<'shared' | 'downloaded'>    // Web Share (files) or <a download>
 // recording.ts — raw capture recordings (developer option; docs/ENGINE.md §5, e2e/README.md)

@@ -21,7 +21,8 @@
  * `storedModel`, `LiveUpdate.modelRebuild`),
  * optional FramePump metadata on `FrameInput`, `SessionSummary` carries the stored models, the
  * Gaussian splatting stage (`splat`, `splatModel`, export 'ply-splat', `ProgressEvent.detail`), the
- * object box of object-mode meshes (`MeshOptions.objectRoi`, `MeshResult`, `SessionSummary.objectRoi`).
+ * object box of object-mode meshes (`MeshOptions.objectRoi`, `MeshResult`, `SessionSummary.objectRoi`), export
+ * 'usdz' (AR Quick Look).
  *
  * Times: FrameInput and LiveUpdate times are on the page's performance.now() base. The engine
  * stores a capture on its session time base (FrameInput time + the capture segment's shift, see
@@ -320,9 +321,11 @@ export interface MeshResult extends TriangleMesh {
  * 'ply-splat': the trained Gaussian splats as an INRIA 3DGS PLY (x y z, f_dc / f_rest, opacity
  * logit, log-scales, rot w x y z; appearance-normalised; world frame of the model) — opens in
  * SuperSplat, Brush, Spark and most splat viewers.
+ * 'usdz': the mesh for AR Quick Look (≤ 100 k triangles, colours baked into a 2048² JPEG atlas,
+ * Y-up metres, origin at the AR pivot, horizontal-plane anchoring; src/io/usdz.ts) — needs a mesh.
  */
-export type ExportFormat = 'ply-points' | 'ply-mesh' | 'glb' | 'colmap-zip' | 'ply-splat';
-export const EXPORT_FORMATS: readonly ExportFormat[] = ['ply-points', 'ply-mesh', 'glb', 'colmap-zip', 'ply-splat'];
+export type ExportFormat = 'ply-points' | 'ply-mesh' | 'glb' | 'colmap-zip' | 'ply-splat' | 'usdz';
+export const EXPORT_FORMATS: readonly ExportFormat[] = ['ply-points', 'ply-mesh', 'glb', 'colmap-zip', 'ply-splat', 'usdz'];
 
 // ---------------------------------------------------------------------------------------------
 // Gaussian splatting stage (extension; docs/ENGINE.md "Splat")

@@ -231,7 +231,7 @@ async function dispatch(req: EngineRequest): Promise<{ result: unknown; transfer
     case 'export': {
       const e = requireEngine();
       const { format } = req.params as { format: ExportFormat };
-      return { result: await longOp(req.id, () => e.exportModel(format)), transfer: false };
+      return { result: await longOp(req.id, (_p, c) => e.exportModel(format, c)), transfer: false };
     }
     case 'loadSession': {
       const { id, options } = req.params as { id: string; options?: Partial<InitParams> };

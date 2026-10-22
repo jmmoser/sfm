@@ -2,8 +2,10 @@
  * glTF 2.0 binary (.glb) writer for meshes and point clouds.
  *
  * Layout decisions (compatibility first — three.js / <model-viewer> (which
- * converts to USDZ for iOS AR Quick Look via three's USDZExporter), Blender,
- * Babylon, Sketchfab, Windows 3D Viewer, gltf-validator):
+ * converts to USDZ for iOS AR Quick Look via three's USDZExporter; COLOR_0 only
+ * becomes displayColor there, which AR Quick Look does not render — the app's
+ * own AR export is usdz.ts with a baked texture), Blender, Babylon, Sketchfab,
+ * Windows 3D Viewer, gltf-validator):
  *  - Non-interleaved buffer views, every view 4-byte aligned, one per attribute.
  *  - POSITION: FLOAT VEC3 with exact accessor min/max (required by the spec).
  *  - NORMAL: FLOAT VEC3, re-normalised to unit length (validator requirement).

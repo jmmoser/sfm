@@ -1068,7 +1068,7 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
     if (cfg.exports && abortReason === null) {
       const formats: ExportFormat[] = Array.isArray(cfg.exports)
         ? cfg.exports
-        : EXPORT_FORMATS.filter((fm) => (fm !== 'ply-mesh' || !!mesh) && (fm !== 'ply-splat' || !!splat));
+        : EXPORT_FORMATS.filter((fm) => (fm !== 'ply-mesh' || !!mesh) && (fm !== 'usdz' || !!mesh) && (fm !== 'ply-splat' || !!splat));
       curStep = 'export';
       const te = performance.now();
       for (const fm of formats) {

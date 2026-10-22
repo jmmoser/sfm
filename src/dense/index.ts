@@ -1,8 +1,8 @@
 /**
  * Dense reconstruction (ARCHITECTURE §4.6): PatchMatch MVS (WebGPU + CPU), undistortion,
- * view selection, fusion, halo / sky filter, TSDF + marching cubes, simplification, point-cloud
- * filters, tuned presets, the object box of object-mode captures, and the synthetic test-data
- * generator (`synthetic` namespace).
+ * view selection, fusion, halo / sky filter, TSDF + marching cubes, simplification, the colour
+ * atlas of AR exports, point-cloud filters, tuned presets, the object box of object-mode captures,
+ * and the synthetic test-data generator (`synthetic` namespace).
  */
 export * from './types';
 export { patchMatchCPU, lastPatchMatchCPUStats, type PatchMatchCPUStats } from './patchmatch-cpu';
@@ -47,6 +47,7 @@ export {
   type MarchingCubesOptions,
 } from './marching-cubes';
 export { simplifyMesh, type SimplifyOptions } from './simplify';
+export { buildColourAtlas, buildColourAtlasAsync, ClosestTriangleFinder, type ColourAtlas, type ColourAtlasOptions, type ColourAtlasStats } from './colour-atlas';
 export {
   filterPointCloud,
   voxelDownsample,
