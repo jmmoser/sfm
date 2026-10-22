@@ -24,9 +24,9 @@
  * restore therefore starts a time segment: a frame earlier than the stored capture — and every
  * reopened capture unless it is already EXTEND_TIME_GAP_MS later — is shifted to start
  * EXTEND_TIME_GAP_MS after it (frame, IMU, GPS and attitude times alike), so the gyro never
- * integrates across the gap (> IMU_MAX_GAP_MS) and the inertial alignment splits the segments by
- * itself (keyframe gaps > 3 s); frame indices below the stored counter get an offset. LiveUpdate
- * times stay on the FrameInput (page) time base.
+ * integrates across the gap (> IMU_MAX_GAP_MS), the inertial scale splits its segments there
+ * (keyframe gaps > 3 s) and the gravity skips it (sfm/inertial.ts); frame indices below the stored
+ * counter get an offset. LiveUpdate times stay on the FrameInput (page) time base.
  *
  * Limits: there is one live model — when tracking is lost for good, later keyframes stay pending,
  * and refine keeps only the largest offline model (keyframes outside it are reported as

@@ -221,6 +221,15 @@ describe('engine: extend a stored capture after a page reload', () => {
     const rec = (await p1.store.getValue<EngineStateRecord>('engine/state'))!;
     expect(rec.timeSegments).toEqual(st.timeSegments);
     expect(rec.resultsStale).toBe(true);
+    {
+      // killed now: the scan opens as a capture to process, without decoding the old dense cloud
+      const c = new PhotogrammetryEngine({ ...opts }, engineConfig(p1.store));
+      const sum = await c.loadSession('extend');
+      expect(sum.status).toBe('capturing');
+      expect(sum.dense).toBeNull();
+      expect(sum.sparse!.cameras.length).toBe(res1.cameras.length);
+      c.dispose();
+    }
 
     await b.finishCapture();
     // a cancelled second refine keeps the first model (and opens the scan as a capture to process)

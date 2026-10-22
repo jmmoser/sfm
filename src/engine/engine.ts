@@ -1439,7 +1439,7 @@ export class PhotogrammetryEngine {
     const status = pending
       ? st?.captureFinished
         ? 'captured'
-        : meta.status
+        : 'capturing'
       : this.hasMesh
         ? 'meshed'
         : this.hasDense

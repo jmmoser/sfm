@@ -137,8 +137,8 @@ which applies from the first frame: `InitResult.captureMemory`). Times: performa
 every page load, so the engine keeps a capture on its SESSION time base — FrameInput time + the capture
 segment's shift (`EngineStateRecord.timeSegments`). The first frame of a continued capture starts a
 segment ≥ 10 s (`EXTEND_TIME_GAP_MS`) after everything stored (frame, IMU, GPS and attitude times shifted
-alike; lower frame indices offset): the gyro never integrates across the gap and the inertial alignment
-splits the segments. LiveUpdate times stay on the page's base. The first new keyframe marks the stored
+alike; lower frame indices offset): the gyro never integrates across the gap, the inertial scale splits
+its segments there and the gravity skips the gap (`estimateGravity`). LiveUpdate times stay on the page's base. The first new keyframe marks the stored
 results stale (`resultsStale`: `loadSession` then opens the scan with its sparse model only, status
 'capturing' / 'captured') until the next `refine`, which covers every keyframe and invalidates the dense
 cloud, mesh and splats as always (a cancelled or failed refine keeps the previous model). No multi-map
