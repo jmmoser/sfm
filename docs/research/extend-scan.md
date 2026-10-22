@@ -54,6 +54,24 @@ Neither run is metric (the dataset is too short for the IMU scale). The spec's r
 the single session) and the value check (a higher second pass scored with `nvs.mjs --test-dataset
 object-real-up12`) are still to be run.
 
+## Frames during the live-model rebuild (review follow-up, 2026-10-22)
+
+`restore` rebuilds the live model as one mapping job. The mapping back-pressure used to count it: the
+second new keyframe of a continued capture waited for the whole rebuild (on a large scan on a phone
+plausibly 30–90 s, past EngineClient's 30 s frame timeout). Now the back-pressure counts keyframe jobs
+only, at most `maxMappingBacklog` keyframes queue behind the rebuild, and LiveUpdate.modelRebuild
+reports it. `extend-capture.test.ts` ("slow rebuild": 10 stored keyframes, 400 ms added per rebuilt
+keyframe, background mapping, `maxMappingBacklog` 1, one frame per macrotask like worker messages):
+
+| | old back-pressure | now |
+|---|---|---|
+| frames of 17 answered while the rebuild (≈ 7–10 s) runs | 5 (one waited for the rest of it) | 9, none waited |
+| keyframe decisions dropped behind the rebuild | — | 1 (`timings.rebuildLimited`) |
+| largest mapping wait | rest of the rebuild | ≈ 0.5 s (one keyframe job, after the rebuild) |
+
+The rebuild time per keyframe on an iPhone is still unmeasured; the restore log now prints it
+("live model rebuilt from N keyframes … (X ms per keyframe)").
+
 ## Open
 
 - Pairs across the gap get no gyro check (the IMU does not cover it): a false relocalisation on

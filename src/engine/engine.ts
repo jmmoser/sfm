@@ -18,8 +18,10 @@
  *
  * A stored capture is continued — also after it was processed, after a page reload — with
  * `{ sessionId, persist: true, resume: true, extend: true }` (LiveSession.reopenCapture: new frames
- * go onto the session time base after the stored ones); the next finishCapture / refine covers
- * every keyframe, and refine invalidates the dense cloud, mesh and splats as always.
+ * go onto the session time base after the stored ones; InitResult.storedModel previews the stored
+ * sparse model); the next finishCapture / refine covers every keyframe, and refine invalidates the
+ * dense cloud, mesh and splats as always. A session without a readable stored capture state is not
+ * continued (init rejects before anything is written).
  */
 import type { CancelToken, FeatureSet, PointCloud, ProgressCallback, TriangleMesh } from '../core/types';
 import type { FeaturePipeline } from '../features/extractor';
@@ -37,6 +39,7 @@ import {
   type DecodedFrameInput,
   type FrameInput,
   type InitResult,
+  type LiveCamera,
   type LiveUpdate,
   type LogLevel,
   type MeshOptions,
@@ -50,7 +53,7 @@ import { EngineDepthStore } from './depth-store';
 import { PatchMatchHolder, rebuildColourViews, runDensify, runMesh, type DenseOutput } from './dense';
 import { buildExport } from './export';
 import { closeSource, rotateVec } from './frame-ingest';
-import { LiveSession } from './live';
+import { LiveSession, decimatePoints } from './live';
 import { modelKeypoints, originalKeypoints } from './refine-camera';
 import {
   MemoryEngineStore,
@@ -484,7 +487,8 @@ export class PhotogrammetryEngine {
    * Create the feature pipeline (WebGPU preferred: pipelines compiled up front + self-test, CPU
    * fallback), open the session store when persisting, and restore the persisted capture when
    * `resume` is set — reopened for new frames with `extend` (stored mode / quality, sparse model
-   * only: the dense cloud and mesh stay in the store, out of the capture's memory).
+   * only: the dense cloud and mesh stay in the store, out of the capture's memory; rejects when the
+   * stored state is missing or unreadable, a restore failure included).
    */
   async init(): Promise<InitResult> {
     if (this.disposed) throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');
@@ -496,8 +500,20 @@ export class PhotogrammetryEngine {
     const deleted = !!o.resume && this.store!.persistent && (await this.store!.getSessionMeta().catch(() => undefined)) === null;
     this.stopIfDisposed();
     if (deleted) throw namedError('SessionNotFoundError', `Session not found: ${o.sessionId}`);
-    const st = o.resume ? await this.store!.getValue<EngineStateRecord>('engine/state').catch(() => null) : null;
+    let st: EngineStateRecord | null = null;
+    if (o.resume) {
+      try {
+        st = await this.store!.getValue<EngineStateRecord>('engine/state');
+      } catch (e) {
+        // a scan to extend is not started over (below), also not after a read error
+        if (o.extend) throw new Error(`The stored capture could not be read: ${(e as Error)?.message ?? e}`);
+        st = null;
+      }
+    }
     this.stopIfDisposed();
+    // … before anything is written: a blank state record would replace the stored θ₀ / hand-eye /
+    // time base, and the next refine the stored model with one of the new frames alone
+    if (o.extend && !st) throw new Error(`Session ${o.sessionId} has no stored capture to continue`);
     if (st && o.extend) this.adoptStoredSettings(st);
     try {
       await this.store!.ensureSession({ mode: o.mode, quality: o.quality });
@@ -511,7 +527,6 @@ export class PhotogrammetryEngine {
     this.live = this.createLive();
     let resumed = 0;
     if (o.resume) {
-      if (!st && o.extend) this.log('warn', `session ${o.sessionId} has no stored capture to extend: starting empty`);
       if (st) {
         try {
           resumed = await this.live.restore(st);
@@ -559,8 +574,19 @@ export class PhotogrammetryEngine {
       // (the cap follows the device budget known by now)
       const m = this.live.captureMemoryStatus();
       res.captureMemory = { usedMB: Math.round(m.bytes / MB), capMB: Math.round(m.capBytes / MB) };
+      if (o.extend && this.sparse) res.storedModel = this.storedModelPreview(this.sparse);
     }
     return res;
+  }
+
+  /**
+   * The stored sparse model as the capture view shows it until the rebuilt live model arrives
+   * (decimated like a live update; no camera times: they are on the session time base).
+   */
+  private storedModelPreview(sp: SparseResultEx): NonNullable<InitResult['storedModel']> {
+    const max = this.config.liveMaxPoints ?? ENGINE_DEFAULTS.liveMaxPoints;
+    const cameras: LiveCamera[] = sp.cameras.map((c) => ({ pose: c.pose, intrinsics: { ...c.intrinsics }, ...(c.upCam ? { upCam: c.upCam } : {}) }));
+    return { sparse: decimatePoints(sp.points.positions, sp.points.colors, max), cameras };
   }
 
   /**

@@ -17,7 +17,8 @@
  * no `visibilitychange`; the engine must not submit GPU work while the page is hidden), the
  * `close` request (let go of a session before it is deleted),
  * `EngineOptions.resume` (re-open a persisted session after a worker respawn) and `extend`
- * (continue a stored capture: "Add more views"; `InitResult.resumedKeyframes` / `captureMemory`),
+ * (continue a stored capture: "Add more views"; `InitResult.resumedKeyframes` / `captureMemory` /
+ * `storedModel`, `LiveUpdate.modelRebuild`),
  * optional FramePump metadata on `FrameInput`, `SessionSummary` carries the stored models, the
  * Gaussian splatting stage (`splat`, `splatModel`, export 'ply-splat', `ProgressEvent.detail`).
  *
@@ -90,6 +91,11 @@ export interface InitResult {
    * no more keyframes (MB) — how much room a continued capture has.
    */
   captureMemory?: { usedMB: number; capMB: number };
+  /**
+   * Extension (`extend`): the stored sparse model (decimated like LiveUpdate.sparse; cameras without
+   * times), for the capture view until the rebuilt live model arrives.
+   */
+  storedModel?: { sparse: { positions: Float32Array; colors: Uint8Array }; cameras: LiveCamera[] };
 }
 
 export interface HeadingSample {
@@ -208,6 +214,13 @@ export interface LiveUpdate {
   /** With `cameras`: the engine's gyro bias estimate (rad/s, device frame, subtracted from ω); null = none yet. */
   gyroBias?: [number, number, number] | null;
   timings: Record<string, number>;
+  /**
+   * Extension (`resume`): the restored capture's live model is still being rebuilt — keyframes
+   * re-added / total; its model update comes when it is done. Meanwhile at most
+   * `maxMappingBacklog` new keyframes are added (later keyframe frames are skipped,
+   * `timings.rebuildLimited`).
+   */
+  modelRebuild?: { done: number; total: number };
   /** Per-frame diagnostics for the capture debug overlay. */
   debug?: LiveDebug;
 }

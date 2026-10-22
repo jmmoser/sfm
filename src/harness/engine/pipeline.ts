@@ -472,9 +472,13 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
       }
       ext.first.refineMs = round(performance.now() - tf, 1);
       try {
-        ext.init = await eng.init({ ...initOpts!, resume: true, extend: true });
-        ext.resumedKeyframes = ext.init.resumedKeyframes ?? 0;
-        log(`[harness] extend: re-init restored ${ext.resumedKeyframes} keyframes, capture memory ${JSON.stringify(ext.init.captureMemory ?? null)}`);
+        // (the stored-model preview is not kept: the report is JSON)
+        const { storedModel, ...init } = await eng.init({ ...initOpts!, resume: true, extend: true });
+        ext.init = init;
+        ext.resumedKeyframes = init.resumedKeyframes ?? 0;
+        log(
+          `[harness] extend: re-init restored ${ext.resumedKeyframes} keyframes (preview ${storedModel ? storedModel.sparse.positions.length / 3 : 0} points), capture memory ${JSON.stringify(init.captureMemory ?? null)}`,
+        );
       } catch (e) {
         fail('extend re-init', e);
         return false;

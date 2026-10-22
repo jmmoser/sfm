@@ -17,7 +17,12 @@
  *
  * Resume / extend: `restore` rebuilds the capture from the store (worker respawn; the live model in
  * its own gauge, in the mapping queue); `reopenCapture` continues a restored — also a finished —
- * capture (EngineOptions.extend, "Add more views"). Stored capture times are on the SESSION time
+ * capture (EngineOptions.extend, "Add more views"). While the live model is rebuilt (one mapping
+ * job, ≈ 190 ms per keyframe on SwiftShader / CPU features: a large scan takes a minute on a phone)
+ * frames are not held back by it: the mapping back-pressure counts only keyframe jobs and never
+ * waits on the rebuild, at most `maxMappingBacklog` new keyframes queue behind it (later keyframe
+ * decisions are dropped, `timings.rebuildLimited`) and every LiveUpdate reports its progress
+ * (`modelRebuild`). Stored capture times are on the SESSION time
  * base (EngineStateRecord.timeSegments): performance.now() restarts with every page load, and a new
  * page's IMU samples would interleave with the stored ones (ImuLog inserts out-of-order samples at
  * their sorted position, the gyro integral then spans both captures). The first frame after a
@@ -26,8 +31,11 @@
  * EXTEND_TIME_GAP_MS after it (frame, IMU, GPS and attitude times alike), so the gyro never
  * integrates across the gap (> IMU_MAX_GAP_MS), the inertial scale splits its segments there
  * (keyframe gaps > 3 s) and the gravity skips it (sfm/inertial.ts); frame indices below the stored
- * counter get an offset. LiveUpdate times stay on the FrameInput (page) time base. Measurements:
- * docs/research/extend-scan.md.
+ * counter get an offset. A GPS fix does not decide the segment and one at or before the stored
+ * capture's end is dropped (the FramePump attaches the nearest fix, up to 30 s old: after a respawn
+ * often one already stored). LiveUpdate times stay on the FrameInput (page) time base; until the
+ * first frame has decided the segment, model updates carry no keyframe times (the page's clock is
+ * not known yet). Measurements: docs/research/extend-scan.md.
  *
  * Limits: there is one live model — when tracking is lost for good, later keyframes stay pending,
  * and refine keeps only the largest offline model (keyframes outside it are reported as
@@ -384,13 +392,31 @@ export function segmentTimeShift(tMinMs: number, horizonMs: number, shiftMs: num
   return t > horizonMs && t >= horizonMs + minGapMs ? shiftMs : horizonMs + EXTEND_TIME_GAP_MS - tMinMs;
 }
 
-/** Earliest time a frame carries (frame, IMU samples, GPS fix, attitude). */
-export function frameTimeMin(f: Pick<FrameInput, 't' | 'imu' | 'geo' | 'attitude'>): number {
+/**
+ * Earliest time of a frame's own sensor streams (frame, IMU samples, attitude). Not its GPS fix: the
+ * FramePump attaches the nearest one, up to 30 s old — after a worker respawn often one already
+ * stored, which would start a new segment in a capture that simply continues.
+ */
+export function frameTimeMin(f: Pick<FrameInput, 't' | 'imu' | 'attitude'>): number {
   let m = f.t;
   for (const s of f.imu ?? []) if (s && s.t < m) m = s.t;
-  if (f.geo && f.geo.t < m) m = f.geo.t;
   if (f.attitude && f.attitude.t < m) m = f.attitude.t;
   return m;
+}
+
+/** Every `stride`-th point (and colour) so that at most `max` remain; the arrays themselves when they fit. */
+export function decimatePoints(positions: Float32Array, colors: Uint8Array, max: number): { positions: Float32Array; colors: Uint8Array } {
+  const n = Math.floor(positions.length / 3);
+  if (!(n > max)) return { positions, colors };
+  const stride = Math.ceil(n / max);
+  const m = Math.ceil(n / stride);
+  const pos = new Float32Array(3 * m);
+  const col = new Uint8Array(3 * m);
+  for (let i = 0, j = 0; i < n && j < m; i += stride, j++) {
+    pos.set(positions.subarray(3 * i, 3 * i + 3), 3 * j);
+    col.set(colors.subarray(3 * i, 3 * i + 3), 3 * j);
+  }
+  return { positions: pos, colors: col };
 }
 
 /** The frame with every time shifted by `s` ms (new IMU / GPS / attitude objects; the caller's stay as they are). */
@@ -415,9 +441,14 @@ export class LiveSession {
   private segmentCheck: 'resume' | 'reopen' | null = null;
   /** Added to FrameInput.index in the current segment (a reloaded page counts frames from 0 again). */
   private indexOffset = 0;
+  /** Latest stored capture time when the current segment started (session time; GPS fixes up to it are dropped). */
+  private segmentHorizon = -Infinity;
   /** The capture was reopened and has no new keyframe yet (the first one makes the stored results stale). */
   private reopened = false;
+  /** The restored live model being rebuilt in the mapping queue (`restore`): keyframes re-added / total. */
+  private rebuild: { done: number; total: number } | null = null;
   private queue: Promise<void> = Promise.resolve();
+  /** Mapping jobs queued or running, the restore rebuild included (`pendingMapping`). */
   private queued = 0;
   private readonly writes = new Set<Promise<unknown>>();
   /** Bytes held by writes not yet completed (JPEG canvases / blobs, features, colours). */
@@ -657,7 +688,7 @@ export class LiveSession {
 
   private baseUpdate(frameIndex: number, decision: LiveUpdate['decision'], guidance: Guidance, timings: Record<string, number>): LiveUpdate {
     const rec = this.mapper.reconstruction;
-    return {
+    const u: LiveUpdate = {
       frameIndex,
       decision,
       guidance,
@@ -667,6 +698,8 @@ export class LiveSession {
       numPoints: rec.numPoints,
       timings,
     };
+    if (this.rebuild) u.modelRebuild = { ...this.rebuild };
+    return u;
   }
 
   private mapGuidance(g: string | undefined): Guidance {
@@ -692,11 +725,16 @@ export class LiveSession {
       this.indexOffset = idx !== null && idx < st.frameCounter ? st.frameCounter - idx : 0;
       if (this.deps.config.extendTimeShift !== false) {
         const horizon = this.timeHorizon();
+        this.segmentHorizon = horizon;
         const shift = segmentTimeShift(frameTimeMin(f), horizon, st.timeShiftMs, check === 'reopen' ? EXTEND_TIME_GAP_MS : 0);
         if (check === 'reopen' || shift !== st.timeShiftMs) this.startTimeSegment(shift, horizon);
       }
     }
-    return shiftFrameTimes(f, st.timeShiftMs);
+    const g = shiftFrameTimes(f, st.timeShiftMs);
+    // a GPS fix at or before the stored capture's end is not this segment's: the FramePump attaches
+    // the nearest fix up to 30 s old — after a respawn often one already stored, which would be
+    // stored again (or, shifted, at a time the user was elsewhere)
+    return g.geo && !(g.geo.t > this.segmentHorizon) ? { ...g, geo: null } : g;
   }
 
   /** Latest capture time stored in the session (IMU, keyframes, GPS; session time base), −∞ when none. */
@@ -908,6 +946,14 @@ export class LiveSession {
         decision = { ...decision, decision: 'skip' };
         timings.memoryLimited = 1;
       }
+      const maxBacklog = this.deps.config.maxMappingBacklog ?? ENGINE_DEFAULTS.maxMappingBacklog;
+      if (decision.decision === 'keyframe' && this.rebuild && maxBacklog >= 0 && this.jobs.length >= Math.max(1, maxBacklog)) {
+        // the restored live model is still being rebuilt: the back-pressure must not wait for it
+        // (a minute on a large scan), so no more keyframes queue up behind it — keep tracking
+        this.selector.revertLastKeyframe();
+        decision = { ...decision, decision: 'skip' };
+        timings.rebuildLimited = 1;
+      }
       const overlay = overlayPoints(fs, W, H, kOut, this.deps.config.overlayMaxPoints ?? ENGINE_DEFAULTS.overlayMaxPoints);
       // best-of-window keyframing: the selector holds this frame as the best of a deferral window,
       // or makes the held frame the keyframe (one frame kept at most)
@@ -938,11 +984,12 @@ export class LiveSession {
         await mapped;
         timings.mapping = this.lastJobMs;
       } else if (mapped) {
-        // back-pressure: keep the live model (and the guidance derived from it) close to the capture
-        const maxBacklog = this.deps.config.maxMappingBacklog ?? ENGINE_DEFAULTS.maxMappingBacklog;
-        if (maxBacklog >= 0 && this.queued > maxBacklog) {
+        // back-pressure: keep the live model (and the guidance derived from it) close to the capture.
+        // Keyframe jobs only — never the rebuild of a restored model, which they queue behind
+        // (capped above while it runs)
+        if (maxBacklog >= 0 && !this.rebuild && this.jobs.length > maxBacklog) {
           const tw = now();
-          while (this.queued > maxBacklog && !this.disposed && this.jobs.length) await this.jobs[0];
+          while (this.jobs.length > maxBacklog && !this.rebuild && !this.disposed) await this.jobs[0];
           timings.mappingWait = now() - tw;
         }
       }
@@ -1311,9 +1358,19 @@ export class LiveSession {
     return run;
   }
 
-  /** Number of keyframes waiting for mapping. */
+  /** Number of keyframes waiting for mapping (the rebuild of a restored live model counts as one). */
   get pendingMapping(): number {
     return this.queued;
+  }
+
+  /** Keyframe mapping jobs queued or running (without the rebuild of a restored live model). */
+  get pendingKeyframeJobs(): number {
+    return this.jobs.length;
+  }
+
+  /** Progress of the rebuild of a restored live model (keyframes re-added / total), null when none runs. */
+  get rebuildProgress(): { done: number; total: number } | null {
+    return this.rebuild ? { ...this.rebuild } : null;
   }
 
   /**
@@ -1680,29 +1737,20 @@ export class LiveSession {
 
   private attachModel(u: LiveUpdate): void {
     const snap = this.mapper.snapshot();
-    const n = snap.points.length / 3;
-    const max = this.deps.config.liveMaxPoints ?? ENGINE_DEFAULTS.liveMaxPoints;
-    if (n > max) {
-      const stride = Math.ceil(n / max);
-      const m = Math.ceil(n / stride);
-      const pos = new Float32Array(3 * m);
-      const col = new Uint8Array(3 * m);
-      for (let i = 0, j = 0; i < n && j < m; i += stride, j++) {
-        pos.set(snap.points.subarray(3 * i, 3 * i + 3), 3 * j);
-        col.set(snap.colors.subarray(3 * i, 3 * i + 3), 3 * j);
-      }
-      u.sparse = { positions: pos, colors: col };
-    } else u.sparse = { positions: snap.points, colors: snap.colors };
+    u.sparse = decimatePoints(snap.points, snap.colors, this.deps.config.liveMaxPoints ?? ENGINE_DEFAULTS.liveMaxPoints);
     const rec = this.mapper.reconstruction;
     const st = this.state;
-    // IMU clock of the page (FrameInput time base): earlier segments' keyframes come out before it
+    // IMU clock of the page (FrameInput time base): earlier segments' keyframes come out before it.
+    // Not known before the first frame after a restore decided the segment (its shift): no times
+    // then — the previous page's would lie ahead of this page's clock
+    const timed = this.segmentCheck === null;
     const offset = (st.timeOffsetMs ?? 0) - st.timeShiftMs;
     const cams: LiveCamera[] = [];
     for (const { id, pose } of snap.poses.sort((a, b) => a.id - b.id)) {
       const cam = rec.cameras.get(rec.images.get(id)!.cameraId)!;
       const r = st.records.get(id);
       const upCam = r ? keyframeUpCam(r) : undefined;
-      cams.push({ pose, intrinsics: { ...cam }, ...(r ? { t: r.t + offset } : {}), ...(upCam ? { upCam } : {}) });
+      cams.push({ pose, intrinsics: { ...cam }, ...(r && timed ? { t: r.t + offset } : {}), ...(upCam ? { upCam } : {}) });
     }
     u.cameras = cams;
     u.R_cam_device = Float64Array.from(st.cameraFromDevice());
@@ -1834,12 +1882,15 @@ export class LiveSession {
     // pairs record: still queued when the worker died) are matched and mapped like new ones
     const ids = st.order.slice();
     this.queued++;
+    // (frames are not held back by it, see processFrame; LiveUpdate.modelRebuild reports it)
+    const progress = (this.rebuild = { done: 0, total: ids.length });
     this.queue = this.queue.then(async () => {
       const t0 = now();
       let remapped = 0;
       try {
         for (const id of ids) {
           if (this.disposed) return;
+          progress.done++;
           if (!pairsById.has(id)) {
             try {
               await this.mapKeyframe({ id, tracking: null });
@@ -1861,9 +1912,11 @@ export class LiveSession {
           if (!this.inline) await tick();
         }
         this.updateMemoryEstimate();
-        this.deps.log('info', `live model rebuilt from ${ids.length} keyframes (${remapped} matched again) in ${Math.round(now() - t0)} ms`);
+        const ms = now() - t0;
+        this.deps.log('info', `live model rebuilt from ${ids.length} keyframes (${remapped} matched again) in ${Math.round(ms)} ms (${ids.length ? Math.round(ms / ids.length) : 0} ms per keyframe)`);
       } finally {
         this.queued--;
+        if (this.rebuild === progress) this.rebuild = null;
       }
       if (!this.inline) this.emitModelUpdate();
     });

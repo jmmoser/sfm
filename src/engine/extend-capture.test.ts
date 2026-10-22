@@ -4,15 +4,21 @@
  * restarts with every load), so without the session time base they would interleave with the
  * stored ones. With it the second segment lies after the stored capture, the reopened capture
  * registers into ONE model with the first segment (gravity aligned, no gyro break), the extension
- * loads only the sparse model, a cancelled second refine keeps the first model loadable, and the
- * same run without the shift (EngineConfig.extendTimeShift: false) fails the IMU-order check —
- * the check detects the hazard.
+ * loads only the sparse model (and previews it: InitResult.storedModel), a cancelled second refine
+ * keeps the first model loadable, and the same run without the shift (EngineConfig.extendTimeShift:
+ * false) fails the IMU-order check — the check detects the hazard. A scan without a readable
+ * stored state is not continued (nothing written). With background mapping, frames are answered
+ * while a slow rebuild of the stored live model runs (no back-pressure wait on it, at most
+ * maxMappingBacklog keyframes behind it), model updates before the first frame carry no times, and
+ * a page counting frames from 0 again gets frame indices above the stored ones. A worker respawn
+ * in the same page whose first frame re-attaches a stored GPS fix continues unshifted.
  */
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 import type { GeoFix } from '../core/types';
 import type { FeaturePipeline } from '../features/extractor';
 import { umeyama } from '../math/sim3';
-import type { FrameInput } from '../workers/protocol';
+import { LiveMapper } from '../sfm/live';
+import type { FrameInput, LiveUpdate } from '../workers/protocol';
 import { createCpuFeaturePipeline } from './cpu-pipeline';
 import { PhotogrammetryEngine } from './engine';
 import { EXTEND_TIME_GAP_MS, frameTimeMin, segmentTimeShift, shiftFrameTimes, type CaptureState } from './live';
@@ -161,7 +167,8 @@ describe('session time base (pure)', () => {
       attitude: { t: 95, R_world_device: Float64Array.of(1, 0, 0, 0, 1, 0, 0, 0, 1), absolute: false, yawAccuracyDeg: null },
       screenAngleSince: -Infinity,
     };
-    expect(frameTimeMin(f)).toBe(40);
+    // (not the GPS fix: the FramePump attaches the nearest one, up to 30 s old)
+    expect(frameTimeMin(f)).toBe(90);
     const g = shiftFrameTimes(f, 1000);
     expect([g.t, g.imu[0].t, g.geo!.t, g.attitude!.t, g.screenAngleSince]).toEqual([1100, 1090, 1040, 1095, -Infinity]);
     expect([f.t, imu[0].t, f.geo.t, f.attitude.t]).toEqual([100, 90, 40, 95]);
@@ -184,6 +191,10 @@ describe('engine: extend a stored capture after a page reload', () => {
     expect(init.resumedKeyframes).toBe(p1.keyframes.length);
     expect(init.captureMemory!.usedMB).toBeGreaterThan(0);
     expect(init.captureMemory!.capMB).toBeGreaterThan(init.captureMemory!.usedMB);
+    // the stored sparse model for the capture view (no camera times: they are on the session time base)
+    expect(init.storedModel!.cameras).toHaveLength(res1.cameras.length);
+    expect(init.storedModel!.cameras.every((c) => c.t === undefined)).toBe(true);
+    expect(init.storedModel!.sparse.positions.length).toBe(3 * res1.points.count); // (< liveMaxPoints: not decimated)
     const live = b.liveSession!;
     const st = live.state;
     const old = stored(st);
@@ -277,6 +288,173 @@ describe('engine: extend a stored capture after a page reload', () => {
     const added = new Set(frames2.flatMap((f) => f.imu.map((s) => s.t))).size;
     for (const f of frames2) await b.processFrame(f);
     expect(imuInOrder(b.liveSession!.state, old.imu, added)).toBe(false);
+    b.dispose();
+  }, 300_000);
+});
+
+describe('engine: extend — a stored state that cannot be read is not started over', () => {
+  async function storeWithMeta(id: string): Promise<MemoryEngineStore> {
+    const store = persistentStore(id);
+    await store.ensureSession({ mode: 'object', quality: 'fast' });
+    return store;
+  }
+
+  it('rejects without a stored state, and writes nothing', async () => {
+    const store = await storeWithMeta('nostate');
+    const b = new PhotogrammetryEngine({ ...opts, sessionId: 'nostate', resume: true, extend: true }, engineConfig(store));
+    await expect(b.init()).rejects.toThrow(/no stored capture to continue/);
+    expect(await store.getValue('engine/state')).toBeNull();
+    b.dispose();
+  });
+
+  it('rejects on a read error of the stored state, and keeps the stored record', async () => {
+    const store = await storeWithMeta('unreadable');
+    const rec = { version: 1, mode: 'object', quality: 'fast', thetaSession: 0, cameraTheta: 0, nextKeyframeId: 7, frameCounter: 40, imuChunks: 3, captureFinished: true, updatedAt: 1 };
+    await store.putValue('engine/state', rec);
+    const get = store.getValue.bind(store);
+    let failing = true;
+    store.getValue = <T>(key: string): Promise<T | null> => (failing && key === 'engine/state' ? Promise.reject(new Error('IDB read failed')) : get<T>(key));
+    const b = new PhotogrammetryEngine({ ...opts, sessionId: 'unreadable', resume: true, extend: true }, engineConfig(store));
+    await expect(b.init()).rejects.toThrow(/could not be read: IDB read failed/);
+    await b.flush().catch(() => undefined);
+    failing = false;
+    expect(await store.getValue('engine/state')).toEqual(rec);
+    b.dispose();
+  });
+});
+
+describe('engine: extend with background mapping', () => {
+  it('frames are answered while a slow rebuild of the stored model runs; model times wait for the first frame; frame indices restarting at 0 get an offset', async () => {
+    const id = 'rebuild';
+    const p1 = await firstPage(id, false);
+    const storedCounter = (await p1.store.getValue<EngineStateRecord>('engine/state'))!.frameCounter;
+    const cfg = engineConfig(p1.store, { mapping: 'background' });
+
+    {
+      // the rebuild ends before the first frame (a small scan, a camera that starts late): its model
+      // update carries no keyframe times — the previous page's would lie ahead of this page's clock
+      const b = new PhotogrammetryEngine({ ...opts, sessionId: id, resume: true, extend: true }, cfg);
+      const live: LiveUpdate[] = [];
+      b.on('live', (u) => live.push(u));
+      await b.init();
+      await b.flush();
+      const u = live.filter((x) => x.cameras?.length).pop();
+      expect(u).toBeDefined();
+      expect(u!.cameras!.length).toBeGreaterThan(3);
+      expect(u!.cameras!.every((c) => c.t === undefined)).toBe(true);
+      b.dispose();
+    }
+
+    // a slow rebuild (≈ 400 ms per keyframe — a large scan on a phone takes a minute)
+    let slow = p1.keyframes.length;
+    const add = LiveMapper.prototype.addKeyframe;
+    const spy = vi.spyOn(LiveMapper.prototype, 'addKeyframe').mockImplementation(function (this: LiveMapper, kf: number) {
+      if (slow > 0) {
+        slow--;
+        const end = performance.now() + 400;
+        while (performance.now() < end) {
+          /* busy */
+        }
+      }
+      return add.call(this, kf);
+    });
+    try {
+      // (one keyframe job may queue behind the rebuild: the second keyframe decision meets the cap)
+      const b = new PhotogrammetryEngine({ ...opts, sessionId: id, resume: true, extend: true }, { ...cfg, maxMappingBacklog: 1 });
+      const live: LiveUpdate[] = [];
+      b.on('live', (u) => live.push(u));
+      const tInit = performance.now();
+      await b.init();
+      const ls = b.liveSession!;
+      const st = ls.state;
+      expect(ls.rebuildProgress).not.toBeNull();
+      // a reloaded page: a new FramePump counts frames from 0 again
+      const frames2 = pageFrames(RESUME_AT, cap.frames.length, reloadDt()).map((f, i) => ({ ...f, index: i }));
+      const answered: { u: LiveUpdate; started: boolean; rebuilding: boolean; jobs: number; ms: number }[] = [];
+      let rebuildMs = NaN;
+      for (const f of frames2) {
+        // each frame arrives as a worker message (a macrotask: the rebuild's steps run in between)
+        await new Promise((r) => setTimeout(r, 0));
+        const started = ls.rebuildProgress !== null;
+        const t0 = performance.now();
+        const u = await b.processFrame(f);
+        answered.push({ u, started, rebuilding: ls.rebuildProgress !== null, jobs: ls.pendingKeyframeJobs, ms: performance.now() - t0 });
+        if (Number.isNaN(rebuildMs) && ls.rebuildProgress === null) rebuildMs = performance.now() - tInit;
+      }
+      await b.flush();
+      if (Number.isNaN(rebuildMs)) rebuildMs = performance.now() - tInit;
+      expect(rebuildMs).toBeGreaterThan(400 * p1.keyframes.length);
+
+      // answered meanwhile, with its progress; never waiting for it; at most maxMappingBacklog
+      // keyframes behind it — a later keyframe decision is dropped (tracking goes on)
+      const during = answered.filter((a) => a.u.modelRebuild);
+      expect(during.length).toBeGreaterThanOrEqual(p1.keyframes.length - 2);
+      // a frame that came during the rebuild is answered during it (its steps run between frames)
+      for (const a of answered) if (a.started) expect(a.u.modelRebuild).toBeDefined();
+      expect(Math.max(...answered.map((a) => a.ms))).toBeLessThan(rebuildMs / 2);
+      for (const a of during) {
+        expect(a.u.modelRebuild!.total).toBe(p1.keyframes.length);
+        expect(a.u.timings.mappingWait).toBeUndefined();
+      }
+      for (const a of answered.filter((x) => x.rebuilding)) expect(a.jobs).toBeLessThanOrEqual(1);
+      expect(during.filter((a) => a.u.decision === 'keyframe').length).toBe(1);
+      expect(during.some((a) => a.u.timings.rebuildLimited === 1)).toBe(true);
+      const maxWait = Math.max(0, ...answered.map((a) => a.u.timings.mappingWait ?? 0));
+      expect(maxWait).toBeLessThan(rebuildMs / 2);
+
+      // the new keyframes join the rebuilt live model
+      const newIds = st.order.slice(p1.keyframes.length);
+      expect(newIds.length).toBeGreaterThan(2);
+      const rec = ls.mapper.reconstruction;
+      expect(newIds.filter((k) => rec.images.get(k)?.registered).length).toBeGreaterThanOrEqual(newIds.length - 1);
+
+      // frame indices: above the stored counter, increasing, and they map back to the page's frames
+      const shift = st.timeSegments[0].shiftMs;
+      let prev = -1;
+      for (const k of newIds) {
+        const r = st.records.get(k)!;
+        expect(r.frameIndex).toBeGreaterThanOrEqual(storedCounter);
+        expect(r.frameIndex).toBeGreaterThan(prev);
+        prev = r.frameIndex;
+        expect(r.t).toBeCloseTo(frames2[r.frameIndex - storedCounter].t + shift, 6);
+      }
+      for (const k of p1.keyframes) expect(st.records.get(k)!.frameIndex).toBeLessThan(storedCounter);
+
+      // model updates after the first frame carry the page's times: the stored keyframes before it
+      const last = live.filter((x) => x.cameras?.length).pop()!;
+      expect(last.cameras!.every((c) => c.t !== undefined)).toBe(true);
+      const off = st.timeOffsetMs ?? 0;
+      expect(Math.max(...last.cameras!.slice(0, p1.keyframes.length).map((c) => c.t!))).toBeLessThan(frames2[0].t + off);
+      b.dispose();
+    } finally {
+      spy.mockRestore();
+    }
+  }, 600_000);
+});
+
+describe('engine: worker respawn in the same page', () => {
+  it('a first frame re-attaching a stored GPS fix neither shifts the capture nor stores the fix twice', async () => {
+    const id = 'respawn-geo';
+    const p1 = await firstPage(id, false);
+    const b = new PhotogrammetryEngine({ ...opts, sessionId: id, resume: true }, engineConfig(p1.store));
+    await b.init();
+    const st = b.liveSession!.state;
+    const stored0 = st.geo.length;
+    const lastFix = st.geo[stored0 - 1];
+    // same page clock; fresh fixes at the frame times, the first frame carries the stored nearest one
+    const frames2 = frameInputs(cap, { from: SPLIT, to: SPLIT + 10 }).map((f): FrameInput => ({ ...f, geo: { t: f.t, lat: 47.3769, lon: 8.5417, alt: 408, accuracy: 30, altitudeAccuracy: null } }));
+    frames2[0] = { ...frames2[0], geo: { ...lastFix } };
+    for (const f of frames2) await b.processFrame(f);
+    await b.flush();
+    expect(st.timeSegments).toEqual([]);
+    expect(st.timeShiftMs).toBe(0);
+    for (let i = 1; i < st.geo.length; i++) expect(st.geo[i].t).toBeGreaterThan(st.geo[i - 1].t);
+    expect(st.geo.length).toBe(stored0 + frames2.length - 1);
+    // the capture continues on the same time base
+    const newIds = st.order.slice(p1.keyframes.length);
+    expect(newIds.length).toBeGreaterThan(0);
+    const ts = new Set(frames2.map((f) => f.t));
+    for (const k of newIds) expect(ts.has(st.records.get(k)!.t)).toBe(true);
     b.dispose();
   }, 300_000);
 });
