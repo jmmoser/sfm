@@ -88,6 +88,8 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   let stored: SessionMeta | null = null;
   let baseKeyframes = 0;
   let markedCapturing = false;
+  /** The cards' leave button: a continued capture goes back where it came from (leaveExtended). */
+  const backLabel = extend ? 'Stop adding views' : 'Back to home';
 
   const camera = new CameraCapture();
   /** The "VideoFrame grab" setting (where VideoFrame exists): no main-thread copy per grab. */
@@ -232,10 +234,14 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     return elapsedMs + (runningSince !== null ? performance.now() - runningSince : 0);
   }
 
+  /** Enough keyframes to finish; a continued capture also needs a new one (it is processed again). */
+  function canFinish(): boolean {
+    return numKeyframes >= MIN_KEYFRAMES && (!extend || numKeyframes > baseKeyframes);
+  }
+
   function updateFinish(): void {
     const added = numKeyframes - baseKeyframes;
-    // a continued capture finishes (and is processed again) only with new views
-    const enough = numKeyframes >= MIN_KEYFRAMES && (!extend || added > 0);
+    const enough = canFinish();
     finishBtn.disabled = !enough || !(phase === 'running' || phase === 'paused');
     if (extend) {
       finishHint.hidden = phase === 'starting' || phase === 'error';
@@ -267,7 +273,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     setPhase('error');
     const actions: HTMLElement[] = [];
     if (retry) actions.push(button({ label: retryLabel, variant: 'primary', size: 'lg', block: true, onClick: retry, testId: 'capture-retry' }));
-    actions.push(button({ label: 'Back to home', variant: 'secondary', size: 'lg', block: true, onClick: () => void abandon(), testId: 'capture-back' }));
+    actions.push(button({ label: backLabel, variant: 'secondary', size: 'lg', block: true, onClick: () => void abandon(), testId: 'capture-back' }));
     showCard(infoCard({ icon: 'warning', title, text: capitalize(text), actions, tone: 'bad', testId: 'capture-error' }));
   }
 
@@ -661,7 +667,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     if (phase !== 'running' && phase !== 'paused') return;
     memoryLimited = true;
     pause('user');
-    const enough = numKeyframes >= MIN_KEYFRAMES;
+    const enough = canFinish();
     showCard(
       infoCard({
         icon: 'cpu',
@@ -669,12 +675,14 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
         title: 'Memory limit reached — finish scan now?',
         text: enough
           ? `This device cannot hold more keyframes for this scan. Finish now to reconstruct the ${numKeyframes} keyframes captured so far, or continue with tracking only — no new keyframes are added.`
-          : 'This device cannot hold more keyframes for this scan, and there are too few to reconstruct. Continue with tracking only, or start again with a lower quality.',
+          : extend
+            ? 'This device cannot hold more keyframes for this scan: there is no room for new views. Stop to keep the scan as it is, or continue with tracking only.'
+            : 'This device cannot hold more keyframes for this scan, and there are too few to reconstruct. Continue with tracking only, or start again with a lower quality.',
         testId: 'capture-memory-limit',
         actions: [
           ...(enough ? [button({ label: 'Finish scan', icon: 'check', variant: 'primary', size: 'lg', block: true, testId: 'memory-finish', onClick: () => void finish() })] : []),
           button({ label: 'Continue (tracking only)', variant: enough ? 'secondary' : 'primary', size: 'lg', block: true, testId: 'memory-continue', onClick: () => resume() }),
-          ...(enough ? [] : [button({ label: 'Back to home', variant: 'secondary', size: 'lg', block: true, onClick: () => void abandon() })]),
+          ...(enough ? [] : [button({ label: backLabel, variant: 'secondary', size: 'lg', block: true, onClick: () => void abandon() })]),
         ],
       }),
     );
@@ -747,7 +755,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       case 'storage': {
         if (phase !== 'running') return;
         pause('user');
-        const enough = numKeyframes >= MIN_KEYFRAMES;
+        const enough = canFinish();
         const full = isQuotaError(e);
         showCard(
           infoCard({
@@ -765,7 +773,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
             actions: [
               ...(enough ? [button({ label: 'Finish scan', icon: 'check', variant: 'primary', size: 'lg', block: true, onClick: () => void finish() })] : []),
               button({ label: 'Resume', variant: enough ? 'secondary' : 'primary', size: 'lg', block: true, onClick: () => resume() }),
-              button({ label: 'Back to home', variant: 'secondary', size: 'lg', block: true, onClick: () => void abandon() }),
+              button({ label: backLabel, variant: 'secondary', size: 'lg', block: true, onClick: () => void abandon() }),
             ],
           }),
         );
@@ -839,7 +847,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
               void p.then((st) => (closed ? undefined : afterPermissions(st)));
             },
           }),
-          button({ label: 'Back to home', variant: 'secondary', size: 'lg', block: true, onClick: () => void abandon() }),
+          button({ label: backLabel, variant: 'secondary', size: 'lg', block: true, onClick: () => void abandon() }),
         ],
       }),
     );
@@ -1122,7 +1130,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
   const FINISH_ABORT_GRACE_MS = 4000;
 
   async function finish(): Promise<void> {
-    if (numKeyframes < MIN_KEYFRAMES || !(phase === 'running' || phase === 'paused')) return;
+    if (!canFinish() || !(phase === 'running' || phase === 'paused')) return;
     setPhase('finishing');
     pump?.stop();
     clearOverlay();
