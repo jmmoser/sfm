@@ -178,15 +178,17 @@ describe('viewer screen: fly-through video export row', () => {
     await waitFor(() => !!q('export-cancel-video'));
     expect(app.wakeLock.active).toBe(true);
     await tap('export-cancel-video');
-    await waitFor(() => !!q('export-prepare-video'));
+    // (Prepare is enabled once the stopped export let go of the GPU, the wake lock and app.busy)
+    await waitFor(() => !!q('export-prepare-video') && !(q('export-prepare-video') as HTMLButtonElement).disabled);
     expect(app.wakeLock.active).toBe(false);
+    expect(app.busy).toBe(false);
     // hidden page: the export stops
     await tap('export-prepare-video');
     await waitFor(() => !!q('export-cancel-video'));
     let hidden = true;
     Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden });
     document.dispatchEvent(new Event('visibilitychange'));
-    await waitFor(() => !!q('export-prepare-video'));
+    await waitFor(() => !!q('export-prepare-video') && !(q('export-prepare-video') as HTMLButtonElement).disabled);
     expect(q('export-video')!.textContent).toMatch(/background/);
     hidden = false;
     delete (document as unknown as { hidden?: boolean }).hidden;

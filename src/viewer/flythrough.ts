@@ -3,8 +3,9 @@
  * keyframe cameras in capture order, it builds N frame poses (ARCHITECTURE §2: world-to-camera,
  * OpenCV camera frame) and the pinhole intrinsics of the video. The path is a stabilised replay of
  * the capture rather than a free orbit. The splats are photoreal only near the photos: on the
- * synthetic object scene they lose ~1 dB at +5 cm off the trajectory and ~9 dB at +25 cm (e2e/README
- * "Novel views"). So the path hugs the trajectory and the view direction follows the photos.
+ * object-real scene they lose 1.5 dB 5 cm off the trajectory and 8 dB 25 cm off it (e2e/README
+ * "Novel views: held-out and off-trajectory"). So the path hugs the trajectory and the view
+ * direction follows the photos.
  *
  * Modes ('auto': object when the optical axes converge, src/geometry/convergence.ts):
  *  - object: an orbit about the vertical axis through the optical-axis convergence point, swept

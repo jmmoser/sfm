@@ -453,10 +453,15 @@ export class SplatLayer {
     let fallbackReason: string | null = null;
     let closed = false;
     let hiddenDuring = false;
-    let wake: (() => void) | null = null;
+    /** Frames waiting for the page to become visible (or for close). */
+    const wakers = new Set<() => void>();
+    const wakeAll = (): void => {
+      for (const w of [...wakers]) w();
+      wakers.clear();
+    };
     const onVis = (): void => {
       if (document.hidden) hiddenDuring = true;
-      else wake?.();
+      else wakeAll();
     };
     document.addEventListener('visibilitychange', onVis);
     const rb = device0.createBuffer({ size: bytesPerRow * H, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST, label: 'splat-offscreen-readback' });
@@ -471,8 +476,7 @@ export class SplatLayer {
       if (layer.disposed || layer.gpu.device !== device0 || !layer.renderer || !layer.presenter || !layer.countBuf) throw new Error('the photoreal model was unloaded or the GPU device was lost');
     };
     const whenVisible = async (): Promise<void> => {
-      while (typeof document !== 'undefined' && document.hidden && !closed) await new Promise<void>((res) => (wake = res));
-      wake = null;
+      while (typeof document !== 'undefined' && document.hidden && !closed) await new Promise<void>((res) => wakers.add(res));
     };
     const ownTexture = (): GPUTexture => {
       texture ??= device0.createTexture({ size: [W, H], format: layer.format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC, label: 'splat-offscreen' });
@@ -499,10 +503,14 @@ export class SplatLayer {
     const render = async (cam: SplatCamera, target: 'canvas' | 'texture', readback: boolean): Promise<void> => {
       if (cam.width !== W || cam.height !== H) throw new Error(`camera ${cam.width}×${cam.height} for a ${W}×${H} session`);
       for (;;) {
-        // one heavy command buffer in flight: a viewer frame finishes first
-        while (layer.inFlight) await new Promise((r) => setTimeout(r, 2));
-        await whenVisible();
-        check();
+        // one heavy command buffer in flight: another frame (a screenshot, a second call) finishes
+        // first; checked right before the synchronous encode + submit below
+        for (;;) {
+          await whenVisible();
+          check();
+          if (!layer.inFlight) break;
+          await new Promise((r) => setTimeout(r, 2));
+        }
         const r = layer.renderer!;
         if (r.maxWidth !== W || r.maxHeight !== H) r.setMaxSize(W, H);
         const tex = target === 'canvas' ? ctx!.getCurrentTexture() : ownTexture();
@@ -649,7 +657,7 @@ export class SplatLayer {
       close() {
         if (closed) return;
         closed = true;
-        wake?.();
+        wakeAll();
         document.removeEventListener('visibilitychange', onVis);
         layer.offscreenOpen = false;
         // (a frame still running keeps them until it completes: destroy defers the free)

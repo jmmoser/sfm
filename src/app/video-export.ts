@@ -189,6 +189,11 @@ export interface VideoExportHost {
   openFrames(o: SplatOffscreenOptions): SplatOffscreen | null;
   /** Why the splats cannot be rendered now (null: they can). */
   blocked(): string | null;
+  /**
+   * Another job holds `app.busy` / the wake lock now (the photoreal build): a stopped export leaves
+   * them to it.
+   */
+  othersBusy(): boolean;
   /** Re-render the open Export sheet. */
   rerender(): void;
 }
@@ -227,6 +232,22 @@ export function createVideoExport(host: VideoExportHost): VideoExportController 
     if (document.hidden && abort) stop('Stopped: the app went to the background. Tap Prepare to start again.');
   };
   document.addEventListener('visibilitychange', onVisibility);
+  /** This export holds `app.busy` (leaving asks first) and the wake lock. */
+  let holding = false;
+  const hold = (): void => {
+    if (holding) return;
+    holding = true;
+    app.busy = true;
+    void app.wakeLock.acquire();
+  };
+  /** Released at once on dispose / a build start: the export settles later, when the next owner may hold them. */
+  const unhold = (): void => {
+    if (!holding) return;
+    holding = false;
+    if (host.othersBusy()) return;
+    app.busy = false;
+    void app.wakeLock.release();
+  };
 
   function stop(note?: string): void {
     if (!abort) return;
@@ -249,9 +270,7 @@ export function createVideoExport(host: VideoExportHost): VideoExportController 
     state = { status: 'rendering', done: 0, total: path.poses.length };
     host.rerender();
     let frames: SplatOffscreen | null = null;
-    const wasBusy = app.busy;
-    app.busy = true;
-    void app.wakeLock.acquire();
+    hold();
     try {
       const config = await chooseVideoConfig(path.width, path.height, path.fps);
       if (!config) throw new Error(`This browser cannot encode H.264 video at ${path.width} × ${path.height}`);
@@ -288,9 +307,10 @@ export function createVideoExport(host: VideoExportHost): VideoExportController 
       if (abort === ctl && !ctl.signal.aborted) state = { status: 'error', error: (e as Error)?.message ?? String(e) };
     } finally {
       frames?.close();
-      if (abort === ctl) abort = null;
-      app.busy = wasBusy;
-      void app.wakeLock.release();
+      if (abort === ctl) {
+        abort = null;
+        unhold();
+      }
       if (!disposed) host.rerender();
     }
   }
@@ -353,7 +373,8 @@ export function createVideoExport(host: VideoExportHost): VideoExportController 
       });
     } else {
       if (state.status === 'error') sub = state.error;
-      action = button({ label: state.status === 'error' ? 'Retry' : 'Prepare', variant: 'secondary', size: 'sm', testId: 'export-prepare-video', onClick: () => void start() });
+      // (disabled while a stopped export is still letting go of the GPU)
+      action = button({ label: state.status === 'error' ? 'Retry' : 'Prepare', variant: 'secondary', size: 'sm', testId: 'export-prepare-video', disabled: !!abort, onClick: () => void start() });
     }
     subEl.textContent = sub;
     el.append(h('span', { class: 'export-icon' }, icon('play', { size: 22 })), text, action);
@@ -362,14 +383,19 @@ export function createVideoExport(host: VideoExportHost): VideoExportController 
 
   return {
     row,
-    cancel: () => stop(),
+    cancel() {
+      stop();
+      unhold();
+    },
     invalidate() {
       stop();
+      unhold();
       state = { status: 'idle' };
     },
     dispose() {
       disposed = true;
       stop();
+      unhold();
       document.removeEventListener('visibilitychange', onVisibility);
     },
   };

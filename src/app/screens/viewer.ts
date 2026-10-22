@@ -633,6 +633,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
           : splatFetching || splatState !== 'ready'
             ? 'Loading the photoreal model…'
             : null,
+    othersBusy: () => building,
     rerender: () => renderExports?.(),
   });
 
