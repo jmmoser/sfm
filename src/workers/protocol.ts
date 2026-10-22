@@ -354,9 +354,11 @@ export interface SplatResult {
    * Well-known keys: splatViews, splatWidth / splatHeight, splatMaxGaussians, splatInitGaussians,
    * splatShell, splatItPerSec, splatLoss, splatResumedFrom, splatMemPeakMB, splatGpuMB,
    * splatDegraded, splatTrainMs, splatPrepareMs, splatStoredBytes, splatIterations (the
-   * schedule), splatPreviews. Ended by `finishEarly`: splatFinishedEarly = 1 and, when the
-   * checkpoint at that iteration was kept for a later `splat` to continue from, splatContinueFrom
-   * (that iteration; loadSession then reports it as splatResumableIteration).
+   * schedule), splatPreviews and splatPreviewFinalPsnr (with `preview`: the trained model from the
+   * preview view, the PSNR the previews converge to). Ended by `finishEarly`: splatFinishedEarly = 1
+   * and, when the checkpoint at that iteration was kept for a later `splat` to continue from,
+   * splatContinueFrom (that iteration) and splatContinueKey (its run): loadSession then reports
+   * splatResumableIteration and, while that checkpoint is still the kept one, splatContinuesModel = 1.
    */
   stats: Record<string, number | string>;
 }

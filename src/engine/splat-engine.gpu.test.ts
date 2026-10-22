@@ -5,10 +5,10 @@
  *    its checkpoint dropped first: read again, never stored stale), the engine dropped without
  *    cleanup ("killed"), a NEW engine reports the resumable iteration, resumes from the
  *    checkpoint (its first preview shows the checkpoint) and is ended early ("Use it now"): the
- *    model is persisted with its checkpoint kept; a third engine reports it as continuable,
- *    continues to the end, clears the checkpoints and exports 'ply-splat';
+ *    model is persisted with its checkpoint kept (and its run key); a third engine reports it as
+ *    continuable, continues to the end, clears the checkpoints and exports 'ply-splat';
  *  - in-memory session without a dense cloud: previews (the first before the training, PSNR
- *    rising), dropped GPU work rolls back to the last checkpoint, a destroyed device is replaced
+ *    rising to the final model's), dropped GPU work rolls back to the last checkpoint, a destroyed device is replaced
  *    and training continues from the checkpoint; dropped readbacks of the appearance normalisation
  *    are read again.
  */
@@ -140,8 +140,10 @@ describe('engine splat stage', () => {
       expect(resumed.map((d) => d.iteration)).toEqual([110, 120, 130]);
       expect(early.iterations).toBe(130);
       expect(early.stats).toMatchObject({ splatResumedFrom: 100, splatFinishedEarly: 1, splatContinueFrom: 130, splatIterations: 200 });
-      // the model is persisted, the checkpoint at 130 kept
-      expect((await b.engineStore!.getValue<{ iteration: number }>('splat/progress'))?.iteration).toBe(130);
+      // the model is persisted, the checkpoint at 130 kept (its run key with the model)
+      const progB = await b.engineStore!.getValue<{ iteration: number; key: string }>('splat/progress');
+      expect(progB?.iteration).toBe(130);
+      expect(early.stats.splatContinueKey).toBe(progB!.key);
       expect((await b.engineStore!.getValue<EngineStateRecord>('engine/state'))?.hasSplat).toBe(true);
       expect((await b.splatModel())?.model.count).toBe(early.count);
       b.dispose();
@@ -151,6 +153,7 @@ describe('engine splat stage', () => {
       const sumC = await c.loadSession(id);
       expect(sumC.splat).toMatchObject({ count: early.count, iterations: 130 });
       expect(sumC.stats.splatResumableIteration).toBe(130);
+      expect(sumC.stats.splatContinuesModel).toBe(1);
       const continued: SplatTrainingDetail[] = [];
       const info = await c.splat(undefined, (p) => {
         const d = training(p);
@@ -184,6 +187,7 @@ describe('engine splat stage', () => {
       const sum2 = await d.loadSession(id);
       expect(sum2.splat).toMatchObject({ count: info.count, iterations: 200 });
       expect(sum2.stats.splatResumableIteration).toBeUndefined();
+      expect(sum2.stats.splatContinuesModel).toBeUndefined();
       expect((await d.splatModel())?.model.count).toBe(info.count);
       d.dispose();
     } finally {
@@ -251,6 +255,8 @@ describe('engine splat stage', () => {
     for (const p of previews) expect([p.width, p.height, p.d.viewId]).toEqual([info.stats.splatWidth, info.stats.splatHeight, previews[0].d.viewId]);
     expect(new Set(previews.map((p) => p.sum)).size).toBeGreaterThan(2);
     expect(previews[previews.length - 1].d.psnr).toBeGreaterThan(previews[0].d.psnr + 3);
+    // the trained model from that view (not posted): what the previews converge to
+    expect(Number(info.stats.splatPreviewFinalPsnr)).toBeGreaterThan(previews[previews.length - 1].d.psnr - 1);
     e.dispose();
   }, 600_000);
 

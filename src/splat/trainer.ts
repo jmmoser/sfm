@@ -26,8 +26,9 @@
  * `SplatWorkDroppedError` when one is missing (the caller restores a checkpoint: a dropped
  * relocation leaves grown slots uninitialised). Every readback copies its own stamp behind the
  * data: a dropped one throws `SplatWorkDroppedError` instead of returning stale staging contents
- * (`readState` / `readModel` / `readMoments` / `normaliseAppearance` can then simply be called
- * again). Checkpoints: `readState` + `readMoments` + `readModel`, restored by
+ * (`readState` / `readModel` / `readMoments` / `normaliseAppearance` / `render` can then simply be
+ * called again; `render` submits its forward pass, the copy and the stamp as one command buffer).
+ * Checkpoints: `readState` + `readMoments` + `readModel`, restored by
  * `init(params, views)` + `restore(state, moments)`.
  *
  * An iteration is one command buffer of ≈ 20 ms GPU time on an M4 (600×800, 300 k Gaussians; half
@@ -871,15 +872,16 @@ export class SplatTrainer {
    * a dropped copy (iOS drops work submitted while the app goes to the background, and mapAsync
    * still resolves) leaves the previous staging contents and throws `SplatWorkDroppedError`
    * instead of returning them. Nothing on the GPU changes, so the read can simply be repeated.
+   * `enc`: the copies are appended to (and submitted with) this encoder's work, which produced
+   * `src` — dropped with it, never read as stale `src` contents (`render`).
    */
-  private async readBuffer(src: GPUBuffer, offset: number, bytes: number): Promise<ArrayBuffer> {
+  private async readBuffer(src: GPUBuffer, offset: number, bytes: number, enc = this.device.createCommandEncoder({ label: 'splat-readback' })): Promise<ArrayBuffer> {
     const size = Math.ceil(bytes / 4) * 4;
     const st = this.ensureStaging(size + 4);
     if (!this.readStampBuf) this.readStampBuf = this.device.createBuffer({ size: 4, usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST, label: 'splat-read-stamp' });
     this.readStamp = (this.readStamp % 0xfffffff0) + 1;
     const stamp = this.readStamp;
     this.device.queue.writeBuffer(this.readStampBuf, 0, new Uint32Array([stamp]));
-    const enc = this.device.createCommandEncoder({ label: 'splat-readback' });
     enc.copyBufferToBuffer(src, offset, st, 0, size);
     enc.copyBufferToBuffer(this.readStampBuf, 0, st, size, 4);
     if (this.dropNext.readbacks > 0) {
@@ -1045,20 +1047,17 @@ export class SplatTrainer {
     this.count = plan.count;
   }
 
-  /** Renders the current model (forward only; between steps). */
+  /**
+   * Renders the current model (forward only; between steps). The forward pass and the stamped
+   * readback are one command buffer: dropped work throws `SplatWorkDroppedError` (render again).
+   */
   async render(cam: SplatCamera, background: ArrayLike<number> = this.background): Promise<SplatImage> {
     const f = this.fwd;
     f.setFrame(cam, this.count, background);
     const px = cam.width * cam.height;
-    const st = this.ensureStaging(px * 16);
     const enc = this.device.createCommandEncoder({ label: 'splat-train-render' });
     f.encode(enc, null);
-    enc.copyBufferToBuffer(f.outColor, 0, st, 0, px * 16);
-    this.device.queue.submit([enc.finish()]);
-    const r = await Promise.race([st.mapAsync(GPUMapMode.READ, 0, px * 16).then(() => 'ok' as const), this.lost.then(() => 'lost' as const)]);
-    if (r === 'lost') throw new Error('GPU device lost during render');
-    const data = new Float32Array(st.getMappedRange(0, px * 16).slice(0));
-    st.unmap();
+    const data = new Float32Array(await this.readBuffer(f.outColor, 0, px * 16, enc));
     return { width: cam.width, height: cam.height, data };
   }
 

@@ -915,6 +915,10 @@ export class PhotogrammetryEngine {
         // come back under this run's stats after a reload
         if (!this.densePersisted) await this.store.deleteBinary('dense/points').catch(() => undefined);
       }
+      // splat checkpoints of the previous cloud: its identity is part of their run key (a later
+      // splat() would start over), so loadSession must not offer to resume or continue them
+      await clearSplatCheckpoints(this.store);
+      if (this.scratch) await clearSplatCheckpoints(this.scratch);
       out.stats.memoryMB = this.logMemory('densify');
       return out.cloud;
     });
@@ -1027,8 +1031,9 @@ export class PhotogrammetryEngine {
    * a checkpoint of the same run (a cancel / kill / reload). The model is persisted (`splat/model`)
    * and not kept in memory: `splatModel()` / `exportModel('ply-splat')` read it back. The
    * checkpoints are cleared, except after a finish early (`cancel.finishEarly`) that stored one at
-   * the model's iteration (`stats.splatContinueFrom`): the next splat() of the same settings
-   * continues the training from it (loadSession: `splatResumableIteration`).
+   * the model's iteration (`stats.splatContinueFrom` / `splatContinueKey`): the next splat() of
+   * the same settings continues the training from it (loadSession: `splatResumableIteration` and
+   * `splatContinuesModel`). A densify that replaces the dense cloud clears them (new run key).
    */
   splat(opts?: SplatOptions, progress?: ProgressCallback, cancel?: CancelToken): Promise<SplatResult> {
     return this.longRun('splat', async () => {
@@ -1130,7 +1135,7 @@ export class PhotogrammetryEngine {
       if (ck && result.stats.splatContinueFrom === undefined) await clearSplatCheckpoints(ck);
       this.splatInfo = result;
       // (keys of an earlier early-finished run must not outlive it)
-      for (const k of ['splatFinishedEarly', 'splatContinueFrom']) {
+      for (const k of ['splatFinishedEarly', 'splatContinueFrom', 'splatContinueKey']) {
         delete this.stats[k];
         if (this.sparse) delete this.sparse.stats[k];
       }
@@ -1386,6 +1391,10 @@ export class PhotogrammetryEngine {
     if (sprog && typeof sprog.iteration === 'number' && sprog.iteration > 0) {
       extra.splatResumableIteration = sprog.iteration;
       if (sprog.quality === 'fast' || sprog.quality === 'balanced' || sprog.quality === 'max') extra.splatResumableQuality = sprog.quality;
+      // … and it is the one kept for the stored model ended early (its run, at its iteration), not
+      // the checkpoint of another, interrupted run that happens to be at the same iteration
+      const s = this.splatInfo;
+      if (s && s.iterations === sprog.iteration && s.stats.splatContinueFrom === sprog.iteration && s.stats.splatContinueKey === sprog.key) extra.splatContinuesModel = 1;
     }
     return {
       id,
