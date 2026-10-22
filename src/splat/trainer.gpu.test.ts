@@ -629,7 +629,7 @@ describe('SplatTrainer checkpoints and dropped work', () => {
     expect((await t.step(10)).iteration).toBe(120);
   });
 
-  it('a dropped readback throws SplatWorkDroppedError instead of returning stale staging data (review)', async () => {
+  it('a dropped readback (or render) throws SplatWorkDroppedError instead of returning stale staging data (review)', async () => {
     const gt = randomScene({ count: 100, seed: 97 });
     const views = orbit(gt, 3, 32, 24);
     const t = await trainer(gt, views, { iterations: 200, maxGaussians: 200, resolution: [], mcmc: false });
@@ -643,6 +643,16 @@ describe('SplatTrainer checkpoints and dropped work', () => {
     t.simulateDroppedWork({ readbacks: 1 });
     expect(await t.readState().catch((e: unknown) => e)).toBeInstanceOf(SplatWorkDroppedError);
     expect(Array.from((await t.readState()).colour)).toEqual(Array.from(state.colour));
+    // render (the engine's previews): its forward pass and readback are dropped together; the
+    // staging buffer holds the colour state just read, never returned as an image
+    const cam: SplatCamera = { width: 32, height: 24, fx: 50, fy: 50, cx: 15.5, cy: 11.5, R: views[1].pose.R, t: views[1].pose.t };
+    const image = await t.render(cam);
+    await t.readState();
+    t.simulateDroppedWork({ readbacks: 1 });
+    expect(await t.render(cam).catch((e: unknown) => e)).toBeInstanceOf(SplatWorkDroppedError);
+    const again = (await t.render(cam)).data;
+    expect(again.length).toBe(image.data.length);
+    expect(again.every((v, i) => Math.abs(v - image.data[i]) < 1e-6)).toBe(true);
     // normaliseAppearance: a dropped colour or SH read changes nothing; called again it works
     for (const drop of [1, 2]) {
       t.simulateDroppedWork({ readbacks: drop });

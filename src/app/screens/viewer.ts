@@ -28,12 +28,16 @@
  * (stats.unconnectedImages; dismissed per refine: stats.unconnectedNoticeRefineMs). A scan that
  * loads as a capture to process (results.toProcess: new views its record missed) goes on to
  * processing instead of showing the model that leaves them out.
+ * The photoreal progress card shows the engine's latest 'splat_preview' snapshot (tap: larger, in a
+ * sheet) and "Use it now" once the training passed `finishFrom`: the engine stops there and the
+ * model is stored like a finished one, its checkpoint kept so the Build sheet can continue it
+ * (model-info.ts splatBuildResume: Resume / Continue / Rebuild of an incomplete model).
  */
 import { saveFile } from '../../io/download';
 import type { SplatDisplayState, Viewer } from '../../viewer';
 import { loadViewerModule } from '../viewer-loader';
 import { formatDistance } from '../../viewer/helpers';
-import type { ProgressEvent } from '../../core/types';
+import type { ProgressEvent, RGBAImage } from '../../core/types';
 import { SPLAT_STAGES, isCancelledError, type ExportFormat, type QualityPreset } from '../../workers/protocol';
 import type { App, Results, Screen } from '../app';
 import { arQuickLookAvailable, createARQuickLook, withViewInAR } from '../ar-quicklook';
@@ -57,9 +61,16 @@ import {
   denseResumeQuality,
   memoryStatRows,
   northInfo,
+  splatBuildResume,
+  splatContinuable,
+  splatInterruptedStats,
+  splatIterationsText,
+  splatPreviewCaption,
   splatProgressView,
   splatResumable,
   splatResumeQuality,
+  splatUseNow,
+  type SplatUseNow,
 } from '../model-info';
 
 /** What the 3D view shows: one model layer at a time. */
@@ -121,6 +132,13 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   let splatRun: RunHandle | null = null;
   /** Home's "run interrupted" card (or list item) opened this scan: what stopped (hintInterrupted). */
   const interrupted = app.journal.takeOpened(route.sessionId);
+  /** "Use it now" was tapped: the engine ends the training at its next chunk and stores the model. */
+  let finishing = false;
+  /** "Use it now" from the latest training report. */
+  let useNowState: SplatUseNow = { ready: false, note: '' };
+  /** The build's latest preview snapshot (drawn into the card and the open preview sheet). */
+  let lastPreview: { image: RGBAImage; detail?: Record<string, number> } | null = null;
+  let previewSheet: { sheet: SheetHandle; canvas: HTMLCanvasElement; caption: HTMLElement; use: HTMLButtonElement } | null = null;
   /** Splats cannot be built here (no WebGPU in this browser; the engine would reject). */
   const webgpuMissing = (): boolean => app.env.webgpu === 'unsupported' || app.env.webgpu === 'no-adapter';
   /** "View in AR" for a prepared USDZ (an iPhone / iPad Safari tab only: src/app/ar-quicklook.ts). */
@@ -192,16 +210,24 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     iconButton('close', 'Dismiss', () => dismissUnconnected(), { testId: 'unconnected-dismiss' }),
   );
 
-  // Photoreal build progress (engine.splat runs while the model stays explorable).
+  // Photoreal build progress (engine.splat runs while the model stays explorable): the latest
+  // training preview (tap: larger), the progress, "Use it now" (from finishFrom on) and Cancel.
   const jobBar = progressBar('Photoreal model');
   const jobSub = h('span', { class: 'viewer-job-sub', 'data-testid': 'splat-progress-text' });
+  const jobIcon = h('span', { class: 'viewer-job-icon' }, spinner('sm', 'Building'));
+  const jobCanvas = h('canvas', { class: 'viewer-job-canvas', role: 'img', 'aria-label': 'Preview of the photoreal model', 'data-testid': 'splat-preview' });
+  const jobPreview = h('button', { type: 'button', class: 'viewer-job-preview', hidden: true, 'aria-label': 'Show the preview larger', 'data-testid': 'splat-preview-open' }, jobCanvas);
+  jobPreview.addEventListener('click', () => openPreview());
+  const jobNote = h('span', { class: 'viewer-job-note', 'data-testid': 'splat-use-note' });
+  const jobUse = button({ label: 'Use it now', variant: 'primary', size: 'sm', testId: 'splat-use-now', disabled: true, onClick: () => useNow() });
   const jobCancel = button({ label: 'Cancel', variant: 'glass', size: 'sm', testId: 'splat-cancel', onClick: () => void cancelBuild() });
   const jobHud = h(
     'div',
     { class: 'viewer-job', hidden: true, role: 'status', 'aria-live': 'polite', 'data-testid': 'splat-progress' },
-    h('span', { class: 'viewer-job-icon' }, spinner('sm', 'Building')),
+    jobIcon,
+    jobPreview,
     h('div', { class: 'viewer-job-text' }, h('span', { class: 'viewer-job-title', text: 'Building photoreal model' }), jobSub, jobBar.el),
-    jobCancel,
+    h('div', { class: 'viewer-job-actions' }, jobNote, jobCancel, jobUse),
   );
 
   // Layer pill above the toolbar (Splats / Points / Mesh), shown when there is a choice.
@@ -297,7 +323,8 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     resumeHud.hidden = !dense || building;
     const rq = denseResumeQuality(r);
     resumeSub.textContent = rq ? `Resume from the saved depth maps (${qualityLabel(rq)} quality).` : 'Resume from the saved depth maps.';
-    splatResumeHud.hidden = dense || building || !splatResumable(r) || webgpuMissing();
+    // (a model ended early by "Use it now" is not an interruption: the Build sheet continues it)
+    splatResumeHud.hidden = dense || building || !splatResumable(r) || splatContinuable(r) || webgpuMissing();
     const sq = splatResumeQuality(r);
     const it = r.stats.splatResumableIteration;
     splatResumeSub.textContent = `Continues from the saved training${typeof it === 'number' && it > 0 ? ` (iteration ${it.toLocaleString('en-US')})` : ''}${sq ? ` · ${qualityLabel(sq)}` : ''}.`;
@@ -618,8 +645,8 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       steps: ProcessingStep[];
       /** Runs here instead of the Processing screen (the photoreal build). */
       run?: (q: QualityPreset) => void;
-      /** Resumable at this quality: "Resume" + this sub line. */
-      resume?: (q: QualityPreset) => string | null;
+      /** Resumable at this quality (or incomplete): this button label ("Resume" / "Continue" / "Rebuild") + sub line. */
+      resume?: (q: QualityPreset) => { label: string; sub: string } | null;
       testId: string;
       disabled?: boolean;
     }): HTMLElement => {
@@ -628,7 +655,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       const sync = (): void => {
         const built = o.done && o.done.quality === q;
         const resume = o.resume?.(q) ?? null;
-        sub.textContent = resume ?? (!o.done ? o.desc : built ? `${o.done.sub} · ${qualityLabel(o.done.quality)}` : o.rebuildDesc(q));
+        sub.textContent = resume?.sub ?? (!o.done ? o.desc : built ? `${o.done.sub} · ${qualityLabel(o.done.quality)}` : o.rebuildDesc(q));
         const onClick = (): void => {
           if (!o.run) return build(o.steps);
           sheet.close();
@@ -638,7 +665,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
           action,
           built && !resume
             ? chip('Built', 'good', 'check')
-            : button({ label: resume ? 'Resume' : o.done ? 'Rebuild' : 'Build', variant: 'primary', size: 'sm', testId: o.testId, disabled: o.disabled, onClick }),
+            : button({ label: resume ? resume.label : o.done ? 'Rebuild' : 'Build', variant: 'primary', size: 'sm', testId: o.testId, disabled: o.disabled, onClick }),
         );
       };
       syncs.push(sync);
@@ -684,12 +711,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
             rebuildDesc: (q) => `Retrains at ${qualityLabel(q)} quality.`,
             steps: [],
             run: (q) => void buildSplats(q),
-            resume: (q) => {
-              if (!splatResumable(r)) return null;
-              const rq = splatResumeQuality(r);
-              if (rq && rq !== q) return null;
-              return 'Interrupted — continues from the saved training.';
-            },
+            resume: (q) => splatBuildResume(r, q),
             testId: 'build-splat',
             disabled: !r.sparse || building || webgpuMissing(),
           }),
@@ -933,14 +955,17 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   /**
    * Trains the Gaussian splats (engine.splat) while the model stays explorable (points / mesh: the
    * splat layer of a previous model is freed meanwhile and loaded again when the build stops):
-   * progress card with Cancel; the wake lock is held and leaving the page asks first. A cancelled /
-   * failed run is marked resumable (the engine keeps checkpoints; the same quality continues from
-   * the last one).
+   * progress card with the latest preview snapshot, "Use it now" and Cancel; the wake lock is held
+   * and leaving the page asks first. A cancelled / failed run is marked resumable (the engine keeps
+   * checkpoints; the same quality continues from the last one); one ended by "Use it now" stores
+   * its model and stays continuable (stats.splatContinueFrom → splatResumableIteration).
    */
   async function buildSplats(q: QualityPreset): Promise<void> {
     if (building || closed || !app.results.sparse) return;
     building = true;
     cancelling = false;
+    finishing = false;
+    useNowState = { ready: false, note: '' };
     app.busy = true;
     // iOS suspends a hidden page; the engine pauses its GPU work while hidden anyway
     void app.wakeLock.acquire();
@@ -948,9 +973,10 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     const wasSplats = display.layer === 'splats';
     releaseSplats();
     let built = false;
+    resetPreview();
     jobBar.set(-1);
     jobSub.textContent = 'Starting';
-    jobCancel.disabled = false;
+    syncUseNow();
     renderBadges();
     const sessionId = route.sessionId;
     // the run journal: a kill during the build is reported at the next launch; after one, light mode
@@ -958,9 +984,16 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     const run = sessionId ? app.journal.begin({ sessionId, name: app.results.name, step: 'splat', stage: SPLAT_STAGES.prepare, quality: q }) : null;
     splatRun = run;
     try {
-      const res = await app.engine.splat({ quality: q }, (e: ProgressEvent) => {
+      const res = await app.engine.splat({ quality: q, preview: true }, (e: ProgressEvent) => {
         run?.stage(e.stage);
         if (closed || cancelling) return;
+        if (e.stage === SPLAT_STAGES.preview) return showPreview(e);
+        if (e.stage === SPLAT_STAGES.training) {
+          useNowState = splatUseNow(e.detail);
+          syncUseNow();
+          // ("Finishing…" stays until the engine reports the finishing stage)
+          if (finishing) return;
+        }
         const v = splatProgressView(e);
         jobBar.set(v.progress);
         jobSub.textContent = v.text;
@@ -973,24 +1006,31 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       for (const k of ['splatPrepareMs', 'splatTrainMs', 'splatFinishMs']) if (typeof res.stats[k] === 'number') timings[k] = res.stats[k] as number;
       r.stats = { ...r.stats, ...timings, splatQuality: q };
       clearSplatResume(r.stats);
+      // ended by "Use it now": the engine kept the checkpoint, a later build continues from it
+      const cont = res.stats.splatContinueFrom;
+      if (typeof cont === 'number') Object.assign(r.stats, { splatResumableIteration: cont, splatResumableQuality: q, splatContinuesModel: 1 });
       // a splat PLY prepared before (or still being prepared) holds the previous model
       exports.delete('ply-splat');
       void app.updateSession(sessionId, { stats: { splatGaussians: res.count, splatIterations: res.iterations, splatQuality: q } });
       if (closed) return;
       renderExports?.();
-      toast(`Photoreal model ready · ${formatCount(res.count)} Gaussians`, { tone: 'good', icon: 'splats' });
+      const early = res.stats.splatFinishedEarly ? ` · ${splatIterationsText(res.iterations, res.stats.splatIterations)}` : '';
+      toast(`Photoreal model ready · ${formatCount(res.count)} Gaussians${early}`, { tone: 'good', icon: 'splats' });
       // a new model: show it (also replaces an older one in the viewer)
       void loadSplats(true);
     } catch (e) {
       run?.end('stopped');
       const r = app.results;
-      r.stats = { ...r.stats, splatInterrupted: 1, splatInterruptedQuality: q };
+      // (the checkpoint's iteration is not known any more: e.g. a continued run cancelled later on)
+      r.stats = splatInterruptedStats(r.stats, q);
       if (closed) return;
       if (isCancelledError(e) || cancelling) toast('Stopped. Resume continues from the saved training.', { tone: 'info', icon: 'splats' });
       else toast(`Couldn’t build the photoreal model: ${(e as Error)?.message ?? e}`, { tone: 'bad', durationMs: 9000 });
     } finally {
       building = false;
       cancelling = false;
+      finishing = false;
+      resetPreview();
       // once the screen was left, leave() released them and the next screen may hold them now
       if (!closed) {
         app.busy = false;
@@ -1020,10 +1060,87 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   /** Cancel the running build; restart the engine if it does not stop within 8 s. */
   function stopBuild(): void {
     cancelling = true;
-    jobCancel.disabled = true;
+    previewSheet?.sheet.close();
+    syncUseNow();
     jobSub.textContent = 'Stopping…';
     jobBar.set(-1);
     void app.engine.abortLongOperation({ graceMs: 8000, method: 'splat' });
+  }
+
+  /**
+   * "Use it now": the engine ends the training at its next chunk (≤ 25 iterations), stores the
+   * model like a finished one and keeps the checkpoint for continuing later (no confirmation:
+   * nothing is lost).
+   */
+  function useNow(): void {
+    if (!building || cancelling || finishing || !useNowState.ready) return;
+    finishing = true;
+    previewSheet?.sheet.close();
+    syncUseNow();
+    jobSub.textContent = 'Finishing at the current iteration…';
+    app.engine.finishEarly('splat');
+  }
+
+  /** "Use it now" / Cancel enabled states and the note (card and preview sheet). */
+  function syncUseNow(): void {
+    const ok = building && useNowState.ready && !finishing && !cancelling;
+    jobUse.disabled = !ok;
+    jobCancel.disabled = !building || cancelling || finishing;
+    jobNote.textContent = finishing || cancelling ? '' : useNowState.note;
+    if (previewSheet) previewSheet.use.disabled = !ok;
+  }
+
+  /** A 'splat_preview' snapshot: into the card (replacing the spinner) and the open sheet. */
+  function showPreview(e: ProgressEvent): void {
+    if (!e.image) return;
+    lastPreview = { image: e.image, detail: e.detail };
+    const caption = splatPreviewCaption(e.detail);
+    drawPreview(jobCanvas, e.image);
+    jobCanvas.setAttribute('aria-label', `Preview of the photoreal model: ${caption}`);
+    jobIcon.hidden = true;
+    jobPreview.hidden = false;
+    if (previewSheet) {
+      drawPreview(previewSheet.canvas, e.image);
+      previewSheet.caption.textContent = caption;
+    }
+  }
+
+  function drawPreview(c: HTMLCanvasElement, img: RGBAImage): void {
+    if (c.width !== img.width || c.height !== img.height) {
+      c.width = img.width;
+      c.height = img.height;
+    }
+    const data = img.data instanceof Uint8ClampedArray ? img.data : new Uint8ClampedArray(img.data.buffer, img.data.byteOffset, img.data.byteLength);
+    c.getContext('2d')?.putImageData(new ImageData(data as Uint8ClampedArray<ArrayBuffer>, img.width, img.height), 0, 0);
+  }
+
+  /** No preview (a new build, or the build ended): the spinner again, the sheet closed. */
+  function resetPreview(): void {
+    lastPreview = null;
+    previewSheet?.sheet.close();
+    jobPreview.hidden = true;
+    jobIcon.hidden = false;
+  }
+
+  /** The latest preview, larger (a sheet that follows the next snapshots), with "Use it now". */
+  function openPreview(): void {
+    if (!lastPreview || previewSheet || !building) return;
+    const canvas = h('canvas', { class: 'splat-preview-canvas', role: 'img', 'aria-label': 'Preview of the photoreal model', 'data-testid': 'splat-preview-large' });
+    const caption = h('p', { class: 'section-note splat-preview-caption', 'data-testid': 'splat-preview-caption', text: splatPreviewCaption(lastPreview.detail) });
+    const use = button({ label: 'Use it now', variant: 'primary', size: 'md', block: true, testId: 'splat-use-now-sheet', onClick: () => useNow() });
+    const sheet = openSheet({
+      title: 'Photoreal preview',
+      subtitle: 'The model so far, from one of your photos (colours before the final balance).',
+      content: [canvas, caption, h('div', { class: 'sheet-footer' }, use)],
+      className: 'sheet-splat-preview',
+      testId: 'sheet-splat-preview',
+      onClose: () => {
+        if (previewSheet?.sheet === sheet) previewSheet = null;
+      },
+    });
+    previewSheet = { sheet, canvas, caption, use };
+    drawPreview(canvas, lastPreview.image);
+    syncUseNow();
   }
 
   async function goBack(): Promise<void> {

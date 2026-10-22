@@ -2482,15 +2482,17 @@ h3 {
   color: var(--text-2);
 }
 
-/* Photoreal build progress (same place as the resume cards; hidden while measuring). */
+/* Photoreal build progress (same place as the resume cards; hidden while measuring): the latest
+   training preview (or a spinner) and the progress, then a row with Use it now and Cancel. */
 .viewer-job {
   position: absolute;
   top: calc(var(--safe-t) + 70px);
   left: 50%;
   transform: translateX(-50%);
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 12px;
+  gap: 8px 12px;
   width: min(440px, calc(100vw - 24px));
   padding: 10px 8px 10px 14px;
   border-radius: 20px;
@@ -2530,6 +2532,59 @@ h3 {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* The preview thumbnail: the snapshot's aspect at 72 px tall; a tap opens it larger. */
+.viewer-job-preview {
+  flex: none;
+  display: inline-flex;
+  height: 72px;
+  min-width: 44px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 10px;
+  overflow: hidden;
+  background: #000;
+  cursor: pointer;
+}
+
+.viewer-job-canvas {
+  display: block;
+  height: 100%;
+  width: auto;
+  max-width: 128px;
+  object-fit: contain;
+}
+
+.viewer-job-actions {
+  display: flex;
+  flex-basis: 100%;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.viewer-job-note {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.sheet-splat-preview .splat-preview-canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 60vh;
+  max-height: 60dvh;
+  object-fit: contain;
+  border-radius: var(--radius-m);
+  background: #000;
+}
+
+.sheet-splat-preview .splat-preview-caption {
+  margin: 10px 0 0;
+  font-variant-numeric: tabular-nums;
 }
 
 /* Layer pill (Splats / Points / Mesh) above the toolbar. */

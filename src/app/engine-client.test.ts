@@ -262,3 +262,25 @@ describe('EngineClient: a continued capture (init with extend)', () => {
     expect(initOf(workers[2]).extend).toBeUndefined();
   });
 });
+
+describe('EngineClient: splat previews and finishEarly', () => {
+  it('a preview event reaches the splat callback with its image; finishEarly targets the running splat', async () => {
+    const { c, workers } = client();
+    await start(c, workers);
+    c.finishEarly('splat'); // nothing runs: nothing sent
+    const seen: { stage: string; image?: unknown }[] = [];
+    const run = c.splat({ preview: true }, (p) => seen.push({ stage: p.stage, image: p.image }));
+    await flush();
+    const req = workers[0].posted.find((r) => r.method === 'splat')!;
+    expect(req.params).toEqual({ preview: true });
+    const image = { width: 2, height: 1, data: new Uint8ClampedArray(8) };
+    workers[0].emit({ type: 'progress', requestId: req.id, stage: 'splat_preview', progress: 0.1, detail: { iteration: 10 }, image });
+    expect(seen).toEqual([{ stage: 'splat_preview', image }]);
+    c.finishEarly('mesh'); // another method: not this one
+    c.finishEarly('splat');
+    await flush();
+    expect(workers[0].posted.filter((r) => r.method === 'finishEarly').map((r) => r.params)).toEqual([{ target: req.id }]);
+    workers[0].reply('splat', { count: 1, iterations: 10, stats: { splatFinishedEarly: 1 } });
+    expect(await run).toMatchObject({ iterations: 10 });
+  });
+});

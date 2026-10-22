@@ -163,6 +163,20 @@ export interface HarnessConfig {
   extendSkipS?: number;
 }
 
+/** One 'splat_preview' snapshot of the splat stage (SplatPreviewDetail + where it went). */
+export interface SplatPreviewRecord {
+  iteration: number;
+  /** Arrival, ms after the splat stage started. */
+  ms: number;
+  /** PSNR (dB) against that training view's photo, raw trainer colours. */
+  psnr: number;
+  viewId: number;
+  width: number;
+  height: number;
+  /** The streamed PNG (relative to the runner's output directory), null when not written. */
+  file: string | null;
+}
+
 /** Config with every default filled in. */
 export interface ResolvedHarnessConfig extends Required<Omit<HarnessConfig, 'output' | 'fps' | 'maxFrames' | 'timeouts' | 'hfovPriorDeg' | 'engineConfig' | 'extendAt'>> {
   extendAt: number | null;
@@ -469,6 +483,9 @@ export interface HarnessResult {
     /** `detail` of the last 'splat_training' progress event (SplatTrainingDetail). */
     lastDetail: Record<string, number> | null;
     file: string | null;
+    /** With `splat.preview`: every 'splat_preview' snapshot, and when the first training report came (ms after the stage started). */
+    previews?: SplatPreviewRecord[];
+    firstTrainingMs?: number | null;
   } | null;
   exports: Record<string, { bytes: number; ms: number; type: string } | { error: string }>;
   /** Files streamed through `__e2eWrite` (relative to the runner's output directory). */

@@ -238,15 +238,31 @@ densify — or after refine when there is no dense cloud. One long operation wit
    stamp missing) is read again once the page is visible, so a checkpoint or the saved model never holds stale
    staging data; a device loss — in a step, a checkpoint or the finishing readbacks — rebuilds the trainer on the
    new device from it (from the initial Gaussians before the first one) and trains on from there (twice; then
-   `GPUDeviceLostError`, code 'gpu-lost').
+   `GPUDeviceLostError`, code 'gpu-lost'). Finish early (`CancelToken.finishEarly`, the `finishEarly` request,
+   the app's "Use it now"): from `SplatTrainingDetail.finishFrom` on — the end of the coarse-to-fine resolution
+   schedule, 30 % of the iterations; an earlier request waits for it — the loop stops between chunks, writes a
+   checkpoint at that iteration and goes on to 3. like a complete run (stats `splatFinishedEarly`).
+   `splat_preview` (with `SplatOptions.preview`): `trainer.render` of the training view nearest the middle
+   registered image (the viewer's default view), box-downscaled by an integer factor to ≤ 400 px, as RGBA8 in
+   `ProgressEvent.image` with `detail: SplatPreviewDetail` {iteration, iterations, viewId, psnr (against that
+   photo, raw colours)}; once right after that view's upload (it goes first: the initial Gaussians, seconds
+   before the first iteration) and then between chunks every ≥ 2 s. Forward only under the GPU lock (no new
+   pipeline; it waits while the page is hidden), one ≤ 1.9 MB readback stamped like the others, in the forward's
+   command buffer: work iOS drops as the page hides (`SplatWorkDroppedError`) or any other failure only skips
+   that snapshot, never posts stale bytes. When the training ends the same view is rendered once more (not
+   posted): `stats.splatPreviewFinalPsnr`, the PSNR the previews converge to.
 3. `splat_finishing`: appearance normalisation (the mean training-view colour matrix folded into the colours),
    read-back, persisted compactly (`splat/model`: f32 means, f16 rest ≈ 34 B per Gaussian + `splat/meta`);
-   checkpoints cleared.
+   checkpoints cleared — except after a finish early whose checkpoint at the model's iteration is stored
+   (`stats.splatContinueFrom`, its run key `splatContinueKey`).
 
 A later `splat()` of the same run (same model, dense cloud, preset, options) resumes from the checkpoint with the
-stored plan; `loadSession` reports `stats.splatResumableIteration` / `splatResumableQuality`. `refine` deletes the
-splats and checkpoints (new poses); densify / mesh leave them. Without WebGPU (`preferGPU: false`, CPU tier) `splat`
-rejects with `NotSupportedError` (code 'no-webgpu').
+stored plan — after a cancel / kill, or to continue a model ended early; `loadSession` reports
+`stats.splatResumableIteration` / `splatResumableQuality`, and `splatContinuesModel = 1` while that checkpoint is
+the one kept for the stored model ended early (same run key and iteration), not one of another, interrupted run.
+`refine` deletes the splats and checkpoints (new poses); a completed densify deletes the checkpoints (the dense
+cloud is part of the run key: they could not resume) and keeps the model; mesh leaves both. Without WebGPU
+(`preferGPU: false`, CPU tier) `splat` rejects with `NotSupportedError` (code 'no-webgpu').
 
 Measured (object-real, fast, worker engine, M4 / Metal): 60 s for 3 000 iterations / 200 k Gaussians on 90 views at
 600×800 (prepare 12.6 s, 64.6 it/s), memory plan peak ≈ 811 MB; held-out novel views 31.2 dB full-frame PSNR vs 8.7 dB
@@ -257,10 +273,12 @@ for the lit mesh (research/splat-tuning.md "Engine splat stage", e2e/README.md).
 Request/response RPC with ids, plus unsolicited events:
 
 * requests: `init`, `frame`, `finishCapture`, `refine`, `densify`, `mesh`, `splat`, `splatModel`,
-  `export`, `loadSession`, `cancel`, `visibility` (page hidden / visible: pause GPU work), `close`
+  `export`, `loadSession`, `cancel`, `finishEarly` (end a long operation early and keep its result: only
+  the splat training reacts), `visibility` (page hidden / visible: pause GPU work), `close`
   (let go of a session before it is deleted: its engine is disposed and the CPU SIFT scratch freed,
   the compiled feature pipeline kept for the next init; answers whether the engine held it), `dispose`
-* events: `progress` (ProgressEvent, optional numeric `detail`), `live` (LiveUpdate), `log`, `error`.
+* events: `progress` (ProgressEvent, optional numeric `detail`, optional RGBA8 `image` — never throttled,
+  its buffer transferred), `live` (LiveUpdate), `log`, `error`.
   With background mapping (the default) the model (`sparse`, `cameras`) comes only in `live` model
   updates sent when a keyframe is mapped: no `overlay` / `framePose`, the `frameIndex` of the frame
   in flight and the previous frame's `guidance` — per-frame consumers use the `frame` responses.
@@ -275,10 +293,11 @@ Request/response RPC with ids, plus unsolicited events:
 
 | call | params → result | notes |
 |---|---|---|
-| `splat` (long: progress, cancel, inactivity timeout) | `SplatOptions?` {quality, iterations, maxGaussians, maxImageSize, maxViews, backgroundShell, restart} → `SplatResult` {count, iterations, ms, shDegree, bytes, antialiased, stats} | stages `SPLAT_STAGES` = `splat_prepare` → `splat_training` → `splat_finishing`; training events carry `detail: SplatTrainingDetail`. `stats`: splatViews, splatWidth / splatHeight, splatMaxGaussians, splatInitGaussians (Dense / Sparse / Shell), splatItPerSec, splatLoss, splatResumedFrom, splatMemPeakMB, splatGpuMB, splatDegraded, splatPrepareMs / TrainMs / FinishMs, splatCheckpoints, splatStoredBytes. Cancel → `CancelledError`, the next call resumes (`restart: true` starts over). |
+| `splat` (long: progress, cancel, inactivity timeout) | `SplatOptions?` {quality, iterations, maxGaussians, maxImageSize, maxViews, backgroundShell, restart, preview} → `SplatResult` {count, iterations, ms, shDegree, bytes, antialiased, stats} | stages `SPLAT_STAGES` = `splat_prepare` → `splat_training` → `splat_finishing`; training events carry `detail: SplatTrainingDetail` {iteration, iterations, loss, itPerSec, gaussians, finishFrom}; with `preview: true` `splat_preview` events (interleaved) carry `image` (RGBA8 ≤ 400 px) + `detail: SplatPreviewDetail`. `stats`: splatViews, splatWidth / splatHeight, splatMaxGaussians, splatInitGaussians (Dense / Sparse / Shell), splatItPerSec, splatLoss, splatResumedFrom, splatMemPeakMB, splatGpuMB, splatDegraded, splatPrepareMs / TrainMs / FinishMs, splatCheckpoints, splatStoredBytes, splatIterations (schedule), splatPreviews, splatPreviewFinalPsnr, splatFinishedEarly, splatContinueFrom, splatContinueKey. Cancel → `CancelledError`, the next call resumes (`restart: true` starts over). |
+| `finishEarly` (short, fire and forget) | `{target?}` → — | the running `splat` stops at its current iteration (from `finishFrom`), resolves with that model (`iterations` < the schedule) and keeps its checkpoint: the next `splat` of the same settings continues from it. |
 | `splatModel` (short) | — → `SplatModelPayload \| null` | {model: SplatModel, antialiased, background, iterations}; arrays freshly decoded and TRANSFERRED (≈ 56 B per Gaussian at SH 0). |
 | `export` | `{format: 'ply-splat'}` → Blob | INRIA 3DGS PLY (`encodeSplatPLY`; SuperSplat / Brush / Spark), appearance-normalised, comment `antialiased`. |
-| `loadSession` | → `SessionSummary.splat` (SplatResult of the stored model, or null) | `stats.splatResumableIteration` when an interrupted run can resume. |
+| `loadSession` | → `SessionSummary.splat` (SplatResult of the stored model, or null) | `stats.splatResumableIteration` (+ `splatResumableQuality`) when a checkpoint can resume; `splatContinuesModel = 1` when it is the stored model's, ended early (it can continue). |
 
 `SplatModel` conventions (world frame of the sparse model: +Z up, metres when metric): per Gaussian i, mean
 `means[3i..3i+2]`; σ = exp(`logScales[3i..]`) along its local axes; rotation = quaternion [w, x, y, z]
@@ -287,7 +306,8 @@ max(0, SH_C0 · `sh[3i..3i+2]` + 0.5) (SH degree 1 adds SH_C1 · (−y f1 + z f2
 mean direction; `sh` holds K = 1 or 4 RGB triplets per Gaussian). `antialiased` (always true today): add 0.3 px²
 to the projected 2-D covariance and multiply the opacity by √(det Σ₂ / det(Σ₂ + 0.3 I)) (Mip-Splatting), like the
 trainer. Colours are sRGB values (no transfer function on output); render premultiplied, front to back. The
-MockEngine implements the same calls (a fast fake run whose model is one Gaussian per dense point).
+MockEngine implements the same calls (a fast fake run whose model is one Gaussian per dense point; synthetic
+previews: the cloud projected into the middle camera, coarse to fine; `finishEarly` from 30 %).
 
 ## 4. UI flow (`src/app`)
 
@@ -308,7 +328,10 @@ to the stored model unchanged. A scan whose record missed new views (killed befo
 frame answered after Stop) loads as a capture to process (`loadSession` status 'capturing' /
 'captured'): App.ensureSessionLoaded sets the record back and the viewer hands it to processing. The splat
 stage runs from the viewer itself ("Photoreal model" in the Build sheet → `splat` with a progress card fed by
-`SplatTrainingDetail`, Cancel, Resume after an interruption), the model is fetched with `splatModel` into the
+`SplatTrainingDetail` and the latest `splat_preview` snapshot (tap: larger), "Use it now" from `finishFrom` on
+(`finishEarly`: the model is stored, the Build sheet offers Continue — Rebuild once a new dense cloud or another
+run dropped its checkpoint), Cancel, Resume after an interruption),
+the model is fetched with `splatModel` into the
 viewer's WebGPU splat layer and shown by default, and the export sheet offers 'ply-splat' (src/viewer/splat-layer.ts,
 research/viewer-rendering.md). The export sheet's 'usdz' (AR model: the mesh simplified to ≤ 100 k triangles with its
 colours baked into a 2048² JPEG atlas, built in the engine worker: seconds on a phone, so it yields between steps and

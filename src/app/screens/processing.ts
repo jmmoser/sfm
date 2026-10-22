@@ -371,6 +371,9 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
           app.results.mesh = null; // the engine dropped the mesh of the previous cloud
           app.results.stats = { ...app.results.stats, denseQuality: quality };
           clearDenseResume();
+          // the engine dropped the splat checkpoints of the previous cloud (a new run: no resume /
+          // continue); the stored splat model stays
+          clearSplatResume(app.results.stats);
           completeStep('densify');
           endRun('done');
           showPreview();

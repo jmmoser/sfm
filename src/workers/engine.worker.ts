@@ -10,8 +10,11 @@
  *    nothing more is written to it); the feature pipeline is kept for the next `init` /
  *    `loadSession` (handed over like on a re-init, unless it fell back to the CPU meanwhile).
  *  - Long operations (finishCapture / refine / densify / mesh / splat / export / loadSession)
- *    report `progress` events with their `requestId` (throttled; `detail` passed through) and are
- *    cancelled by `cancel` (target = request id, default: the running long operation).
+ *    report `progress` events with their `requestId` (throttled; `detail` passed through; an event
+ *    with an `image` — the splat previews — is never throttled and its buffer is transferred) and
+ *    are cancelled by `cancel` (target = request id, default: the running long operation).
+ *    `finishEarly` (same targeting) sets the token's `finishEarly`: the splat training stops at its
+ *    current iteration and resolves with the model.
  *  - `splatModel`: the stored splat model, decoded into fresh arrays and transferred.
  *  - Engine `live` events (background keyframe mapping) and `log` / non-fatal `error` events are
  *    forwarded. Frame responses are NOT repeated as `live` events.
@@ -67,7 +70,7 @@ let engine: PhotogrammetryEngine | null = null;
 let spare: { pipeline: FeaturePipeline; key: string; gpu: boolean } | null = null;
 let hidden = false;
 /** Cancel tokens of running long operations by request id. */
-const tokens = new Map<number, { cancelled: boolean }>();
+const tokens = new Map<number, { cancelled: boolean; finishEarly: boolean }>();
 let currentLong: number | null = null;
 
 function post(msg: WorkerToMainMessage, transfer: Transferable[] = []): void {
@@ -144,11 +147,19 @@ function destroyPipeline(p: FeaturePipeline): void {
   }
 }
 
-/** Progress callback posting throttled `progress` events for request `id`. */
+/** Progress callback posting throttled `progress` events for request `id` (with an image: every one, transferred). */
 function progressFor(id: number): (p: ProgressEvent) => void {
   let lastT = 0;
   let lastStage = '';
   return (p) => {
+    if (p.image) {
+      // the engine's fresh snapshot (src/engine/splat.ts): not throttled, its pixels transferred
+      const ev: EngineEvent = { type: 'progress', requestId: id, stage: p.stage, progress: p.progress, image: p.image };
+      if (p.message !== undefined) ev.message = p.message;
+      if (p.detail) ev.detail = { ...p.detail };
+      postEvent(ev, collectTransferables(p.image));
+      return;
+    }
     const t = performance.now();
     if (p.stage === lastStage && t - lastT < 100 && p.progress !== 1 && p.progress !== 0) return;
     lastT = t;
@@ -166,7 +177,7 @@ function requireEngine(): PhotogrammetryEngine {
 }
 
 async function longOp<T>(id: number, fn: (progress: (p: ProgressEvent) => void, cancel: CancelToken) => Promise<T>): Promise<T> {
-  const token = { cancelled: false };
+  const token = { cancelled: false, finishEarly: false };
   tokens.set(id, token);
   currentLong = id;
   try {
@@ -249,12 +260,14 @@ async function dispatch(req: EngineRequest): Promise<{ result: unknown; transfer
       ];
       return { result: sum, transfer };
     }
-    case 'cancel': {
+    case 'cancel':
+    case 'finishEarly': {
       const p = req.params as { target?: number } | undefined;
       const target = p?.target ?? currentLong;
       if (target !== null && target !== undefined) {
         const t = tokens.get(target);
-        if (t) t.cancelled = true;
+        if (t && req.method === 'cancel') t.cancelled = true;
+        else if (t) t.finishEarly = true;
       }
       return { result: undefined, transfer: false };
     }

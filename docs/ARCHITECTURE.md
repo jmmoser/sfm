@@ -609,4 +609,6 @@ object box from the sparse model — orbit centre + support plane, `dense/object
 result and `mesh/meta` carry for later ground-placed exports; the dense cloud and splats are not cropped).
 
 **Splat**: dense (else sparse) cloud → 3D Gaussians → WebGPU training against all keyframes
-(MCMC densification, depth supervision from the dense maps, per-view colour correction).
+(MCMC densification, depth supervision from the dense maps, per-view colour correction; optional
+snapshot previews between chunks; "finish early" from the end of the coarse-to-fine schedule keeps
+the model and a checkpoint to continue from).

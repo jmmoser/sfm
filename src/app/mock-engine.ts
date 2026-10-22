@@ -6,6 +6,8 @@
  * the current mock camera), runs refine / densify / mesh / splat as timed stages with progress,
  * and returns REAL PointCloud / TriangleMesh / Gaussian-splat objects and export Blobs encoded
  * with src/io.
+ * The splat stage posts synthetic 'splat_preview' snapshots (the cloud projected into the middle
+ * camera, coarse to fine) with `preview: true` and honours `finishEarly` like the engine.
  *
  * Model updates are sent like the real engine's default background mapping: a keyframe's model
  * (sparse cloud + cameras) is not in its frame response but in a standalone `live` update emitted
@@ -100,7 +102,7 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, Ma
 /** Like the engine's splat `checkpointEvery` (ENGINE.md "Splat"). */
 const CHECKPOINT_EVERY = 500;
 const DENSE_RESUME_KEYS = { denseResumablePass: null, denseResumableQuality: null };
-const SPLAT_RESUME_KEYS = { splatResumableIteration: null, splatResumableQuality: null };
+const SPLAT_RESUME_KEYS = { splatResumableIteration: null, splatResumableQuality: null, splatContinuesModel: null };
 
 function frameSize(f: FrameInput): { w: number; h: number } {
   const b = f.bitmap as { width?: number; height?: number; displayWidth?: number; displayHeight?: number };
@@ -138,6 +140,8 @@ export class MockEngine implements EngineLike {
   private frameTap: FrameTap | null = null;
   private hidden = false;
   private cancelled = false;
+  /** finishEarly() during the running long operation (only the splat stage reacts). */
+  private finishRequested = false;
   private longOp = false;
   private disposed = false;
   // Live state.
@@ -161,6 +165,8 @@ export class MockEngine implements EngineLike {
   private splatResumable: number | null = null;
   /** Quality of that run (stats.splatResumableQuality; another quality starts over). */
   private splatResumableQuality: QualityPreset | null = null;
+  /** That iteration is the stored model's, ended early (stats.splatContinuesModel), not an interrupted run's. */
+  private splatContinues = false;
   private sessionId: string | null = null;
   private sessionName = 'Mock scan';
   private readonly live = new Emitter<LiveUpdate>();
@@ -248,6 +254,7 @@ export class MockEngine implements EngineLike {
     this.splatOut = null;
     this.splatResumable = null;
     this.splatResumableQuality = null;
+    this.splatContinues = false;
     this.cancelled = false;
     this.memoryLimitHit = false;
     this.denseResumablePass = null;
@@ -571,6 +578,7 @@ export class MockEngine implements EngineLike {
 
   private async longRun<T>(fn: () => Promise<T>): Promise<T> {
     this.cancelled = false;
+    this.finishRequested = false;
     this.longOp = true;
     const aborted = new Promise<never>((_, reject) => {
       this.abortCurrent = reject;
@@ -580,6 +588,7 @@ export class MockEngine implements EngineLike {
     } finally {
       this.longOp = false;
       this.cancelled = false;
+      this.finishRequested = false;
       this.abortCurrent = null;
     }
   }
@@ -668,6 +677,7 @@ export class MockEngine implements EngineLike {
       this.splatResumable = null;
       this.splatResumableQuality = null;
       await this.persistResume({ ...DENSE_RESUME_KEYS, ...SPLAT_RESUME_KEYS });
+      this.splatContinues = false;
       return this.sparse;
     });
   }
@@ -706,7 +716,11 @@ export class MockEngine implements EngineLike {
       }
       this.denseResumablePass = null;
       this.denseResumableQuality = null;
-      await this.persistResume(DENSE_RESUME_KEYS);
+      // like the engine: the splat checkpoints of the previous cloud go (a new run; the model stays)
+      this.splatResumable = null;
+      this.splatResumableQuality = null;
+      this.splatContinues = false;
+      await this.persistResume({ ...DENSE_RESUME_KEYS, ...SPLAT_RESUME_KEYS });
       const n = Math.round(this.sizes.dense * (q === 'fast' ? 0.6 : q === 'max' ? 1.5 : 1));
       this.denseCloud = scene.dense(n);
       const size = q === 'fast' ? 800 : q === 'max' ? 1600 : 1280;
@@ -740,16 +754,23 @@ export class MockEngine implements EngineLike {
 
   /**
    * Like the real stage: 'splat_prepare' → 'splat_training' (progress `detail`: iteration,
-   * iterations, loss, itPerSec, gaussians) → 'splat_finishing'; a cancel keeps the iteration for
-   * a resume. The model: one isotropic Gaussian per point of the dense (else sparse) cloud.
+   * iterations, loss, itPerSec, gaussians, finishFrom) → 'splat_finishing'; with `preview`,
+   * 'splat_preview' snapshots after the preparation and about 12 times during the training. A
+   * cancel keeps the iteration for a resume; `finishEarly` (from 30 % of the iterations on) ends
+   * the training there and keeps it resumable too (stats splatFinishedEarly / splatContinueFrom;
+   * loadSession adds splatContinuesModel). A densify drops the resume state, as the engine does.
+   * The model: one isotropic Gaussian per point of the dense (else sparse) cloud.
    */
   splat(options?: SplatOptions, onProgress?: ProgressCallback): Promise<SplatResult> {
     return this.longRun(async () => {
       this.check('splat');
       this.ensureScene();
       if (!this.sparse) throw new Error('Run refine() first');
+      const sparse = this.sparse;
       const q = options?.quality ?? this.options?.quality ?? 'balanced';
       const iterations = options?.iterations ?? (q === 'fast' ? 3000 : q === 'max' ? 7000 : 5000);
+      // the engine's: the end of the trainer's coarse-to-fine schedule
+      const finishFrom = Math.round(0.3 * iterations);
       const t0 = performance.now();
       const emit = (e: ProgressEvent): void => {
         try {
@@ -759,6 +780,14 @@ export class MockEngine implements EngineLike {
         }
         this.progressE.emit(e);
       };
+      const cam = sparse.cameras[Math.floor(sparse.cameras.length / 2)];
+      const preview = (it: number): void => {
+        if (!options?.preview || !cam) return;
+        const f = it / iterations;
+        const image = mockSplatPreview(this.denseCloud ?? sparse.points, cam, f);
+        const psnr = Math.round(100 * (19 + 11 * (1 - Math.exp(-4 * f)))) / 100;
+        emit({ stage: SPLAT_STAGES.preview, progress: f, message: `iteration ${it}`, detail: { iteration: it, iterations, viewId: cam.id, psnr }, image });
+      };
       await this.stage(SPLAT_STAGES.prepare, 700, onProgress, 'initial Gaussians');
       // like the engine's run key: only the same settings resume
       const sameRun = !this.splatResumableQuality || this.splatResumableQuality === q;
@@ -766,13 +795,21 @@ export class MockEngine implements EngineLike {
       const ms = (2600 * (q === 'fast' ? 0.6 : q === 'max' ? 1.6 : 1)) / this.speed;
       let elapsed = (ms * start) / iterations;
       let it = start;
+      preview(it);
+      let lastPreview = elapsed;
+      let finishedEarly = false;
       while (it < iterations) {
         if (this.cancelled) {
           this.splatResumable = it;
           this.splatResumableQuality = q;
+          this.splatContinues = false;
           // (a disposed engine is gone, like a terminated worker: it writes nothing more)
-          if (it > 0 && !this.disposed) await this.persistResume({ splatResumableIteration: it, splatResumableQuality: q });
+          if (it > 0 && !this.disposed) await this.persistResume({ splatResumableIteration: it, splatResumableQuality: q, splatContinuesModel: null });
           throw namedError(ENGINE_ERRORS.cancelled, 'Cancelled');
+        }
+        if (this.finishRequested && it >= finishFrom) {
+          finishedEarly = true;
+          break;
         }
         if (this.disposed) throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');
         await sleep(80);
@@ -782,20 +819,32 @@ export class MockEngine implements EngineLike {
         it = Math.min(iterations, Math.round((iterations * elapsed) / ms));
         // a checkpoint (not of the last iteration: the model is saved then)
         const ckpt = Math.floor(it / CHECKPOINT_EVERY) * CHECKPOINT_EVERY;
-        if (ckpt > prev && ckpt < iterations) void this.persistResume({ splatResumableIteration: ckpt, splatResumableQuality: q });
+        if (ckpt > prev && ckpt < iterations) void this.persistResume({ splatResumableIteration: ckpt, splatResumableQuality: q, splatContinuesModel: null });
         const loss = 0.04 + 0.2 * Math.exp((-5 * it) / iterations);
-        emit({ stage: SPLAT_STAGES.training, progress: it / iterations, message: `iteration ${it}/${iterations}`, detail: { iteration: it, iterations, loss, itPerSec: Math.round((1000 * iterations) / ms), gaussians: 20_000 + Math.round(it * 10) } });
+        emit({
+          stage: SPLAT_STAGES.training,
+          progress: it / iterations,
+          message: `iteration ${it}/${iterations}`,
+          detail: { iteration: it, iterations, loss, itPerSec: Math.round((1000 * iterations) / ms), gaussians: 20_000 + Math.round(it * 10), finishFrom },
+        });
+        if (it < iterations && elapsed - lastPreview >= Math.max(400, ms / 12)) {
+          lastPreview = elapsed;
+          preview(it);
+        }
       }
-      this.splatResumable = null;
-      this.splatResumableQuality = null;
-      await this.persistResume(SPLAT_RESUME_KEYS);
+      // finished early: resumable from there, like the engine's kept checkpoint
+      this.splatResumable = finishedEarly ? it : null;
+      this.splatResumableQuality = finishedEarly ? q : null;
+      this.splatContinues = finishedEarly;
+      await this.persistResume(finishedEarly ? { splatResumableIteration: it, splatResumableQuality: q, splatContinuesModel: 1 } : SPLAT_RESUME_KEYS);
       // like the engine: a cancel arriving now is ignored (the training is complete)
       emit({ stage: SPLAT_STAGES.finishing, progress: 0, message: 'saving' });
       await sleep(300 / this.speed);
       emit({ stage: SPLAT_STAGES.finishing, progress: 1 });
-      const model = this.mockSplats(this.denseCloud ?? this.sparse.points);
-      const info = this.splatInfo(model, iterations, Math.round(performance.now() - t0));
+      const model = this.mockSplats(this.denseCloud ?? sparse.points);
+      const info = this.splatInfo(model, it, Math.round(performance.now() - t0), iterations);
       if (start) info.stats.splatResumedFrom = start;
+      if (finishedEarly) Object.assign(info.stats, { splatFinishedEarly: 1, splatContinueFrom: it });
       this.splatOut = { model, info };
       return info;
     });
@@ -827,7 +876,8 @@ export class MockEngine implements EngineLike {
     return this.persistQ;
   }
 
-  private splatInfo(model: SplatModel, iterations: number, ms: number): SplatResult {
+  /** Info of a model trained `iterations` of a `schedule`-iteration run. */
+  private splatInfo(model: SplatModel, iterations: number, ms: number, schedule = iterations): SplatResult {
     return {
       count: model.count,
       iterations,
@@ -835,7 +885,7 @@ export class MockEngine implements EngineLike {
       shDegree: model.shDegree,
       bytes: 56 * model.count,
       antialiased: true,
-      stats: { splatViews: this.sparse?.cameras.length ?? 0, splatIterations: iterations, splatItPerSec: 40, splatTrainMs: ms },
+      stats: { splatViews: this.sparse?.cameras.length ?? 0, splatIterations: schedule, splatItPerSec: 40, splatTrainMs: ms },
     };
   }
 
@@ -855,6 +905,7 @@ export class MockEngine implements EngineLike {
     this.meshModel = o.mesh;
     this.splatOut = o.splat ? { model: o.splat, info: this.splatInfo(o.splat, 3000, 0) } : null;
     this.splatResumable = null;
+    this.splatContinues = false;
     this.sessionName = o.name;
     this.setState('ready');
   }
@@ -1019,6 +1070,7 @@ export class MockEngine implements EngineLike {
         if (typeof sr === 'number' && this.sparse) this.splatResumable = sr;
         const sq = meta.stats?.splatResumableQuality;
         if (sq === 'fast' || sq === 'balanced' || sq === 'max') this.splatResumableQuality = sq;
+        this.splatContinues = this.splatResumable !== null && meta.stats?.splatContinuesModel === 1;
         const rp = meta.stats?.denseResumablePass;
         if (typeof rp === 'number' && this.sparse && !this.denseCloud) this.denseResumablePass = rp;
         const rq = meta.stats?.denseResumableQuality;
@@ -1044,6 +1096,7 @@ export class MockEngine implements EngineLike {
           ...(this.sparse?.stats ?? {}),
           ...(this.splatResumable !== null ? { splatResumableIteration: this.splatResumable } : {}),
           ...(this.splatResumable !== null && this.splatResumableQuality ? { splatResumableQuality: this.splatResumableQuality } : {}),
+          ...(this.splatResumable !== null && this.splatContinues && this.splatOut?.info.iterations === this.splatResumable ? { splatContinuesModel: 1 } : {}),
           ...(this.denseResumablePass !== null ? { denseResumablePass: this.denseResumablePass } : {}),
           ...(this.denseResumablePass !== null && this.denseResumableQuality ? { denseResumableQuality: this.denseResumableQuality } : {}),
         },
@@ -1064,6 +1117,11 @@ export class MockEngine implements EngineLike {
   /** (One long operation runs at a time here — exports are not long ones —: `method` is not checked.) */
   cancel(_method?: EngineMethod): void {
     if (this.longOp) this.cancelled = true;
+  }
+
+  /** Like the engine: only the splat training reacts (from its `finishFrom` on). */
+  finishEarly(_method?: EngineMethod): void {
+    if (this.longOp) this.finishRequested = true;
   }
 
   async abortLongOperation(opts: { graceMs?: number; reinit?: boolean; method?: EngineMethod } = {}): Promise<AbortOutcome> {
@@ -1171,4 +1229,61 @@ async function mockJpeg(img: RGBAImage): Promise<Uint8Array | null> {
   if (!ctx) return null;
   ctx.putImageData(new ImageData(new Uint8ClampedArray(img.data), img.width, img.height), 0, 0);
   return new Uint8Array(await (await c.convertToBlob({ type: 'image/jpeg', quality: 0.9 })).arrayBuffer());
+}
+
+/**
+ * Synthetic 'splat_preview' snapshot: `pc` projected into `cam` (pinhole, distortion ignored) at
+ * ≤ 400 px, coarse to fine like the trainer's resolution schedule (8 / 4 / 2 / 1 px blocks until
+ * 10 / 30 / 60 % of the training, `frac`), fading in from the black training background.
+ */
+export function mockSplatPreview(pc: PointCloud, cam: SparseCamera, frac: number): RGBAImage {
+  const K = cam.intrinsics;
+  const factor = Math.max(1, Math.ceil(Math.max(K.width, K.height) / 400));
+  const W = Math.max(1, Math.floor(K.width / factor));
+  const H = Math.max(1, Math.floor(K.height / factor));
+  const block = frac < 0.1 ? 8 : frac < 0.3 ? 4 : frac < 0.6 ? 2 : 1;
+  const w = Math.ceil(W / block);
+  const h = Math.ceil(H / block);
+  const depth = new Float32Array(w * h).fill(Infinity);
+  const rgb = new Uint8Array(3 * w * h);
+  const { R, t } = cam.pose;
+  // §2 downscale of the camera by factor · block
+  const s = factor * block;
+  const f = K.f / s;
+  const cx = (K.cx + 0.5) / s - 0.5;
+  const cy = (K.cy + 0.5) / s - 0.5;
+  // a 2 × 2 footprint at full resolution (the samples are sparser than the pixels there)
+  const foot = block === 1 ? 2 : 1;
+  const P = pc.positions;
+  for (let i = 0, stride = Math.max(1, Math.floor(pc.count / 60_000)); i < pc.count; i += stride) {
+    const X = P[3 * i];
+    const Y = P[3 * i + 1];
+    const Z = P[3 * i + 2];
+    const z = R[6] * X + R[7] * Y + R[8] * Z + t[2];
+    if (!(z > 0.02)) continue;
+    const u = Math.round((f * (R[0] * X + R[1] * Y + R[2] * Z + t[0])) / z + cx);
+    const v = Math.round((f * (R[3] * X + R[4] * Y + R[5] * Z + t[1])) / z + cy);
+    for (let y = v; y < v + foot; y++) {
+      for (let x = u; x < u + foot; x++) {
+        if (x < 0 || y < 0 || x >= w || y >= h) continue;
+        const k = y * w + x;
+        if (z >= depth[k]) continue;
+        depth[k] = z;
+        rgb.set(pc.colors.subarray(3 * i, 3 * i + 3), 3 * k);
+      }
+    }
+  }
+  const a = Math.min(1, 0.35 + 0.65 * frac);
+  const data = new Uint8ClampedArray(4 * W * H);
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const k = 3 * (Math.floor(y / block) * w + Math.floor(x / block));
+      const o = 4 * (y * W + x);
+      data[o] = a * rgb[k];
+      data[o + 1] = a * rgb[k + 1];
+      data[o + 2] = a * rgb[k + 2];
+      data[o + 3] = 255;
+    }
+  }
+  return { width: W, height: H, data };
 }

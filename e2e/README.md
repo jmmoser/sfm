@@ -462,6 +462,7 @@ node e2e/run-e2e.mjs [object|yard|all|<dataset> ...] [--engine worker|inline|moc
      [--max-frames N] [--fps F] [--no-imu] [--no-gps] [--no-heading] [--hfov DEG|gt|none]
      [--no-dense] [--no-mesh] [--dense-size N] [--dense-views N] [--mesh-voxel V]
      [--mesh-triangles N] [--splat] [--splat-iterations N] [--splat-max N] [--splat-size N] [--splat-views N]
+     [--splat-previews]
      [--no-export | --export fmt,fmt] [--nvs] [--nvs-views N] [--mapping inline|background]
      [--timeout-min M] [--out DIR] [--tag NAME] [--thresholds FILE] [--no-thresholds]
      [--enforce] [--mock-speed X] [--set key=json ...] [--quiet] [--verbose] [--headed]
@@ -514,7 +515,7 @@ reports for an iPhone main camera; the datasets use 65°. `--hfov gt` uses the e
 The harness waits for every `LiveUpdate` before it sends the next frame, so there is one frame in
 flight. Then it runs `finishCapture`, `refine`, `densify`, `mesh`, with `--splat` the Gaussian-splatting stage
 (`engine.splat()`, after densify / mesh, or after refine with `--no-dense`; `--splat-iterations`, `--splat-max`,
-`--splat-size`, `--splat-views` set `SplatOptions` and imply `--splat`) and the exports, collecting the
+`--splat-size`, `--splat-views`, `--splat-previews` set `SplatOptions` and imply `--splat`) and the exports, collecting the
 progress events. A failing step is recorded in `errors`, the steps that depend on it are skipped,
 and a partial result is still written. On `--timeout-min` the runner calls `harnessAbort()`, which
 cancels the long operation, and saves what was done.
@@ -541,6 +542,7 @@ registered and how many are in the final model (also logged as `extend: …`).
 | `result.json` | Harness result plus the `metrics.mjs` input fields. See below. |
 | `sparse.ply`, `dense.ply`, `mesh.ply` | Streamed from the page through `window.__e2eWrite` (Playwright), or the HTTP bridge with `--device phone` / `local-bridge`. |
 | `splats.ply` | With `--splat`: `exportModel('ply-splat')` (INRIA 3DGS PLY, run world frame); `--nvs` scores it as the `splat` renderer. |
+| `previews/NNN-it<i>.png` | With `--splat-previews` (`SplatOptions.preview`): the training snapshots of the splat stage (the training view nearest the middle photo, ≤ 400 px, raw trainer colours). |
 | `metrics.json` | `computeMetrics` output, sparse-cloud accuracy, live-trajectory metrics and threshold checks (+ the `nvs` summary with `--nvs`). |
 | `nvs/nvs.json` | With `--nvs [--nvs-views N]`: the novel-view evaluation of the output (see "Novel-view evaluation"). |
 
@@ -578,7 +580,10 @@ The harness fields of `result.json` are:
   in object mode (the baseline of the focus-box scores).
 * `splat` (with `--splat`): the `SplatResult` (count, iterations, ms, `stats`: views, size, init, it/s, memory
   plan, checkpoints, …), `lastDetail` (the last training progress `detail`) and the `splats.ply` path; also
-  copied to `metrics.json`.
+  copied to `metrics.json`. With `--splat-previews`: `previews` (iteration, arrival ms after the stage
+  started, PSNR against that training photo, file) and `firstTrainingMs`; the summary line gives the first
+  arrival, the largest gap while training and the PSNR first → last, next to `stats.splatPreviewFinalPsnr`
+  (the trained model rendered from the same view in the same raw colours: what the previews converge to).
 
 The `metrics.mjs` fields are `intrinsics`, `images`, `metric`, `numInputImages`, `pointsFile` and (with a
 mesh) `objectRoi`.
@@ -1815,7 +1820,11 @@ E2E_GPU=host node e2e/run-e2e.mjs object-real --engine worker --splat --tag gr-b
 E2E_GPU=host node e2e/splat-replay.mjs e2e/out/e2e/object-real-gr-base --out e2e/out/replay/object \
   --variant before='{"colourCorrection":{},"geometry":false}' --variant ccoff='{"colourCorrection":false}'
 #   --variants FILE (name → overrides JSON), --tests held,sim3,<test datasets> (default: held, sim3 and every
-#   e2e/data/<dataset>-* set), --skip-nvs (train only), --nvs-only (score what is missing; resumes), --repeat N
+#   e2e/data/<dataset>-* set), --skip-nvs (train only), --nvs-only (score what is missing; resumes), --repeat N,
+#   --splat-previews (every variant trains with SplatOptions.preview, as the app does)
+# preview cost: two sequential invocations into the same --out, without and with previews (compare "stage s")
+E2E_GPU=host node e2e/splat-replay.mjs e2e/out/e2e/object-real-gr-base --out e2e/out/replay/previews --variant off='{}' --skip-nvs
+E2E_GPU=host node e2e/splat-replay.mjs e2e/out/e2e/object-real-gr-base --out e2e/out/replay/previews --variant on='{}' --splat-previews --skip-nvs
 ```
 
 * **Faithfulness**: the page (`harness.html`, `window.replaySplat`, src/harness/engine/replay.ts) loads the dump into
@@ -1825,7 +1834,9 @@ E2E_GPU=host node e2e/splat-replay.mjs e2e/out/e2e/object-real-gr-base --out e2e
   stage 59.8 s (59.7 s).
 * **Output**: `<out>/<variant>/{splats.ply, result.json (copied from the run), replay.json, nvs*/nvs.json}` and
   `<out>/summary.json`; the script prints full-frame PSNR per test set, the off-trajectory mean and the stage times.
-  `profile: true` in a variant adds per-pass GPU ms per iteration.
+  `profile: true` in a variant adds per-pass GPU ms per iteration. With `--splat-previews`, `replay.json` holds the
+  snapshots (`previews`: iteration, arrival ms, PSNR; `firstTrainingMs`) and the summary their count, first arrival,
+  largest gap while training and PSNR first → last → final model.
 * **Noise**: five replays of the unchanged stage spread 0.11 dB held-out (object 31.21–31.32, yard 31.07–31.14),
   up to 0.2 dB on single off-trajectory sets (yard +0.75 m: 20.48–20.68) and 0.05 (object) / 0.09 dB (yard) in the
   off-trajectory means (the GPU's float CAS adds make runs non-deterministic). Stage times are only comparable within a sequential run (see below): the

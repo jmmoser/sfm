@@ -48,10 +48,13 @@
  *                    camera" starts the scan
  *   memory-limit-background  the memory cap is reached by the frame in flight when the app goes to
  *                    the background → the prompt comes after Resume
- *   splat-build      "Photoreal model" from the viewer's Build sheet: progress card, Cancel →
- *                    "Photoreal model interrupted" card → Resume continues → layer pill offers Splats,
- *                    the export sheet the Gaussian-splat PLY; after a reload the scan reopens with its
- *                    splats (E2E_GPU=host: shown by default; SwiftShader: refused, points shown)
+ *   splat-build      "Photoreal model" from the viewer's Build sheet: progress card with the training
+ *                    preview (its pixels change; "Use it now" disabled until finishFrom), Cancel →
+ *                    "Photoreal model interrupted" card → Resume continues → the preview opens larger
+ *                    → "Use it now" stores the model early (no resume card; Build: Continue) →
+ *                    Continue trains to the end → layer pill offers Splats, the export sheet the
+ *                    Gaussian-splat PLY; after a reload the scan reopens with its splats
+ *                    (E2E_GPU=host: shown by default; SwiftShader: refused, points shown)
  *   splat-no-webgpu  no WebGPU in the browser: the photoreal build is disabled with an explanation
  *   coverage         object mode: the coverage ring fills along the mock's level orbit ("Walk to the
  *                    other side" → "Raise the phone, loop looking down" with the elevation bands, or
@@ -1141,14 +1144,26 @@ await scenario('empty-dense', async () => {
 await scenario('splat-build', async () => {
   const hostGpu = process.env.E2E_GPU === 'host';
   const { page, context } = await newPage();
-  // slow stages: Cancel lands during the training
-  await page.goto(`${base}?mock=1&mockSpeed=0.25`);
+  // slow stages (7.8 s of training at fast): Cancel lands during the training
+  await page.goto(`${base}?mock=1&mockSpeed=0.2`);
   await by(page, 'new-scan').waitFor();
   await page.evaluate(async () => {
     const { SessionStore } = await import('/src/io/storage.ts');
     const s = await SessionStore.open();
     await s.createSession({ id: 'seed-splat', name: 'Garden bench', mode: 'object', status: 'dense', stats: { quality: 'fast', keyframes: 24 } });
   });
+  /** Pause / resume the mock's training (it pauses while hidden): slow screenshots and audits must not outlast it. */
+  const freeze = (on) => page.evaluate((v) => globalThis.__sfmApp.engine.setHidden(v), on);
+  /** A hash of the card's preview pixels ('' before the first snapshot). */
+  const previewPixels = () =>
+    page.evaluate(() => {
+      const c = document.querySelector('[data-testid="splat-preview"]');
+      if (!c || !c.width || c.closest('[hidden]')) return '';
+      const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+      let hash = 0;
+      for (let i = 0; i < d.length; i += 3) hash = (Math.imul(hash, 31) + d[i]) >>> 0;
+      return `${c.width}×${c.height}:${hash}`;
+    });
   await page.reload();
   await by(page, 'session-item').first().tap();
   await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
@@ -1162,7 +1177,19 @@ await scenario('splat-build', async () => {
   await by(page, 'build-splat').tap();
   await by(page, 'splat-progress').waitFor({ state: 'visible', timeout: 10000 });
   await page.waitForFunction(() => /iterations/.test(document.querySelector('[data-testid="splat-progress-text"]')?.textContent ?? ''), null, { timeout: 30000 });
-  await sleep(400);
+  // "Use it now" waits for the end of the coarse-to-fine schedule (30 %: iteration 900 of 3000)
+  check(await by(page, 'splat-use-now').isDisabled(), '"Use it now" disabled early in the training');
+  check(/Usable from iteration 900/.test((await by(page, 'splat-use-note').textContent()) ?? ''), 'its note says from when');
+  // the preview snapshot replaces the spinner; its pixels change as the model trains
+  await by(page, 'splat-preview').waitFor({ state: 'visible', timeout: 10000 });
+  const seenPixels = new Set([await previewPixels()]);
+  for (const t0 = Date.now(); seenPixels.size < 3 && Date.now() - t0 < 15000; ) {
+    await sleep(150);
+    seenPixels.add(await previewPixels());
+  }
+  seenPixels.delete('');
+  check(seenPixels.size >= 3, `the preview's pixels change at least twice before Cancel (${seenPixels.size} distinct)`);
+  await freeze(true);
   await shot(page, 'state-splat-progress');
   await audit(page, 'splat progress');
   // the other builds wait while it runs
@@ -1170,6 +1197,7 @@ await scenario('splat-build', async () => {
   await by(page, 'sheet-build').waitFor();
   check(await by(page, 'build-mesh').isDisabled(), 'mesh build disabled while the photoreal model trains');
   await page.keyboard.press('Escape');
+  await freeze(false);
   await by(page, 'sheet-build').waitFor({ state: 'detached' });
   await by(page, 'splat-cancel').tap();
   await by(page, 'dialog-confirm').tap();
@@ -1191,17 +1219,53 @@ await scenario('splat-build', async () => {
   }, null, { timeout: 30000 });
   const it0 = Number(((await firstText.jsonValue()) ?? '').replace(/,/g, '').match(/^(\d+)/)?.[1] ?? 0);
   check(it0 > 0, `the resumed run continues (first progress at iteration ${it0})`);
+  // the preview, larger: a sheet that follows the snapshots, with its own "Use it now"
+  await by(page, 'splat-preview-open').waitFor({ state: 'visible', timeout: 10000 });
+  await freeze(true);
+  await by(page, 'splat-preview-open').tap();
+  await by(page, 'sheet-splat-preview').waitFor({ state: 'visible', timeout: 5000 });
+  check(/^(Iteration [\d,]+ of 3,000|Initial Gaussians)/.test((await by(page, 'splat-preview-caption').textContent()) ?? ''), 'the larger preview has the iteration as its caption');
+  await sleep(400);
+  await shot(page, 'state-splat-preview');
+  await audit(page, 'splat preview sheet');
+  await page.keyboard.press('Escape');
+  await by(page, 'sheet-splat-preview').waitFor({ state: 'detached' });
+  await freeze(false);
+  // "Use it now" from iteration 900 on: the model is stored where it is, continuable later
+  await page.waitForFunction(() => document.querySelector('[data-testid="splat-use-now"]')?.disabled === false, null, { timeout: 30000 });
+  await by(page, 'splat-use-now').tap();
+  await by(page, 'splat-progress').waitFor({ state: 'hidden', timeout: 30000 });
+  check(await by(page, 'splat-resume').isHidden(), 'no "interrupted" card for a model ended early');
+  await by(page, 'tool-build').tap();
+  await by(page, 'build-splat').waitFor({ timeout: 5000 });
+  const early = (await by(page, 'sheet-build').textContent()) ?? '';
+  check(/Continue/.test((await by(page, 'build-splat').textContent()) ?? '') && /Stopped early at [\d,]+ of 3,000 iterations/.test(early), 'Build sheet: Continue the training of the model ended early');
+  await shot(page, 'state-splat-continue');
+  await by(page, 'build-splat').tap();
+  await by(page, 'splat-progress').waitFor({ state: 'visible', timeout: 10000 });
   await by(page, 'splat-progress').waitFor({ state: 'hidden', timeout: 90000 });
   check(await by(page, 'splat-resume').isHidden(), 'no resume card once the model exists');
-  await by(page, 'layer-switch').waitFor({ state: 'visible', timeout: 15000 });
-  const segs = await page.locator('[data-testid="layer-switch"] .segment').evaluateAll((els) => els.map((e) => e.dataset.value));
+  await by(page, 'tool-build').tap();
+  await by(page, 'sheet-build').waitFor();
+  check(!/Stopped early/.test((await by(page, 'sheet-build').textContent()) ?? ''), 'the continued model is complete (no Continue)');
+  await page.keyboard.press('Escape');
+  await by(page, 'sheet-build').waitFor({ state: 'detached' });
+  const segments = () => page.locator('[data-testid="layer-switch"] .segment').evaluateAll((els) => els.map((e) => e.dataset.value));
   if (hostGpu) {
+    await by(page, 'layer-switch').waitFor({ state: 'visible', timeout: 15000 });
+    const segs = await segments();
     check(segs.join(',') === 'splats,points', `layer pill Splats / Points (got ${segs})`);
     await page.waitForFunction(() => document.querySelector('[data-testid="layer-switch"]')?.dataset.layer === 'splats', null, { timeout: 30000 });
     await sleep(500);
     await shot(page, 'state-splat-shown');
     await audit(page, 'splats shown');
-  } else console.log(`[states] software adapter: layer pill ${segs}`);
+  } else {
+    // SwiftShader: the splat layer refuses the software adapter (for good, since the model ended
+    // early was loaded): the points stay, and the layer pill has nothing to switch to
+    await page.waitForFunction(() => document.querySelector('.viewer-screen')?.dataset.splats === 'unavailable', null, { timeout: 30000 });
+    const segs = await segments();
+    check((await by(page, 'layer-switch').isHidden()) && !segs.includes('splats'), `software adapter: splats refused, points only (layer pill hidden, segments ${segs})`);
+  }
   await by(page, 'tool-export').tap();
   await by(page, 'export-ply-splat').waitFor();
   check(!(await by(page, 'export-ply-splat').getAttribute('class'))?.includes('disabled'), 'export sheet offers the Gaussian-splat PLY');

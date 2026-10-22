@@ -26,6 +26,8 @@
  *   result.json   harness result + the e2e/metrics.mjs input fields (intrinsics, images, metric,
  *                 numInputImages, pointsFile) — re-score with `node e2e/metrics.mjs e2e/data/<d> result.json`
  *   sparse.ply / dense.ply / mesh.ply / splats.ply   (streamed from the page; splats with --splat)
+ *   previews/NNN-it<i>.png  with --splat-previews: the splat stage's training snapshots (arrival
+ *                 times and PSNR in result.json splat.previews and the summary line)
  *   metrics.json  metrics (e2e/lib/metrics-core.mjs) + sparse-cloud accuracy + live-trajectory
  *                 metrics + threshold checks (e2e/thresholds.json) [+ novel-view summary with --nvs];
  *                 with a mesh, the object-isolation scores against meta.focus: `focus` (mesh.ply
@@ -146,6 +148,19 @@ function printTimings(r, log) {
         `${s.splatViews} views ${s.splatWidth}×${s.splatHeight}, init ${s.splatInitGaussians} (dense ${s.splatInitDense ?? 0}, sparse ${s.splatInitSparse ?? 0}, shell ${s.splatShell ?? 0}), memory plan ≈ ${s.splatMemPeakMB} MB (GPU ${s.splatGpuMB} MB)` +
         `${s.splatDegraded ? `, degraded: ${s.splatDegraded}` : ''}; checkpoints ${s.splatCheckpoints} × ${s.splatCheckpoints ? Math.round(s.splatCheckpointMs / s.splatCheckpoints) : 0} ms${r.splat.file ? ` → ${r.splat.file}` : ''}`,
     );
+    const pv = r.splat.previews;
+    if (pv?.length) {
+      // (gaps between the snapshots of the training, not the one before the view uploads)
+      const train = pv.filter((p) => p.iteration > 0);
+      const gaps = train.slice(1).map((p, i) => p.ms - train[i].ms);
+      const first = r.splat.firstTrainingMs;
+      log(
+        `splat previews: ${pv.length}, first at ${fmtNum(pv[0].ms / 1000, 1)} s (first iteration reported at ${first != null ? `${fmtNum(first / 1000, 1)} s` : '–'}), ` +
+          `max gap while training ${gaps.length ? `${fmtNum(Math.max(...gaps) / 1000, 1)} s` : '–'}, PSNR vs the training photo ${fmtNum(pv[0].psnr, 2)} → ${fmtNum(pv[pv.length - 1].psnr, 2)} dB` +
+          `${s.splatPreviewFinalPsnr != null ? ` (final model ${fmtNum(s.splatPreviewFinalPsnr, 2)} dB)` : ''}` +
+          `${pv[0].file ? ` → ${dirname(pv[0].file)}/` : ''}`,
+      );
+    }
   }
   if (r.exports && Object.keys(r.exports).length) {
     log(`exports: ${Object.entries(r.exports).map(([k, v]) => `${k} ${'bytes' in v ? `${fmtNum(v.bytes / 1048576, 2)} MB` : `ERROR ${v.error}`}`).join(', ')}`);
@@ -181,6 +196,8 @@ async function prepareRun(name, opts, outRoot) {
   const dir = join(outRoot, runName);
   await mkdir(dir, { recursive: true });
   for (const f of ['result.json', 'metrics.json', 'sparse.ply', 'dense.ply', 'mesh.ply', 'splats.ply']) await rm(join(dir, f), { force: true });
+  await rm(join(dir, 'previews'), { recursive: true, force: true });
+
   const cfg = { ...structuredClone(opts.config), dataset: name, output: { prefix: `${runName}/` } };
   return { name, runName, log, dsDir, dir, cfg };
 }

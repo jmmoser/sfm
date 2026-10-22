@@ -12,8 +12,13 @@
  *   E2E_GPU=host node e2e/splat-replay.mjs e2e/out/e2e/object-real-gr-base \
  *     --variant base='{}' --variant geo='{"geometry":{"depth":[0.5,0.05]}}' \
  *     [--tests held,sim3,object-real-up12,…] [--out DIR] [--skip-nvs] [--nvs-only] [--repeat N]
+ *     [--splat-previews]
  *   (--nvs-only: no training; scores the variants' existing splats.ply on the tests missing from
- *   summary.json — resumes an interrupted run)
+ *   summary.json — resumes an interrupted run; --splat-previews: every variant of this invocation
+ *   trains with SplatOptions.preview, as the app does, and records the snapshots' arrival times and
+ *   PSNR. The preview cost is the stage-time change between two sequential invocations into the
+ *   same --out, without and with it, under different variant names, e.g.
+ *     … --variant off='{}' --skip-nvs   then   … --variant on='{}' --splat-previews --skip-nvs)
  *
  * Writes <out>/<variant>/{result.json (copied from the run), splats.ply, replay.json,
  * nvs-<test>/nvs.json} and <out>/summary.json; prints a table of full-frame PSNR per test set and
@@ -32,8 +37,26 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const exists = (p) => access(p).then(() => true, () => false);
 const f2 = (v, d = 2) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(d) : '—');
 
+/** Preview timings of a replay result (--splat-previews): count, first arrival, largest gap while training (s), PSNR first → last. */
+function previewSummary(r) {
+  const pv = r.previews ?? [];
+  if (!pv.length) return null;
+  // (gaps between the snapshots of the training, not the one before the view uploads)
+  const train = pv.filter((p) => p.iteration > 0);
+  const gaps = train.slice(1).map((p, i) => p.ms - train[i].ms);
+  return {
+    count: pv.length,
+    firstS: pv[0].ms / 1000,
+    firstTrainingS: r.firstTrainingMs != null ? r.firstTrainingMs / 1000 : null,
+    maxGapS: gaps.length ? Math.max(...gaps) / 1000 : null,
+    psnrFirst: pv[0].psnr,
+    psnrLast: pv[pv.length - 1].psnr,
+    psnrFinal: r.stats?.splatPreviewFinalPsnr ?? null,
+  };
+}
+
 function parse(argv) {
-  const o = { run: null, variants: [], tests: null, out: null, skipNvs: false, repeat: 1, verbose: false, ssim: true };
+  const o = { run: null, variants: [], tests: null, out: null, skipNvs: false, repeat: 1, verbose: false, ssim: true, previews: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = () => argv[++i];
@@ -50,6 +73,7 @@ function parse(argv) {
     else if (a === '--nvs-only') o.nvsOnly = true;
     else if (a === '--no-ssim') o.ssim = false;
     else if (a === '--repeat') o.repeat = Math.max(1, Number(next()) | 0);
+    else if (a === '--splat-previews') o.previews = true;
     else if (a === '--verbose') o.verbose = true;
     else if (a.startsWith('--')) throw new Error(`unknown option ${a}`);
     else o.run = a;
@@ -108,7 +132,7 @@ try {
       for (let attempt = 0; attempt < 2 && !r; attempt++) {
         let timer;
         r = await Promise.race([
-          page.evaluate((c) => window.replaySplat(c), { dump: `/${relRun}/session/`, quality, mode, splatConfig: { trainer: v.trainer }, outPrefix: `${name}/` }),
+          page.evaluate((c) => window.replaySplat(c), { dump: `/${relRun}/session/`, quality, mode, splatConfig: { trainer: v.trainer }, ...(o.previews ? { splat: { preview: true } } : {}), outPrefix: `${name}/` }),
           new Promise((res) => (timer = setTimeout(() => res(null), 900_000))),
         ]).finally(() => clearTimeout(timer));
         if (!r) {
@@ -125,10 +149,16 @@ try {
         `[replay] ${name}: ${r.count} Gaussians, ${r.iterations} it, stage ${(r.ms / 1000).toFixed(1)} s (prepare ${(st.splatPrepareMs / 1000).toFixed(1)} s, train ${(st.splatTrainMs / 1000).toFixed(1)} s at ${st.splatItPerSec} it/s), loss ${st.splatLoss}` +
           `${st.splatDepthViews !== undefined ? `, depth targets ${st.splatDepthViews} views (${st.splatDepthMs} ms)` : ''} (${((Date.now() - t0) / 1000).toFixed(1)} s)`,
       );
+      const pv = previewSummary(r);
+      if (pv)
+        console.log(
+          `[replay] ${name}: ${pv.count} previews, first at ${f2(pv.firstS, 1)} s (first iteration reported at ${f2(pv.firstTrainingS, 1)} s), max gap while training ${f2(pv.maxGapS, 1)} s, ` +
+            `PSNR vs the training photo ${f2(pv.psnrFirst)} → ${f2(pv.psnrLast)} dB (final model ${f2(pv.psnrFinal)} dB)`,
+        );
       if (r.gpuMs) console.log(`[replay] ${name}: GPU ms per iteration ${Object.entries(r.gpuMs).map(([k, ms]) => `${k} ${(ms / r.profiledIterations).toFixed(2)}`).join(', ')} (${r.profiledIterations} it)`);
       await copyFile(join(runDir, 'result.json'), join(vdir, 'result.json'));
-      await writeFile(join(vdir, 'replay.json'), JSON.stringify({ variant: v, ...r }, null, 1));
-      const entry = { trainer: v.trainer, stageS: r.ms / 1000, prepareS: st.splatPrepareMs / 1000, trainS: st.splatTrainMs / 1000, itPerSec: st.splatItPerSec, loss: st.splatLoss, count: r.count, stats: st, nvs: summary[name]?.nvs ?? {} };
+      await writeFile(join(vdir, 'replay.json'), JSON.stringify({ variant: v, splatPreviews: o.previews, ...r }, null, 1));
+      const entry = { trainer: v.trainer, previews: pv, stageS: r.ms / 1000, prepareS: st.splatPrepareMs / 1000, trainS: st.splatTrainMs / 1000, itPerSec: st.splatItPerSec, loss: st.splatLoss, count: r.count, stats: st, nvs: summary[name]?.nvs ?? {} };
       summary[name] = entry;
       await writeFile(join(outRoot, 'summary.json'), JSON.stringify(summary, null, 1));
     }
@@ -171,9 +201,9 @@ if (!o.skipNvs) {
 }
 
 const offs = tests.filter((t) => t !== 'held' && t !== 'sim3');
-const rows = [['variant', 'stage s', 'train s', 'it/s', ...tests.map((t) => t.replace(`${dataset}-`, '')), 'off mean']];
+const rows = [['variant', 'stage s', 'train s', 'it/s', 'previews', ...tests.map((t) => t.replace(`${dataset}-`, '')), 'off mean']];
 for (const [name, e] of Object.entries(summary)) {
   const off = offs.map((t) => e.nvs?.[t]?.psnr).filter((x) => Number.isFinite(x));
-  rows.push([name, f2(e.stageS, 1), f2(e.trainS, 1), f2(e.itPerSec, 1), ...tests.map((t) => f2(e.nvs?.[t]?.psnr)), off.length === offs.length && off.length ? f2(off.reduce((a, b) => a + b, 0) / off.length) : '—']);
+  rows.push([name, f2(e.stageS, 1), f2(e.trainS, 1), f2(e.itPerSec, 1), e.previews ? String(e.previews.count) : '—', ...tests.map((t) => f2(e.nvs?.[t]?.psnr)), off.length === offs.length && off.length ? f2(off.reduce((a, b) => a + b, 0) / off.length) : '—']);
 }
 console.log(`\n[replay] ${dataset}: full-frame PSNR (dB) per test set\n${table(rows, [0])}`);
