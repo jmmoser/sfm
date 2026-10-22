@@ -1104,22 +1104,27 @@ dense: the same with `--dense-size 480 --tag verify-dense480` (instead of `--no-
 | object-real | 89/89 (live) | 2.84e-4 | 0.08 | +0.09 | 0.9 | −0.9 (imu) | 0.02 | −0.54 | −25.1 | cols −21.6 ms | 0.9995 / 0.9941 / 0.9968 | 0.31 / 1.06 mm | 943 (86 / 775) |
 | yard-real | 81/81 (live) | 3.17e-4 | 0.09 | +0.16 | 0.4 | +1.6 (imu+gps) | 0.06 | −0.93 | −25.1 | rows 22.0 ms | 0.961 / 0.351 / 0.515 | 8.8 / 47 mm | 843 (69 / 684) |
 
-#### Phone-like analysis rate (`--stride 3`, 2026-10-21, worker engine, CPU features)
+#### Phone-like analysis rate (`--stride 3`, 2026-10-22, worker engine, CPU features)
 
-`node e2e/run-e2e.mjs <dataset> --stride 3 --no-dense --set 'engineConfig={"featureBackend":"cpu"}'` analyses 2
-(yard) / 2.7 (object) frames per second, the rate a phone may reach. Before = 18d73c9; after = re-triangulation of
-the registered neighbours of a keyframe at the edge of the map plus gyro-aided registration (diagnosis, ablations and
-the other strided phases: ../docs/research/real-capture-robustness.md "Phone-rate capture").
+`node e2e/run-e2e.mjs <dataset> --stride 3 [--start 1|2] --no-dense --set 'engineConfig={"featureBackend":"cpu"}'`
+analyses 2 (yard) / 2.7 (object) frames per second, the rate a phone may reach. Before = claude/next-level b2377c7;
+after = re-triangulation of the registered neighbours of a keyframe at the edge of the map, then gyro-aided
+registration (live, in refine's retry and its offline SfM) and the offline SfM for live models with an unclosed loop,
+run back to back (every run, the diagnosis and the stride-1 checks: ../docs/research/real-capture-robustness.md
+"Phone-rate capture").
 
-| dataset | live kf reg | lost frames | offline SfM | ATE / extent | rot° p50 |
-|---|---|---|---|---|---|
-| yard-real, before | 19/48 | 38 of 80 | run (29 not registered) | 5.1–5.4e-4 (offline) | 0.11 |
-| yard-real, after (9 of 10 runs) | 48/48 | 0 | skipped | 4.9–5.2e-4 (live) | 0.10–0.11 |
-| object-real, before → after | 50/50 | 0 | skipped | 5.9e-4 → 6.0e-4 | 0.21 → 0.19 |
+| dataset | live kf reg | lost frames | offline SfM | ATE / extent | rot° p50 | failed checks |
+|---|---|---|---|---|---|---|
+| yard-real, before (5 runs) | 19/48 | 38 of 80 | run (29 not registered) | 5.1e-4 (offline) | 0.11 | – |
+| yard-real, after (5 runs) | 48/48 | 0 | skipped | 5.3e-4 (live) | 0.12 | – |
+| yard-real `--start 1`, before (4) | 20/49 | 38 | run | 6.6e-4 (offline, 33 of 49) | 0.22 | registrationRate, gravityErrorDeg |
+| yard-real `--start 1`, after (4) | 48/48 | 0 | 3 skipped, 1 run (open loop) | 9.6e-4–1.03e-3 (48 of 48) | 0.13–0.15 | 1 run ateRelative (1.03e-3) |
+| yard-real `--start 2`, before / after (2 + 2) | 20/51 / 34/51 | 39 / 17 | run | 1.70–1.78e-3 / 1.84–1.85e-3 (offline, 37 of 51) | 0.32–0.35 / 0.40 | registrationRate, ateRelative, rotErrDegMedian |
+| object-real, before / after (2 + 2) | 50/50 | 0 | skipped | 6.0e-4 / 6.0e-4 | 0.20 / 0.20 | – |
 
-The tenth yard-real run lost the chain at frame 138 (23/48, offline model 1.2e-3). yard-real at stride 3 fails
-`scaleError` before and after (−6.4 %, GPS scale: the IMU excitation is too low at this keyframe rate). At stride 1
-both datasets are unchanged within run-to-run noise (yard-real back to back 5.2e-4 → 5.5e-4, object-real 2.7e-4).
+`--start 2` loses the loop's corner both before and after (no map points to register on); its offline ATE spread is
+that of the before code (1.87e-3 with both new paths off). The stride-3 `scaleError` failure of 2026-10-21 is gone
+on both sides (the keyframe-interval IMU scale of claude/next-level).
 
 ### Refine performance on Metal (2026-10)
 

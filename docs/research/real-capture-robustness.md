@@ -108,13 +108,13 @@ offline one (0.392 vs 0.393 px) but explained fewer correspondences (84.2 vs 87.
   the focal error (0.09 → 0.20 %, pp 0.91 px). So the 6-round cap stays; a joint BA with intrinsics
   shared ACROSS cameras remains the principled fix.
 
-## Phone-rate capture: keyframes past a fast pan (2026-10-21)
+## Phone-rate capture: keyframes past a fast pan (2026-10-21, review fixes 2026-10-22)
 
 Question: an iPhone analyses only 2–4 frames per second. Does live registration survive the fast
 pans then? Replay at a third of the dataset rate: `node e2e/run-e2e.mjs yard-real --stride 3 --no-dense
 --set 'engineConfig={"featureBackend":"cpu"}'` (2 analysed frames per second; worker engine; the host
-shared, load 5–20 on 4 cores, so refine times are only comparable within a column of similar load).
-Before = commit 18d73c9, run back to back with the change.
+shared, load 3–12 on 4 cores, so refine times are only comparable back to back), also from frames 1
+and 2 (`--start 1` / `--start 2`: the other two phases of the same capture).
 
 ### Diagnosis (instrumented replays of 18d73c9, debug dump compared with GT)
 
@@ -140,67 +140,201 @@ Before = commit 18d73c9, run back to back with the change.
   COLMAP). The batch SfM has every pair from the start; live, the third view arrives later, and
   nothing triangulates those tracks again before the third view registers — on exactly those points.
 
+### Diagnosis of the first implementation's failures (2026-10-22, review)
+
+- 1 in 10 stride-3 runs (`fin2`) still lost tracking. Cause: the gyro path ran before
+  re-triangulation and registered the keyframe at frame 102 with 26 of 35 inliers, its refinement
+  moving the rotation 1.92° — and its baseline 154° off GT: with far points (houses 18–47 m away,
+  0.4–0.9 m baselines) rotation and translation couple, and that pose passed every gate (inliers,
+  ratio, spread, σ, gyro check). The next keyframes chained off it (baselines 90–162° off) until
+  tracking was lost at frame 126. The re-triangulated map gives P3P 84–85 of 99–100 inliers there
+  (the correct pose: 0.3° / 3.5° off GT).
+- `--start 1` (live 48/48 registered, offline SfM skipped, ATE 9.6e-4–1.0e-3 against 6.6e-4
+  before). The before runs' 6.6e-4 is over the 33 of 49 keyframes the offline SfM kept: it dropped
+  frames 178–238 — the loop's corner and everything after it, including the loop closure (it
+  failed `registrationRate` and `gravityErrorDeg`). On those 32 common frames the new model is
+  7.2–7.6e-4 with rotation p50 0.11–0.13° (before 0.22–0.23°). The real hazard was the tail: in 2
+  of 13 earlier runs (first implementation and the interrupted fix) refine left the loop open (ATE 1.8e-2, rotation 2.4°, focal
+  2.3 % off) and the health check skipped the offline SfM. Why: the live self-calibration of the
+  focal wanders on the first ≈ 8 keyframes (weak geometry: far points, small baselines; the
+  focal after the global BAs at 3 / 4 / 6 / 8 / 11 / 26 / 41 keyframes, instrumented: 745 / 754 /
+  755 / 779 / 774 / 775 / 775 px, truth 753 — the jump between 6 and 8 from the local BAs, which
+  refine the focal while they hold every image; from frame 0 it ends at 753, from frame 2 at 742),
+  so the live model is mapped with the focal 2.8 % long and its loop's ends are ≈ 11° apart before
+  refine (consecutive relative rotations 0.3–1.1° off GT, ≈ 2.8 % of each pan). Refine's global
+  refinement corrects the focal (→ 754) and closes that gap when enough loop tracks merge; when
+  they do not (split loop pairs 1–42, 1–44, 2–44 at ≈ 210 px), nothing else could: the health
+  check's loop-correspondence count (limit 150) does not see 47–69 split correspondences, and the
+  offline SfM, run with `refineOfflineSfM: 'always'`, split into 3 models and kept 32 of 48
+  keyframes, so the live model would have won on registered images anyway.
+- `--start 2` (34/51 live, 37/51 offline both before and after): the loop's corner (frames
+  179–191, 13–20° per analysed frame for 6 s, little translation) leaves keyframes that see 0–11
+  map points even after re-triangulation — below P3P's 30 and the gyro path's 15; the offline SfM
+  (with the gyro path too) also keeps 37. Not a regression: the same keyframes are lost before and
+  after. Beyond the corner the only registrable keyframe (frame 212, 118 map points) gets a P3P pose
+  152° off the gyro (loop-start points matched to the wrong place) and is rightly rejected. Its
+  offline ATE spread (1.70–1.88e-3) is that of the before code too: with both new paths off the
+  merged code gave 1.87e-3, the before code 1.70–1.78e-3 (5 runs, also with other offline seeds).
+
 ### Change
 
 1. `LiveMapper.triangulateNeighbours` (src/sfm/live.ts): a keyframe that sees fewer than 30 map
-   points, or fails to register, first has up to 6 registered neighbours triangulated again (its
-   pairs made their tracks multi-view), then registration is retried once. On the stride-3 replay it
-   created +75 / +18 / +114 / +71 / +37 points (visible points 1 → 75, 26 → 37, 29 → 143, 26 → 93,
-   3 → 40); without the gyro path the keyframe at frame 102 went 36 → 97 and P3P registered it.
+   points, or whose P3P fails, has up to 6 registered neighbours triangulated again (its pairs made
+   their tracks multi-view), then P3P is tried again. On the stride-3 replay it created +75 / +18 /
+   +114 / +71 / +37 points (visible points 1 → 75, 26 → 37, 29 → 143, 26 → 93, 3 → 40); the
+   keyframe at frame 102 went 36 → 97 and P3P registered it.
 2. Gyro-aided registration (src/geometry/pnp.ts `solvePnPKnownRotationRansac`, src/sfm/mapper.ts
-   `registerKnownRotation`, src/engine/live.ts `predictRotation`): when P3P still fails, the rotation
-   the gyro propagates from the registered keyframe nearest in time (≤ 3 s; σ = 1° + 0.3°/s·Δt + 3 %
+   `registerKnownRotation`, src/engine/live.ts `predictRotation`) only when P3P still fails on the
+   re-triangulated map (order: P3P, re-triangulation, P3P again, known rotation): the rotation the
+   gyro propagates from the registered keyframe nearest in time (≤ 3 s; σ = 1° + 0.3°/s·Δt + 3 %
    of the rotation) is kept known: 2-point linear translation LO-MSAC (LO = depth-reweighted least
    squares + 4 robust 6-DOF LM steps), final 2-pass 6-DOF refinement; accepted with ≥ 15 inliers that
    are ≥ 50 % of the correspondences, a refined rotation ≤ 3 σ from the prediction, an inlier spread
-   ≥ 5 % of the long image side and the gyro pose check. The keyframe at frame 102: 27 inliers,
-   rotation moved 0.54° by the refinement.
+   ≥ 5 % of the long image side, a baseline within 30° of the direction of the keyframe's best
+   verified pair (≥ 1.5° triangulation angle; the `fin2` pose was 154° off it) and the gyro pose
+   check. It needs the verified R_cam_device, not the gyro gates (`gyroGate: false` keeps it).
+   Live, in refine's retry of the pending keyframes and in refine's offline SfM.
+3. `liveModelHealth` (src/engine/refine.ts) no longer skips the offline SfM for a live model with
+   a keyframe registered with the gyro-predicted rotation (its rotation agrees with the gyro by
+   construction), or with a loop-like split pair (a's points 8–300 px from b's features) between
+   keyframes ≥ 1/3 of the capture apart — the ends of an unclosed loop, which a phone-rate capture
+   shows on too few correspondences for the count limits. Closed models' loop-like pairs join
+   keyframes ≤ 17 % of the capture apart (yard-real: 14 of 81 at stride 1, 7 of 48 at stride 3).
+   With the gyro path in the offline SfM (2.) it registers what the live mapper did (`--start 1`:
+   1 model of 48 instead of 3 models / 32), so a complete live model with an open loop meets a
+   complete offline one and loses on explained correspondences (75.2 vs 78.0 % in run `a1-4`).
+   One closed `--start 1` model had a 12 px split across 43 of 48 keyframes: the rule then costs
+   the offline SfM's time only. Not used as evidence: the gyro-consistency median and the explained
+   share (closed `--start 1` models 0.29–0.31° / 76.5–76.8 %, open ones 0.20–0.22° / 75.0–75.3 %:
+   no threshold separates them), and registrations rescued by re-triangulation: P3P poses with
+   ≥ 30 inliers that passed the gyro check (6 per stride-3 run: 5 within 0.07–0.30° relative
+   rotation of GT, the one at the 5th keyframe 3.6° like the plain P3P one before it, 2.7°, the
+   focal still wandering); counting them would run the offline SfM on every phone-rate capture
+   (5–8 s of refine's 22) for a model choice that kept the live model in all 4 forced runs.
+4. Diagnostics: every registration other than a plain P3P one is logged at debug level (map points
+   before / after re-triangulation, P3P and known-rotation inliers, rejections by the gyro); a P3P
+   pose the gyro rejected before the known rotation registered the keyframe is reported apart
+   (`stats.gyroRecoveredPoses`, mapper `numRotationRejectsRecovered`).
 
 Unit evidence: the solver recovers t to 1e-9 from 2 noise-free points; with 12 inliers among 70 %
 outliers at 0.5 px it returns the robust optimum (what LM from the true pose reaches) in 200 / 200
 seeded trials (rotation exact or 1° off at 2–8 m depth, 1° off at 5–40 m); that optimum is within
 1 % of the 1 m baseline at 2–8 m in 200 / 200 (centre error p50 0.35, p95 0.75 cm; at 5–40 m p50 1.1,
-p95 2.8 cm: the rotation ↔ translation coupling of 12 points). src/sfm/live.test.ts isolates the
-two-view mechanism (a keyframe seeing 10 map points and the walk after it stay pending without
-re-triangulation, all register with it); src/sfm/mapper.test.ts the gyro path (26 / 17 good points
-register; 14 of 44, a 7 × 9 px cluster, a prediction 20° off or none do not).
+p95 2.8 cm: the rotation ↔ translation coupling of 12 points). src/sfm/live.test.ts: a synthetic
+yard walk with a 35° pan between keyframes (K − 2 to K turning to 26°) — keyframe K sees 20 map
+points; P3P, the gyro path alone (its inliers lie in a sliver: spread gate) and re-triangulation
+alone (27 points < 30) leave K and the rest of the walk pending, both together register all 26 (rotation max
+< 0.5°); with the pan 0.5° narrower re-triangulation gives P3P its 30 points and the gyro is not
+used; the two-view mechanism in isolation; the order (P3P on the map as it is, re-triangulation,
+P3P, only then the gyro). src/sfm/mapper.test.ts the gyro path (26 / 17 good points register; 14 of
+44, a 7 × 9 px cluster, a prediction 20° off or none do not; a reversed baseline is refused; a P3P
+pose the gyro check rejects falls back to the known rotation). src/engine/gyro-registration.test.ts
+`LiveSession.predictRotation` against a synthetic orbit's exact IMU (nearest keyframe, ≤ 3 s, σ,
+the verified R_cam_device, independent of the gyro gates, IMU gaps).
 
-### Results (yard-real unless noted; `lost` = frames reported lost; ATE = Sim3 ATE / extent)
+### Results (2026-10-22, back to back: before = claude/next-level b2377c7, after = 97d4da1)
 
-| run | live kf reg | lost | offline SfM | model | ATE | rot° p50 | refine s |
-|---|---|---|---|---|---|---|---|
-| stride 3, before (lead's `s3-base` / `pre-s3`) | 19/48 / 19/48 | 38 / 38 | run (29 not reg.) | offline | 5.10e-4 / 5.41e-4 | 0.111 / 0.115 | 21.4 / 59.3 (load 18) |
-| stride 3, after: 9 of 10 runs | 48/48 | 0 | skipped | live | 4.88–5.21e-4 | 0.104–0.113 | 17.0–19.4 |
-| stride 3, after: 1 of 10 runs (`fin2`) | 23/48 | 31 | run (25) | offline | 1.22e-3 | 0.376 | 23.4 |
-| stride 3, gyro path only (no re-triangulation): 11 of 12 runs | 48/48 | 0 | skipped | live | 5.31–5.62e-4 | 0.089–0.099 | 22–53 |
-| stride 3, gyro path only: 1 of 12 runs (`gyro1`, load 20) | 21/48 | 34 | run | offline | 5.16e-4 | 0.124 | 76.3 |
-| stride 3, re-triangulation only (`gyroAidedRegistration: false`) | 48/48 | 0 | skipped | live | 5.32e-4 | 0.119 | 21.3 |
-| stride 3 from frame 1 (`--start 1`), before → after | 20/49 → 48/48 | 38 → 0 | run → skipped | offline (33/49 reg.) → live | 6.6e-4 → 9.8e-4 | 0.219 → 0.127 | 37.6 → 22.8 |
-| stride 3 from frame 2 (`--start 2`), before → after | 20/51 → 34/51 | 39 → 17 | run → run | offline 37/51 both | 1.75e-3 → 1.88e-3 | 0.341 → 0.409 | 35.9 → 39.9 |
-| stride 1, before (`pre-s1` / back-to-back `pre2-s1`) | 82/82 / 81/81 | 0 | run / skipped | offline / live | 2.49e-4 / 5.20e-4 | 0.078 / 0.102 | 149 / 51 |
-| stride 1, after (`fin-s1` / back-to-back `fin2-s1`) | 81/81 | 0 | skipped | live | 5.46e-4 / 5.51e-4 | 0.107 / 0.103 | 38 / 37 |
-| object-real stride 3, before → after | 50/50 | 0 | skipped | live | 5.94e-4 → 6.00e-4 | 0.209 → 0.192 | 49 → 18 |
-| object-real stride 1, before → after | 89/89 | 0 | skipped | live | 2.67e-4 → 2.73e-4 | 0.047 → 0.044 | 163 → 51 |
+Every run (`lost` = frames reported lost; model = live / offline with its registered keyframes;
+ATE = Sim3 ATE / scene extent; scale = metric scale error; refine s on the shared host; failed =
+`e2e/thresholds.json` checks that fail). The IMU scale estimator of claude/next-level fixed the
+stride-3 `scaleError` failure of 2026-10-21 on both sides.
 
-Every run passes the same `thresholds.json` checks before and after except where noted: yard-real
-at stride 3 fails `scaleError` before and after (−6.4 %: the IMU scale is rejected for too little
-excitation, 0.010 < 0.08 m/s², so GPS sets it); `--start 1` before also failed `registrationRate`
-and `gravityErrorDeg`, after only `scaleError`; `--start 2` and `fin2` fail ATE / rotation.
-Per run, re-triangulation registered 5 keyframes live at stride 3 and 1 at stride 1, the gyro path
-1 at stride 3 (2 and 2 in `fin2`) and none at stride 1 or on object-real.
+| run | live kf reg | lost | offline SfM | model (reg) | ATE | rot° p50 | scale % | refine s | failed |
+|---|---|---|---|---|---|---|---|---|---|
+| yard-real s3 from 0, before `b0-1` | 19/48 | 38 | run: 29 of 48 not reg. | offline (48) | 5.10e-04 | 0.111 | -1.4 | 26.0 | – |
+| yard-real s3 from 0, before `b0-2` | 19/48 | 38 | run: 29 of 48 not reg. | offline (48) | 5.10e-04 | 0.111 | -1.4 | 25.7 | – |
+| yard-real s3 from 0, before `b0-3` | 19/48 | 38 | run: 29 of 48 not reg. | offline (48) | 5.09e-04 | 0.111 | -1.4 | 27.1 | – |
+| yard-real s3 from 0, before `b0-4` | 19/48 | 38 | run: 29 of 48 not reg. | offline (48) | 5.10e-04 | 0.111 | -1.4 | 26.5 | – |
+| yard-real s3 from 0, before `b0-5` | 19/48 | 38 | run: 29 of 48 not reg. | offline (48) | 5.09e-04 | 0.111 | -1.4 | 27.4 | – |
+| yard-real s3 from 0, after `a0-1` | 48/48 | 0 | skipped | live (48) | 5.27e-04 | 0.118 | -0.8 | 22.3 | – |
+| yard-real s3 from 0, after `a0-2` | 48/48 | 0 | skipped | live (48) | 5.30e-04 | 0.119 | -0.9 | 21.9 | – |
+| yard-real s3 from 0, after `a0-3` | 48/48 | 0 | skipped | live (48) | 5.32e-04 | 0.119 | -0.9 | 22.8 | – |
+| yard-real s3 from 0, after `a0-4` | 48/48 | 0 | skipped | live (48) | 5.29e-04 | 0.120 | -0.9 | 22.9 | – |
+| yard-real s3 from 0, after `a0-5` | 48/48 | 0 | skipped | live (48) | 5.32e-04 | 0.119 | -0.9 | 23.3 | – |
+| yard-real s3 from 0, after `off0` (both new paths off) | 19/48 | 38 | run: 29 of 48 not reg. | offline (48) | 5.09e-04 | 0.112 | -1.4 | 25.4 | – |
+| yard-real s3 from 1, before `b1-1` | 20/49 | 38 | run: 29 of 49 not reg. | offline (33) | 6.64e-04 | 0.224 | -2.3 | 31.7 | registrationRate, gravityErrorDeg |
+| yard-real s3 from 1, before `b1-2` | 20/49 | 38 | run: 29 of 49 not reg. | offline (33) | 6.55e-04 | 0.229 | -2.4 | 27.4 | registrationRate, gravityErrorDeg |
+| yard-real s3 from 1, before `b1-3` | 20/49 | 38 | run: 29 of 49 not reg. | offline (33) | 6.61e-04 | 0.219 | -2.3 | 28.0 | registrationRate, gravityErrorDeg |
+| yard-real s3 from 1, before `b1-4` | 20/49 | 38 | run: 29 of 49 not reg. | offline (33) | 6.61e-04 | 0.225 | -2.4 | 31.8 | registrationRate, gravityErrorDeg |
+| yard-real s3 from 1, after `a1-1` | 48/48 | 0 | skipped | live (48) | 1.03e-03 | 0.142 | -0.5 | 26.6 | ateRelative |
+| yard-real s3 from 1, after `a1-2` | 48/48 | 0 | skipped | live (48) | 9.63e-04 | 0.139 | -0.7 | 22.4 | – |
+| yard-real s3 from 1, after `a1-3` | 48/48 | 0 | skipped | live (48) | 1.00e-03 | 0.127 | -0.4 | 27.7 | – |
+| yard-real s3 from 1, after `a1-4` | 48/48 | 0 | run: unclosed loop: far loop-like pairs | offline (48) | 9.63e-04 | 0.150 | -0.4 | 28.2 | – |
+| yard-real s3 from 2, before `b2-1` | 20/51 | 39 | run: 31 of 51 not reg. | offline (37) | 1.70e-03 | 0.323 | -2.1 | 33.3 | registrationRate, ateRelative, rotErrDegMedian |
+| yard-real s3 from 2, before `b2-2` | 20/51 | 39 | run: 31 of 51 not reg. | offline (37) | 1.78e-03 | 0.349 | -1.7 | 33.7 | registrationRate, ateRelative, rotErrDegMedian |
+| yard-real s3 from 2, after `a2-1` | 34/51 | 17 | run: 17 of 51 not reg. | offline (37) | 1.85e-03 | 0.405 | -1.4 | 34.5 | registrationRate, ateRelative, rotErrDegMedian |
+| yard-real s3 from 2, after `a2-2` | 34/51 | 17 | run: 17 of 51 not reg. | offline (37) | 1.84e-03 | 0.403 | -1.3 | 34.5 | registrationRate, ateRelative, rotErrDegMedian |
+| yard-real s3 from 2, before `sd11` (offline seed 11) | 20/51 | 39 | run: 31 of 51 not reg. | offline (37) | 1.78e-03 | 0.349 | -1.7 | 30.3 | registrationRate, ateRelative, rotErrDegMedian |
+| yard-real s3 from 2, before `sd12` (offline seed 12) | 20/51 | 39 | run: 31 of 51 not reg. | offline (37) | 1.78e-03 | 0.349 | -1.7 | 31.1 | registrationRate, ateRelative, rotErrDegMedian |
+| yard-real s3 from 2, before `sd13` (offline seed 13) | 20/51 | 39 | run: 31 of 51 not reg. | offline (37) | 1.78e-03 | 0.349 | -1.7 | 26.7 | registrationRate, ateRelative, rotErrDegMedian |
+| yard-real s3 from 2, after `sd11` (offline seed 11) | 34/51 | 17 | run: 17 of 51 not reg. | offline (37) | 1.84e-03 | 0.403 | -1.3 | 30.0 | registrationRate, ateRelative, rotErrDegMedian |
+| yard-real s3 from 2, after `sd12` (offline seed 12) | 34/51 | 17 | run: 17 of 51 not reg. | offline (37) | 1.80e-03 | 0.394 | -1.3 | 32.6 | registrationRate, ateRelative, rotErrDegMedian |
+| yard-real s3 from 2, after `sd13` (offline seed 13) | 34/51 | 17 | run: 17 of 51 not reg. | offline (37) | 1.84e-03 | 0.403 | -1.3 | 32.2 | registrationRate, ateRelative, rotErrDegMedian |
+| yard-real s3 from 2, before `nrs2` (no rolling shutter) | 20/51 | 39 | run: 31 of 51 not reg. | offline (37) | 1.68e-03 | 1.284 | -10.2 | 27.6 | registrationRate, ateRelative, rotErrDegMedian, scaleError, gravityErrorDeg |
+| yard-real s3 from 2, after `ers2` (no rolling shutter) | 34/51 | 17 | run: 17 of 51 not reg. | offline (37) | 1.87e-03 | 1.415 | -10.2 | 29.1 | registrationRate, ateRelative, rotErrDegMedian, scaleError, gravityErrorDeg |
+| yard-real s3 from 2, after `off2` (both new paths off) | 20/51 | 39 | run: 31 of 51 not reg. | offline (37) | 1.87e-03 | 0.394 | -2.0 | 29.1 | registrationRate, ateRelative, rotErrDegMedian |
+| object-real s3, before `bo3-1` | 50/50 | 0 | skipped | live (50) | 6.00e-04 | 0.198 | +1.1 | 22.9 | – |
+| object-real s3, before `bo3-2` | 50/50 | 0 | skipped | live (50) | 5.97e-04 | 0.199 | +1.1 | 22.5 | – |
+| object-real s3, after `ao3-1` | 50/50 | 0 | skipped | live (50) | 5.97e-04 | 0.198 | +1.1 | 22.3 | – |
+| object-real s3, after `ao3-2` | 50/50 | 0 | skipped | live (50) | 5.96e-04 | 0.201 | +1.1 | 19.3 | – |
+| yard-real s1, before `by1-1` | 81/81 | 0 | skipped | live (81) | 4.98e-04 | 0.099 | +0.9 | 37.6 | – |
+| yard-real s1, before `by1-2` | 81/81 | 0 | skipped | live (81) | 4.99e-04 | 0.100 | +0.9 | 46.2 | – |
+| yard-real s1, before `by1-3` | 81/81 | 0 | skipped | live (81) | 4.98e-04 | 0.101 | +1.0 | 36.5 | – |
+| yard-real s1, before `by1-4` | 81/81 | 0 | skipped | live (81) | 4.82e-04 | 0.098 | +0.8 | 61.0 | – |
+| yard-real s1, after `ay1-1` | 81/81 | 0 | run: unclosed loop: split counts | offline (81) | 3.63e-04 | 0.091 | +0.1 | 59.0 | – |
+| yard-real s1, after `ay1-2` | 81/81 | 0 | skipped | live (81) | 5.72e-04 | 0.100 | +1.2 | 44.6 | – |
+| yard-real s1, after `ay1-3` | 81/81 | 0 | skipped | live (81) | 5.67e-04 | 0.095 | +1.0 | 40.7 | – |
+| yard-real s1, after `ay1-4` | 81/81 | 0 | skipped | live (81) | 5.61e-04 | 0.107 | +1.2 | 63.0 | – |
+| yard-real s1, before `ls1` (live seed 1) | 81/81 | 0 | skipped | live (81) | 5.35e-04 | 0.107 | +1.1 | 50.5 | – |
+| yard-real s1, before `ls2` (live seed 2) | 81/81 | 0 | skipped | live (81) | 5.13e-04 | 0.100 | +1.1 | 58.7 | – |
+| yard-real s1, before `ls3` (live seed 3) | 81/81 | 0 | skipped | live (81) | 5.29e-04 | 0.102 | +1.2 | 46.2 | – |
+| yard-real s1, after `ls1` (live seed 1) | 81/81 | 0 | skipped | live (81) | 5.25e-04 | 0.100 | +0.8 | 60.2 | – |
+| yard-real s1, after `ls2` (live seed 2) | 81/81 | 0 | skipped | live (81) | 5.49e-04 | 0.105 | +0.9 | 44.0 | – |
+| yard-real s1, after `ls3` (live seed 3) | 81/81 | 0 | skipped | live (81) | 5.28e-04 | 0.098 | +0.9 | 45.1 | – |
+| yard-real s1, after `rt0s1` (re-triangulation off) | 81/81 | 0 | skipped | live (81) | 5.25e-04 | 0.101 | +0.9 | 47.5 | – |
+| object-real s1, before `bo1-1` | 89/89 | 0 | skipped | live (89) | 2.68e-04 | 0.047 | +0.3 | 57.2 | – |
+| object-real s1, before `bo1-2` | 89/89 | 0 | skipped | live (89) | 2.72e-04 | 0.042 | +0.3 | 49.0 | – |
+| object-real s1, after `ao1-1` | 89/89 | 0 | skipped | live (89) | 2.69e-04 | 0.045 | +0.4 | 56.5 | – |
+| object-real s1, after `ao1-2` | 89/89 | 0 | skipped | live (89) | 2.66e-04 | 0.045 | +0.3 | 56.0 | – |
+
+Summary: yard-real at stride 3 from frame 0 registers 48/48 live in 5 of 5 runs (before 19/48, 38
+of 80 frames lost) and skips the offline SfM (refine 22–23 s against 26–27 s); its live model is
+5.3e-4 / 0.12° against the before runs' offline model 5.1e-4 / 0.11° (the healthy-live-model
+trade-off of refine, as at stride 1; with both new paths off the after code gives the before
+result, 5.09e-4). From frame 1: 48/48 in 4 of 4 (before 20/49), all checks
+pass but one ATE of 1.03e-3 (limit 1e-3; before: `registrationRate` and `gravityErrorDeg` fail
+every run), and in `a1-4` the open loop was caught: offline SfM run, the gyro-aided offline model
+(48/48) chosen, 9.6e-4 — the case that ended at 1.8e-2 before this fix. From frame 2: unchanged
+failure (37/51 offline in both; ATE 1.80–1.87e-3 after, 1.70–1.78e-3 before, 1.87e-3 for the
+after code with both new paths off). object-real at stride 3 and both datasets at stride 1: within
+run-to-run noise (see the stride-1 note below); `ay1-1` ran the offline SfM for the older
+split-count rule (a live loop that did not close at stride 1) and kept the better offline model.
+
+Stride 1 (yard-real): the default-seed runs gave 5.6–5.7e-4 after against 4.8–5.0e-4 before. The only
+behavioural difference there: re-triangulation registers keyframe 64 (frame 192, the loop's corner: 12 map
+points → 129, P3P 129/129) at once, the before code three keyframes later in a retry. The live models
+before refine are alike (ATE 4.5–4.7e-3 on both sides); the difference arises in refine's loop closure,
+which is sensitive to such details: with the live mapper's seed changed (1–3) the before code gives
+5.13–5.35e-4 and the after code 5.25–5.49e-4, and the after code with re-triangulation off 5.25e-4. The
+perturbed runs' spread covers both sides (means 5.1 vs 5.5e-4 over 7 / 6 live runs — at most a small
+cost, far inside the 1e-3 limit); object-real is unchanged (2.66–2.72e-4).
+
+Superseded first implementation (2026-10-21, gyro path before re-triangulation, base 18d73c9):
+9 of 10 stride-3 runs 48/48 live (ATE 4.88–5.21e-4), 1 of 10 lost (`fin2`, above); gyro path alone
+11 of 12 runs 48/48 (5.31–5.62e-4); re-triangulation alone 48/48 (5.32e-4).
 
 ### Limits
 
 - Live mapping depends on the host's load (time-bounded BAs, the intrinsics the frame tracking
-  uses), so replays diverge from frame 57 on and the region past the pan is decided by a few points:
-  1 of 10 runs still lost the chain at frame 138. Its live model was poor (0.64 px), and the rolling
-  shutter estimated on it biased the keypoints the offline SfM then ran on (0.51 instead of 0.35 px):
-  ATE 1.22e-3, worse than the before runs' offline model.
-- `--start 2` still loses the loop's corner (frames 179–191, 13–20° per analysed frame for 6 s):
-  the keyframes there see 0–11 map points even after re-triangulation (fewer than the gyro path's 15).
-- An all-registered live model skips the offline SfM, so `liveModelHealth` alone must catch a live
-  loop that did not close: with the gyro path only, `--start 1` registered 49/49 but drifted 0.5 m /
-  3° at the loop's ends (ATE 6.9e-3) with just 16 loop-like split correspondences — healthy by its
-  rules. With re-triangulation the same replay closed the loop (9.8e-4).
+  uses), so runs diverge after the first pan; the phone-rate live focal is decided by the first
+  ≈ 8 keyframes and can be off by ±3 % (`--start 1` / `--start 2`), which only refine's loop closure
+  corrects. A loop refine does not close is now caught and handed to the offline SfM; when that
+  registers fewer keyframes than the live model (it kept 47 of 48 in one forced stride-3 run), the
+  open live model still wins on registered images.
+- `--start 2` still loses the loop's corner (frames 179–191): no map points to register on; bridging
+  it needs rotation-only tracking (gyro rotation with an unknown, later resolved translation).
+- An all-registered healthy live model is less accurate than a from-scratch offline model on some
+  inputs (stride 3 from frame 0: 5.3e-4 against 5.1e-4) — the time / accuracy trade-off of
+  `liveModelHealth`, unchanged here.
 - Not measured on a device; `abl-yard-shake` is not in this checkout (only `object-real` /
   `yard-real` datasets), so it was not replayed.
