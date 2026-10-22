@@ -1,7 +1,8 @@
 /**
  * Fly-through video on the GPU (headless Chromium): the splat layer's offscreen frames
  * (`Viewer.openSplatFrames`) equal SplatRenderer's own render of the same camera, the canvas and
- * readback VideoFrames hold those pixels, the viewer does not draw while a session is open (and
+ * readback VideoFrames hold those pixels (each frame its own, after the session's canvas checks
+ * keep it on the canvas path), the viewer does not draw while a session is open (and
  * redraws after), a hidden page holds the next frame back until it is visible again, and a closed
  * session rejects a waiting frame. Then the whole export: path → frames → VideoEncoder → MP4 →
  * VideoDecoder, frame count and PSNR against the directly read frames (skipped where this browser
@@ -110,16 +111,26 @@ describe('fly-through video (GPU)', () => {
     expect(lit).toBeGreaterThan(200);
     expect(maxDiff).toBeLessThanOrEqual(1);
 
-    // first frame of an 'auto' session: the canvas path when it verifies, else the readback
+    // the first frames of an 'auto' session check the canvas path (drawn over: kept, not stale);
+    // Chromium passes, so the session stays on it
     const f = await s.videoFrame(cam, 0, 33333);
     console.log(`[video-gpu] frame path ${s.path}${s.fallbackReason ? ` (${s.fallbackReason})` : ''}, format ${f.format}, ${f.codedWidth}×${f.codedHeight}`);
     expect([f.codedWidth, f.codedHeight]).toEqual([W, H]);
     expect(f.timestamp).toBe(0);
     expect(psnr(framePixels(f, W, H), px.data)).toBeGreaterThan(35);
     f.close();
-    const f2 = await s.videoFrame(camera(W, H, [0.4, -1.3, 0.7]), 33333, 33333);
+    const cam2 = camera(W, H, [0.4, -1.3, 0.7]);
+    const f2 = await s.videoFrame(cam2, 33333, 33333);
     expect(f2.timestamp).toBe(33333);
+    const px2 = await s.pixels(cam2);
+    // (a different image: frame 1 shown again would fail)
+    expect(psnr(px2.data, px.data)).toBeLessThan(30);
+    expect(psnr(framePixels(f2, W, H), px2.data)).toBeGreaterThan(35);
     f2.close();
+    const f2b = await s.videoFrame(cam, 66667);
+    expect(s.path, s.fallbackReason ?? '').toBe('canvas');
+    expect(psnr(framePixels(f2b, W, H), px.data)).toBeGreaterThan(35);
+    f2b.close();
 
     // a hidden page: nothing is submitted until it is visible again
     let hidden = true;
@@ -243,8 +254,9 @@ describe('fly-through video (GPU)', () => {
     const rep = await probeVideoExport(12);
     console.log(`[video-gpu] probe ${JSON.stringify(rep)}`);
     expect(rep.webCodecs).toBe(true);
-    // the frame path is probed with or without an encoder (SwiftShader Chromium: the canvas path)
-    expect(rep.framePath === 'canvas' || rep.framePath === 'readback').toBe(true);
+    // the frame path is probed with or without an encoder (Chromium: the canvas path, its frames
+    // kept once the canvas is drawn over and not stale)
+    expect(rep.framePath, rep.canvasNote ?? '').toBe('canvas');
     if (!rep.codecPortrait) {
       expect(rep.error).toMatch(/H\.264/);
       return;
@@ -252,6 +264,6 @@ describe('fly-through video (GPU)', () => {
     expect(rep.error).toBeNull();
     expect(rep.frames).toBe(12);
     expect(rep.msPerFrame).toBeGreaterThan(0);
-    if (rep.decoded !== null) expect(rep.decoded).toBe(12);
+    if (rep.decoded !== null) expect([rep.decoded, rep.decodedColours]).toEqual([12, true]);
   });
 });

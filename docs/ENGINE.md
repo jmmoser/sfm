@@ -237,7 +237,9 @@ stage runs from the viewer itself ("Photoreal model" in the Build sheet → `spl
 viewer's WebGPU splat layer and shown by default, and the export sheet offers 'ply-splat' and 'spz' (src/viewer/splat-layer.ts,
 research/viewer-rendering.md). With a splat model and an H.264 encoder (`VideoEncoder.isConfigSupported`) the export
 sheet also offers "Fly-through video (MP4)". This is no engine call: the page renders it from the viewer's splat
-layer (`Viewer.openSplatFrames`, one command buffer per frame). The camera path is src/viewer/flythrough.ts, the
-encoder WebCodecs H.264 at 30 fps and 6 Mbit/s, and the muxer src/io/mp4.ts (src/app/video-export.ts). The row shows
-progress and Cancel and then the two-tap Share / Save. The export stops when the page is hidden, when a photoreal
+layer (`Viewer.openSplatFrames`, one command buffer per frame). The camera path is src/viewer/flythrough.ts (an orbit
+or a walk as the user chose the capture mode, else as the engine resolved it: `refine` reports it as
+`stats.captureMode`), the encoder WebCodecs H.264 at 30 fps and 6 Mbit/s, and the muxer src/io/mp4.ts
+(src/app/video-export.ts). The row shows progress (updated in place, the sheet is not rebuilt per frame) and Cancel
+and then the two-tap Share / Save. The export stops when the page is hidden, when a photoreal
 build starts, or when the viewer is left. Diagnostics has "Test video encoding" (codec, frame path, encode speed).

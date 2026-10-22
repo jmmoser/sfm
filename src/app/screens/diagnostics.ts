@@ -18,9 +18,9 @@
  *
  * "Video export": `probeVideoExport` (src/app/video-export.ts) without a model. It reports the H.264
  * codec the fly-through export would use (portrait / landscape 720p), whether a VideoFrame of a
- * WebGPU OffscreenCanvas holds the rendered pixels (the 'canvas' frame path) or the export reads
- * frames back, the encode time per 720p frame, and whether the MP4 decodes again. Also part of
- * "Copy".
+ * WebGPU OffscreenCanvas holds the rendered pixels (the 'canvas' frame path; also once the canvas
+ * is drawn again, and not stale) or the export reads frames back, the encode time per 720p frame,
+ * and whether the MP4 decodes again with every frame in its own colour. Also part of "Copy".
  */
 import { startBenchmark, type BenchRun } from '../bench/bench';
 import { STATUS_LABEL, estimateLine, formatMs, qualityName, reportClipboardText, verdict } from '../bench/report';
@@ -488,7 +488,8 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
       rows.push(kvRow('Frame path', r.framePath === 'canvas' ? chip('WebGPU canvas', 'good', 'check') : r.framePath === 'readback' ? chip('Readback (slower)', 'warn') : chip('–', 'neutral')));
       if (r.canvasNote) rows.push(h('div', { class: 'row row-note' }, h('span', { class: 'row-sub', text: r.canvasNote })));
       if (r.msPerFrame !== null) rows.push(kvRow('Per 720p frame', h('span', { text: `${r.msPerFrame.toFixed(1)} ms (${r.frames} frames, ${formatBytes(r.bytes)})` })));
-      rows.push(kvRow('MP4 decodes', r.decoded === null ? chip('No decoder check', 'neutral') : chip(`${r.decoded} of ${r.frames} frames`, r.decoded === r.frames ? 'good' : 'bad')));
+      rows.push(kvRow('MP4 decodes', r.decoded === null ? chip('No decoder check', 'neutral') : chip(`${r.decoded} of ${r.frames} frames`, r.decoded === r.frames && r.decodedColours !== false ? 'good' : 'bad')));
+      if (r.decodeNote) rows.push(h('div', { class: 'row row-note' }, h('span', { class: 'row-sub', text: r.decodeNote })));
       if (r.error) rows.push(kvRow('Probe', chip(r.error, 'bad')));
     } else if (videoProbe.error) rows.push(kvRow('Probe', chip(videoProbe.error, 'bad')));
     const btn = button({

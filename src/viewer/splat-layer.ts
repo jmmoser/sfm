@@ -21,8 +21,11 @@
  * and the per-pixel buffers are sized to the video frame. A frame waits while the page is hidden,
  * and is drawn again when the page was hidden while it ran (dropped work) or when it overflowed the
  * intersection reservation. Frame source: `new VideoFrame(OffscreenCanvas 'webgpu')`. The first
- * frame of an 'auto' session checks it against a copy of the same texture (PSNR ≥ 35 dB), because
- * WebKit's VideoFrame-from-WebGPU-canvas path is unverified. The fallback copies the texture into a
+ * two frames of an 'auto' session check it, because WebKit's VideoFrame-from-WebGPU-canvas path is
+ * unverified: after the frame is taken the canvas is cleared to magenta (one small command buffer),
+ * then the frame must still match a copy of the rendered texture (PSNR ≥ 35 dB: it was snapshotted,
+ * not read when the encoder gets to it) and a new frame of the canvas must be magenta (not a stale
+ * texture). A failed check switches the session to the fallback, which copies the texture into a
  * MAP_READ buffer and builds the frame from those bytes ('RGBX' / 'BGRX' with the 256-byte row
  * stride, 3.9 MB per 720p frame).
  *
@@ -64,12 +67,17 @@ export interface SplatLayerOptions {
 /** Where an offscreen session's VideoFrames come from. */
 export type SplatFramePath = 'canvas' | 'readback';
 
+/** Frames of an 'auto' offscreen session that check the canvas path (see the file header). */
+const CANVAS_CHECK_FRAMES = 2;
+/** The colour the canvas is cleared to by that check (sRGB). */
+const CANVAS_CHECK_COLOUR: [number, number, number] = [1, 0, 1];
+
 export interface SplatOffscreenOptions {
   width: number;
   height: number;
   /** sRGB background in [0, 1] (default black). */
   background?: [number, number, number];
-  /** 'auto' (default): the canvas path when the session's first frame verifies, else the readback. */
+  /** 'auto' (default): the canvas path when the session's first frames verify, else the readback. */
   path?: 'auto' | SplatFramePath;
 }
 
@@ -450,6 +458,8 @@ export class SplatLayer {
     const bgra = this.format === 'bgra8unorm';
     const bytesPerRow = Math.ceil((4 * W) / 256) * 256;
     let path: SplatFramePath | null = o.path === 'canvas' || o.path === 'readback' ? o.path : null;
+    /** Frames left that check the canvas path ('auto'). */
+    let checksLeft = path === null ? CANVAS_CHECK_FRAMES : 0;
     let fallbackReason: string | null = null;
     let closed = false;
     let hiddenDuring = false;
@@ -499,18 +509,42 @@ export class SplatLayer {
       return ctx;
     };
 
+    /** Resolves when the page is visible and no other command buffer of the layer is in flight. */
+    const myTurn = async (): Promise<void> => {
+      for (;;) {
+        await whenVisible();
+        check();
+        if (!layer.inFlight) return;
+        await new Promise((r) => setTimeout(r, 2));
+      }
+    };
+
+    /** Clears the canvas texture to `rgb` (one small command buffer, awaited; again if the page was hidden meanwhile). */
+    const clearCanvas = async (rgb: [number, number, number]): Promise<void> => {
+      for (;;) {
+        await myTurn();
+        const enc = device0.createCommandEncoder({ label: 'splat-offscreen-check' });
+        enc.beginRenderPass({ colorAttachments: [{ view: ctx!.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store', clearValue: { r: rgb[0], g: rgb[1], b: rgb[2], a: 1 } }] }).end();
+        hiddenDuring = false;
+        device0.queue.submit([enc.finish()]);
+        layer.inFlight = true;
+        try {
+          await device0.queue.onSubmittedWorkDone();
+        } finally {
+          layer.inFlight = false;
+        }
+        check();
+        if (!hiddenDuring && !document.hidden) return;
+      }
+    };
+
     /** Draws one frame into `target` (+ the readback copy), awaited; drawn again after dropped work or an overflow. */
     const render = async (cam: SplatCamera, target: 'canvas' | 'texture', readback: boolean): Promise<void> => {
       if (cam.width !== W || cam.height !== H) throw new Error(`camera ${cam.width}×${cam.height} for a ${W}×${H} session`);
       for (;;) {
         // one heavy command buffer in flight: another frame (a screenshot, a second call) finishes
         // first; checked right before the synchronous encode + submit below
-        for (;;) {
-          await whenVisible();
-          check();
-          if (!layer.inFlight) break;
-          await new Promise((r) => setTimeout(r, 2));
-        }
+        await myTurn();
         const r = layer.renderer!;
         if (r.maxWidth !== W || r.maxHeight !== H) r.setMaxSize(W, H);
         const tex = target === 'canvas' ? ctx!.getCurrentTexture() : ownTexture();
@@ -579,7 +613,10 @@ export class SplatLayer {
       }
     };
 
-    /** First frame of an 'auto' session: is the canvas VideoFrame the rendered image? */
+    /**
+     * The first frames of an 'auto' session: is the canvas VideoFrame the rendered image, taken when
+     * it was made (not when the encoder reads it) and not a stale texture? Null: use the readback.
+     */
     const probeCanvas = async (cam: SplatCamera, timestamp: number, duration: number | undefined): Promise<VideoFrame | null> => {
       if (!canvasContext()) return null;
       let frame: VideoFrame | null = null;
@@ -596,6 +633,17 @@ export class SplatLayer {
         rb.unmap();
         const c2 = new OffscreenCanvas(W, H).getContext('2d', { willReadFrequently: true });
         if (!c2) throw new Error('no 2D canvas to check the frame');
+        // the canvas drawn over: a new frame must show it, and `frame` must keep its own image
+        await clearCanvas(CANVAS_CHECK_COLOUR);
+        const later = new VideoFrame(canvas!, { timestamp });
+        try {
+          c2.drawImage(later, 0, 0, W, H);
+        } finally {
+          later.close();
+        }
+        const mid = c2.getImageData(W >> 1, H >> 1, 1, 1).data;
+        if (CANVAS_CHECK_COLOUR.some((v, c) => Math.abs(mid[c] - 255 * v) > 24))
+          throw new Error(`a new canvas VideoFrame shows rgb(${mid[0]}, ${mid[1]}, ${mid[2]}) after the canvas was cleared to magenta (a stale snapshot)`);
         c2.drawImage(frame, 0, 0, W, H);
         const seen = c2.getImageData(0, 0, W, H).data;
         let se = 0;
@@ -603,7 +651,7 @@ export class SplatLayer {
         const mse = se / (3 * W * H);
         const psnr = mse > 0 ? 10 * Math.log10((255 * 255) / mse) : Infinity;
         if (frame.codedWidth !== W || frame.codedHeight !== H || psnr < 35)
-          throw new Error(`the canvas VideoFrame differs from the rendered image (${frame.codedWidth}×${frame.codedHeight}, PSNR ${psnr.toFixed(1)} dB)`);
+          throw new Error(`the canvas VideoFrame differs from the rendered image once the canvas is drawn over (${frame.codedWidth}×${frame.codedHeight}, PSNR ${psnr.toFixed(1)} dB)`);
         return frame;
       } catch (e) {
         frame?.close();
@@ -632,10 +680,15 @@ export class SplatLayer {
         return stats.frames;
       },
       async videoFrame(cam, timestampUs, durationUs) {
-        if (path === null) {
+        if (checksLeft > 0) {
           const f = await probeCanvas(cam, timestampUs, durationUs);
-          path = f ? 'canvas' : 'readback';
-          if (f) return f;
+          if (f) {
+            path = 'canvas';
+            checksLeft--;
+            return f;
+          }
+          path = 'readback';
+          checksLeft = 0;
         }
         if (path === 'canvas') {
           if (!canvasContext()) throw new Error(fallbackReason ?? 'no WebGPU OffscreenCanvas');

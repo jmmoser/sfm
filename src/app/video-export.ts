@@ -1,7 +1,8 @@
 /**
  * Fly-through video export (MP4, H.264), on the main thread next to the viewer. The camera path is
  * src/viewer/flythrough.ts (from the registered keyframes; depth from the sparse points; up = +Z
- * when gravity aligned, else estimated from the cameras). The frames come from the viewer's splat
+ * when gravity aligned, else estimated from the cameras; object or scene as the user chose, else as
+ * the engine resolved it, `stats.captureMode`). The frames come from the viewer's splat
  * layer (`Viewer.openSplatFrames`: one command buffer per frame, awaited). They are encoded with
  * WebCodecs `VideoEncoder` and muxed by src/io/mp4.ts.
  *
@@ -17,17 +18,22 @@
  * stream into the muxer (≈ 7.5 MB for 10 s at 6 Mbit/s). Cancel: an AbortSignal, checked per frame
  * (the encoder is closed and nothing is kept). The UI (`createVideoExport`) stops the export when
  * the page is hidden (iOS may drop GPU work and reclaim the encoder), and so does leaving the
- * viewer or starting a photoreal build. The frame source itself never submits while hidden.
+ * viewer or starting a photoreal build. The frame source itself never submits while hidden. While
+ * it renders, the row's progress line and bar are updated in place: the Export sheet is rebuilt
+ * only when the state changes, so a tap on Cancel (or another row) is not lost to a rebuild.
  *
  * `probeVideoExport` (Diagnostics) needs no model. It reports the codec, whether a VideoFrame of a
- * WebGPU OffscreenCanvas holds the rendered pixels (a cleared texture), the encode time per 720p
- * frame, and whether VideoDecoder reads the MP4 back. The first iPhone run thus tells which frame
- * path and codec the export will use. Measurements so far: docs/research/flythrough-video.md.
+ * WebGPU OffscreenCanvas holds the rendered pixels (a cleared texture; the frame must keep its
+ * colour once the canvas is cleared again, and a second frame must show the new colour, so a lazy
+ * or stale snapshot shows), the encode time per 720p frame, and whether VideoDecoder reads the MP4
+ * back with every frame in its own colour (consecutive frames differ by ≥ 89 levels). The first
+ * iPhone run thus tells which frame path and codec the export will use. Measurements so far:
+ * docs/research/flythrough-video.md.
  */
 import { saveFile } from '../io/download';
 import { Mp4Writer, readMp4 } from '../io/mp4';
 import { getGPU } from '../gpu/device';
-import type { SparseResult } from '../workers/protocol';
+import type { CaptureMode, SparseResult } from '../workers/protocol';
 import { buildFlythrough, flythroughCamera, flythroughTimestampUs, viewingDepth, type FlythroughCamera, type FlythroughPath } from '../viewer/flythrough';
 import { estimateUpVector } from '../viewer/helpers';
 import type { SplatFramePath, SplatOffscreen, SplatOffscreenOptions } from '../viewer/splat-layer';
@@ -185,13 +191,19 @@ export async function renderFlythroughVideo(o: FlythroughVideoOptions): Promise<
   };
 }
 
-/** The fly-through path of a sparse model (cameras in capture order). Null with fewer than 2 cameras. */
-export function flythroughForModel(sparse: Pick<SparseResult, 'cameras' | 'metric' | 'points'>): FlythroughPath | null {
+/**
+ * The fly-through path of a sparse model (cameras in capture order). Object or scene: `mode` when
+ * the user chose one, else the mode the engine resolved during the capture (`stats.captureMode`),
+ * else the engine's own test on all the cameras ('auto'). Null with fewer than 2 cameras.
+ */
+export function flythroughForModel(sparse: Pick<SparseResult, 'cameras' | 'metric' | 'points'> & Partial<Pick<SparseResult, 'stats'>>, mode: CaptureMode = 'auto'): FlythroughPath | null {
   const sorted = sparse.cameras.slice().sort((a, b) => a.id - b.id);
   const cams: FlythroughCamera[] = sorted.map((c) => ({ pose: c.pose, intrinsics: c.intrinsics }));
   const up = sparse.metric.gravityAligned ? [0, 0, 1] : (estimateUpVector(sorted.map((c) => ({ R: c.pose.R, upCam: c.upCam ?? null }))) ?? [0, 0, 1]);
   const depth = viewingDepth(cams, sparse.points.positions) ?? undefined;
-  return buildFlythrough(cams, { up, depth, fps: VIDEO_FPS });
+  const resolved = sparse.stats?.captureMode;
+  const m = mode !== 'auto' ? mode : resolved === 'object' || resolved === 'scene' ? resolved : 'auto';
+  return buildFlythrough(cams, { up, depth, fps: VIDEO_FPS, mode: m });
 }
 
 // ------------------------------------------------------------------------------- export sheet row
@@ -236,6 +248,9 @@ export function createVideoExport(host: VideoExportHost): VideoExportController 
   let abort: AbortController | null = null;
   let sharingUntil = 0;
   const bar = progressBar('Fly-through video');
+  /** The row's sub-line while rendering: updated in place (a sheet rebuild would eat taps). */
+  let liveSub: HTMLElement | null = null;
+  const progressText = (done: number, total: number): string => `Rendering frame ${done} of ${total}`;
   bar.el.style.marginTop = '6px';
   void videoExportSupported().then((ok) => {
     supported = ok;
@@ -273,7 +288,7 @@ export function createVideoExport(host: VideoExportHost): VideoExportController 
     const why = host.blocked();
     const sparse = app.results.sparse;
     if (why || !sparse) return;
-    const path = flythroughForModel(sparse);
+    const path = flythroughForModel(sparse, app.results.mode);
     if (!path) {
       state = { status: 'error', error: 'Not enough registered photos for a camera path' };
       return host.rerender();
@@ -293,7 +308,6 @@ export function createVideoExport(host: VideoExportHost): VideoExportController 
       const f = frames;
       // a cancel also stops a frame waiting for the page to become visible
       ctl.signal.addEventListener('abort', () => f.close(), { once: true });
-      let lastPaint = 0;
       const result = await renderFlythroughVideo({
         frames,
         path,
@@ -303,11 +317,7 @@ export function createVideoExport(host: VideoExportHost): VideoExportController 
           if (state.status !== 'rendering' || abort !== ctl) return;
           state = { status: 'rendering', done, total };
           bar.set(done / total);
-          const now = performance.now();
-          if (now - lastPaint > 250 || done === total) {
-            lastPaint = now;
-            host.rerender();
-          }
+          if (liveSub) liveSub.textContent = progressText(done, total);
         },
       });
       console.info(
@@ -360,8 +370,9 @@ export function createVideoExport(host: VideoExportHost): VideoExportController 
     const subEl = h('span', { class: 'export-sub' });
     text.appendChild(subEl);
     const el = h('div', { class: `export-item${state.status === 'error' ? ' error' : ''}`, 'data-testid': 'export-video' });
+    liveSub = state.status === 'rendering' ? subEl : null;
     if (state.status === 'rendering') {
-      sub = `Rendering frame ${state.done} of ${state.total}`;
+      sub = progressText(state.done, state.total);
       bar.set(state.total ? state.done / state.total : -1);
       text.appendChild(bar.el);
       action = button({ label: 'Cancel', variant: 'secondary', size: 'sm', testId: 'export-cancel-video', onClick: () => (stop(), host.rerender()) });
@@ -432,12 +443,41 @@ export interface VideoProbeReport {
   bytes: number;
   /** Frames VideoDecoder read back from the MP4 (null: no decoder for it). */
   decoded: number | null;
+  /** Every decoded frame shows its own colour (null: not decoded). */
+  decodedColours: boolean | null;
+  /** Which decoded frames showed the wrong colour. */
+  decodeNote: string | null;
   error: string | null;
 }
 
 /**
- * Encodes `frames` cleared 720 × 1280 frames (a colour ramp) through the export's frame path and
- * encoder into an MP4 and decodes it again. Needs no model; see the file header.
+ * Probe frame `i`'s colour (sRGB 0–1): red steps every frame, green every third, so a frame read
+ * late or stale (the previous one, or the first) shows up.
+ */
+export function probeColour(i: number): [number, number, number] {
+  return [0.15 + 0.35 * (i % 3), 0.15 + 0.35 * (Math.floor(i / 3) % 3), 0.45];
+}
+
+/** The colour (0–255) at the centre of an image source (a VideoFrame). */
+function centreColour(src: CanvasImageSource): [number, number, number] {
+  const c = new OffscreenCanvas(8, 8).getContext('2d', { willReadFrequently: true })!;
+  c.drawImage(src, 0, 0, 8, 8);
+  const px = c.getImageData(4, 4, 1, 1).data;
+  return [px[0], px[1], px[2]];
+}
+
+/** `seen` (0–255) is `want` (0–1) within `tol` levels per channel. */
+function sameColour(seen: ArrayLike<number>, want: ArrayLike<number>, tol: number): boolean {
+  for (let c = 0; c < 3; c++) if (Math.abs(seen[c] - Math.round(255 * want[c])) > tol) return false;
+  return true;
+}
+
+const rgbText = (c: ArrayLike<number>): string => `rgb(${Array.from(c).slice(0, 3).join(', ')})`;
+
+/**
+ * Encodes `frames` cleared 720 × 1280 frames (`probeColour`) through the export's frame path and
+ * encoder into an MP4 and decodes it again, checking every decoded frame's colour. Needs no model;
+ * see the file header.
  */
 export async function probeVideoExport(frames = 60): Promise<VideoProbeReport> {
   const W = 720;
@@ -452,6 +492,8 @@ export async function probeVideoExport(frames = 60): Promise<VideoProbeReport> {
     msPerFrame: null,
     bytes: 0,
     decoded: null,
+    decodedColours: null,
+    decodeNote: null,
     error: null,
   };
   if (!rep.webCodecs) return { ...rep, error: 'WebCodecs VideoEncoder is not available (older iOS or Lockdown Mode)' };
@@ -459,7 +501,7 @@ export async function probeVideoExport(frames = 60): Promise<VideoProbeReport> {
   rep.codecPortrait = cfg?.codec ?? null;
   rep.codecLandscape = (await chooseVideoConfig(H, W))?.codec ?? null;
   const gpu = typeof navigator !== 'undefined' && navigator.gpu ? await getGPU() : null;
-  const colour = (i: number): [number, number, number] => [0.8, 0.2 + (0.6 * i) / Math.max(1, frames - 1), 0.4];
+  const colour = probeColour;
   let make: (i: number, ts: number) => Promise<VideoFrame>;
   let cleanup = (): void => {};
   if (gpu) {
@@ -481,21 +523,29 @@ export async function probeVideoExport(frames = 60): Promise<VideoProbeReport> {
       ctx = null;
     }
     if (ctx && canvas) {
-      // does the canvas VideoFrame show the cleared colour?
-      const enc = device.createCommandEncoder();
-      clear(enc, ctx.getCurrentTexture().createView(), 0);
-      device.queue.submit([enc.finish()]);
-      await device.queue.onSubmittedWorkDone();
+      const c = ctx;
+      const draw = (i: number): Promise<undefined> => {
+        const enc = device.createCommandEncoder();
+        clear(enc, c.getCurrentTexture().createView(), i);
+        device.queue.submit([enc.finish()]);
+        return device.queue.onSubmittedWorkDone();
+      };
+      // does the canvas VideoFrame show the cleared colour, keep it once the canvas is cleared
+      // again (no lazy read when the encoder gets to it), and does a new one show the new colour?
+      await draw(0);
       try {
-        const f = new VideoFrame(canvas, { timestamp: 0 });
-        const c2 = new OffscreenCanvas(8, 8).getContext('2d', { willReadFrequently: true })!;
-        c2.drawImage(f, 0, 0, 8, 8);
-        f.close();
-        const px = c2.getImageData(4, 4, 1, 1).data;
-        const want = colour(0).map((v) => Math.round(255 * v));
-        const ok = Math.abs(px[0] - want[0]) <= 8 && Math.abs(px[1] - want[1]) <= 8 && Math.abs(px[2] - want[2]) <= 8;
-        if (ok) rep.framePath = 'canvas';
-        else rep.canvasNote = `the canvas VideoFrame shows rgb(${px[0]}, ${px[1]}, ${px[2]}), not rgb(${want.join(', ')})`;
+        const f0 = new VideoFrame(canvas, { timestamp: 0 });
+        await draw(1);
+        const f1 = new VideoFrame(canvas, { timestamp: 1 });
+        const seen0 = centreColour(f0);
+        const seen1 = centreColour(f1);
+        f0.close();
+        f1.close();
+        const want = (i: number): string => rgbText(colour(i).map((v) => Math.round(255 * v)));
+        if (!sameColour(seen0, colour(0), 8))
+          rep.canvasNote = `the canvas VideoFrame shows ${rgbText(seen0)}, not ${want(0)}${sameColour(seen0, colour(1), 8) ? ' (read lazily: the canvas was drawn again meanwhile)' : ''}`;
+        else if (!sameColour(seen1, colour(1), 8)) rep.canvasNote = `a second canvas VideoFrame shows ${rgbText(seen1)}, not ${want(1)} (a stale snapshot)`;
+        else rep.framePath = 'canvas';
       } catch (e) {
         rep.canvasNote = `new VideoFrame(OffscreenCanvas): ${(e as Error)?.message ?? e}`;
       }
@@ -553,7 +603,19 @@ export async function probeVideoExport(frames = 60): Promise<VideoProbeReport> {
     rep.frames = res.frames;
     rep.msPerFrame = res.msPerFrame;
     rep.bytes = res.blob.size;
-    rep.decoded = await decodeCount(new Uint8Array(await res.blob.arrayBuffer()));
+    // every decoded frame in its own colour (by its timestamp): a stale or late-read frame shows
+    let wrong = 0;
+    rep.decoded = await decodeCount(new Uint8Array(await res.blob.arrayBuffer()), (f) => {
+      const i = Math.round((f.timestamp * VIDEO_FPS) / 1e6);
+      const seen = centreColour(f);
+      if (sameColour(seen, colour(i), 24)) return;
+      if (!wrong) rep.decodeNote = `frame ${i} shows ${rgbText(seen)}, not ${rgbText(colour(i).map((v) => Math.round(255 * v)))}`;
+      wrong++;
+    });
+    if (rep.decoded !== null) {
+      rep.decodedColours = wrong === 0;
+      if (wrong) rep.decodeNote = `${wrong} of ${rep.decoded} decoded frames show the wrong colour; ${rep.decodeNote}`;
+    }
   } catch (e) {
     rep.error = (e as Error)?.message ?? String(e);
   } finally {

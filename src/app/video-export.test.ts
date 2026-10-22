@@ -181,4 +181,17 @@ describe('video export', () => {
     expect(Array.from(a.poses[50].t)).toEqual(Array.from(b.poses[50].t));
     expect(flythroughForModel({ ...sparse, cameras: cams.slice(0, 1) } as SparseResult)).toBeNull();
   });
+
+  it("flythroughForModel follows the user's capture mode, else the engine's resolved one", () => {
+    const cameras = OBJECT_REAL.poses.map((p, i) => ({ id: i, pose: { R: Float64Array.from(p.slice(0, 9)), t: Float64Array.from(p.slice(9, 12)) }, intrinsics: { ...OBJECT_REAL.intrinsics, k1: 0, k2: 0 } }));
+    const sparse = (stats: Record<string, string>): SparseResult =>
+      ({ cameras, metric: { gravityAligned: true }, points: { count: 0, positions: new Float32Array(0), colors: new Uint8Array(0) }, stats }) as unknown as SparseResult;
+    // an orbit: 'auto' finds the object …
+    expect(flythroughForModel(sparse({}))!.mode).toBe('object');
+    // … but "Large area" (or the engine having keyframed it as a scene) is a scene
+    expect(flythroughForModel(sparse({}), 'scene')!.mode).toBe('scene');
+    expect(flythroughForModel(sparse({ captureMode: 'scene' }))!.mode).toBe('scene');
+    expect(flythroughForModel(sparse({ captureMode: 'scene' }), 'object')!.mode).toBe('object');
+    expect(flythroughForModel(sparse({ captureMode: 'auto' }))!.mode).toBe('object');
+  });
 });

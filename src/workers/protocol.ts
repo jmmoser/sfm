@@ -232,6 +232,7 @@ export interface SparseResult {
   /**
    * Free-form statistics for the info sheet. Well-known keys (all optional): `images`,
    * `registeredImages`, `points`, `meanReprojErrorPx`, `meanTrackLength`, `focalPx`, `k1`, `k2`,
+   * `captureMode` (refine: 'object' | 'scene' as the capture resolved it, 'auto' when it never did),
    * and timings `<stage>Ms` (e.g. `matchingMs`, `reconstructionMs`, `alignmentMs`).
    */
   stats: Record<string, number | string>;

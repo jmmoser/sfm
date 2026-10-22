@@ -19,7 +19,7 @@
  *
  * Needs a hardware WebGPU adapter (the app's viewer refuses SwiftShader) and an H.264 encoder
  * (Google Chrome; Playwright's Chromium has none): run with E2E_GPU=host.
- *   E2E_GPU=host node e2e/ui/flythrough.mjs <runDir> [--out /tmp/sfm-flythrough] [--name object-real]
+ *   E2E_GPU=host node e2e/ui/flythrough.mjs <runDir> [--out /tmp/sfm-flythrough] [--name object-real] [--verbose]
  * --probe: only the Diagnostics "Test video encoding" probe (any browser, no run directory).
  *   node e2e/ui/flythrough.mjs --probe
  */
@@ -35,7 +35,9 @@ const opt = (k, d) => {
   return i >= 0 ? args[i + 1] : d;
 };
 const probeOnly = args.includes('--probe');
-const runDir = resolve(args.find((a, i) => !a.startsWith('--') && !(i > 0 && args[i - 1].startsWith('--') && args[i - 1] !== '--probe')) ?? '');
+// (the run directory: the first argument that is neither a flag nor the value of --out / --name)
+const VALUE_OPTIONS = ['--out', '--name'];
+const runDir = resolve(args.find((a, i) => !a.startsWith('--') && !(i > 0 && VALUE_OPTIONS.includes(args[i - 1]))) ?? '');
 if (!probeOnly && (!existsSync(join(runDir, 'result.json')) || !existsSync(join(runDir, 'splats.ply')))) {
   console.error('usage: E2E_GPU=host node e2e/ui/flythrough.mjs <runDir with result.json + splats.ply> [--out dir] [--name label] | --probe');
   process.exit(2);
@@ -121,7 +123,7 @@ try {
       const { flythroughCamera } = await import('/src/viewer/flythrough.ts');
       const app = globalThis.__sfmApp;
       const v = app.debug.viewer;
-      const path = ve.flythroughForModel(app.results.sparse);
+      const path = ve.flythroughForModel(app.results.sparse, app.results.mode);
       if (!path) return { error: 'no camera path' };
       const config = await ve.chooseVideoConfig(path.width, path.height, path.fps);
       if (!config) return { error: 'no H.264 encoder in this browser (run with E2E_GPU=host: Google Chrome)' };

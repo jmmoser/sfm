@@ -5,9 +5,10 @@
  * Chromium has no H.264 encoder, and its software VP8 takes ~0.5 s per 720p frame on a loaded
  * host; the real encoder loop is covered by video-export.gpu.test.ts). The MP4 is checked for
  * structure only.
- * Covered: Prepare → progress → Save (download); Cancel; a hidden page stops it; a photoreal build
- * (cancel while another job holds app.busy) leaves busy and the wake lock to it; dispose
- * mid-export lets them go at once. (Own file: the encoder support is cached per page.)
+ * Covered: Prepare → progress (updated in place: the row is not rebuilt) → Save (download);
+ * Cancel; a hidden page stops it; a photoreal build (cancel while another job holds app.busy)
+ * leaves busy and the wake lock to it; dispose mid-export lets them go at once. (Own file: the
+ * encoder support is cached per page.)
  */
 import { afterAll, describe, expect, it } from 'vitest';
 import { readMp4 } from '../io/mp4';
@@ -174,6 +175,12 @@ describe('video export row', () => {
     expect(t.app.busy).toBe(true);
     expect(t.app.wakeLock.active).toBe(true);
     expect(t.host.textContent).toMatch(/Rendering frame \d+ of 180/);
+    // the progress line is updated in place: the row (and its Cancel button) is not rebuilt, so a
+    // tap on it cannot fall between two versions of the button
+    const cancel = t.q('export-cancel-video');
+    const frameNo = (): number => Number(/Rendering frame (\d+) of/.exec(t.host.textContent ?? '')?.[1] ?? -1);
+    await waitFor(() => frameNo() >= 100);
+    expect(t.q('export-cancel-video')).toBe(cancel);
     await waitFor(() => !!t.q('export-save-video'), 120_000);
     expect(t.app.busy).toBe(false);
     expect(t.app.wakeLock.active).toBe(false);
