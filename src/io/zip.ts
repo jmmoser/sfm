@@ -10,6 +10,10 @@
  *    parts so large frame Blobs (from IndexedDB) are never copied into one
  *    contiguous buffer — peak memory is one streamed chunk, which matters on iOS.
  *  - `readZip` is a small STORE-only reader used by tests and imports.
+ *  - `align` (USDZ needs 64): each local header gets a padding extra field (id 0x1986, the id
+ *    Pixar's usdzip writer uses; zeros) so every entry's data starts at a multiple of `align`
+ *    bytes from the archive start. The central directory carries no extra fields (the APPNOTE
+ *    lets local and central extras differ), so readers that ignore extras are unaffected.
  */
 
 export interface ZipEntryInput {
@@ -37,6 +41,11 @@ export interface ZipEntry {
 export interface ZipOptions {
   /** Archive comment (UTF-8, ≤ 65 535 bytes). */
   comment?: string;
+  /**
+   * Start every entry's data at a multiple of this many bytes (padding extra field in the local
+   * header; integer 1–32 768, default 1 = no padding). USDZ requires 64.
+   */
+  align?: number;
 }
 
 export class ZipError extends Error {
@@ -59,6 +68,8 @@ const CENTRAL_HEADER_SIZE = 46;
 const EOCD_SIZE = 22;
 const FLAG_UTF8 = 0x0800;
 const VERSION = 20; // 2.0
+/** Extra-field header id of the alignment padding (as Pixar's UsdZipFileWriter). */
+const PAD_EXTRA_ID = 0x1986;
 
 // ---------------------------------------------------------------------------
 // CRC-32 (slicing-by-8)
@@ -183,6 +194,8 @@ interface EntryMeta {
   time: number;
   date: number;
   offset: number;
+  /** Length of the local header's padding extra field (0, or ≥ 4: id + size + zeros). */
+  pad: number;
 }
 
 function writeLocalHeader(dv: DataView, o: number, e: EntryMeta): number {
@@ -196,9 +209,15 @@ function writeLocalHeader(dv: DataView, o: number, e: EntryMeta): number {
   dv.setUint32(o + 18, e.size, true); // compressed
   dv.setUint32(o + 22, e.size, true); // uncompressed
   dv.setUint16(o + 26, e.name.length, true);
-  dv.setUint16(o + 28, 0, true); // extra length
+  dv.setUint16(o + 28, e.pad, true); // extra length
   new Uint8Array(dv.buffer, dv.byteOffset + o + LOCAL_HEADER_SIZE, e.name.length).set(e.name);
-  return o + LOCAL_HEADER_SIZE + e.name.length;
+  const x = o + LOCAL_HEADER_SIZE + e.name.length;
+  if (e.pad > 0) {
+    dv.setUint16(x, PAD_EXTRA_ID, true);
+    dv.setUint16(x + 2, e.pad - 4, true);
+    new Uint8Array(dv.buffer, dv.byteOffset + x + 4, e.pad - 4).fill(0);
+  }
+  return x + e.pad;
 }
 
 function writeCentralHeader(dv: DataView, o: number, e: EntryMeta): number {
@@ -262,6 +281,26 @@ function prepareComment(comment: string | undefined): Uint8Array {
   return c;
 }
 
+function prepareAlign(align: number | undefined): number {
+  const a = align ?? 1;
+  if (!Number.isInteger(a) || a < 1 || a > 32768) throw new ZipError(`Invalid alignment ${String(align)} (integer 1–32768)`);
+  return a;
+}
+
+/**
+ * Padding extra-field length that puts the data of an entry whose local header starts at `offset`
+ * on a multiple of `align`: 0, or ≥ 4 (a record needs its 4-byte id + size; 1–3 bytes short of
+ * the boundary pad to the next one instead).
+ */
+function padFor(offset: number, nameLength: number, align: number): number {
+  if (align <= 1) return 0;
+  const r = (offset + LOCAL_HEADER_SIZE + nameLength) % align;
+  if (r === 0) return 0;
+  let pad = align - r;
+  while (pad < 4) pad += align;
+  return pad;
+}
+
 function checkTotal(total: number): void {
   if (total > ZIP_MAX_SIZE) {
     throw new ZipError(`Archive would be ${(total / 2 ** 30).toFixed(2)} GiB; ZIP64 (> 4 GiB) is not supported`);
@@ -277,12 +316,18 @@ export function createZip(files: ZipEntryInput[], opts: ZipOptions = {}): Uint8A
   const now = new Date();
   const names = prepareNames(files.map((f) => f.name));
   const comment = prepareComment(opts.comment);
+  const align = prepareAlign(opts.align);
   const datas = files.map((f) => toBytes(f.data));
 
-  let total = EOCD_SIZE + comment.length;
+  // offsets (and the alignment padding they need) first, then one exact-size buffer
+  const pads = new Array<number>(files.length);
+  let total = 0;
   for (let i = 0; i < files.length; i++) {
-    total += LOCAL_HEADER_SIZE + CENTRAL_HEADER_SIZE + 2 * names[i].length + datas[i].length;
+    pads[i] = padFor(total, names[i].length, align);
+    total += LOCAL_HEADER_SIZE + names[i].length + pads[i] + datas[i].length;
   }
+  for (let i = 0; i < files.length; i++) total += CENTRAL_HEADER_SIZE + names[i].length;
+  total += EOCD_SIZE + comment.length;
   checkTotal(total);
 
   const out = new Uint8Array(total);
@@ -291,7 +336,7 @@ export function createZip(files: ZipEntryInput[], opts: ZipOptions = {}): Uint8A
   let o = 0;
   for (let i = 0; i < files.length; i++) {
     const { time, date } = dosDateTime(files[i].lastModified, now);
-    const e: EntryMeta = { name: names[i], crc: crc32(datas[i]), size: datas[i].length, time, date, offset: o };
+    const e: EntryMeta = { name: names[i], crc: crc32(datas[i]), size: datas[i].length, time, date, offset: o, pad: pads[i] };
     metas.push(e);
     o = writeLocalHeader(dv, o, e);
     out.set(datas[i], o);
@@ -328,6 +373,7 @@ export async function createZipBlob(files: ZipBlobEntryInput[], opts: ZipOptions
   const now = new Date();
   const names = prepareNames(files.map((f) => f.name));
   const comment = prepareComment(opts.comment);
+  const align = prepareAlign(opts.align);
 
   let total = EOCD_SIZE + comment.length;
   for (let i = 0; i < files.length; i++) {
@@ -362,9 +408,14 @@ export async function createZipBlob(files: ZipBlobEntryInput[], opts: ZipOptions
       crc = crc32(bytes);
     }
     const { time, date } = dosDateTime(files[i].lastModified, now);
-    const e: EntryMeta = { name: names[i], crc, size, time, date, offset: o };
+    const pad = padFor(o, names[i].length, align);
+    if (pad > 0) {
+      total += pad;
+      checkTotal(total);
+    }
+    const e: EntryMeta = { name: names[i], crc, size, time, date, offset: o, pad };
     metas.push(e);
-    const header = new Uint8Array(LOCAL_HEADER_SIZE + e.name.length);
+    const header = new Uint8Array(LOCAL_HEADER_SIZE + e.name.length + pad);
     writeLocalHeader(new DataView(header.buffer), 0, e);
     parts.push(header, part as BlobPart);
     o += header.length + size;
