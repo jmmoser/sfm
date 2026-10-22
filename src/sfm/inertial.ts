@@ -3,12 +3,19 @@
  *  (a) `estimateTimeOffset` — camera ↔ IMU clock offset by matching relative rotations of
  *      consecutive keyframes (SfM) with gyro-integrated rotations, jointly with a gyro bias;
  *  (a') `estimateTimeOffsetFromAcceleration` — the same offset from linear acceleration, for
- *      captures with too little angular acceleration (an offset error biases the scale);
+ *      captures with too little angular acceleration (an offset error biases the scale): the
+ *      offset minimising the misfit of (c), or at low keyframe rates of (c');
  *  (b) `estimateGravity` — gravity direction in the reconstruction frame from the specific
  *      force rotated into the world by the vision-anchored attitude;
  *  (c) `estimateMetricScale` — metres per reconstruction unit by regressing band-limited
  *      second derivatives of the visual camera-centre trajectory on the same operator applied
  *      to double-integrated world-frame IMU acceleration;
+ *  (c') `estimateMetricScaleFromIntervals` — the same scale from keyframe-interval
+ *      preintegration (velocity-free second differences over keyframes k ± m, Mur-Artal &
+ *      Tardós 2017 / VINS-Mono style), not band-limited by the keyframe rate: the fallback when
+ *      (c) lacks excitation, e.g. at phone keyframe rates of 1–2 /s (`world.ts`). Its σ holds the
+ *      IMU-noise attenuation κ, the time offset's σ (`offsetStdMs`) and an `accel` / `accelG`
+ *      cross-check;
  *  (d) `composeGravityAlignment` — rotation mapping the gravity direction to −Z.
  *
  * Conventions (ARCHITECTURE §2): keyframe rotations are camera-to-world `R_wc` (= pose Rᵀ),
@@ -17,18 +24,40 @@
  * t_cam was exposed at IMU time t_cam + offsetMs.
  *
  * Assumptions / limits: one constant gyro bias and constant accelerometer biases per capture;
- * the scale needs band-limited (0.3–3 Hz) acceleration ≥ 0.08 m/s² RMS (`excitationRms`), so
- * tripod-smooth motion comes out `reliable: false` (as does the gyro time offset of a smooth
- * constant-rate pan); segments are
- * split at keyframe gaps > 3 s and IMU gaps > 250 ms, and the gravity skips keyframe intervals
- * with an IMU gap (a capture continued later: one session, several segments). `estimateTimeOffset` costs ∝ keyframes ×
- * grid points (±250 ms at 2 ms, evaluated twice: 2000 keyframes ≈ 1 s per grid pass). When the
- * device hardly rotates, an uncompensated horizontal accelerometer bias b tilts gravity by ≈ b/g.
+ * (c) needs band-limited (0.3–3 Hz) acceleration ≥ 0.08 m/s² RMS (`excitationRms`) AS SAMPLED AT
+ * THE KEYFRAMES — its band ends at 0.4/h for keyframes h seconds apart, so at 1.2 keyframes/s
+ * only 0.3–0.48 Hz is left and a walk (turns below 0.3 Hz, sway / bob at 1–2 Hz) reads ≈ 0.01
+ * m/s². (c') needs the errors-in-variables attenuation κ by accelerometer white noise ≤ 2 %, with
+ * the noise per sample max(measured, 0.05 m/s²) (`accelNoiseLevel`: 8th differences, i.e. the
+ * 15–30 Hz band of a 60 Hz stream, blind to 8–12 Hz hand tremor; the floor covers an output the
+ * device low-passes, which would read low). κ is not corrected (the scale reads high by ≈ κ on
+ * synthetic data) but is part of σ. (c') reports `accel` (CoreMotion's gravity removal; an attitude
+ * error δθ costs it |a|·δθ against g·δθ for accelG − g) and refits `accelG` − g at the same span:
+ * the difference bounds an error of CoreMotion's gravity estimate during the slow accelerations
+ * (c') relies on and is added to σ (> 3 combined σ ⇒ unreliable) — no real iPhone recording has
+ * validated either source yet. Gentle orbits (centripetal acceleration ≲ 0.05 m/s²) stay
+ * unreliable in both: the centripetal term is degenerate with a device-frame bias along the
+ * optical axis. Tripod-smooth motion comes out `reliable: false` (as does the gyro time offset of
+ * a smooth constant-rate pan); segments are split at keyframe gaps > 3 s and IMU gaps > 250 ms,
+ * and the gravity skips keyframe intervals with an IMU gap (a capture continued later: one
+ * session, several segments).
+ * Accelerations are linear between IMU samples, which attenuates content at f by ≈ (π f Δt)²/3
+ * (0.4 % at 2 Hz for 60 Hz). `estimateTimeOffset` costs ∝ keyframes × grid points (±250 ms at
+ * 2 ms, evaluated twice: 2000 keyframes ≈ 1 s per grid pass). When the device hardly rotates, an
+ * uncompensated horizontal accelerometer bias b tilts gravity by ≈ b/g.
  *
  * Synthetic accuracy (extras-testutil: gyro noise 0.005 rad/s, bias ≈ 0.01; accel noise / bias
  * ≈ 0.05 m/s²; 2–4 Hz keyframes; 30 seeds): hand-held 0.4 m orbit scale rms 0.5 % (max 1.0 %),
  * 40 m walk rms 1.0 % (max 2.4 %); time offset max error < 1 ms; gravity rms 0.2° (orbit) /
  * 0.4° (walk); scale z-scores rms 0.8–0.95. `estimateInertialAlignment` ≈ 20–30 ms (Node).
+ * (c') with a 60 Hz IMU (docs/research/imu-scale.md, 30 seeds per cell): walk 0.8–4 keyframes/s
+ * rms 0.6–0.8 % (max 2.2 %), orbit 1.2–4 /s rms 0.6–1.2 % (max 2.4 %), z rms 0.66–1.05 (1.34
+ * for the walk at 3 /s, where (c) is used anyway); at 1.2 /s (c) is unreliable on every walk;
+ * at 0.8 /s 9 of 30 orbits pass the attenuation bound. A 0.15 m/s² accelerometer is rejected
+ * (κ 2–8 %) at 1.2 /s instead of read up to 9 % high. With the gyro offset unobservable, (a')
+ * on (c') finds the offset to 3.5–4.3 ms rms at 1.2 /s and the scale no longer depends on the
+ * default offset's error (≤ 50 ms tested). (c') ≈ 3–7 ms per source (Node, 45 keyframes, 60 Hz),
+ * two sources and two `offsetStdMs` refits in `computeWorldAlignment`; (a') on it ≈ 0.13 s.
  */
 import type { ImuSample, Mat3, Vec3 } from '../core/types';
 import { solveSPD } from '../math/decomp';
@@ -1174,7 +1203,10 @@ export interface MetricScaleOptions {
   minR2: number;
 }
 
-/** Result of `estimateMetricScale`. */
+/**
+ * Result of `estimateMetricScale` (`method` 'bandpass') and `estimateMetricScaleFromIntervals`
+ * ('intervals'); where the two differ, the field says so.
+ */
 export interface MetricScaleResult {
   /** Metres per reconstruction unit (multiply reconstruction coordinates by this). */
   scale: number;
@@ -1183,7 +1215,11 @@ export interface MetricScaleResult {
   reliable: boolean;
   /** Why it is unreliable ('' when reliable). */
   reason: string;
-  /** RMS of the band-limited IMU acceleration used (m/s²) — the excitation. */
+  /**
+   * The excitation (m/s²). 'bandpass': RMS of the band-limited IMU acceleration as sampled at the
+   * keyframes (gated by `minExcitation`). 'intervals': RMS hat-averaged acceleration D[P]/((h₁+h₂)/2)
+   * orthogonal to the bias columns (informative only; that estimator gates on `intervals.attenuation`).
+   */
   excitationRms: number;
   /** Explained variance of the visual signal. */
   r2: number;
@@ -1197,7 +1233,29 @@ export interface MetricScaleResult {
   numRows: number;
   numEffective: number;
   durationS: number;
-  source: 'accel' | 'accelG';
+  /** Acceleration used; 'accel+accelG' = `accel`, cross-checked against `accelG` ('intervals' only). */
+  source: 'accel' | 'accelG' | 'accel+accelG';
+  /** 'bandpass' = `estimateMetricScale`, 'intervals' = `estimateMetricScaleFromIntervals`. */
+  method: 'bandpass' | 'intervals';
+  /** Details of method 'intervals' (null for 'bandpass'). */
+  intervals: IntervalScaleDetails | null;
+}
+
+/** Details of a keyframe-interval scale (`estimateMetricScaleFromIntervals`). */
+export interface IntervalScaleDetails {
+  /** Errors-in-variables attenuation κ of the scale column by accelerometer noise (scale ≈ κ high; in σ, gated). */
+  attenuation: number;
+  /** Accelerometer white noise per sample (m/s²) behind κ: max(`accelNoiseMeasured`, `accelNoiseFloor`). */
+  accelNoise: number;
+  /** Level measured from the samples (`accelNoiseLevel`, m/s² per sample; NaN when too few). */
+  accelNoiseMeasured: number;
+  /** Mean half-span (s) of the second differences, and the span multiple c used (spans c·m₀). */
+  spanS: number;
+  spanMultiple: number;
+  /** Relative scale change for a time-offset error of ± `offsetStdMs` (in σ; 0 when not evaluated). */
+  offsetSensitivity: number;
+  /** ln(scale from `accel` / scale from `accelG`) for source 'accel+accelG', else null. */
+  sourceDisagreement: number | null;
 }
 
 const DEFAULT_SCALE: MetricScaleOptions = {
@@ -1262,43 +1320,95 @@ function doubleIntegrateAt(s: Float64Array, a: Float64Array, dim: number, q: Flo
   }
 }
 
+/** Binomial 8th-difference weights (−1)ᵏ C(8, k) and their white-noise gain √Σw² = √C(16, 8). */
+const D8 = [1, -8, 28, -56, 70, -56, 28, -8, 1];
+const D8_GAIN = Math.sqrt(12870);
+
 /**
- * Metric scale from IMU acceleration. With the same linear operator F (smoothing-spline
- * second derivative through the keyframe samples → uniform grid → zero-phase band-pass)
- * applied to the visual camera centres C_k and to the double-integrated world-frame IMU
- * acceleration P(τ_k) (R_wd from `AttitudeInterpolator`), the model
- *   F[C] = s₀ F[P] + c_w F[½t²] (+ F[∫∫R_wd] c_d)
- * holds exactly up to noise — aliasing of fast motion by the keyframe sampling affects both
- * sides identically, and drift from unknown initial velocity vanishes under F. Vision is the
- * regressand (its noise is larger after differentiation; IMU noise in the band is small, so
- * the errors-in-variables attenuation ≈ σ²_noise / var(F[P]) is small — ≈ 2 % only at the
- * `minExcitation` floor with 0.05 m/s² noise — and is not corrected). IRLS (Huber) least
- * squares; scale = 1/s₀.
- * The uncertainty is a Newey–West (HAC) sandwich estimate, since the band-limited, oversampled
- * residuals are strongly autocorrelated.
- * Unknowns c_w absorb a constant world-frame acceleration bias (e.g. gravity leakage when
- * accelG − g is used); c_d (optional) a device-frame accelerometer bias with a Gaussian prior.
+ * White-noise level (m/s² per sample and axis) of an accelerometer field, from the 8th differences
+ * of consecutive samples (gain |2 sin(π f Δt)|⁸ against √12870 for white noise, so at 60 Hz it
+ * measures the 15–30 Hz band: 8–12 Hz hand tremor is suppressed ≥ 30× relative to the noise — a
+ * 4th difference reads the e2e datasets' 0.4 m/s² of 10 Hz tremor as 0.059 m/s² of noise instead
+ * of their 0.040 — and slow hand motion contributes nothing), robust (MAD) over all axes; runs
+ * with a sample spacing outside 0.5–1.5× the median are skipped. NaN with fewer than 20
+ * differences. Timestamp jitter on moving samples counts as noise, as it does in the integration.
+ * An output the device low-passes below ≈ 20 Hz reads low (hence
+ * `IntervalScaleOptions.accelNoiseFloor`); footstep impacts read high.
  */
-export function estimateMetricScale(
-  keyframes: readonly InertialKeyframe[],
-  imu: readonly ImuSample[],
-  options: Partial<MetricScaleOptions> = {},
-): MetricScaleResult | null {
-  const o = { ...DEFAULT_SCALE, ...options };
-  const kf = sortKeyframes(keyframes);
-  const gyro = new GyroIntegrator(imu, o.gyroBias);
-  if (gyro.n < 2 || kf.length < o.minSegmentKeyframes) return null;
+export function accelNoiseLevel(samples: readonly ImuSample[], field: 'accel' | 'accelG'): number {
+  const s = samples.filter((x) => Number.isFinite(x.t) && finite3(x[field])).sort((a, b) => a.t - b.t);
+  const n = s.length;
+  const w = D8.length;
+  if (n < w + 4) return NaN;
+  const dt = new Float64Array(n - 1);
+  for (let i = 0; i + 1 < n; i++) dt[i] = s[i + 1].t - s[i].t;
+  const h = median(dt);
+  const d: number[] = [];
+  for (let i = 0; i + w <= n; i++) {
+    let ok = true;
+    for (let j = i; j < i + w - 1 && ok; j++) ok = dt[j] >= 0.5 * h && dt[j] <= 1.5 * h;
+    if (!ok) continue;
+    for (let c = 0; c < 3; c++) {
+      let v = 0;
+      for (let k = 0; k < w; k++) v += D8[k] * s[i + k][field]![c];
+      d.push(Math.abs(v));
+    }
+  }
+  return d.length >= 20 ? (1.4826 * median(d)) / D8_GAIN : NaN;
+}
+
+/** The options both scale estimators share (see `MetricScaleOptions`). */
+type ScaleInputOptions = Pick<
+  MetricScaleOptions,
+  'offsetMs' | 'gravity' | 'source' | 'estimateDeviceBias' | 'gyroBias' | 'maxGapMs' | 'maxImuGapMs' | 'minSegmentS' | 'minSegmentKeyframes'
+>;
+
+/** Keyframe-time samples of one contiguous trajectory segment (input of both scale estimators). */
+interface ScaleSegment {
+  /** Index of the segment's first keyframe in the time-sorted keyframes. */
+  k0: number;
+  /** Keyframe IMU times (s) from the segment start, strictly increasing. */
+  tk: Float64Array;
+  /** ∫∫ world-frame IMU acceleration from the segment start (zero position and velocity there), 3 per keyframe. */
+  P: Float64Array;
+  /** ∫∫ R_wd (device-frame bias columns), 9 per keyframe; zeros unless `estimateDeviceBias`. */
+  Dm: Float64Array;
+  durS: number;
+}
+
+/** Acceleration fields usable for the scale: 'auto' prefers `accel` (≥ half the samples); `accelG` needs `gravity`. */
+function scaleSources(imu: readonly ImuSample[], o: Pick<ScaleInputOptions, 'source' | 'gravity'>): { auto: 'accel' | 'accelG' | null; both: boolean } {
   let nAcc = 0,
     nAccG = 0;
   for (const s of imu) {
     if (finite3(s.accel)) nAcc++;
     if (finite3(s.accelG)) nAccG++;
   }
-  let source: 'accel' | 'accelG';
-  if (o.source === 'accel' || (o.source === 'auto' && nAcc >= 0.5 * imu.length && nAcc > 0)) source = 'accel';
-  else source = 'accelG';
-  if (source === 'accel' && nAcc === 0) return null;
-  if (source === 'accelG' && (nAccG === 0 || !o.gravity)) return null;
+  const okAcc = nAcc > 0,
+    okAccG = nAccG > 0 && !!o.gravity;
+  let auto: 'accel' | 'accelG' | null;
+  if (o.source === 'accel' || (o.source === 'auto' && nAcc >= 0.5 * imu.length && nAcc > 0)) auto = okAcc ? 'accel' : null;
+  else auto = okAccG ? 'accelG' : null;
+  return { auto, both: nAcc >= 0.5 * imu.length && nAccG >= 0.5 * imu.length && okAcc && okAccG };
+}
+
+/**
+ * Sorted keyframes, the acceleration source, its white-noise level (`accelNoiseLevel`), and per
+ * segment (split at keyframe gaps > `maxGapMs` and IMU gaps > `maxImuGapMs`; segments shorter than
+ * `minSegmentS` / `minSegmentKeyframes` dropped) the double-integrated world-frame IMU acceleration
+ * at the keyframe times, with the vision-anchored attitude (`AttitudeInterpolator`). Null without
+ * usable gyro or accelerometer data.
+ */
+function scaleInputs(
+  keyframes: readonly InertialKeyframe[],
+  imu: readonly ImuSample[],
+  o: ScaleInputOptions,
+): { kf: InertialKeyframe[]; source: 'accel' | 'accelG'; segments: ScaleSegment[]; imuDtS: number; accelNoise: number } | null {
+  const kf = sortKeyframes(keyframes);
+  const gyro = new GyroIntegrator(imu, o.gyroBias);
+  if (gyro.n < 2 || kf.length < o.minSegmentKeyframes) return null;
+  const source = scaleSources(imu, o).auto;
+  if (!source) return null;
   const gdown = o.gravity ? o.gravity.down : [0, 0, -1];
   const gn = Math.hypot(gdown[0], gdown[1], gdown[2]) || 1;
   const gmag = o.gravity?.magnitude ?? G0;
@@ -1351,12 +1461,7 @@ export function estimateMetricScale(
   }
   if (segStart >= 0) segments.push([segStart, kf.length - 1]);
 
-  const rowsY: number[] = [];
-  const rowsX: number[][] = [[], [], [], [], [], [], []];
-  const rowSeg: number[] = [];
-  let usedKf = 0,
-    usedSeg = 0,
-    dur = 0;
+  const out: ScaleSegment[] = [];
   const R = new Float64Array(9);
   for (const [s0i, s1i] of segments) {
     const nk = s1i - s0i + 1;
@@ -1399,6 +1504,182 @@ export function estimateMetricScale(
     const Dm = new Float64Array(9 * nk);
     doubleIntegrateAt(ss, aw, 3, tk, P);
     if (o.estimateDeviceBias) doubleIntegrateAt(ss, Rw, 9, tk, Dm);
+    out.push({ k0: s0i, tk, P, Dm, durS });
+  }
+  const dts = new Float64Array(ns - 1);
+  for (let i = 0; i + 1 < ns; i++) dts[i] = (st[i + 1] - st[i]) / 1000;
+  return { kf, source, segments: out, imuDtS: median(dts), accelNoise: accelNoiseLevel(samp, source) };
+}
+
+/** Result of `robustScaleFit`. */
+interface ScaleFit {
+  /** β₀ = s₀ (reconstruction units per metre), then the bias columns. */
+  beta: Float64Array;
+  /** Huber weights and residuals of the last pass. */
+  w: Float64Array;
+  r: Float64Array;
+  /** Var(ŝ₀): max(Newey–West within row blocks, iid value) × calibration² (+ the device-bias prior's spread with `priorVariance`). */
+  varS0: number;
+  /** Effective (decorrelated) row count. */
+  nEff: number;
+  /** R² with the Huber weights. */
+  r2: number;
+  /** (A⁻¹)₀₀ of the final weighted normal matrix (1 / partial sum of squares of the scale column). */
+  Ainv00: number;
+}
+
+/**
+ * Huber-IRLS least squares y ≈ X β (6 passes; column 0 the scale s₀, columns 1–3 the world-frame
+ * bias, 4–6 the optional device-frame bias with a Gaussian prior of σ `deviceBiasSigma` in m/s²)
+ * and a Newey–West (Bartlett) HAC variance of ŝ₀: influence gᵢ = wᵢ rᵢ (A⁻¹)₀· xᵢ, autocovariances
+ * summed within each contiguous block (`rowSeg`: segment × axis) up to `hacLagRows` (Newey & West
+ * 1987). Shared by both scale estimators. Null when the normal equations are singular.
+ */
+function robustScaleFit(
+  y: Float64Array,
+  X: Float64Array[],
+  rowSeg: readonly number[],
+  o: { deviceBias: boolean; deviceBiasSigma: number; hacLagRows: number; calibration: number; priorVariance: boolean },
+): ScaleFit | null {
+  const N = y.length;
+  const p = X.length;
+  const w = new Float64Array(N).fill(1);
+  const r = new Float64Array(N);
+  let beta: Float64Array = new Float64Array(p);
+  let ysq = 0;
+  for (let i = 0; i < N; i++) ysq += y[i] * y[i];
+
+  const solve = (prior: number): { beta: Float64Array; A: Float64Array } | null => {
+    const A = new Float64Array(p * p),
+      bv = new Float64Array(p);
+    for (let i = 0; i < N; i++) {
+      const wi = w[i];
+      if (wi === 0) continue;
+      for (let a = 0; a < p; a++) {
+        const xa = X[a][i] * wi;
+        if (xa === 0) continue;
+        bv[a] += xa * y[i];
+        for (let b = a; b < p; b++) A[a * p + b] += xa * X[b][i];
+      }
+    }
+    for (let a = 0; a < p; a++) for (let b = 0; b < a; b++) A[a * p + b] = A[b * p + a];
+    // prior < 0 ⇒ first pass: device-bias columns effectively excluded (prior unknown yet)
+    for (let a = 1; a < p; a++) A[a * p + a] += 1e-9 * N + (a >= 4 ? (prior < 0 ? 1e6 * A[a * p + a] + 1e-6 * N : prior) : 0);
+    const sol = solveSPD(A, p, bv);
+    return sol ? { beta: sol, A } : null;
+  };
+  let A: Float64Array = new Float64Array(p * p);
+  let prior = -1,
+    priorUsed = -1;
+  for (let it = 0; it < 6; it++) {
+    const res = solve(prior);
+    if (!res) return null;
+    priorUsed = prior;
+    beta = res.beta;
+    A = res.A;
+    for (let i = 0; i < N; i++) {
+      let f = 0;
+      for (let a = 0; a < p; a++) f += beta[a] * X[a][i];
+      r[i] = y[i] - f;
+    }
+    const absr = new Float64Array(N);
+    for (let i = 0; i < N; i++) absr[i] = Math.abs(r[i]);
+    const sig = Math.max(1.4826 * median(absr), 1e-12);
+    const kH = 2 * sig;
+    for (let i = 0; i < N; i++) w[i] = absr[i] <= kH ? 1 : kH / absr[i];
+    if (o.deviceBias) {
+      // prior on c_d = −s₀ b_d: variance (s₀ σ_b)² in units of y; ridge = σ_r² / var.
+      const s0 = Math.abs(beta[0]) || 1;
+      prior = (sig * sig) / Math.max((s0 * o.deviceBiasSigma) ** 2, 1e-300);
+    }
+  }
+  // Uncertainty.
+  let rss = 0,
+    sw = 0;
+  for (let i = 0; i < N; i++) {
+    rss += w[i] * r[i] * r[i];
+    sw += w[i];
+  }
+  const sigma2 = rss / Math.max(1, sw - p);
+  const e0 = new Float64Array(p);
+  e0[0] = 1;
+  const Ainv0 = solveSPD(A, p, e0);
+  let varS0 = Infinity,
+    nEff = 0;
+  if (Ainv0) {
+    const g = new Float64Array(N);
+    for (let i = 0; i < N; i++) {
+      let ax = 0;
+      for (let a = 0; a < p; a++) ax += Ainv0[a] * X[a][i];
+      g[i] = w[i] * r[i] * ax;
+    }
+    const L = Math.max(1, o.hacLagRows);
+    let v = 0;
+    for (let i = 0; i < N; i++) v += g[i] * g[i];
+    for (let l = 1; l <= L; l++) {
+      const kw = 1 - l / (L + 1);
+      let c = 0;
+      for (let i = 0; i + l < N; i++) if (rowSeg[i] === rowSeg[i + l]) c += g[i] * g[i + l];
+      v += 2 * kw * c;
+    }
+    v *= N / Math.max(1, N - p);
+    const iid = sigma2 * Ainv0[0];
+    varS0 = Math.max(v, iid) * o.calibration * o.calibration;
+    if (o.priorVariance && o.deviceBias && priorUsed > 0) {
+      // the prior's own spread: ĉ_d is shrunk towards 0 while c_d ~ N(0, (s₀σ_b)²) ⇒ the error
+      // −A⁻¹Λc_d adds Σ (A⁻¹)₀ₐ² λ² (s₀σ_b)² (the bias / scale degeneracy of orbits shows here)
+      const sb2 = (Math.abs(beta[0]) * o.deviceBiasSigma) ** 2;
+      for (let a = 4; a < p; a++) varS0 += Ainv0[a] * Ainv0[a] * priorUsed * priorUsed * sb2;
+    }
+    nEff = (N * iid) / varS0;
+  }
+  // R² with the robust (Huber) weights of the fit: one misregistered keyframe (a few rows with
+  // huge residuals) must not turn an excellent fit into R² ≈ 0 (e2e yard-real: the IMU scale was
+  // rejected for "R² 0.01" and the far less precise GPS scale used instead).
+  let rr = 0,
+    wy = 0;
+  for (let i = 0; i < N; i++) {
+    rr += w[i] * r[i] * r[i];
+    wy += w[i] * y[i] * y[i];
+  }
+  const r2 = ysq > 0 && wy > 0 ? 1 - rr / wy : 0;
+  return { beta, w, r, varS0, nEff, r2, Ainv00: Ainv0 ? Ainv0[0] : Infinity };
+}
+
+/**
+ * Metric scale from IMU acceleration. With the same linear operator F (smoothing-spline
+ * second derivative through the keyframe samples → uniform grid → zero-phase band-pass)
+ * applied to the visual camera centres C_k and to the double-integrated world-frame IMU
+ * acceleration P(τ_k) (R_wd from `AttitudeInterpolator`), the model
+ *   F[C] = s₀ F[P] + c_w F[½t²] (+ F[∫∫R_wd] c_d)
+ * holds exactly up to noise — aliasing of fast motion by the keyframe sampling affects both
+ * sides identically, and drift from unknown initial velocity vanishes under F. Vision is the
+ * regressand (its noise is larger after differentiation; IMU noise in the band is small, so
+ * the errors-in-variables attenuation ≈ σ²_noise / var(F[P]) is small — ≈ 2 % only at the
+ * `minExcitation` floor with 0.05 m/s² noise — and is not corrected). IRLS (Huber) least
+ * squares; scale = 1/s₀.
+ * The uncertainty is a Newey–West (HAC) sandwich estimate, since the band-limited, oversampled
+ * residuals are strongly autocorrelated.
+ * Unknowns c_w absorb a constant world-frame acceleration bias (e.g. gravity leakage when
+ * accelG − g is used); c_d (optional) a device-frame accelerometer bias with a Gaussian prior.
+ */
+export function estimateMetricScale(
+  keyframes: readonly InertialKeyframe[],
+  imu: readonly ImuSample[],
+  options: Partial<MetricScaleOptions> = {},
+): MetricScaleResult | null {
+  const o = { ...DEFAULT_SCALE, ...options };
+  const inp = scaleInputs(keyframes, imu, o);
+  if (!inp) return null;
+  const { kf, source } = inp;
+  const rowsY: number[] = [];
+  const rowsX: number[][] = [[], [], [], [], [], [], []];
+  const rowSeg: number[] = [];
+  let usedKf = 0,
+    usedSeg = 0,
+    dur = 0;
+  for (const { k0: s0i, tk, P, Dm, durS } of inp.segments) {
+    const nk = tk.length;
     // Channels per keyframe.
     const ch: Float64Array[] = [];
     for (let c = 0; c < NCH; c++) ch.push(new Float64Array(nk));
@@ -1453,106 +1734,20 @@ export function estimateMetricScale(
   const y = Float64Array.from(rowsY);
   const X: Float64Array[] = [];
   for (let c = 0; c < p; c++) X.push(Float64Array.from(rowsX[c]));
-  const w = new Float64Array(N).fill(1);
-  const r = new Float64Array(N);
-  let beta: Float64Array = new Float64Array(p);
   let excit = 0;
-  let ysq = 0;
-  for (let i = 0; i < N; i++) {
-    excit += X[0][i] * X[0][i];
-    ysq += y[i] * y[i];
-  }
+  for (let i = 0; i < N; i++) excit += X[0][i] * X[0][i];
   excit = Math.sqrt(excit / N);
-
-  const solve = (prior: number): { beta: Float64Array; A: Float64Array } | null => {
-    const A = new Float64Array(p * p),
-      bv = new Float64Array(p);
-    for (let i = 0; i < N; i++) {
-      const wi = w[i];
-      if (wi === 0) continue;
-      for (let a = 0; a < p; a++) {
-        const xa = X[a][i] * wi;
-        if (xa === 0) continue;
-        bv[a] += xa * y[i];
-        for (let b = a; b < p; b++) A[a * p + b] += xa * X[b][i];
-      }
-    }
-    for (let a = 0; a < p; a++) for (let b = 0; b < a; b++) A[a * p + b] = A[b * p + a];
-    // prior < 0 ⇒ first pass: device-bias columns effectively excluded (prior unknown yet)
-    for (let a = 1; a < p; a++) A[a * p + a] += 1e-9 * N + (a >= 4 ? (prior < 0 ? 1e6 * A[a * p + a] + 1e-6 * N : prior) : 0);
-    const sol = solveSPD(A, p, bv);
-    return sol ? { beta: sol, A } : null;
-  };
-  let A: Float64Array = new Float64Array(p * p);
-  let prior = -1;
-  for (let it = 0; it < 6; it++) {
-    const res = solve(prior);
-    if (!res) return null;
-    beta = res.beta;
-    A = res.A;
-    for (let i = 0; i < N; i++) {
-      let f = 0;
-      for (let a = 0; a < p; a++) f += beta[a] * X[a][i];
-      r[i] = y[i] - f;
-    }
-    const absr = new Float64Array(N);
-    for (let i = 0; i < N; i++) absr[i] = Math.abs(r[i]);
-    const sig = Math.max(1.4826 * median(absr), 1e-12);
-    const kH = 2 * sig;
-    for (let i = 0; i < N; i++) w[i] = absr[i] <= kH ? 1 : kH / absr[i];
-    if (o.estimateDeviceBias) {
-      // prior on c_d = −s₀ b_d: variance (s₀ σ_b)² in units of y; ridge = σ_r² / var.
-      const s0 = Math.abs(beta[0]) || 1;
-      prior = (sig * sig) / Math.max((s0 * o.deviceBiasSigma) ** 2, 1e-300);
-    }
-  }
-  // Uncertainty.
-  let rss = 0,
-    sw = 0;
-  for (let i = 0; i < N; i++) {
-    rss += w[i] * r[i] * r[i];
-    sw += w[i];
-  }
-  const sigma2 = rss / Math.max(1, sw - p);
-  const e0 = new Float64Array(p);
-  e0[0] = 1;
-  const Ainv0 = solveSPD(A, p, e0);
-  // Newey–West (Bartlett) HAC variance of ŝ₀: influence gᵢ = wᵢ rᵢ (A⁻¹)₀· xᵢ, autocovariances
-  // summed within each contiguous block (segment × axis) up to `hacLagS` (Newey & West 1987).
-  let varS0 = Infinity,
-    nEff = 0;
-  if (Ainv0) {
-    const g = new Float64Array(N);
-    for (let i = 0; i < N; i++) {
-      let ax = 0;
-      for (let a = 0; a < p; a++) ax += Ainv0[a] * X[a][i];
-      g[i] = w[i] * r[i] * ax;
-    }
-    const L = Math.max(1, Math.ceil(o.hacLagS * o.gridHz));
-    let v = 0;
-    for (let i = 0; i < N; i++) v += g[i] * g[i];
-    for (let l = 1; l <= L; l++) {
-      const kw = 1 - l / (L + 1);
-      let c = 0;
-      for (let i = 0; i + l < N; i++) if (rowSeg[i] === rowSeg[i + l]) c += g[i] * g[i + l];
-      v += 2 * kw * c;
-    }
-    const iid = sigma2 * Ainv0[0];
-    varS0 = Math.max(v * (N / Math.max(1, N - p)), iid) * HAC_CALIBRATION * HAC_CALIBRATION;
-    nEff = (N * iid) / varS0;
-  }
+  const fit = robustScaleFit(y, X, rowSeg, {
+    deviceBias: o.estimateDeviceBias,
+    deviceBiasSigma: o.deviceBiasSigma,
+    hacLagRows: Math.ceil(o.hacLagS * o.gridHz),
+    calibration: HAC_CALIBRATION,
+    priorVariance: false,
+  });
+  if (!fit) return null;
+  const { beta, varS0, nEff, r2 } = fit;
   const s0 = beta[0];
   const relUnc = Math.sqrt(Math.max(varS0, 0)) / Math.abs(s0);
-  // R² with the robust (Huber) weights of the fit: one misregistered keyframe (a few rows with
-  // huge residuals) must not turn an excellent fit into R² ≈ 0 (e2e yard-real: the IMU scale was
-  // rejected for "R² 0.01" and the far less precise GPS scale used instead).
-  let rr = 0,
-    wy = 0;
-  for (let i = 0; i < N; i++) {
-    rr += w[i] * r[i] * r[i];
-    wy += w[i] * y[i] * y[i];
-  }
-  const r2 = ysq > 0 && wy > 0 ? 1 - rr / wy : 0;
   const reasons: string[] = [];
   if (!(s0 > 0)) reasons.push('non-positive scale');
   if (excit < o.minExcitation) reasons.push(`insufficient excitation (${excit.toFixed(3)} m/s² < ${o.minExcitation})`);
@@ -1574,7 +1769,336 @@ export function estimateMetricScale(
     numEffective: nEff,
     durationS: dur,
     source,
+    method: 'bandpass',
+    intervals: null,
   };
+}
+
+/** Options of `estimateMetricScaleFromIntervals` (the shared fields as in `MetricScaleOptions`). */
+export interface IntervalScaleOptions extends ScaleInputOptions {
+  /** Prior σ (m/s²) of the device-frame bias (default 0.05). */
+  deviceBiasSigma: number;
+  /**
+   * Second differences span keyframes k − m, k, k + m. Candidates m = c·m₀ (c = 1, 2, …), m₀ the
+   * smallest m whose median half-span (t_{k+m} − t_{k−m})/2 reaches `minSpanS` (default 0.25 s),
+   * up to a half-span of `maxSpanS` (default 2 s); the candidate with the smallest σ is returned.
+   */
+  minSpanS: number;
+  maxSpanS: number;
+  /** Fit only c = `spanMultiple` instead of selecting it (default 0 = select). */
+  spanMultiple: number;
+  /** Max lag (s) of the Newey–West uncertainty estimate (default 3). */
+  hacLagS: number;
+  /**
+   * Floor (m/s² per sample, default 0.05) of the accelerometer white noise behind the attenuation
+   * κ; the level measured from the samples (`accelNoiseLevel`) is used when it is higher.
+   */
+  accelNoiseFloor: number;
+  /**
+   * 1-σ (ms) of `offsetMs` (default 0 = exact): when > 0, the larger relative scale change at
+   * offsetMs ± offsetStdMs is added to σ in quadrature (`intervals.offsetSensitivity`).
+   */
+  offsetStdMs: number;
+  /**
+   * Source 'auto' with both `accel` and `accelG` (and `gravity`): both are fitted, the `accel` one is
+   * returned with their difference in σ; further apart than this many combined σ (default 3) ⇒
+   * unreliable.
+   */
+  maxSourceDisagreementSigma: number;
+  /** Reliability thresholds: attenuation (0.02), rel. σ (0.05), R² (0.5), rows (30). */
+  maxAttenuation: number;
+  maxRelUncertainty: number;
+  minR2: number;
+  minRows: number;
+}
+
+const DEFAULT_INTERVAL_SCALE: IntervalScaleOptions = {
+  offsetMs: 0,
+  gravity: null,
+  source: 'auto',
+  estimateDeviceBias: true,
+  deviceBiasSigma: 0.05,
+  gyroBias: null,
+  maxGapMs: 3000,
+  maxImuGapMs: 250,
+  minSegmentS: 3,
+  minSegmentKeyframes: 6,
+  minSpanS: 0.25,
+  maxSpanS: 2,
+  spanMultiple: 0,
+  hacLagS: 3,
+  accelNoiseFloor: 0.05,
+  offsetStdMs: 0,
+  maxSourceDisagreementSigma: 3,
+  maxAttenuation: 0.02,
+  maxRelUncertainty: 0.05,
+  minR2: 0.5,
+  minRows: 30,
+};
+
+/**
+ * Empirical factor on the HAC σ of `estimateMetricScaleFromIntervals`: Monte Carlo over the IMU
+ * noise of one synthetic walk (3 keyframes/s, 1.2 s spans) gave a true σ 1.15–1.25× the plain
+ * Newey–West σ (heavily overlapping rows, few effective samples); with 1.2 the 30-seed sweeps of
+ * docs/research/imu-scale.md give z rms 0.7–1.1.
+ */
+const INTERVAL_HAC_CALIBRATION = 1.2;
+
+/** Why a keyframe-interval scale is unreliable (`extra` first), from its fields. */
+function intervalReasons(r: MetricScaleResult, o: IntervalScaleOptions, extra: readonly string[] = []): string[] {
+  const iv = r.intervals!;
+  const reasons = [...extra];
+  if (!(r.scale > 0)) reasons.push('non-positive scale');
+  if (r.numRows < o.minRows) reasons.push(`too few intervals (${r.numRows / 3} < ${Math.ceil(o.minRows / 3)})`);
+  if (!(iv.attenuation <= o.maxAttenuation))
+    reasons.push(
+      `IMU-noise attenuation κ ${(100 * iv.attenuation).toFixed(1)} % > ${(100 * o.maxAttenuation).toFixed(0)} % (accel noise ${iv.accelNoise.toFixed(3)} m/s², hat-averaged acceleration ${r.excitationRms.toFixed(3)} m/s²)`,
+    );
+  if (!(r.relUncertainty <= o.maxRelUncertainty)) reasons.push(`uncertainty ${(100 * r.relUncertainty).toFixed(1)} % > ${(100 * o.maxRelUncertainty).toFixed(0)} %`);
+  if (!(r.r2 >= o.minR2)) reasons.push(`poor fit (R² ${r.r2.toFixed(2)})`);
+  return reasons;
+}
+
+function withReasons(r: MetricScaleResult, reasons: string[]): MetricScaleResult {
+  return { ...r, reliable: reasons.length === 0, reason: reasons.join('; ') };
+}
+
+type ScaleInputsResult = NonNullable<ReturnType<typeof scaleInputs>>;
+
+/** Median half-span (s) of second differences over keyframes k ± m. */
+function intervalHalfSpan(tk: Float64Array, m: number): number {
+  const half = new Float64Array(tk.length - 2 * m);
+  for (let k = m; k + m < tk.length; k++) half[k - m] = (tk[k + m] - tk[k - m]) / 2;
+  return median(half);
+}
+
+/** Base span m₀ per segment: the smallest m whose median half-span reaches `minSpanS`. */
+function intervalBaseSpans(inp: ScaleInputsResult, o: IntervalScaleOptions): number[] {
+  return inp.segments.map(({ tk }) => {
+    let m = 1;
+    while (2 * m + 4 <= tk.length && intervalHalfSpan(tk, m) < o.minSpanS) m++;
+    return m;
+  });
+}
+
+/**
+ * The interval regression of one acceleration source with spans c·m₀ (null: no usable segment;
+ * undefined: every span is beyond `maxSpanS`). See `estimateMetricScaleFromIntervals`.
+ */
+function fitIntervalSpan(inp: ScaleInputsResult, base: number[], c: number, o: IntervalScaleOptions): MetricScaleResult | null | undefined {
+  const { kf, source } = inp;
+  const p = o.estimateDeviceBias ? 7 : 4;
+  const accelNoise = Math.max(o.accelNoiseFloor, Number.isFinite(inp.accelNoise) ? inp.accelNoise : 0);
+  const noiseDensity2 = accelNoise * accelNoise * inp.imuDtS;
+  const rowsY: number[] = [];
+  const rowsX: number[][] = [];
+  for (let j = 0; j < p; j++) rowsX.push([]);
+  const rowSeg: number[] = [];
+  let noise = 0,
+    usedKf = 0,
+    usedSeg = 0,
+    dur = 0,
+    lagRows = 1,
+    spanSum = 0,
+    within = false;
+  const rowNoise: number[] = [];
+  const rowHalf: number[] = [];
+  inp.segments.forEach(({ k0, tk, P, Dm, durS }, si) => {
+    const nk = tk.length;
+    const m = c * base[si];
+    if (nk - 2 * m < 3) return;
+    const span = intervalHalfSpan(tk, m);
+    if (c > 1 && span > o.maxSpanS) return;
+    within = true;
+    lagRows = Math.max(lagRows, 2 * m, Math.ceil((o.hacLagS * (nk - 1)) / durS));
+    for (let ax = 0; ax < 3; ax++) {
+      for (let k = m; k + m < nk; k++) {
+        const a = k - m,
+          b = k + m;
+        const ca = 1 / (tk[k] - tk[a]),
+          cb = 1 / (tk[b] - tk[k]),
+          ck = -(ca + cb);
+        const half = (tk[b] - tk[a]) / 2;
+        rowsY.push(ca * kf[k0 + a].C[ax] + ck * kf[k0 + k].C[ax] + cb * kf[k0 + b].C[ax]);
+        rowsX[0].push(ca * P[3 * a + ax] + ck * P[3 * k + ax] + cb * P[3 * b + ax]);
+        for (let j = 0; j < 3; j++) rowsX[1 + j].push(ax === j ? half : 0);
+        if (o.estimateDeviceBias)
+          for (let j = 0; j < 3; j++) {
+            const q = 3 * ax + j;
+            rowsX[4 + j].push(ca * Dm[9 * a + q] + ck * Dm[9 * k + q] + cb * Dm[9 * b + q]);
+          }
+        rowSeg.push(usedSeg * 3 + ax);
+        // var(D[noise]) = σ_a² Δt ∫Λ² = σ_a² Δt (h₁ + h₂)/3
+        rowNoise.push((noiseDensity2 * 2 * half) / 3);
+        rowHalf.push(half);
+      }
+    }
+    usedKf += nk;
+    usedSeg++;
+    dur += durS;
+    spanSum += span * nk;
+  });
+  if (!within) return undefined;
+  const N = rowsY.length;
+  if (N < 9) return null;
+  const fit = robustScaleFit(
+    Float64Array.from(rowsY),
+    rowsX.map((col) => Float64Array.from(col)),
+    rowSeg,
+    { deviceBias: o.estimateDeviceBias, deviceBiasSigma: o.deviceBiasSigma, hacLagRows: lagRows, calibration: INTERVAL_HAC_CALIBRATION, priorVariance: true },
+  );
+  if (!fit) return null;
+  const { beta, varS0, nEff, r2, w, Ainv00 } = fit;
+  // Attenuation κ = Σ wᵢ var(noise of D[P]ᵢ) / (partial Σ wᵢ x̃ᵢ² = 1/(A⁻¹)₀₀).
+  let hw = 0;
+  for (let i = 0; i < N; i++) {
+    noise += w[i] * rowNoise[i];
+    hw += w[i] * rowHalf[i] * rowHalf[i];
+  }
+  const attenuation = Number.isFinite(Ainv00) ? noise * Ainv00 : Infinity;
+  const excit = Number.isFinite(Ainv00) && Ainv00 > 0 && hw > 0 ? Math.sqrt(1 / Ainv00 / hw) : 0;
+  const s0 = beta[0];
+  const invS0 = s0 !== 0 ? 1 / s0 : NaN;
+  const r: MetricScaleResult = {
+    scale: invS0,
+    relUncertainty: Math.hypot(Math.sqrt(Math.max(varS0, 0)) / Math.abs(s0), attenuation),
+    reliable: false,
+    reason: '',
+    excitationRms: excit,
+    r2,
+    biasWorld: Float64Array.of(-beta[1] * invS0, -beta[2] * invS0, -beta[3] * invS0),
+    biasDevice: o.estimateDeviceBias ? Float64Array.of(-beta[4] * invS0, -beta[5] * invS0, -beta[6] * invS0) : null,
+    numKeyframes: usedKf,
+    numSegments: usedSeg,
+    numRows: N,
+    numEffective: nEff,
+    durationS: dur,
+    source,
+    method: 'intervals',
+    intervals: {
+      attenuation,
+      accelNoise,
+      accelNoiseMeasured: inp.accelNoise,
+      spanS: spanSum / usedKf,
+      spanMultiple: c,
+      offsetSensitivity: 0,
+      sourceDisagreement: null,
+    },
+  };
+  return withReasons(r, intervalReasons(r, o));
+}
+
+/** The most precise span of one source (a reliable one if there is any), or span c = `spanMultiple`. */
+function fitIntervalSpans(inp: ScaleInputsResult, o: IntervalScaleOptions): MetricScaleResult | null {
+  const base = intervalBaseSpans(inp, o);
+  if (o.spanMultiple >= 1) return fitIntervalSpan(inp, base, Math.round(o.spanMultiple), o) ?? null;
+  let best: MetricScaleResult | null = null;
+  for (let c = 1; ; c++) {
+    const r = fitIntervalSpan(inp, base, c, o);
+    if (r === undefined) break;
+    if (!r || !Number.isFinite(r.relUncertainty)) continue;
+    if (!best || (r.reliable && !best.reliable) || (r.reliable === best.reliable && r.relUncertainty < best.relUncertainty)) best = r;
+  }
+  return best;
+}
+
+/**
+ * Cross-check of the two gravity removals at the same span: `accel` (CoreMotion's userAcceleration,
+ * gravity from its attitude filter) and `accelG` − g (gravity removed with the vision-anchored
+ * attitude). The `accel` estimate is kept: an attitude error δθ enters its world acceleration as
+ * |a|·δθ, but `accelG` − g as g·δθ, 10–30× more (e2e yard-real stride 3: the two agree to 0.2 % on
+ * the GT poses and differ by 2.4 % on the reconstructed ones). What `accel` alone cannot show is a
+ * systematic error of CoreMotion's gravity estimate during the slow accelerations this estimator
+ * relies on (docs/research/ios-sensors.md §1.6); their difference d bounds it, so σ = hypot(σ_a, d),
+ * and |d| > `maxSourceDisagreementSigma` · hypot(σ_a, σ_g) is a disagreement (unreliable).
+ */
+function combineIntervalSources(a: MetricScaleResult, g: MetricScaleResult, o: IntervalScaleOptions): { r: MetricScaleResult; extra: string[] } {
+  const d = a.scale > 0 && g.scale > 0 ? Math.log(a.scale / g.scale) : NaN;
+  const sc = Math.hypot(a.relUncertainty, g.relUncertainty);
+  const extra =
+    Number.isFinite(d) && Math.abs(d) > o.maxSourceDisagreementSigma * sc
+      ? [`accel and accelG scales disagree (${(100 * d).toFixed(1)} % > ${o.maxSourceDisagreementSigma} × ${(100 * sc).toFixed(1)} %)`]
+      : [];
+  const r: MetricScaleResult = {
+    ...a,
+    relUncertainty: Number.isFinite(d) ? Math.hypot(a.relUncertainty, d) : a.relUncertainty,
+    source: 'accel+accelG',
+    intervals: { ...a.intervals!, sourceDisagreement: Number.isFinite(d) ? d : null },
+  };
+  return { r, extra };
+}
+
+/** One interval estimate at `o.offsetMs` without the offset term: span selection, then the source cross-check. */
+function intervalEstimate(
+  keyframes: readonly InertialKeyframe[],
+  imu: readonly ImuSample[],
+  o: IntervalScaleOptions,
+): { r: MetricScaleResult; extra: string[] } | null {
+  const inp = scaleInputs(keyframes, imu, o);
+  if (!inp) return null;
+  const best = fitIntervalSpans(inp, o);
+  if (!best) return null;
+  // 'auto' with both fields has picked `accel`
+  if (o.source !== 'auto' || inp.source !== 'accel' || !scaleSources(imu, o).both) return { r: best, extra: [] };
+  const gInp = scaleInputs(keyframes, imu, { ...o, source: 'accelG' });
+  const g = gInp ? fitIntervalSpans(gInp, { ...o, spanMultiple: best.intervals!.spanMultiple }) : null;
+  if (!g || !Number.isFinite(g.relUncertainty)) return { r: best, extra: [] };
+  return combineIntervalSources(best, g, o);
+}
+
+/**
+ * Metric scale from keyframe-interval IMU preintegration (visual-inertial initialisation in the
+ * style of Mur-Artal & Tardós 2017, "Visual-inertial monocular SLAM with map reuse", §IV-B, and
+ * the linear alignment of Qin & Shen's VINS-Mono): for keyframes a = k − m, k, b = k + m (times
+ * t, gaps h₁ = t_k − t_a, h₂ = t_b − t_k) the unknown velocities cancel in the second divided
+ * difference D[f] = (f_b − f_k)/h₂ − (f_k − f_a)/h₁, and D[x] = ∫ Λ_k(τ) a(τ) dτ for any
+ * trajectory x with acceleration a (Λ_k the hat function, 1 at t_k, 0 outside [t_a, t_b]). So
+ *   D[C] = s₀ D[P] + c_w (h₁ + h₂)/2 (+ D[∫∫R_wd] c_d)
+ * with P the double-integrated world-frame IMU acceleration (`scaleInputs`), regressed like
+ * `estimateMetricScale` (Huber IRLS, world bias c_w, device bias c_d with its prior, HAC σ).
+ * Unlike the band-pass estimator nothing here is limited by the keyframe rate: D[P] integrates
+ * every IMU sample in [t_a, t_b], and the only band limit is the hat's (low-pass, first null at
+ * 1/h), which keeps the slow accelerations — turns of a walk, an orbit's centripetal term — that
+ * the 0.3 Hz high-pass of the band estimator removes and that dominate when keyframes are 0.5–1 s
+ * apart.
+ * Span: m = 1 amplifies vision noise by 1/h², long spans suppress the IMU noise and keep the
+ * slow accelerations but low-pass the hand motion, so spans m = c·m₀ up to `maxSpanS` are fitted
+ * and the smallest σ wins (a reliable fit before an unreliable one): 0.4–0.8 s for orbits, 1.0–1.6
+ * s for walks, 1.5 s on e2e yard-real at 1.2 keyframes/s (m = 1 there: +2.0 % ± 3.2 %, chosen
+ * m = 2: +0.5 % ± 1.6 %). Overlapping rows are correlated over ≤ 2m rows (HAC lag ≥ 2m).
+ * Errors in variables: white accelerometer noise σ_a (per sample, interval Δt) puts variance
+ * σ_a² Δt (h₁ + h₂)/3 on each D[P]; its share of the scale column's partial sum of squares is the
+ * attenuation κ of ŝ₀ (scale biased ≈ +κ), reported, bounded by `maxAttenuation`, and added to the
+ * relative σ in quadrature. σ_a = max(measured `accelNoiseLevel`, `accelNoiseFloor`): a noisier
+ * accelerometer is caught, a quieter one keeps the floor's (conservative) κ. The device-bias prior's
+ * own spread (the orbit degeneracy) is in σ as well (`robustScaleFit`).
+ * Gravity removal: the slow accelerations this estimator relies on are where CoreMotion's gravity
+ * estimate (behind `accel`) can lag, so with source 'auto' and both fields present `accelG` is fitted
+ * at the same span as a cross-check whose difference enters σ (`combineIntervalSources`).
+ * Time offset: an offset error δ decorrelates the two sides (the scale reads high, ≈ 5 % for 50 ms on
+ * a 1.2 keyframes/s orbit); `offsetStdMs` propagates the offset's uncertainty into σ.
+ * Cost ≈ 3–7 ms per source (Node, 45 keyframes, 60 Hz IMU), + 2 `accel` fits with `offsetStdMs`.
+ */
+export function estimateMetricScaleFromIntervals(
+  keyframes: readonly InertialKeyframe[],
+  imu: readonly ImuSample[],
+  options: Partial<IntervalScaleOptions> = {},
+): MetricScaleResult | null {
+  const o = { ...DEFAULT_INTERVAL_SCALE, ...options };
+  const est = intervalEstimate(keyframes, imu, o);
+  if (!est) return null;
+  let { r } = est;
+  if (o.offsetStdMs > 0) {
+    // the reported scale is the `accel` fit when cross-checked: refit only that one
+    const source = r.source === 'accel+accelG' ? 'accel' : o.source;
+    let sens = 0;
+    for (const sgn of [-1, 1]) {
+      const q = intervalEstimate(keyframes, imu, { ...o, source, offsetMs: o.offsetMs + sgn * o.offsetStdMs, spanMultiple: r.intervals!.spanMultiple });
+      sens = Math.max(sens, q && q.r.scale > 0 && r.scale > 0 ? Math.abs(Math.log(q.r.scale / r.scale)) : Infinity);
+    }
+    r = { ...r, relUncertainty: Math.hypot(r.relUncertainty, sens), intervals: { ...r.intervals!, offsetSensitivity: sens } };
+  }
+  return withReasons(r, intervalReasons(r, o, est.extra));
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1591,8 +2115,16 @@ export interface AccelTimeOffsetOptions {
   initialOffsetMs: number;
   /** `reliable` requires stdMs below this (default 5). */
   maxStdMs: number;
+  /**
+   * Regression whose misfit is minimised: 'bandpass' (`estimateMetricScale`, default) or
+   * 'intervals' (`estimateMetricScaleFromIntervals`, for keyframe rates where the band-pass one
+   * has no excitation; its span multiple and source are held fixed over the search).
+   */
+  method: 'bandpass' | 'intervals';
   /** Options forwarded to `estimateMetricScale` (`gravity` is required for the accelG source). */
   scale: Partial<MetricScaleOptions>;
+  /** Options forwarded to `estimateMetricScaleFromIntervals` (method 'intervals'). */
+  intervalScale: Partial<IntervalScaleOptions>;
 }
 
 /** Result of `estimateTimeOffsetFromAcceleration`. */
@@ -1610,16 +2142,25 @@ export interface AccelTimeOffsetResult {
   curve: { offsetMs: Float64Array; cost: Float64Array };
 }
 
-const DEFAULT_ACCEL_OFFSET: Omit<AccelTimeOffsetOptions, 'scale'> = { searchRangeMs: 250, coarseStepMs: 25, initialOffsetMs: 0, maxStdMs: 5 };
+const DEFAULT_ACCEL_OFFSET: Omit<AccelTimeOffsetOptions, 'scale' | 'intervalScale'> = {
+  searchRangeMs: 250,
+  coarseStepMs: 25,
+  initialOffsetMs: 0,
+  maxStdMs: 5,
+  method: 'bandpass',
+};
 
 /**
  * Camera–IMU time offset from LINEAR acceleration: minimises the misfit 1 − R² of the
  * metric-scale regression (`estimateMetricScale`, vision ≈ s₀ · IMU after the same
- * band-limited second-derivative operator) over the offset (coarse grid, then golden section;
- * offsets giving a non-positive scale are rejected). Use it when `estimateTimeOffset` is
+ * band-limited second-derivative operator; or with method 'intervals' the keyframe-interval
+ * regression `estimateMetricScaleFromIntervals`) over the offset (coarse grid, then golden
+ * section; offsets giving a non-positive scale are rejected). Use it when `estimateTimeOffset` is
  * unreliable because the device hardly rotates (e.g. walking with a steady camera): a wrong
  * offset Δ attenuates the in-band regression by ≈ cos(2π f Δ) and biases the metric scale
- * (40 ms at ~1 Hz motion ⇒ ≈ 5 %). Cost ≈ 35 scale fits. Returns null without any valid fit.
+ * (40 ms at ~1 Hz motion ⇒ ≈ 5 %). The same decorrelation raises the misfit, so its minimum is
+ * also where the scale is least attenuated. Cost ≈ 35 scale fits (≈ 0.1 s for 'intervals' at 50
+ * keyframes). Returns null without any valid fit.
  */
 export function estimateTimeOffsetFromAcceleration(
   keyframes: readonly InertialKeyframe[],
@@ -1630,8 +2171,19 @@ export function estimateTimeOffsetFromAcceleration(
   const sopts = options.scale ?? {};
   const kf = sortKeyframes(keyframes);
   if (kf.length < 2 || imu.length < 4) return null;
+  // 'intervals': span multiple and source of the estimate at the initial offset, fixed so that the
+  // misfit is a smooth function of the offset
+  const iopts: Partial<IntervalScaleOptions> = { ...options.intervalScale, offsetStdMs: 0 };
+  if (o.method === 'intervals') {
+    const r0 = estimateMetricScaleFromIntervals(kf, imu, { ...iopts, offsetMs: o.initialOffsetMs });
+    if (!r0) return null;
+    iopts.spanMultiple = r0.intervals!.spanMultiple;
+    iopts.source = r0.source === 'accel+accelG' ? 'accel' : r0.source;
+  }
+  const fit = (d: number): MetricScaleResult | null =>
+    o.method === 'intervals' ? estimateMetricScaleFromIntervals(kf, imu, { ...iopts, offsetMs: d }) : estimateMetricScale(kf, imu, { ...sopts, offsetMs: d });
   const f = (d: number): number => {
-    const r = estimateMetricScale(kf, imu, { ...sopts, offsetMs: d });
+    const r = fit(d);
     if (!r || !(r.scale > 0) || !Number.isFinite(r.r2)) return Infinity;
     return 1 - r.r2;
   };
@@ -1662,7 +2214,10 @@ export function estimateTimeOffsetFromAcceleration(
   const h = 2;
   const cp = f(best + h),
     cm = f(best - h);
-  const res = estimateMetricScale(kf, imu, { ...sopts, offsetMs: best });
+  const res =
+    o.method === 'intervals'
+      ? estimateMetricScaleFromIntervals(kf, imu, { ...options.intervalScale, offsetMs: best, offsetStdMs: 0 })
+      : estimateMetricScale(kf, imu, { ...sopts, offsetMs: best });
   if (!res) return null;
   const curv = (cp - 2 * bestCost + cm) / (h * h);
   const nEff = Math.max(1, Number.isFinite(res.numEffective) ? res.numEffective : 1);

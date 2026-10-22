@@ -361,4 +361,28 @@ describe('low-excitation IMU scale acceptance', () => {
     expect(lowExcitationSigma(0.005, 0.96)).toBeCloseTo(0.04, 6);
     expect(lowExcitationSigma(0.003, 0.995)).toBe(0.02);
   });
+
+  it('replaces a keyframe-interval IMU scale only when the retry claims a smaller σ, and never one fused with GPS', () => {
+    const withIntervals = (relUncertainty: number, source: 'imu' | 'imu+gps' = 'imu'): WorldAlignment => {
+      const a = alignment(0.058, 0.988, 0.009);
+      a.metric = { ...a.metric, metric: true, source, relativeUncertainty: relUncertainty };
+      (a.details as { imuScaleIntervals: unknown }).imuScaleIntervals = { reliable: true, relUncertainty };
+      return a;
+    };
+    // e2e object-real stride 1: interval σ 2.44 % (κ just under its gate) vs the retry's max(2 × 0.9 %, 2 %, 1 − R²) = 2 %
+    expect(lowExcitationSigma(0.009, 0.988)).toBe(0.02);
+    expect(lowExcitationRetry(withIntervals(0.0244))).not.toBeNull();
+    // a more precise interval scale stays
+    expect(lowExcitationRetry(withIntervals(0.016))).toBeNull();
+    // with GPS the retry could not be fused consistently
+    expect(lowExcitationRetry(withIntervals(0.0244, 'imu+gps'))).toBeNull();
+    // nor when the interval regression also found the time offset (the re-run would lose it)
+    const withOffset = withIntervals(0.0244);
+    (withOffset.details as { intervalTimeOffset: unknown }).intervalTimeOffset = { reliable: true };
+    expect(lowExcitationRetry(withOffset)).toBeNull();
+    // a metric scale that is not the interval estimate (e.g. GPS alone) is kept
+    const gpsOnly = alignment(0.058, 0.988, 0.009);
+    gpsOnly.metric = { ...gpsOnly.metric, metric: true, source: 'gps', relativeUncertainty: 0.05 };
+    expect(lowExcitationRetry(gpsOnly)).toBeNull();
+  });
 });
