@@ -127,8 +127,9 @@ only), with a Content-Security-Policy and a versioned service worker (offline af
 CI (`.github/workflows/ci.yml`) runs typecheck, unit tests and the build on pushes to `main` and `claude/**` and
 on pull requests.
 The nightly workflow (`.github/workflows/nightly.yml`, scheduled or started by hand) runs the slow tier: the
-SwiftShader GPU tests in 6 shards, a mock-engine e2e smoke on 40-frame datasets (desktop runner and the phone
-bridge, `--device local-bridge`) and `npm run ui:smoke`. It installs Playwright's Chromium with
+SwiftShader GPU tests in 6 shards (with a cached 40-frame `e2e/data/object`, so the engine worker test in
+`src/engine/engine.gpu.test.ts` runs instead of skipping), a mock-engine e2e smoke on 40-frame datasets
+(desktop runner and the phone bridge, `--device local-bridge`) and `npm run ui:smoke`. It installs Playwright's Chromium with
 `node e2e/ensure-chromium.mjs` unless the runner already has it (`PLAYWRIGHT_BROWSERS_PATH`).
 
 ### End-to-end evaluation with ground truth
