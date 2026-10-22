@@ -1,7 +1,9 @@
 /**
  * Exports (ENGINE.md §2 `exportModel`): PLY points (dense if available, else sparse), PLY
  * mesh, GLB (mesh if available, else points), COLMAP text model + images in a ZIP, Gaussian
- * splats as an INRIA 3DGS PLY (appearance-normalised model of the splat stage).
+ * splats as an INRIA 3DGS PLY or as a Niantic SPZ v3 file (gzip through CompressionStream in the
+ * worker; ≈ 4× smaller than the PLY at SH degree 0, src/splat/spz.ts), both of the
+ * appearance-normalised model of the splat stage.
  *
  * Privacy: no export carries a location — there is no geo input here, coordinates are local
  * (ENU metres when aligned) and the keyframe JPEGs are canvas re-encodes (no EXIF). Keep it so.
@@ -11,6 +13,7 @@ import { createColmapZipBlob, type ColmapArchiveImage, type ColmapModelInput } f
 import { encodeGLB } from '../io/glb';
 import { encodeMeshPLY, encodePLY } from '../io/ply';
 import { encodeSplatPLY } from '../splat/ply';
+import { encodeSplatSPZ } from '../splat/spz';
 import type { ExportFormat, SplatModelPayload } from '../workers/protocol';
 import { isRGBAImage, type EngineStore } from './persistence';
 import type { SparseModel } from './types';
@@ -159,6 +162,12 @@ export async function buildExport(format: ExportFormat, src: ExportSources): Pro
       const sp = src.splat ? await src.splat() : null;
       if (!sp || sp.model.count === 0) throw new Error('No Gaussian splats yet (run splat first)');
       return new Blob([encodeSplatPLY(sp.model, { antialiased: sp.antialiased, comments }) as Uint8Array<ArrayBuffer>], { type: 'application/octet-stream' });
+    }
+    case 'spz': {
+      // (SPZ has no comment field: the file carries the model and the antialiased flag only)
+      const sp = src.splat ? await src.splat() : null;
+      if (!sp || sp.model.count === 0) throw new Error('No Gaussian splats yet (run splat first)');
+      return new Blob([(await encodeSplatSPZ(sp.model, { antialiased: sp.antialiased })) as Uint8Array<ArrayBuffer>], { type: 'application/octet-stream' });
     }
     default:
       throw new Error(`Unknown export format ${String(format)}`);

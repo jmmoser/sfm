@@ -13,6 +13,7 @@ import { createColmapZipBlob, encodeGLB, encodeMeshPLY, encodePLY, type ColmapMo
 import { SessionStore, type SessionMeta } from '../io/storage';
 import { Rng } from '../math/random';
 import { encodeSplatPLY } from '../splat/ply';
+import { encodeSplatSPZ } from '../splat/spz';
 import { SH_C0, allocSplatModel, logit, type SplatModel } from '../splat/types';
 import {
   ENGINE_ERRORS,
@@ -707,6 +708,10 @@ export class MockEngine implements EngineLike {
         if (!this.splatOut) throw new Error('Train Gaussian splats first');
         const ply = encodeSplatPLY(this.splatOut.model, { comments: [`exported by sfm mock engine: ${name}`] });
         return new Blob([ply as Uint8Array<ArrayBuffer>], { type: 'application/octet-stream' });
+      }
+      case 'spz': {
+        if (!this.splatOut) throw new Error('Train Gaussian splats first');
+        return new Blob([(await encodeSplatSPZ(this.splatOut.model)) as Uint8Array<ArrayBuffer>], { type: 'application/octet-stream' });
       }
     }
   }

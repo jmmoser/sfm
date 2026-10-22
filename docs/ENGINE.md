@@ -77,7 +77,7 @@ class PhotogrammetryEngine {
   mesh(opts?, progress?, cancel?): Promise<TriangleMesh>
   splat(opts?: SplatOptions, progress?, cancel?): Promise<SplatResult>   // Gaussian splats (§2 "Splat")
   splatModel(): Promise<SplatModelPayload | null>                        // the stored splat model
-  exportModel(format: 'ply-points' | 'ply-mesh' | 'glb' | 'colmap-zip' | 'ply-splat'): Promise<Blob>
+  exportModel(format: 'ply-points' | 'ply-mesh' | 'glb' | 'colmap-zip' | 'ply-splat' | 'spz'): Promise<Blob>
   loadSession(id: string, options?: Partial<EngineOptions>): Promise<SessionSummary>
   dispose(): void
   // worker / harness hooks: setHidden, flush, recoverGPU, memoryReport, releaseResultMemory,
@@ -214,6 +214,7 @@ Request/response RPC with ids, plus unsolicited events:
 | `splat` (long: progress, cancel, inactivity timeout) | `SplatOptions?` {quality, iterations, maxGaussians, maxImageSize, maxViews, backgroundShell, restart} → `SplatResult` {count, iterations, ms, shDegree, bytes, antialiased, stats} | stages `SPLAT_STAGES` = `splat_prepare` → `splat_training` → `splat_finishing`; training events carry `detail: SplatTrainingDetail`. `stats`: splatViews, splatWidth / splatHeight, splatMaxGaussians, splatInitGaussians (Dense / Sparse / Shell), splatItPerSec, splatLoss, splatResumedFrom, splatMemPeakMB, splatGpuMB, splatDegraded, splatPrepareMs / TrainMs / FinishMs, splatCheckpoints, splatStoredBytes. Cancel → `CancelledError`, the next call resumes (`restart: true` starts over). |
 | `splatModel` (short) | — → `SplatModelPayload \| null` | {model: SplatModel, antialiased, background, iterations}; arrays freshly decoded and TRANSFERRED (≈ 56 B per Gaussian at SH 0). |
 | `export` | `{format: 'ply-splat'}` → Blob | INRIA 3DGS PLY (`encodeSplatPLY`; SuperSplat / Brush / Spark), appearance-normalised, comment `antialiased`. |
+| `export` | `{format: 'spz'}` → Blob | Niantic SPZ v3 (`encodeSplatSPZ`: one gzip stream from `CompressionStream`, RUB axes, flag 0x1 antialiased; ≈ 20 B per Gaussian before gzip at SH 0; SuperSplat / Spark / the reference spz library). |
 | `loadSession` | → `SessionSummary.splat` (SplatResult of the stored model, or null) | `stats.splatResumableIteration` when an interrupted run can resume. |
 
 `SplatModel` conventions (world frame of the sparse model: +Z up, metres when metric): per Gaussian i, mean
@@ -233,5 +234,5 @@ view, counters, finish) → Processing (stages + progress + cancel) → Viewer
 (splats / points / mesh layer pill, cameras, EDL, measure, export, run dense / mesh / photoreal). The splat
 stage runs from the viewer itself ("Photoreal model" in the Build sheet → `splat` with a progress card fed by
 `SplatTrainingDetail`, Cancel, Resume after an interruption), the model is fetched with `splatModel` into the
-viewer's WebGPU splat layer and shown by default, and the export sheet offers 'ply-splat' (src/viewer/splat-layer.ts,
+viewer's WebGPU splat layer and shown by default, and the export sheet offers 'ply-splat' and 'spz' (src/viewer/splat-layer.ts,
 research/viewer-rendering.md).

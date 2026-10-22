@@ -28,8 +28,9 @@ geo-referenced point cloud and mesh that you can measure and export.
 * **Viewer**: the trained splats drawn with the trainer's own WebGPU rasteriser, a three.js point
   view with eye-dome lighting, an unlit mesh view, camera frustums, and a tap-to-measure tool
   (metric when scale is known).
-* **Exports**: PLY (points, mesh, and Gaussian splats in the common 3DGS layout), GLB, and a COLMAP
-  text model with images in a ZIP. Exports go through the iOS share sheet.
+* **Exports**: PLY (points, mesh, and Gaussian splats in the common 3DGS layout), compact SPZ
+  splats (about 4× smaller than the PLY), GLB, and a COLMAP text model with images in a ZIP.
+  Exports go through the iOS share sheet.
 * **Robust on iPhone**:
   * Memory planner that keeps the tab within ≤ 1.2 GB (iOS kills it at ~1.5–2 GB), with resume
     after the tab is killed.
@@ -186,7 +187,7 @@ UI ◀──────── progress / results ──────────
                                               │ geometric) → fusion → filters → TSDF mesh
                                               │ splat: dense cloud → 3D Gaussians → WebGPU training
                                               │ (MCMC, colour correction, depth supervision)
-                                              └ exports: PLY · splat PLY · GLB · COLMAP ZIP
+                                              └ exports: PLY · splat PLY / SPZ · GLB · COLMAP ZIP
 ```
 
 * [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): goals, conventions, module contracts and

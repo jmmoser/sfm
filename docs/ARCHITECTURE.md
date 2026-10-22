@@ -24,7 +24,8 @@ source file headers. Measurements behind the defaults are dated reports in `docs
 * Sensors: gyroscope (rotation priors, blur rejection, guided matching, time-offset
   calibration), accelerometer (gravity alignment, metric scale), compass (north),
   GPS (metric scale and geo-referencing at large scale).
-* Exports: PLY (points / mesh), GLB, COLMAP text model (+ images) in a ZIP.
+* Exports: PLY (points / mesh), GLB, COLMAP text model (+ images) in a ZIP, Gaussian splats
+  (INRIA PLY, SPZ).
 
 ## 2. Conventions (MUST follow)
 
@@ -111,7 +112,7 @@ src/
   dense/                 undistortion, view selection, PatchMatch MVS (WebGPU + CPU),
                          depth-map fusion, TSDF + marching cubes, point-cloud filters
   splat/                 3D Gaussian Splatting: WebGPU trainer + renderer, CPU reference,
-                         splat PLY, point-cloud initialisation, MCMC densification
+                         splat PLY / SPZ, point-cloud initialisation, MCMC densification
   sensors/               camera capture, motion, compass, geolocation, wake lock, frame orientation
   io/                    PLY / GLB / COLMAP export, ZIP writer, IndexedDB session storage, share/download
   viewer/                three.js viewer (points as splats + EDL, mesh, cameras, measure tool)
