@@ -107,3 +107,100 @@ offline one (0.392 vs 0.393 px) but explained fewer correspondences (84.2 vs 87.
   (contraction 0.67) lets the anchor — the breathing-biased input pp — set the fixed point and doubles
   the focal error (0.09 → 0.20 %, pp 0.91 px). So the 6-round cap stays; a joint BA with intrinsics
   shared ACROSS cameras remains the principled fix.
+
+## Phone-rate capture: keyframes past a fast pan (2026-10-21)
+
+Question: an iPhone analyses only 2–4 frames per second. Does live registration survive the fast
+pans then? Replay at a third of the dataset rate: `node e2e/run-e2e.mjs yard-real --stride 3 --no-dense
+--set 'engineConfig={"featureBackend":"cpu"}'` (2 analysed frames per second; worker engine; the host
+shared, load 5–20 on 4 cores, so refine times are only comparable within a column of similar load).
+Before = commit 18d73c9, run back to back with the change.
+
+### Diagnosis (instrumented replays of 18d73c9, debug dump compared with GT)
+
+- Matching is fine: the keyframes past the pan have 200–800 verified inliers with their
+  predecessors, and those consecutive pairs are correct (relative rotation 0.02–0.45° off GT; the
+  longer-range pairs up to 6°). Frames are reported `lost` because 3 keyframes in a row stay
+  unregistered, not because tracking fails. The gyro gates are not the cause either: no
+  registration was rejected live (61 verified pairs were).
+- Pan 2 (trajectory 15 s) rotates 33.7° between analysed frames 90 and 93 (1.0 rad/s): the hard
+  rotation limit (20°) cannot be honoured at this rate. The keyframes after it look at a region only
+  the last 2–3 keyframes saw, from 0.4–0.9 m apart (houses 18–47 m away; median triangulation
+  angles of those pairs 1.6–2.9°).
+- The keyframe at frame 102 sees 36 map points (it has 219 / 171 inliers with the keyframes at
+  frames 96 / 93). P3P finds 27 inliers (75 %) and the pose is right (relative rotation 0.69°,
+  baseline direction 0.77° off GT), but the 30-inlier floor rejects it. A pending keyframe
+  triangulates nothing, so the next ones see 7, 3, 2, 0, 6 map points: 29 of 48 keyframes stay
+  pending, 38 of 80 frames report `lost`, and refine's retry of
+  the pending keyframes fails too (27 inliers of 49; 27 / 21 / 22 visible points) → offline SfM.
+- Lowering the P3P floor is no fix: in that retry the 12–13-inlier P3P poses of the keyframes at
+  frames 126 / 132 were 83–87° off.
+- Root cause: the map past the pan is a set of TWO-VIEW tracks (features matched in one other
+  keyframe only), which the triangulator does not create points from (`ignoreTwoViewTracks`, as
+  COLMAP). The batch SfM has every pair from the start; live, the third view arrives later, and
+  nothing triangulates those tracks again before the third view registers — on exactly those points.
+
+### Change
+
+1. `LiveMapper.triangulateNeighbours` (src/sfm/live.ts): a keyframe that sees fewer than 30 map
+   points, or fails to register, first has up to 6 registered neighbours triangulated again (its
+   pairs made their tracks multi-view), then registration is retried once. On the stride-3 replay it
+   created +75 / +18 / +114 / +71 / +37 points (visible points 1 → 75, 26 → 37, 29 → 143, 26 → 93,
+   3 → 40); without the gyro path the keyframe at frame 102 went 36 → 97 and P3P registered it.
+2. Gyro-aided registration (src/geometry/pnp.ts `solvePnPKnownRotationRansac`, src/sfm/mapper.ts
+   `registerKnownRotation`, src/engine/live.ts `predictRotation`): when P3P still fails, the rotation
+   the gyro propagates from the registered keyframe nearest in time (≤ 3 s; σ = 1° + 0.3°/s·Δt + 3 %
+   of the rotation) is kept known: 2-point linear translation LO-MSAC (LO = depth-reweighted least
+   squares + 4 robust 6-DOF LM steps), final 2-pass 6-DOF refinement; accepted with ≥ 15 inliers that
+   are ≥ 50 % of the correspondences, a refined rotation ≤ 3 σ from the prediction, an inlier spread
+   ≥ 5 % of the long image side and the gyro pose check. The keyframe at frame 102: 27 inliers,
+   rotation moved 0.54° by the refinement.
+
+Unit evidence: the solver recovers t to 1e-9 from 2 noise-free points; with 12 inliers among 70 %
+outliers at 0.5 px it returns the robust optimum (what LM from the true pose reaches) in 200 / 200
+seeded trials (rotation exact or 1° off at 2–8 m depth, 1° off at 5–40 m); that optimum is within
+1 % of the 1 m baseline at 2–8 m in 200 / 200 (centre error p50 0.35, p95 0.75 cm; at 5–40 m p50 1.1,
+p95 2.8 cm: the rotation ↔ translation coupling of 12 points). src/sfm/live.test.ts isolates the
+two-view mechanism (a keyframe seeing 10 map points and the walk after it stay pending without
+re-triangulation, all register with it); src/sfm/mapper.test.ts the gyro path (26 / 17 good points
+register; 14 of 44, a 7 × 9 px cluster, a prediction 20° off or none do not).
+
+### Results (yard-real unless noted; `lost` = frames reported lost; ATE = Sim3 ATE / extent)
+
+| run | live kf reg | lost | offline SfM | model | ATE | rot° p50 | refine s |
+|---|---|---|---|---|---|---|---|
+| stride 3, before (lead's `s3-base` / `pre-s3`) | 19/48 / 19/48 | 38 / 38 | run (29 not reg.) | offline | 5.10e-4 / 5.41e-4 | 0.111 / 0.115 | 21.4 / 59.3 (load 18) |
+| stride 3, after: 9 of 10 runs | 48/48 | 0 | skipped | live | 4.88–5.21e-4 | 0.104–0.113 | 17.0–19.4 |
+| stride 3, after: 1 of 10 runs (`fin2`) | 23/48 | 31 | run (25) | offline | 1.22e-3 | 0.376 | 23.4 |
+| stride 3, gyro path only (no re-triangulation): 11 of 12 runs | 48/48 | 0 | skipped | live | 5.31–5.62e-4 | 0.089–0.099 | 22–53 |
+| stride 3, gyro path only: 1 of 12 runs (`gyro1`, load 20) | 21/48 | 34 | run | offline | 5.16e-4 | 0.124 | 76.3 |
+| stride 3, re-triangulation only (`gyroAidedRegistration: false`) | 48/48 | 0 | skipped | live | 5.32e-4 | 0.119 | 21.3 |
+| stride 3 from frame 1 (`--start 1`), before → after | 20/49 → 48/48 | 38 → 0 | run → skipped | offline (33/49 reg.) → live | 6.6e-4 → 9.8e-4 | 0.219 → 0.127 | 37.6 → 22.8 |
+| stride 3 from frame 2 (`--start 2`), before → after | 20/51 → 34/51 | 39 → 17 | run → run | offline 37/51 both | 1.75e-3 → 1.88e-3 | 0.341 → 0.409 | 35.9 → 39.9 |
+| stride 1, before (`pre-s1` / back-to-back `pre2-s1`) | 82/82 / 81/81 | 0 | run / skipped | offline / live | 2.49e-4 / 5.20e-4 | 0.078 / 0.102 | 149 / 51 |
+| stride 1, after (`fin-s1` / back-to-back `fin2-s1`) | 81/81 | 0 | skipped | live | 5.46e-4 / 5.51e-4 | 0.107 / 0.103 | 38 / 37 |
+| object-real stride 3, before → after | 50/50 | 0 | skipped | live | 5.94e-4 → 6.00e-4 | 0.209 → 0.192 | 49 → 18 |
+| object-real stride 1, before → after | 89/89 | 0 | skipped | live | 2.67e-4 → 2.73e-4 | 0.047 → 0.044 | 163 → 51 |
+
+Every run passes the same `thresholds.json` checks before and after except where noted: yard-real
+at stride 3 fails `scaleError` before and after (−6.4 %: the IMU scale is rejected for too little
+excitation, 0.010 < 0.08 m/s², so GPS sets it); `--start 1` before also failed `registrationRate`
+and `gravityErrorDeg`, after only `scaleError`; `--start 2` and `fin2` fail ATE / rotation.
+Per run, re-triangulation registered 5 keyframes live at stride 3 and 1 at stride 1, the gyro path
+1 at stride 3 (2 and 2 in `fin2`) and none at stride 1 or on object-real.
+
+### Limits
+
+- Live mapping depends on the host's load (time-bounded BAs, the intrinsics the frame tracking
+  uses), so replays diverge from frame 57 on and the region past the pan is decided by a few points:
+  1 of 10 runs still lost the chain at frame 138. Its live model was poor (0.64 px), and the rolling
+  shutter estimated on it biased the keypoints the offline SfM then ran on (0.51 instead of 0.35 px):
+  ATE 1.22e-3, worse than the before runs' offline model.
+- `--start 2` still loses the loop's corner (frames 179–191, 13–20° per analysed frame for 6 s):
+  the keyframes there see 0–11 map points even after re-triangulation (fewer than the gyro path's 15).
+- An all-registered live model skips the offline SfM, so `liveModelHealth` alone must catch a live
+  loop that did not close: with the gyro path only, `--start 1` registered 49/49 but drifted 0.5 m /
+  3° at the loop's ends (ATE 6.9e-3) with just 16 loop-like split correspondences — healthy by its
+  rules. With re-triangulation the same replay closed the loop (9.8e-4).
+- Not measured on a device; `abl-yard-shake` is not in this checkout (only `object-real` /
+  `yard-real` datasets), so it was not replayed.
