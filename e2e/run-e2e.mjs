@@ -17,7 +17,10 @@
  *                 numInputImages, pointsFile) — re-score with `node e2e/metrics.mjs e2e/data/<d> result.json`
  *   sparse.ply / dense.ply / mesh.ply / splats.ply   (streamed from the page; splats with --splat)
  *   metrics.json  metrics (e2e/lib/metrics-core.mjs) + sparse-cloud accuracy + live-trajectory
- *                 metrics + threshold checks (e2e/thresholds.json) [+ novel-view summary with --nvs]
+ *                 metrics + threshold checks (e2e/thresholds.json) [+ novel-view summary with --nvs];
+ *                 with a mesh, the object-isolation scores against meta.focus: `focus` (mesh.ply
+ *                 vertices outside the box ± 2 cm, completeness inside it) and `objectRoi` (the
+ *                 engine's object box: IoU, contains the box − 1 cm)
  *   nvs/nvs.json  with --nvs: novel-view evaluation of the output (e2e/nvs.mjs; informational)
  * Exit code: 0 when every pipeline finished without errors and every enforced check passed,
  * 1 otherwise, 2 for usage errors. Thresholds are not enforced for --engine mock unless --enforce.
@@ -115,7 +118,13 @@ function printTimings(r, log) {
     );
   }
   if (r.dense) log(`dense: ${r.dense.count} points${r.dense.file ? ` → ${r.dense.file}` : ''}`);
-  if (r.mesh) log(`mesh: ${r.mesh.vertexCount} vertices, ${r.mesh.triangleCount} triangles`);
+  if (r.mesh) {
+    const s = r.mesh.stats ?? {};
+    log(
+      `mesh: ${r.mesh.vertexCount} vertices, ${r.mesh.triangleCount} triangles; TSDF voxel ${fmtNum(s.voxelSize)} (auto ${fmtNum(s.tsdfAutoVoxelSize)}, ${s.tsdfCoarsenLevels ?? '?'} coarsen levels), ` +
+        `${s.tsdfBlocks ?? '?'} / ${s.tsdfMaxBlocks ?? '?'} blocks, ${fmtNum((s.meshingMs ?? NaN) / 1000, 1)} s; object box ${s.objectRoi ?? '?'}${r.mesh.objectRoi ? ` (confidence ${fmtNum(r.mesh.objectRoi.confidence, 2)})` : ''}`,
+    );
+  }
   if (r.splat) {
     const s = r.splat.stats ?? {};
     log(
@@ -192,10 +201,14 @@ async function runDataset(browser, name, opts, outRoot, thresholdsSpec) {
   let liveMetrics = null;
   const sparsePly = join(dir, 'sparse.ply');
   const hasSparsePly = await exists(sparsePly);
+  const meshPly = join(dir, 'mesh.ply');
+  const hasMeshPly = await exists(meshPly);
   try {
-    const dataset = await loadDataset(dsDir, { points: !!pointsFile || hasSparsePly });
+    const dataset = await loadDataset(dsDir, { points: !!pointsFile || hasSparsePly || hasMeshPly });
     const points = pointsFile ? parsePoints(new Uint8Array(await readFile(join(dir, pointsFile)))) : undefined;
-    metrics = computeMetrics(dataset, input, { points });
+    // object isolation: mesh vertices against the object-only focus box
+    const focusPoints = hasMeshPly && dataset.meta.focus ? parsePoints(new Uint8Array(await readFile(meshPly))) : undefined;
+    metrics = computeMetrics(dataset, input, { points, focusPoints });
     if (hasSparsePly && input.images.length >= 3) {
       try {
         const sp = parsePoints(new Uint8Array(await readFile(sparsePly)));
@@ -216,6 +229,8 @@ async function runDataset(browser, name, opts, outRoot, thresholdsSpec) {
   const th = resolveThresholds(thresholdsSpec, meta.scene, name);
   const ctx = {
     dense: cfg.densify !== false,
+    mesh: !!cfg.mesh,
+    objectRoi: !!cfg.mesh && cfg.mesh.objectRoi !== false,
     claims: input.metric,
     sensors: {
       imu: cfg.useImu !== false,

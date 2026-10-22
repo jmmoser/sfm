@@ -271,6 +271,67 @@ describe('computeMetrics', () => {
     expect(m.dense!.precision).toBeGreaterThan(0.95);
   });
 
+  it('focus box: mesh vertices outside meta.focus ± 2 cm, completeness inside it, object-box IoU', () => {
+    // object = sphere r 0.4 at the origin inside meta.focus; a table plane 10 cm below the box
+    const focus = { min: [-0.5, -0.5, -0.5], max: [0.5, 0.5, 0.5] };
+    const rng = new SynthRng(21);
+    const sphere = (n: number, r: number): number[] => {
+      const out: number[] = [];
+      for (let i = 0; i < n; i++) {
+        const v = [rng.gaussian(), rng.gaussian(), rng.gaussian()];
+        const l = Math.hypot(...v);
+        out.push((r * v[0]) / l, (r * v[1]) / l, (r * v[2]) / l);
+      }
+      return out;
+    };
+    const table: number[] = [];
+    for (let i = 0; i < 4000; i++) table.push(rng.uniform(-1.5, 1.5), rng.uniform(-1.5, 1.5), -0.6);
+    const gtFocus = { points: new Float32Array([...sphere(5000, 0.4), ...table]), normals: null, visibility: null };
+    const fds: LoadedDataset = { ...ds, meta: { ...ds.meta, focus }, gtFocus };
+    const result = { images: ds.frames.map((f) => ({ index: f.index, pose: toResult(f.pose) })), metric: { metric: false, gravityAligned: false, northAligned: false } };
+    const toRes = (p: number[]): Float32Array => {
+      const out = new Float32Array(p.length);
+      for (let i = 0; i < p.length; i += 3) out.set(applySim3(S, [p[i], p[i + 1], p[i + 2]]), i);
+      return out;
+    };
+    const object = sphere(30000, 0.4);
+    const isolated = computeMetrics(fds, result, { focusPoints: toRes(object) }).focus!;
+    expect(isolated.outsideFraction).toBe(0);
+    expect(isolated.numGtEvaluated).toBe(5000); // table samples are outside meta.focus
+    expect(isolated.completeness).toBeGreaterThan(0.99);
+    const slab = computeMetrics(fds, result, { focusPoints: toRes([...object, ...table]) });
+    expect(slab.focus!.outsideFraction).toBeCloseTo(4000 / 34000, 2);
+    expect(slab.focus!.completeness).toBeCloseTo(isolated.completeness!, 9);
+    expect(slab.objectRoi).toBeNull(); // the result has no objectRoi field (no mesh run)
+    expect(formatTable(slab)).toContain('focus box: points outside');
+
+    // object box: result frame = GT scaled by 2 and shifted (axis-aligned), 20 % too wide in x
+    const S2 = { s: 2, R: [1, 0, 0, 0, 1, 0, 0, 0, 1], t: [1, 2, 3] };
+    const res2 = (pose: { R: number[]; t: number[] }) => ({ R: pose.R, t: [0, 1, 2].map((k) => S2.s * pose.t[k] - (pose.R[3 * k] * S2.t[0] + pose.R[3 * k + 1] * S2.t[1] + pose.R[3 * k + 2] * S2.t[2])) });
+    const images2 = ds.frames.map((f) => ({ index: f.index, pose: res2(f.pose) }));
+    const box = (min: number[], max: number[]) => ({ min: applySim3(S2, min), max: applySim3(S2, max), planeZ: applySim3(S2, [0, 0, -0.5])[2], centre: applySim3(S2, [0, 0, 0]), confidence: 0.9 });
+    const wide = computeMetrics(fds, { images: images2, objectRoi: box([-0.5, -0.5, -0.5], [0.7, 0.5, 0.5]) }).objectRoi!;
+    expect(wide.present).toBe(true);
+    expect(wide.iou).toBeCloseTo(1 / 1.2, 6);
+    expect(wide.focusCoverage).toBe(1);
+    expect(wide.containsFocusShrunk).toBe(true);
+    expect(wide.planeZGt).toBeCloseTo(-0.5, 9);
+    // 2 cm short on one side: no longer contains the focus box − 1 cm
+    const short = computeMetrics(fds, { images: images2, objectRoi: box([-0.5, -0.5, -0.48], [0.5, 0.5, 0.5]) }).objectRoi!;
+    expect(short.containsFocusShrunk).toBe(false);
+    expect(short.iou).toBeCloseTo(0.98, 2);
+    // no box proposed
+    const none = computeMetrics(fds, { images: images2, objectRoi: null }).objectRoi!;
+    expect(none).toMatchObject({ present: false, iou: 0, containsFocusShrunk: false });
+    // yawed by 45° (result frame rotated about z): the square ∩ its 45° turn is an octagon, IoU √2 / 2
+    const S3 = { s: 1, R: axisAngle([0, 0, 1], Math.PI / 4), t: [0, 0, 0] };
+    const res3 = (pose: { R: number[]; t: number[] }) => ({ R: mat3Mul(pose.R, mat3T(S3.R)), t: pose.t });
+    const yawed = computeMetrics(fds, { images: ds.frames.map((f) => ({ index: f.index, pose: res3(f.pose) })), objectRoi: { ...box([0, 0, 0], [0, 0, 0]), min: focus.min, max: focus.max, planeZ: -0.5 } }).objectRoi!;
+    expect(yawed.iou).toBeGreaterThan(0.69);
+    expect(yawed.iou).toBeLessThan(0.725);
+    expect(yawed.containsFocusShrunk).toBe(false);
+  });
+
   it('sim3+icp: completeness on the ICP-moved cloud also when it exceeds maxPoints (review)', () => {
     const result = { images: ds.frames.map((f) => ({ index: f.index, pose: toResult(f.pose) })), metric: { metric: false, gravityAligned: false, northAligned: false } };
     // the dense cloud 2 τ off the poses (ICP's job): completeness only when the shift is undone

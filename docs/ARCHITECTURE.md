@@ -427,7 +427,7 @@ runIncrementalSfM(db: FeatureDatabase, opts?: Partial<MapperOptions>, progress?:
 // keyframes.ts, pairs.ts, vocab.ts, inertial.ts, geo.ts, live.ts — see §5.
 ```
 
-### 4.6 `src/dense`  (depends on math, core, gpu)
+### 4.6 `src/dense`  (depends on math, geometry, core, gpu)
 
 ```ts
 interface DenseView { id: number; cam: CameraIntrinsics /* pinhole, k1=k2=0 */; pose: Pose;
@@ -448,9 +448,14 @@ class PatchMatchGPU { static create(ctx: GPUContext, opts?): Promise<PatchMatchG
 patchMatchCPU(ref, sources, range, opts?, geometric?): DepthMap    // slow reference / fallback
 fuseDepthMaps(views: DenseView[], store: DepthMapStore, neighbours: Map<number, number[]>, opts?, progress?, cancel?)
   : Promise<PointCloud>
-tsdfMesh(views: DenseView[], store: DepthMapStore, opts?: { voxelSize?: number; truncation?: number; maxDepth?: number },
-  progress?, cancel?): Promise<TriangleMesh>
+tsdfMesh(views: DenseView[], store: DepthMapStore, opts?: { voxelSize?: number; truncation?: number; maxDepth?: number;
+  bounds?: { min: ArrayLike<number>; max: ArrayLike<number> } /* world AABB: no vertex outside */ }, progress?, cancel?): Promise<TriangleMesh>
 filterPointCloud(pc: PointCloud, opts?: { voxelSize?: number; statistical?: { k: number; std: number } }): PointCloud
+// object-roi.ts — object box of an orbit capture (gravity-aligned world): orbit centre + support plane
+proposeObjectRoi(model: { images: { pose: Pose }[]; xyz: ArrayLike<number>; numPoints: number; trackOffsets?: ArrayLike<number> },
+  opts: { gravityAligned: boolean; minClearance?: number | { perDistance: number }; minConfidence?: number /* 0.3 */ })
+  : { roi: ObjectRoi | null; reason: string; … }   // ObjectRoi {min, max, planeZ, centre, confidence} (core/types.ts)
+objectRoiPivot(roi: ObjectRoi): [x, y, planeZ]      // bottom centre: the origin for exports that stand the object on the ground
 ```
 
 ### 4.7 `src/sensors`
@@ -590,7 +595,9 @@ offset, gravity, metric scale), GPS Sim3 alignment, compass yaw → world frame 
 **Dense**: undistort keyframes (≤ 1600 px by preset) → source-view selection →
 PatchMatch at ½ resolution (multi-scale) → PatchMatch (photometric) for all views →
 PatchMatch (geometric consistency) → halo / sky filter → fusion → filtered coloured
-point cloud → optional TSDF mesh.
+point cloud → optional TSDF mesh (object mode with a gravity-aligned model: bounded to the automatic
+object box from the sparse model — orbit centre + support plane, `dense/object-roi.ts` — which the mesh
+result and `mesh/meta` carry for later ground-placed exports; the dense cloud and splats are not cropped).
 
 **Splat**: dense (else sparse) cloud → 3D Gaussians → WebGPU training against all keyframes
 (MCMC densification, depth supervision from the dense maps, per-view colour correction).

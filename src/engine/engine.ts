@@ -23,7 +23,7 @@
  * dense cloud, mesh and splats as always. A session without a readable stored capture state is not
  * continued (init rejects before anything is written).
  */
-import type { CancelToken, FeatureSet, PointCloud, ProgressCallback, TriangleMesh } from '../core/types';
+import type { CancelToken, FeatureSet, ObjectRoi, PointCloud, ProgressCallback, TriangleMesh } from '../core/types';
 import type { FeaturePipeline } from '../features/extractor';
 import type { SiftOptions } from '../features/sift-common';
 import { releaseSiftCPUMemory } from '../features/sift-cpu';
@@ -43,6 +43,7 @@ import {
   type LiveUpdate,
   type LogLevel,
   type MeshOptions,
+  type MeshResult,
   type QualityPreset,
   type SessionSummary,
   type SplatModelPayload,
@@ -58,6 +59,7 @@ import { modelKeypoints, originalKeypoints } from './refine-camera';
 import {
   MemoryEngineStore,
   SessionEngineStore,
+  isObjectRoi,
   packSparseModel,
   packSplatModel,
   unpackSparseModel,
@@ -65,6 +67,7 @@ import {
   type DenseMetaRecord,
   type EngineStateRecord,
   type EngineStore,
+  type MeshMetaRecord,
   type SparseMetaRecord,
   type SplatMetaRecord,
   type SplatProgressRecord,
@@ -162,6 +165,8 @@ export class PhotogrammetryEngine {
   private denseCloud: PointCloud | null = null;
   private denseMeta: DenseMetaRecord | null = null;
   private meshModel: TriangleMesh | null = null;
+  /** Object box the mesh was bounded to (`mesh/meta`; kept when the mesh itself is released). */
+  private meshRoi: ObjectRoi | null = null;
   /** A dense cloud / mesh exists (in memory or only in the store after releaseResultMemory). */
   private hasDense = false;
   private hasMesh = false;
@@ -839,6 +844,7 @@ export class PhotogrammetryEngine {
       this.denseCloud = null;
       this.denseMeta = null;
       this.meshModel = null;
+      this.meshRoi = null;
       this.hasDense = false;
       this.hasMesh = false;
       this.hasSplat = false;
@@ -869,6 +875,8 @@ export class PhotogrammetryEngine {
       // the new model with the old meta, dense cloud or mesh)
       await this.store.deleteBinary('dense/points').catch(() => undefined);
       await this.store.deleteBinary('mesh').catch(() => undefined);
+      // the object box is in the old model's world frame
+      await this.store.putValue('mesh/meta', null);
       // splats and their checkpoints were trained on the old poses
       await this.store.deleteBinary('splat/model').catch(() => undefined);
       await this.store.putValue('splat/meta', null);
@@ -978,6 +986,7 @@ export class PhotogrammetryEngine {
       this.denseCloud = out.cloud;
       this.denseMeta = out.meta;
       this.meshModel = null;
+      this.meshRoi = null;
       this.hasDense = true;
       this.hasMesh = false;
       this.densePersisted = false;
@@ -986,6 +995,7 @@ export class PhotogrammetryEngine {
       try {
         // the mesh of the previous cloud goes first: a kill after the cloud's write must not pair them
         await this.store.deleteBinary('mesh').catch(() => undefined);
+        await this.store.putValue('mesh/meta', null).catch(() => undefined);
         await this.store.putBinary('dense/points', serializePointCloud(out.cloud, { float16: true }));
         this.densePersisted = true;
         await this.store.putValue('dense/meta', out.meta);
@@ -1046,8 +1056,11 @@ export class PhotogrammetryEngine {
     this.log('info', `capture state released for the dense stage (≈ ${Math.round(before / MB)} MB; reloaded from storage if refine runs again)`);
   }
 
-  /** TSDF mesh of the dense depth maps (densify runs first when needed). */
-  mesh(opts?: MeshOptions, progress?: ProgressCallback, cancel?: CancelToken): Promise<TriangleMesh> {
+  /**
+   * TSDF mesh of the dense depth maps (densify runs first when needed); in object mode bounded to
+   * the automatic object box (`runMesh`), which the result carries and `mesh/meta` persists.
+   */
+  mesh(opts?: MeshOptions, progress?: ProgressCallback, cancel?: CancelToken): Promise<MeshResult> {
     return this.longRun('mesh', async () => {
       const model = await this.ensureModel();
       if (!this.store) throw namedError(ENGINE_ERRORS.notInitialized, 'No session');
@@ -1075,8 +1088,17 @@ export class PhotogrammetryEngine {
         views = this.denseOut!.views;
         filtered = this.denseOut!.filtered;
       }
-      const { mesh, stats } = await runMesh(
-        { quality: this.quality, mode: this.resolvedMode(), config: this.config, model, memoryBudgetMB: this.memoryBudgetMB },
+      const gravityAligned = (this.sparse?.metric ?? (await this.store.getValue<SparseMetaRecord>('sparse/meta').catch(() => null))?.metric)?.gravityAligned;
+      const { mesh, stats, objectRoi } = await runMesh(
+        {
+          quality: this.quality,
+          mode: this.resolvedMode(),
+          config: this.config,
+          model,
+          memoryBudgetMB: this.memoryBudgetMB,
+          gravityAligned: !!gravityAligned,
+          log: (l, m, d) => this.log(l, m, d),
+        },
         views,
         filtered,
         opts ?? {},
@@ -1084,21 +1106,26 @@ export class PhotogrammetryEngine {
         cancel,
       );
       this.meshModel = mesh;
+      this.meshRoi = objectRoi;
       this.hasMesh = true;
       this.meshPersisted = false;
       stats.memoryMB = this.logMemory('mesh');
       Object.assign(this.stats, stats);
       if (this.sparse) Object.assign(this.sparse.stats, stats);
       try {
+        // meta of the previous mesh first: a kill between the writes must not pair it with this mesh
+        await this.store.putValue('mesh/meta', null);
         await this.store.putBinary('mesh', serializeTriangleMesh(mesh, { float16: true }));
         this.meshPersisted = true;
+        await this.store.putValue('mesh/meta', { version: 1, objectRoi, stats } satisfies MeshMetaRecord);
         await this.store.putValue('engine/state', this.stateRecord());
       } catch (e) {
         this.onStorageError(e);
         // in memory only (as densify): no earlier stored mesh under this one's stats after a reload
         if (!this.meshPersisted) await this.store.deleteBinary('mesh').catch(() => undefined);
       }
-      return mesh;
+      // a shallow copy carries the extras: the engine's own mesh stays a plain TriangleMesh
+      return { ...mesh, objectRoi, stats: { ...stats } };
     });
   }
 
@@ -1300,6 +1327,7 @@ export class PhotogrammetryEngine {
         model: this.model,
         dense: needDense ? this.denseCloud : null,
         mesh: needMesh ? this.meshModel : null,
+        objectRoi: this.objectRoi,
         store: this.store,
         features: (id) => this.featuresOf(id),
         splat: () => this.splatModel(),
@@ -1385,6 +1413,10 @@ export class PhotogrammetryEngine {
         this.meshPersisted = true;
       }
     }
+    if (this.hasMesh) {
+      const mm = await store.getValue<MeshMetaRecord>('mesh/meta').catch(() => null);
+      this.meshRoi = isObjectRoi(mm?.objectRoi) ? mm.objectRoi : null;
+    }
     // splats: only the info (the model is read on demand: splatModel / export)
     const sm = this.model ? await store.getValue<SplatMetaRecord>('splat/meta').catch(() => null) : null;
     const smKeys = sm ? await store.listBinaryKeys('splat/model').catch(() => [] as string[]) : [];
@@ -1421,6 +1453,7 @@ export class PhotogrammetryEngine {
       this.denseCloud = null;
       this.denseMeta = null;
       this.meshModel = null;
+      this.meshRoi = null;
       this.hasDense = false;
       this.hasMesh = false;
       this.hasSplat = false;
@@ -1502,6 +1535,7 @@ export class PhotogrammetryEngine {
       sparse: this.sparse,
       dense: this.denseCloud,
       mesh: this.meshModel,
+      objectRoi: this.hasMesh ? this.meshRoi : null,
       splat: this.splatInfo,
       stats: { ...(meta.stats ?? {}), ...this.stats, ...extra },
     };
@@ -1529,6 +1563,11 @@ export class PhotogrammetryEngine {
 
   get meshResult(): TriangleMesh | null {
     return this.meshModel;
+  }
+
+  /** Object box the current mesh was bounded to (null: no mesh, scene mode or no box found). */
+  get objectRoi(): ObjectRoi | null {
+    return this.hasMesh ? this.meshRoi : null;
   }
 
   get engineStore(): EngineStore | null {

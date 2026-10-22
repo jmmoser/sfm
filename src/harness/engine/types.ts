@@ -3,7 +3,7 @@
  * Everything in {@link HarnessResult} is plain JSON (typed arrays are converted), so it survives
  * Playwright's `page.evaluate` and can be written to disk as is.
  */
-import type { MetricInfo } from '../../core/types';
+import type { MetricInfo, ObjectRoi } from '../../core/types';
 import type { CoveragePrompt } from '../../app/coverage';
 import type { DebugKeyframe, DebugPair } from './debug-dump';
 import type {
@@ -415,7 +415,20 @@ export interface HarnessResult {
   dense: CloudSummary | null;
   /** Dense cloud as base64 (Float32 LE xyz + Uint8 rgb) when not streamed. */
   densePoints?: { count: number; xyz: string; rgb: string };
-  mesh: { vertexCount: number; triangleCount: number; file: string | null; bboxMin: number[] | null; bboxMax: number[] | null } | null;
+  /**
+   * `objectRoi`: the object box the TSDF was bounded to (MeshResult.objectRoi; null = none, e.g. scene
+   * mode); `stats`: the mesh stage's stats (voxelSize, tsdfAutoVoxelSize, tsdfCoarsenLevels, tsdfBlocks,
+   * tsdfMaxBlocks, objectRoi text, objectRoiConfidence, meshingMs, …), {} from engines without them.
+   */
+  mesh: {
+    vertexCount: number;
+    triangleCount: number;
+    file: string | null;
+    bboxMin: number[] | null;
+    bboxMax: number[] | null;
+    objectRoi: ObjectRoi | null;
+    stats: Record<string, number | string>;
+  } | null;
   /** The splat stage's result (SplatResult) and the streamed `splats.ply`. */
   splat?: {
     count: number;

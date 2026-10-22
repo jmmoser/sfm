@@ -5,7 +5,8 @@
  *   JPEG (createImageBitmap, one frame decoded ahead) → FrameInput { bitmap, t, screenAngle, imu
  *   since the previous delivered frame, latest GPS fix / heading ≤ t, gravityDevice, index } →
  *   engine.processFrame (one frame in flight = FramePump back-pressure) → record the LiveUpdate
- *   → finishCapture → refine (progress) → [densify] → [mesh] → [splat] → [exports, sizes only].
+ *   → finishCapture → refine (progress) → [densify] → [mesh: + its object box and TSDF stats] →
+ *   [splat] → [exports, sizes only].
  *
  * The live summary carries the object coverage of the last live cameras (`live.coverage`, the
  * capture screen's ring: src/app/coverage.ts) and, with `liveTrace`, of every model update.
@@ -971,11 +972,18 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
       t0 = performance.now();
       try {
         const mopts: MeshOptions | undefined = typeof cfg.mesh === 'object' ? cfg.mesh : undefined;
-        mesh = await eng.mesh(mopts, onProgress('mesh'));
+        const m = await eng.mesh(mopts, onProgress('mesh'));
+        mesh = m;
         mark('mesh', t0);
-        const b = bbox(mesh.positions, mesh.vertexCount);
-        result.mesh = { vertexCount: mesh.vertexCount, triangleCount: mesh.triangleCount, file: null, bboxMin: b?.min ?? null, bboxMax: b?.max ?? null };
-        log(`[harness] mesh done: ${mesh.vertexCount} vertices, ${mesh.triangleCount} triangles (${Math.round(result.timings.mesh)} ms)`);
+        const b = bbox(m.positions, m.vertexCount);
+        const stats: Record<string, number | string> = {};
+        for (const [k, v] of Object.entries(m.stats ?? {})) if (typeof v === 'number' || typeof v === 'string') stats[k] = v;
+        // ObjectRoi is plain JSON (arrays and numbers)
+        result.mesh = { vertexCount: m.vertexCount, triangleCount: m.triangleCount, file: null, bboxMin: b?.min ?? null, bboxMax: b?.max ?? null, objectRoi: m.objectRoi ?? null, stats };
+        log(
+          `[harness] mesh done: ${m.vertexCount} vertices, ${m.triangleCount} triangles, voxel ${stats.voxelSize ?? '?'}, ${stats.tsdfBlocks ?? '?'} blocks, ` +
+            `${stats.tsdfCoarsenLevels ?? '?'} coarsen levels, object box ${stats.objectRoi ?? '?'} (${Math.round(result.timings.mesh)} ms)`,
+        );
       } catch (e) {
         mark('mesh', t0);
         fail('mesh', e);

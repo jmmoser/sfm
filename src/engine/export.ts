@@ -6,7 +6,7 @@
  * Privacy: no export carries a location — there is no geo input here, coordinates are local
  * (ENU metres when aligned) and the keyframe JPEGs are canvas re-encodes (no EXIF). Keep it so.
  */
-import type { FeatureSet, PointCloud, RGBAImage, TriangleMesh } from '../core/types';
+import type { FeatureSet, ObjectRoi, PointCloud, RGBAImage, TriangleMesh } from '../core/types';
 import { createColmapZipBlob, type ColmapArchiveImage, type ColmapModelInput } from '../io/colmap';
 import { encodeGLB } from '../io/glb';
 import { encodeMeshPLY, encodePLY } from '../io/ply';
@@ -21,6 +21,12 @@ export interface ExportSources {
   model: SparseModel | null;
   dense: PointCloud | null;
   mesh: TriangleMesh | null;
+  /**
+   * Object box the mesh was bounded to (object mode), null when none: for exports that will stand
+   * the object on the ground (USDZ / GLB for AR) with its bottom centre `objectRoiPivot(roi)` at the
+   * origin. No export reads it yet (GLB and PLY are written in world coordinates).
+   */
+  objectRoi?: ObjectRoi | null;
   store: EngineStore | null;
   /** Features of a keyframe (memory or store). */
   features(id: number): Promise<FeatureSet | null>;

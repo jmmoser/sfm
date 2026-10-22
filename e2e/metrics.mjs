@@ -4,10 +4,12 @@
  *
  *   node e2e/metrics.mjs <datasetDir> <result.json> [--tau T] [--out metrics.json]
  *        [--no-roi] [--min-visibility N] [--dense-align sim3|sim3+icp|se3|none] [--max-points N]
+ *        [--focus-points mesh.ply]
  *
  * result.json: { intrinsics: {f,cx,cy,k1,k2}, images: [{index, pose: {R: number[9], t: number[3]}}],
  *   metric: {metric, gravityAligned, northAligned}, pointsFile?: 'binary/ascii PLY or Float32 xyz',
- *   numInputImages? }  (pointsFile is resolved relative to the result file).
+ *   numInputImages?, objectRoi? }  (pointsFile is resolved relative to the result file).
+ * --focus-points: points (e.g. a run's mesh.ply) scored against meta.focus (metrics `focus`).
  * Prints a table and writes metrics.json next to the result (or --out). A dataset without ground
  * truth (a raw capture recording, frames without `pose`) is scored GT-free from the harness fields
  * of a run-e2e result.json (e2e/lib/self-metrics.mjs).
@@ -33,8 +35,10 @@ export async function evaluate(datasetDir, resultPath, opts = {}) {
     const pf = isAbsolute(result.pointsFile) ? result.pointsFile : join(dirname(resultPath), result.pointsFile);
     points = parsePoints(new Uint8Array(await readFile(pf)));
   }
-  const dataset = await loadDataset(datasetDir, { points: !!points });
-  return computeMetrics(dataset, result, { ...opts, points });
+  let focusPoints = opts.focusPoints;
+  if (!focusPoints && opts.focusPointsFile) focusPoints = parsePoints(new Uint8Array(await readFile(opts.focusPointsFile)));
+  const dataset = await loadDataset(datasetDir, { points: !!points || !!focusPoints });
+  return computeMetrics(dataset, result, { ...opts, points, focusPoints });
 }
 
 export function parseArgs(argv) {
@@ -60,6 +64,7 @@ export function parseArgs(argv) {
       o.denseAlign = next();
       if (!['sim3', 'sim3+icp', 'se3', 'none'].includes(o.denseAlign)) throw new Error(`--dense-align must be sim3 | sim3+icp | se3 | none, got ${o.denseAlign}`);
     } else if (a === '--max-points') o.maxPoints = Math.round(num(1));
+    else if (a === '--focus-points') o.focusPointsFile = next();
     else if (a.startsWith('--')) throw new Error(`unknown option ${a}`);
     else o.positional.push(a);
   }
@@ -67,7 +72,7 @@ export function parseArgs(argv) {
 }
 
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-const USAGE = 'usage: node e2e/metrics.mjs <datasetDir> <result.json> [--tau T] [--out metrics.json] [--no-roi] [--min-visibility N] [--dense-align sim3|sim3+icp|se3|none] [--max-points N]';
+const USAGE = 'usage: node e2e/metrics.mjs <datasetDir> <result.json> [--tau T] [--out metrics.json] [--no-roi] [--min-visibility N] [--dense-align sim3|sim3+icp|se3|none] [--max-points N] [--focus-points mesh.ply]';
 if (isMain) {
   let o;
   try {

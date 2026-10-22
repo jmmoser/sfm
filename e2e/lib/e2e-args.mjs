@@ -16,6 +16,8 @@ export const USAGE = `usage: node e2e/run-e2e.mjs [object|yard|all|<dataset> ...
   --no-dense | --no-mesh        skip densify / mesh (mesh needs dense)
   --dense-size N                DenseOptions.maxImageSize       --dense-views N   DenseOptions.maxViews
   --mesh-voxel V                MeshOptions.voxelSize (world units) --mesh-triangles N MeshOptions.targetTriangles
+  --no-object-roi               MeshOptions.objectRoi = false: object mode meshes the whole scene (baseline for
+                                the object-box scores in metrics.json; the object-box checks are skipped)
   --splat                       Gaussian splatting after densify / mesh (after refine with --no-dense):
                                 engine.splat() → <dir>/splats.ply (scored by --nvs as the 'splat' renderer)
   --splat-iterations N          SplatOptions.iterations         --splat-max N   SplatOptions.maxGaussians
@@ -135,6 +137,7 @@ export function parseArgs(argv) {
       case '--dense-views': o.denseOpts.maxViews = int(2); break;
       case '--mesh-voxel': o.meshOpts.voxelSize = num(0); break;
       case '--mesh-triangles': o.meshOpts.targetTriangles = int(4); break;
+      case '--no-object-roi': o.meshOpts.objectRoi = false; break;
       case '--splat': o.splat = true; break;
       case '--splat-iterations': o.splatOpts.iterations = int(1); break;
       case '--splat-max': o.splatOpts.maxGaussians = int(1000); break;

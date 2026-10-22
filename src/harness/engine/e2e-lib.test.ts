@@ -56,6 +56,9 @@ describe('parseArgs', () => {
     expect(nv.nvs).toBe(true);
     expect(nv.nvsViews).toBe(8);
     expect(parseArgs(['object-real', '--extend-at', '0.6', '--extend-skip-s', '2']).config).toMatchObject({ extendAt: 0.6, extendSkipS: 2 });
+    // baseline of the object-box scores: mesh the whole scene in object mode
+    expect(parseArgs(['object-real', '--no-object-roi']).config.mesh).toEqual({ objectRoi: false });
+    expect(parseArgs(['object-real', '--no-object-roi', '--mesh-triangles', '9000']).config.mesh).toEqual({ objectRoi: false, targetTriangles: 9000 });
   });
 
   it('rejects bad input', () => {
@@ -94,6 +97,8 @@ function fakeMetrics(over: Partial<Metrics> = {}): Metrics {
     frame: { gravityAligned: true, northAligned: false, gravityErrorDeg: 0.5, gravityErrorDegSim3: 0.5, headingErrorDeg: -40, headingErrorDegSim3: -40 },
     intrinsics: { fGt: 753, fRes: 760, focalErrorPct: 0.93, ppErrorPx: 1, k1Error: 0, k2Error: 0, cornerDistortionErrorPx: 0.1 },
     dense: null,
+    focus: null,
+    objectRoi: null,
     ...over,
   } as Metrics;
 }
@@ -102,9 +107,17 @@ describe('thresholds + checks', () => {
   const spec = thresholdsJson as unknown as Record<string, Record<string, unknown>>;
 
   it('the shipped thresholds only use known check names and the requested initial values', () => {
-    for (const scope of ['default', 'object', 'yard']) {
-      for (const k of Object.keys(spec[scope])) if (k !== 'claims') expect(Object.keys(CHECKS)).toContain(k);
+    const datasets = spec.datasets as Record<string, Record<string, unknown>>;
+    for (const limits of [spec.default, spec.object, spec.yard, ...Object.values(datasets)]) {
+      for (const k of Object.keys(limits)) if (k !== 'claims') expect(Object.keys(CHECKS)).toContain(k);
     }
+    // object-real: the object box acceptance (IoU ≥ 0.6, ⊇ focus − 1 cm, ≤ 5 % mesh outside focus ± 2 cm)
+    const or = resolveThresholds(spec, 'object', 'object-real');
+    expect(or.limits.objectRoiIoU).toEqual({ min: 0.6 });
+    expect(or.limits.objectRoiContainsFocus).toEqual({ min: 1 });
+    expect(or.limits.meshFocusOutside).toEqual({ max: 0.05 });
+    expect(or.limits.meshFocusCompleteness).toBeUndefined();
+    expect(resolveThresholds(spec, 'yard', 'yard-real').limits.objectRoiIoU).toBeUndefined();
     const o = resolveThresholds(spec, 'object', 'synth40-object');
     expect(o.limits.registrationRate).toEqual({ min: 0.9 });
     expect(o.limits.ateRelative).toEqual({ max: 0.01 });
@@ -148,6 +161,31 @@ describe('thresholds + checks', () => {
     expect(noImu.find((c) => c.name === 'claims.metric')!.status).toBe('skip');
   });
 
+  it('mesh / object-box checks: skip without a mesh run (box checks also with the box off), judge the focus scores', () => {
+    const th = { limits: { meshFocusOutside: { max: 0.05 }, meshFocusCompleteness: { min: 0.9 }, objectRoiIoU: { min: 0.6 }, objectRoiContainsFocus: { min: 1 } }, claims: {} };
+    const ctx = { dense: true, claims: null, sensors: { imu: true, gps: false, heading: false } };
+    expect(runChecks(fakeMetrics(), th, ctx).every((c) => c.status === 'skip' && c.reason === 'no mesh run')).toBe(true);
+    expect(runChecks(fakeMetrics(), th, { ...ctx, objectRoi: true }).every((c) => c.status === 'skip' && c.reason === 'no mesh run')).toBe(true);
+    const good = fakeMetrics({
+      focus: { margin: 0.02, tau: 0.0136, numPoints: 1000, numOutside: 20, outsideFraction: 0.02, numGtEvaluated: 500, completeness: 0.95 },
+      objectRoi: { present: true, iou: 0.72, focusCoverage: 1, containsFocusShrunk: true, shrink: 0.01, confidence: 0.9, planeZGt: 0.75 },
+    });
+    const on = { ...ctx, mesh: true, objectRoi: true };
+    expect(runChecks(good, th, on).map((c) => c.status)).toEqual(['pass', 'pass', 'pass', 'pass']);
+    // the box requested but not proposed: the box checks fail
+    const none = fakeMetrics({ focus: { ...good.focus!, outsideFraction: 0.6 }, objectRoi: { ...good.objectRoi!, present: false, iou: 0, containsFocusShrunk: false } });
+    const by = Object.fromEntries(runChecks(none, th, on).map((c) => [c.name, c]));
+    expect(by.meshFocusOutside).toMatchObject({ status: 'fail', value: 0.6 });
+    expect(by.objectRoiIoU).toMatchObject({ status: 'fail', value: 0 });
+    expect(by.objectRoiContainsFocus).toMatchObject({ status: 'fail', value: 0 });
+    // --no-object-roi (the unbounded baseline): only the completeness is judged
+    const off = Object.fromEntries(runChecks(none, th, { ...ctx, mesh: true, objectRoi: false }).map((c) => [c.name, c]));
+    expect(off.meshFocusCompleteness.status).toBe('pass');
+    for (const k of ['meshFocusOutside', 'objectRoiIoU', 'objectRoiContainsFocus']) expect(off[k]).toMatchObject({ status: 'skip', reason: 'object box off' });
+    // no metrics (e.g. no meta.focus) → missing
+    expect(runChecks(fakeMetrics(), th, on).every((c) => c.status === 'fail' && c.reason === 'missing')).toBe(true);
+  });
+
   it('metricsInput builds the e2e/metrics.mjs result format', () => {
     const r = {
       live: { keyframes: 25 },
@@ -164,8 +202,12 @@ describe('thresholds + checks', () => {
     expect(m.numInputImages).toBe(22);
     expect(m.metric).toMatchObject({ metric: true, gravityAligned: true, northAligned: false });
     expect(m.pointsFile).toBe('dense.ply');
+    expect('objectRoi' in m).toBe(false); // no mesh run
     expect(metricsInput({ live: { keyframes: 25 }, sparse: { ...r.sparse, stats: {} } }).numInputImages).toBe(25);
     expect(metricsInput({}).images).toEqual([]);
+    const roi = { min: [-0.2, -0.1, 0.754], max: [0.2, 0.13, 1.0], planeZ: 0.75, centre: [0, 0, 0.86], confidence: 0.9 };
+    expect(metricsInput({ ...r, mesh: { vertexCount: 10, objectRoi: roi } }).objectRoi).toEqual(roi);
+    expect(metricsInput({ ...r, mesh: { vertexCount: 10, objectRoi: null } }).objectRoi).toBeNull();
   });
 });
 

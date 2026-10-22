@@ -11,6 +11,8 @@ export interface DatasetMeta {
   intrinsics: { f: number; cx: number; cy: number; k1: number; k2: number };
   sceneExtent: number;
   roi?: { min: number[]; max: number[] };
+  /** Box of the object of interest alone (object scene: without the table). */
+  focus?: { min: number[]; max: number[] };
   denseTau?: number;
   gt?: { spacing?: number; focus?: { spacing?: number } | null } | null;
   [k: string]: unknown;
@@ -22,7 +24,10 @@ export interface ResultJSON {
   metric?: { metric: boolean; gravityAligned: boolean; northAligned: boolean };
   pointsFile?: string;
   numInputImages?: number;
+  /** The mesh's object box (result frame); null = none proposed; absent = no mesh run. */
+  objectRoi?: ObjectRoiJSON | null;
 }
+export interface ObjectRoiJSON { min: number[]; max: number[]; planeZ: number; centre: number[]; confidence: number }
 export interface MetricsOptions {
   points?: Float32Array;
   tau?: number;
@@ -31,6 +36,22 @@ export interface MetricsOptions {
   denseAlign?: 'sim3' | 'sim3+icp' | 'se3' | 'none';
   maxPoints?: number;
   maxDistFactor?: number;
+  /** Points scored against meta.focus (e.g. mesh vertices). */
+  focusPoints?: Float32Array;
+  /** Growth of meta.focus for `focus.outsideFraction` (default 0.02 m). */
+  focusMargin?: number;
+  /** Shrink of meta.focus for `objectRoi.containsFocusShrunk` (default 0.01 m). */
+  focusShrink?: number;
+  /** Samples per axis of the IoU grid (default 48). */
+  grid?: number;
+}
+export interface FocusBoxMetrics {
+  margin: number; tau: number; numPoints: number; numOutside: number; outsideFraction: number | null;
+  numGtEvaluated: number; completeness: number | null;
+}
+export interface ObjectRoiMetrics {
+  present: boolean; iou: number; focusCoverage: number; containsFocusShrunk: boolean; shrink: number;
+  confidence: number | null; planeZGt: number | null;
 }
 export interface Metrics {
   dataset: string;
@@ -53,6 +74,12 @@ export interface Metrics {
     accuracyMedian: number; accuracyP90: number; accuracyMeanCapped: number; precision: number;
     completeness: number; completenessSet: 'focus' | 'base'; numGtEvaluated: number; fscore: number;
   } | null;
+  /** `opts.focusPoints` against meta.focus (null without them, meta.focus or a trajectory). */
+  focus: FocusBoxMetrics | null;
+  /** `result.objectRoi` against meta.focus (null when the result has no objectRoi field). */
+  objectRoi: ObjectRoiMetrics | null;
 }
 export function computeMetrics(dataset: LoadedDataset, result: ResultJSON, opts?: MetricsOptions): Metrics;
+export function focusBoxMetrics(dataset: LoadedDataset, points: Float32Array, sim: Sim3, opts?: MetricsOptions): FocusBoxMetrics;
+export function objectRoiMetrics(focus: { min: number[]; max: number[] }, roi: ObjectRoiJSON | null, sim: Sim3, opts?: MetricsOptions): ObjectRoiMetrics;
 export function formatTable(m: Metrics): string;
