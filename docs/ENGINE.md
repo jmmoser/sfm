@@ -143,7 +143,7 @@ results stale (`resultsStale`: `loadSession` then opens the scan with its sparse
 'capturing' / 'captured') until the next `refine`, which covers every keyframe and invalidates the dense
 cloud, mesh and splats as always (a cancelled or failed refine keeps the previous model). No multi-map
 merging: refine keeps the largest offline model and reports the keyframes outside it (`unconnectedImages`,
-`offlineModels`, `offlineDroppedImages`).
+`offlineModels`, `offlineDroppedImages`). Measurements: research/extend-scan.md.
 
 ### Refine
 Train/extend the vocabulary → candidate pairs (sequential 10, retrieval 15,

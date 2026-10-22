@@ -26,7 +26,8 @@
  * EXTEND_TIME_GAP_MS after it (frame, IMU, GPS and attitude times alike), so the gyro never
  * integrates across the gap (> IMU_MAX_GAP_MS), the inertial scale splits its segments there
  * (keyframe gaps > 3 s) and the gravity skips it (sfm/inertial.ts); frame indices below the stored
- * counter get an offset. LiveUpdate times stay on the FrameInput (page) time base.
+ * counter get an offset. LiveUpdate times stay on the FrameInput (page) time base. Measurements:
+ * docs/research/extend-scan.md.
  *
  * Limits: there is one live model — when tracking is lost for good, later keyframes stay pending,
  * and refine keeps only the largest offline model (keyframes outside it are reported as

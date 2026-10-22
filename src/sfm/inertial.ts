@@ -791,8 +791,8 @@ const DEFAULT_GRAVITY: GravityOptions = { offsetMs: 0, g0: G0, magnitudeSigma: 0
  * Samples between two keyframes whose IMU has a gap (> `maxImuGapMs`: a capture continued later,
  * EngineOptions.extend) are skipped except within 100 ms of the keyframes: the gyro does not
  * carry the attitude across the gap, and interpolating the unobserved rotation over the interval
- * tilted gravity by degrees (e2e: 5.4° with a 10 s gap). Falls back to the mean of
- * R_wc·gravityCam over keyframes when no accelG is available.
+ * tilted gravity by degrees (docs/research/extend-scan.md: 5.4° → 0.07° on a synthetic e2e
+ * run). Falls back to the mean of R_wc·gravityCam over keyframes when no accelG is available.
  */
 export function estimateGravity(
   keyframes: readonly InertialKeyframe[],
