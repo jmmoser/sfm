@@ -496,10 +496,16 @@ rows). Every step ran on the engine thread, one after another:
 
 So 21.5 of 37.7 s (57 %) at fast and 56.4 of 122.2 s (46 %) at balanced were CPU steps that can run while the
 GPU computes the next view. If the helper workers keep up, the stage is bounded by PatchMatch + pass inputs:
-≈ 16 s at fast (−55 %) and ≈ 63 s at balanced (−48 %). At fast on the M4 the halo filter (≈ 250 ms per map)
-takes longer than a view's PatchMatch (≈ 120 ms wall), hence up to two maps in flight on two workers. These
-projections are not measured: no `E2E_GPU=host` run of the overlap exists yet, and nothing on an iPhone
-(2 helper workers, possibly on efficiency cores, a 2–3× slower GPU: the CPU steps should hide more easily there).
+≈ 16 s at fast (−55 %) and ≈ 63 s at balanced (−48 %) with the pass inputs unchanged. They are not: with the
+overlap the pass inputs (IndexedDB reads of priors and sources) took 1.6× (before / after) to 2.2× (same-model
+A/B) as long on SwiftShader below, consistent with the reads contending with the writes and deletes in flight.
+At 2.2× the fast bound is ≈ 14.8 + 3.1 = 18 s (−52 %); at balanced the pass inputs were not broken out, so its
+bound is less certain. At fast on the M4 the halo filter (≈ 250 ms per map) takes longer than a view's
+PatchMatch (≈ 120 ms wall), hence up to two maps in flight on two workers. **The speed gain is unmeasured and
+not claimed**: these are upper bounds from the serial profile, the spec's acceptance (`E2E_GPU=host`
+depth maps −25 % at fast, −20 % at balanced) needs the `densifyRepeat` A/B below on a real GPU at both
+qualities, and nothing has run on an iPhone (2 helper workers, possibly on efficiency cores, a 2–3× slower GPU:
+the CPU steps should hide more easily there).
 
 ### Measured (SwiftShader, e2e object-real, 480 px)
 
@@ -530,7 +536,15 @@ bit; load 2.5 → 13):
 | overlap off | 1037.4 | 2.8 / 1.2 / 1027.1 / 4.6 / 1.7 | — | 8.4 | 1 269 253, **bit-identical** |
 
 (dense P / C / F 0.9995 / 0.9928 / 0.9961, accuracy p50 0.324 mm; every check passes.) The wall times again
-follow SwiftShader's PatchMatch under a changing host load: the 'off' stage is 106 s shorter because its GPU
-passes took 112 s less for the same work. The engine thread's view loads + halo + store fell 9.1 → 0.4 s. Whether that becomes wall time depends on a GPU that does not share the CPU: the M4 /
-Metal projection above (fast −55 %, balanced −48 % at best) is the case to measure next (`E2E_GPU=host`,
-`--quality balanced`, the same `densifyRepeat` A/B), then an iPhone.
+follow SwiftShader's PatchMatch under a changing host load: the 'off' stage is 106 s shorter (the overlap run
+took 10 % longer) because its GPU passes took 112 s less for the same work. The engine thread's view loads +
+halo + store fell 9.1 → 0.4 s, but its pass inputs rose 1.2 → 2.6 s (before / after: 1.0 → 1.6 s): the
+IndexedDB reads of a pass now run while earlier maps are still being written and their inputs deleted. On this
+host neither shows in the wall time; on a GPU that does not share the CPU the read increase eats into the gain
+(projection above). So these runs show identical results and the CPU work moved off the engine thread, not a
+speed-up: the M4 / Metal case (fast and `--quality balanced`, the same `densifyRepeat` A/B, `E2E_GPU=host`) is
+the measurement still to do, then an iPhone.
+
+These runs predate one fix: a previous-pass map's stored copy is now deleted only after every map put up to its
+last reader landed (a failed write or a kill could otherwise delete the inputs of a view not stored yet, which a
+resume then skipped; src/engine/dense-overlap.test.ts). The deletes start a little later; the maps are the same.

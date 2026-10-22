@@ -713,8 +713,11 @@ stage and its time follows the host load. Engine thread = what the engine worker
 
 Before / after differ in the sparse model (the captures diverge at the live initialisation, frame 10: 700 vs
 750 points, refine 12 079 vs 12 094 points), hence the 114-point difference; on one model the clouds are
-bit-identical. The wall-time differences are SwiftShader PatchMatch time; the overlap's effect on a real GPU
-(projected from the M4 table above: up to −55 % depth maps at fast, −48 % at balanced) is not measured yet.
+bit-identical. The wall-time differences are SwiftShader PatchMatch time (the same-model 'on' run took 10 %
+longer); the pass inputs (IndexedDB reads) rose 1.2 → 2.6 s with the overlap, the reads contending with the
+writes in flight. The overlap's effect on a real GPU is unmeasured: the M4 table above bounds it at ≈ −52 to
+−55 % depth maps at fast if the helpers keep up, and an `E2E_GPU=host` `densifyRepeat` A/B at fast and balanced
+is still to run.
 Analysis: ../docs/research/dense-tuning.md "CPU/GPU overlap of the depth-map stage".
 
 ### Real-capture baselines (2026-10, sparse, CPU features, worker engine)

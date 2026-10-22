@@ -376,9 +376,11 @@ export function planDense(p: DensePlanInput): DensePlan {
   // stored, with its serialised copy, and with the halo filter on a helper worker also the worker's
   // copy of it and of the reference image + the filter's scratch; a decode in flight is one
   // `decodeDenseView` on a worker. One map and one decode come before the image LRU's growth below
-  // (a judgement, not measured on a device: the halo filter off the engine thread saves more than
-  // the last cached views, whose re-decodes then overlap the GPU too), more only from the budget's
-  // headroom after it.
+  // (a judgement, not measured on a device: the halo filter and the store write off the engine
+  // thread's path save more than the last cached views cost), more only from the budget's headroom
+  // after it. The re-decodes of the views the LRU then drops overlap the GPU only when a decode is
+  // granted; with `decodes` 0 they run on the engine thread (balanced, 80 views 1280×960, 850 MB,
+  // 2 workers: 1 map, 0 decodes, LRU 31.6 → 24 views).
   const overlap: DenseOverlap = { maps: 0, decodes: 0 };
   const workers = Math.max(0, Math.floor(p.overlap?.workers ?? 0));
   const haloOnWorker = workers > 0 && p.haloFilter;
