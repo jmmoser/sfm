@@ -25,12 +25,15 @@
  * closes the bitmap unread never waits for the GPU and the FramePump (≤ 10 Hz) queues copies
  * without back-pressure. Headless on SwiftShader (fake camera, 1920×1080 frames, 4 shared cores)
  * that made ≈ 10 copies/s against ≈ 2–3 executed: the GPU process grew by 100–230 MB/s to 5–8 GB
- * (then crashed) and every later readback — page screenshots — waited minutes (2026-10-22: the
- * e2e/ui/states.mjs coverage screenshot timeouts). The capture screen's 3D thumbnail only masked
- * it: while it draws, the page's WebGL calls block on the GPU (13–20 s round trips) and throttle
- * the pump to ≈ 2 frames/s. Reading the pixels paces delivery to the GPU like the real engine:
- * GPU memory stays flat (≈ 300 MB), WebGL round trips take milliseconds, the same screenshots
- * ≈ 1 s. Production capture is unaffected (the engine reads every frame).
+ * (then crashed) and page screenshots (compositor readbacks; a 1×1 WebGL readPixels still took
+ * milliseconds) waited minutes (2026-10-22: the e2e/ui/states.mjs coverage screenshot timeouts;
+ * docs/research/integration-2026-10.md). The capture screen's 3D thumbnail only masked it: while
+ * it draws, the page's WebGL calls block on the GPU (13–20 s round trips) and throttle the pump to
+ * ≈ 2 frames/s. Reading the pixels paces delivery to the GPU like the real engine: GPU memory stays
+ * flat (≈ 300 MB), the same screenshots ≈ 1 s. Unlike the engine, which reads in its worker, the
+ * mock reads synchronously on the UI thread, so headless the UI thread is ≈ 90 % busy waiting for
+ * those copies (the flows still pass; do not read UI timings off a mock capture). Production
+ * capture is unaffected (the engine reads every frame).
  *
  * Resume state survives a reload like the real engine's stored `dense/progress` and splat
  * checkpoints: a persistent session's record gets `stats.denseResumablePass` / `denseResumableQuality`
