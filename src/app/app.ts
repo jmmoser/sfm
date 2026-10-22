@@ -2,6 +2,10 @@
  * App shell: owns the engine (EngineClient or MockEngine), the session store, the shared
  * capture configuration and results, and hosts the screens behind the pure navigation state
  * machine of router.ts. Single document, no History API (see router.ts).
+ *
+ * Also owns the run journal (run-journal.ts): at start it classifies a long run that never ended
+ * (killed while visible / stopped in the background) for Home's "run interrupted" card, and it
+ * feeds the journal the page's visibility (visibilitychange, pagehide / pageshow) while a run is open.
  */
 import type { PointCloud, TriangleMesh } from '../core/types';
 import { SessionStore, type SessionMeta, type SessionPatch } from '../io/storage';
@@ -25,6 +29,7 @@ import { createHomeScreen } from './screens/home';
 import { createProcessingScreen } from './screens/processing';
 import { createSetupScreen } from './screens/setup';
 import { createViewerScreen } from './screens/viewer';
+import { RunJournal } from './run-journal';
 import { prefetchViewer } from './viewer-loader';
 
 export interface Screen {
@@ -114,6 +119,8 @@ export class App {
   readonly mock: boolean;
   readonly store: Store<AppState>;
   readonly wakeLock = new WakeLock();
+  /** The long run in progress (localStorage): written by Processing / the viewer's photoreal build. */
+  readonly journal = RunJournal.local();
   config: CaptureConfig;
   results: Results;
   /** Session whose state the engine currently holds (init or loadSession). */
@@ -145,6 +152,8 @@ export class App {
     this.root = root;
     this.engine = opts.engine;
     this.mock = !!opts.mock;
+    // a run still open in the journal was stopped by a kill / eviction: Home reports it
+    this.journal.recover();
     this.config = loadConfig();
     this.results = App.emptyResults(this.config);
     const env = detectEnvironment();
@@ -174,7 +183,13 @@ export class App {
     });
 
     // Workers cannot see page visibility; iOS drops GPU work submitted while hidden.
-    document.addEventListener('visibilitychange', () => this.engine.setHidden(document.hidden));
+    document.addEventListener('visibilitychange', () => {
+      this.engine.setHidden(document.hidden);
+      // a run stopped while hidden was evicted, not killed in front of the user
+      this.journal.setVisible(!document.hidden);
+    });
+    window.addEventListener('pagehide', (e: PageTransitionEvent) => this.journal.pageHide(e.persisted));
+    window.addEventListener('pageshow', () => this.journal.pageShow());
     // Desktop / Android: the browser Back button or closing the tab would silently drop a running
     // capture or processing job (there is no History API state to go back to) — ask first.
     // (iOS Safari shows no beforeunload prompt; the capture itself is persisted as it goes.)
@@ -413,6 +428,7 @@ export class App {
     // later engine restart may replay its init (`resume` would re-create the deleted scan).
     await this.engine.closeSession(id).catch(() => undefined);
     if (this.loadedSessionId === id) this.loadedSessionId = null;
+    this.journal.forget(id);
     try {
       await s.deleteSession(id);
       if (this.results.sessionId === id) this.results = App.emptyResults(this.config);

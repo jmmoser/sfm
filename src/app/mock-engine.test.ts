@@ -378,6 +378,54 @@ describe('MockEngine', () => {
     expect(info.stats.splatResumedFrom).toBeUndefined();
   });
 
+  it('resume markers survive a reload in the session record (densify after a stored map, splat checkpoints) and go when the run ends', async () => {
+    const rec = { id: 'k1', name: 'Wall', createdAt: 1, updatedAt: 2, mode: 'object' as const, status: 'sparse' as const, numFrames: 20, stats: { quality: 'fast' } as Record<string, number | string> };
+    const store = {
+      getSession: async (id: string) => (id === rec.id ? { ...rec, stats: { ...rec.stats } } : null),
+      updateSession: async (_id: string, patch: { stats?: Record<string, number | string> }) => Object.assign(rec, patch),
+    };
+    const sessions = async () => store as never;
+    // a densify killed after its first depth map (the page reloads: a new engine)
+    const a = new MockEngine({ speed: 1, sessions });
+    await a.loadSession('k1');
+    let resolveTick!: () => void;
+    const ticked = new Promise<void>((r) => (resolveTick = r));
+    const dense = a.densify(undefined, (p) => {
+      if (p.stage === 'depth_maps' && p.progress > 0.1) resolveTick();
+    });
+    await ticked;
+    a.dispose();
+    await dense.catch(() => undefined);
+    expect(rec.stats).toMatchObject({ denseResumablePass: 1, denseResumableQuality: 'fast' });
+    const b = new MockEngine({ speed: 20, sessions });
+    expect((await b.loadSession('k1')).stats).toMatchObject({ denseResumablePass: 1, denseResumableQuality: 'fast' });
+    await b.densify();
+    expect(rec.stats.denseResumablePass).toBeUndefined();
+    expect(rec.stats.denseResumableQuality).toBeUndefined();
+
+    // a photoreal build killed after its first checkpoint resumes from it
+    let resolveCkpt!: () => void;
+    const pastCkpt = new Promise<void>((r) => (resolveCkpt = r));
+    const c = new MockEngine({ speed: 1, sessions });
+    await c.loadSession('k1');
+    const train = c.splat({ quality: 'fast' }, (p) => {
+      if (p.detail && p.detail.iteration > 700) resolveCkpt();
+    });
+    await pastCkpt;
+    c.dispose();
+    await train.catch(() => undefined);
+    expect(rec.stats).toMatchObject({ splatResumableIteration: 500, splatResumableQuality: 'fast' });
+    const d = new MockEngine({ speed: 20, sessions });
+    expect((await d.loadSession('k1')).stats).toMatchObject({ splatResumableIteration: 500 });
+    const info = await d.splat({ quality: 'fast' });
+    expect(info.stats.splatResumedFrom).toBe(500);
+    expect(rec.stats.splatResumableIteration).toBeUndefined();
+    // refine removes every marker (new poses)
+    rec.stats = { ...rec.stats, denseResumablePass: 1, splatResumableIteration: 900 };
+    await d.refine();
+    expect(Object.keys(rec.stats).filter((k) => /Resumable/.test(k))).toEqual([]);
+  });
+
   it('injectSession serves real models as the in-memory session (screenshot harness)', async () => {
     const e = new MockEngine({ speed: 50, sessions: async () => null });
     const cloud = { count: 2, positions: new Float32Array([0, 0, 0, 1, 1, 1]), colors: new Uint8Array(6) };

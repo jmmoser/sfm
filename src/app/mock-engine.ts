@@ -14,6 +14,13 @@
  *
  * Time base: the mock trajectory advances with the frame timestamps (`FrameInput.t`) times
  * `speed`, so pauses in frame delivery pause the scan.
+ *
+ * Resume state survives a reload like the real engine's stored `dense/progress` and splat
+ * checkpoints: a persistent session's record gets `stats.denseResumablePass` / `denseResumableQuality`
+ * once its densify stored a "depth map" (the first depth-map tick), `splatResumableIteration` /
+ * `splatResumableQuality` at every CHECKPOINT_EVERY iterations and on a cancel; a finished run (and
+ * refine) removes them. loadSession reports them from the record (e2e/ui/states.mjs kills a run with
+ * a page reload).
  */
 import type { MetricInfo, PointCloud, ProgressCallback, ProgressEvent, TriangleMesh } from '../core/types';
 import { createColmapZipBlob, encodeGLB, encodeMeshPLY, encodePLY, type ColmapModelInput } from '../io';
@@ -77,6 +84,11 @@ interface Sizes {
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, Math.max(0, ms)));
 
+/** Like the engine's splat `checkpointEvery` (ENGINE.md "Splat"). */
+const CHECKPOINT_EVERY = 500;
+const DENSE_RESUME_KEYS = { denseResumablePass: null, denseResumableQuality: null };
+const SPLAT_RESUME_KEYS = { splatResumableIteration: null, splatResumableQuality: null };
+
 function frameSize(f: FrameInput): { w: number; h: number } {
   const b = f.bitmap as { width?: number; height?: number; displayWidth?: number; displayHeight?: number };
   return { w: b.width || b.displayWidth || 1280, h: b.height || b.displayHeight || 960 };
@@ -99,6 +111,8 @@ export class MockEngine implements EngineLike {
   /** Quality of the interrupted densify (a resume needs the same one; another starts over). */
   private denseResumableQuality: QualityPreset | null = null;
   private readonly sessionsSrc: () => Promise<SessionStore | null>;
+  /** Writes of the resume markers into the session record, in order (persistResume). */
+  private persistQ: Promise<void> = Promise.resolve();
   private st: EngineStatus = { state: 'idle', respawns: 0 };
   private options: EngineOptions | null = null;
   private scene: MockScene | null = null;
@@ -547,6 +561,7 @@ export class MockEngine implements EngineLike {
       this.splatOut = null; // … and the splats
       this.splatResumable = null;
       this.splatResumableQuality = null;
+      await this.persistResume({ ...DENSE_RESUME_KEYS, ...SPLAT_RESUME_KEYS });
       return this.sparse;
     });
   }
@@ -561,8 +576,17 @@ export class MockEngine implements EngineLike {
       const t0 = performance.now();
       const resumed = this.denseResumablePass !== null && (this.denseResumableQuality ?? q) === q ? this.denseResumablePass : null;
       let t1 = t0;
+      // the first stored depth map makes the run resumable after a kill (the engine's dense/progress)
+      let stored = false;
+      const depthProgress: ProgressCallback = (e) => {
+        if (!stored && e.progress > 0) {
+          stored = true;
+          void this.persistResume({ denseResumablePass: 1, denseResumableQuality: q });
+        }
+        onProgress?.(e);
+      };
       try {
-        await this.stage('depth_maps', 2600 * f * (resumed !== null ? 0.4 : 1), onProgress, `${this.sparse.cameras.length} views`);
+        await this.stage('depth_maps', 2600 * f * (resumed !== null ? 0.4 : 1), depthProgress, `${this.sparse.cameras.length} views`);
         t1 = performance.now();
         await this.stage('fusion', 1100 * f, onProgress);
       } catch (e) {
@@ -570,11 +594,13 @@ export class MockEngine implements EngineLike {
         if ((e as { name?: string })?.name === ENGINE_ERRORS.cancelled) {
           this.denseResumablePass = 1;
           this.denseResumableQuality = q;
+          if (!this.disposed) await this.persistResume({ denseResumablePass: 1, denseResumableQuality: q });
         }
         throw e;
       }
       this.denseResumablePass = null;
       this.denseResumableQuality = null;
+      await this.persistResume(DENSE_RESUME_KEYS);
       const n = Math.round(this.sizes.dense * (q === 'fast' ? 0.6 : q === 'max' ? 1.5 : 1));
       this.denseCloud = scene.dense(n);
       const size = q === 'fast' ? 800 : q === 'max' ? 1600 : 1280;
@@ -638,18 +664,25 @@ export class MockEngine implements EngineLike {
         if (this.cancelled) {
           this.splatResumable = it;
           this.splatResumableQuality = q;
+          // (a disposed engine is gone, like a terminated worker: it writes nothing more)
+          if (it > 0 && !this.disposed) await this.persistResume({ splatResumableIteration: it, splatResumableQuality: q });
           throw namedError(ENGINE_ERRORS.cancelled, 'Cancelled');
         }
         if (this.disposed) throw namedError(ENGINE_ERRORS.crashed, 'Engine disposed');
         await sleep(80);
         if (this.hidden) continue;
         elapsed += 80;
+        const prev = it;
         it = Math.min(iterations, Math.round((iterations * elapsed) / ms));
+        // a checkpoint (not of the last iteration: the model is saved then)
+        const ckpt = Math.floor(it / CHECKPOINT_EVERY) * CHECKPOINT_EVERY;
+        if (ckpt > prev && ckpt < iterations) void this.persistResume({ splatResumableIteration: ckpt, splatResumableQuality: q });
         const loss = 0.04 + 0.2 * Math.exp((-5 * it) / iterations);
         emit({ stage: SPLAT_STAGES.training, progress: it / iterations, message: `iteration ${it}/${iterations}`, detail: { iteration: it, iterations, loss, itPerSec: Math.round((1000 * iterations) / ms), gaussians: 20_000 + Math.round(it * 10) } });
       }
       this.splatResumable = null;
       this.splatResumableQuality = null;
+      await this.persistResume(SPLAT_RESUME_KEYS);
       // like the engine: a cancel arriving now is ignored (the training is complete)
       emit({ stage: SPLAT_STAGES.finishing, progress: 0, message: 'saving' });
       await sleep(300 / this.speed);
@@ -660,6 +693,32 @@ export class MockEngine implements EngineLike {
       this.splatOut = { model, info };
       return info;
     });
+  }
+
+  /**
+   * Set (value) / remove (null) resume markers in the persistent session's stored stats — the
+   * mock's stand-in for the engine's stored progress records (see the header). Queued, so a later
+   * removal never lands before an earlier write; storage errors are ignored.
+   */
+  private persistResume(patch: Record<string, number | string | null>): Promise<void> {
+    const id = this.sessionId;
+    if (!id || !this.options?.persist) return this.persistQ;
+    this.persistQ = this.persistQ
+      .then(async () => {
+        const store = await this.sessionsSrc();
+        const cur = store ? await store.getSession(id) : null;
+        if (!store || !cur) return;
+        const stats = { ...(cur.stats ?? {}) };
+        let changed = false;
+        for (const [k, v] of Object.entries(patch)) {
+          if (v === null ? k in stats : stats[k] !== v) changed = true;
+          if (v === null) delete stats[k];
+          else stats[k] = v;
+        }
+        if (changed) await store.updateSession(id, { stats });
+      })
+      .catch(() => undefined);
+    return this.persistQ;
   }
 
   private splatInfo(model: SplatModel, iterations: number, ms: number): SplatResult {

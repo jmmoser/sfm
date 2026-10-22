@@ -794,6 +794,19 @@ h3 {
   right: 4px;
 }
 
+/* Home: the run journal's "run interrupted" card (dismissible: room for its close button) */
+.interrupt-host {
+  margin: 0 0 16px;
+}
+
+.interrupt-host:empty {
+  display: none;
+}
+
+.run-interrupted .banner-text {
+  padding-right: 30px;
+}
+
 /* ---------------------------------------------------------------- home */
 
 .home-header {
