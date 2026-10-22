@@ -13,7 +13,8 @@
  *    proxy iOS exposes: 26.2+ ≈ min(1 GiB, 23–25 % of RAM / 3); ios-webgpu.md §2).
  *  - `planDense`: analytic peak of each dense stage (PatchMatch, fusion, TSDF) and the caps that
  *    keep it inside the budget: image / depth-map cache sizes, fusion neighbours, the fusion
- *    pixel step and point cap, TSDF blocks.
+ *    pixel step and point cap, TSDF blocks; then the CPU/GPU overlap of the PatchMatch passes
+ *    (depth maps and keyframe decodes in flight on CPU helper workers) within what is left.
  *  - `planSplat` / `fitSplatPlan`: the Gaussian-splatting stage (trainer GPU buffers from
  *    `SplatTrainer.memoryEstimate` = `estimateSplatMemory`, initialisation, view decoding,
  *    checkpoints) and the degradation (fewer views, Gaussians, smaller images) that fits it.
@@ -101,6 +102,20 @@ export const MEM = Object.freeze({
   splatDecodePx: 12,
   /** Background-shell colour thumbnails (all views, ≤ 200 px). */
   splatThumbBytes: 4 * 200 * 150,
+  /**
+   * Halo / sky filter scratch per pixel (`depthHaloMask`: plane parameters 16 B, packed RGB 3 B,
+   * edge / segment / component arrays ≈ 10 B).
+   */
+  haloScratchPx: 30,
+  /**
+   * Decoding one dense view on a CPU helper worker (`decodeDenseView`): the full-size JPEG bitmap +
+   * canvas (as `splatDecodeFixed`) and, per dense pixel, the decoded, undistorted and
+   * rolling-shutter-corrected copies and the colour thumbnail (RGBA).
+   */
+  viewDecodeFixed: 24 * MB,
+  viewDecodePx: 16,
+  /** A CPU helper worker's own JS heap and code (estimate: iOS exposes no per-worker memory). */
+  cpuWorkerFixed: 8 * MB,
 });
 
 /** Named byte counts. */
@@ -240,6 +255,25 @@ export interface DensePlanInput {
   tsdfMaxBlocks: number;
   /** Explicit fusion pixel step (else derived from the budget). */
   fusionStep?: number;
+  /**
+   * CPU/GPU overlap of the PatchMatch passes (`DensePlan.overlap`) with this many CPU helper
+   * workers (0 = only the depth-map writes overlap). Absent / null = serial.
+   */
+  overlap?: { workers: number } | null;
+}
+
+/**
+ * CPU/GPU overlap of the PatchMatch passes (src/engine/dense.ts): what may still be in flight on
+ * the CPU while the engine thread submits the next view's GPU passes.
+ */
+export interface DenseOverlap {
+  /**
+   * Depth maps behind the GPU: final maps on a helper worker (halo filter + serialisation) and maps
+   * being written to the store. 0 = each map is filtered and stored before the next view starts.
+   */
+  maps: number;
+  /** Keyframe decodes on helper workers (the next view's images decoded ahead). 0 = on demand, on the engine thread. */
+  decodes: number;
 }
 
 export interface DenseStagePeak {
@@ -267,6 +301,13 @@ export interface DensePlan {
   /** Bytes available to the engine (budget − reserve − resident). */
   shareBytes: number;
   stages: DenseStagePeak[];
+  /**
+   * CPU/GPU overlap (`DensePlanInput.overlap`), counted in the PatchMatch stage (part `overlap`):
+   * one map and one decode in flight before the image LRU grows into the other stages' peaks, more
+   * maps / decodes only from the budget's headroom after that. It never makes a plan not fit (with
+   * too little room: no decode, then serial) and only ever trims the image LRU's growth.
+   */
+  overlap: DenseOverlap;
   /** Largest stage peak + reserve + resident ≤ budget. */
   fits: boolean;
   peakBytes: number;
@@ -331,16 +372,47 @@ export function planDense(p: DensePlanInput): DensePlan {
     mesh: 120 * MB,
   };
 
+  // ---- CPU/GPU overlap (src/engine/dense.ts). A map in flight is kept by the engine thread until
+  // stored, with its serialised copy, and with the halo filter on a helper worker also the worker's
+  // copy of it and of the reference image + the filter's scratch; a decode in flight is one
+  // `decodeDenseView` on a worker. One map and one decode come before the image LRU's growth below
+  // (a judgement, not measured on a device: the halo filter off the engine thread saves more than
+  // the last cached views, whose re-decodes then overlap the GPU too), more only from the budget's
+  // headroom after it.
+  const overlap: DenseOverlap = { maps: 0, decodes: 0 };
+  const workers = Math.max(0, Math.floor(p.overlap?.workers ?? 0));
+  const haloOnWorker = workers > 0 && p.haloFilter;
+  const mapBytes = (MEM.depthMapPx + MEM.depthStoredPx + (haloOnWorker ? MEM.depthMapPx + MEM.rgbaPx + MEM.haloScratchPx : 0)) * px;
+  const decodeBytes = MEM.viewDecodeFixed + MEM.viewDecodePx * px;
+  const overlapBytes = (o: DenseOverlap): number =>
+    o.maps * mapBytes + o.decodes * decodeBytes + (o.decodes > 0 || (haloOnWorker && o.maps > 0) ? workers * MEM.cpuWorkerFixed : 0);
+  const roomFor = (o: DenseOverlap): boolean => sumBreakdown(pmParts) + overlapBytes(o) + MEM.reserve + p.residentBytes <= budget;
+  if (p.overlap) {
+    for (const o of [{ maps: 1, decodes: Math.min(1, workers) }, { maps: 1, decodes: 0 }]) {
+      if (!roomFor(o)) continue;
+      Object.assign(overlap, o);
+      break;
+    }
+  }
+
   // The image LRU may use what the PatchMatch stage leaves below the larger of the other two
   // stages' peaks (it never raises the plan's peak): up to every view, so each view is decoded
   // and undistorted once per resolution instead of once per pass.
   let imageCacheBytes = imageCacheBase;
   const otherPeak = Math.max(sumBreakdown(fusionParts), sumBreakdown(meshParts));
-  const pmSlack = otherPeak - sumBreakdown(pmParts);
+  const pmSlack = otherPeak - sumBreakdown(pmParts) - overlapBytes(overlap);
   if (pmSlack > 0 && views * img > imageCacheBytes) {
     imageCacheBytes = Math.min(views * img, imageCacheBytes + pmSlack);
     pmParts.images = imageCacheBytes;
   }
+
+  // more maps (the halo filter on a second worker), then more decodes, within the headroom left
+  if (overlap.maps > 0) {
+    const want = { maps: haloOnWorker ? Math.min(2, workers) : 1, decodes: Math.min(3, workers) };
+    while (overlap.maps < want.maps && roomFor({ ...overlap, maps: overlap.maps + 1 })) overlap.maps++;
+    while (overlap.decodes < want.decodes && roomFor({ ...overlap, decodes: overlap.decodes + 1 })) overlap.decodes++;
+  }
+  if (overlapBytes(overlap) > 0) pmParts.overlap = overlapBytes(overlap);
 
   const stages: DenseStagePeak[] = [
     { stage: 'patchmatch', bytes: sumBreakdown(pmParts), parts: pmParts },
@@ -359,6 +431,7 @@ export function planDense(p: DensePlanInput): DensePlan {
     tsdfMaxBlocks,
     shareBytes: share,
     stages,
+    overlap,
     fits: peakBytes <= budget,
     peakBytes,
     storageBytes: Math.round(2.2 * views * px * MEM.depthStoredPx),

@@ -49,14 +49,19 @@ export class EngineDepthStore implements DepthMapStore {
     return d;
   }
 
-  async put(id: number, d: DepthMap): Promise<void> {
+  /**
+   * Store a map. `serialized`: its `serializeDepthMap(d, { float16: true })`, already made (by a CPU
+   * helper worker); else it is serialised here. The map is resident (and listed by `ids`) at once;
+   * the IndexedDB write completes with the promise.
+   */
+  async put(id: number, d: DepthMap, serialized?: ArrayBuffer): Promise<void> {
     this.known.add(id);
     if (!this.persistent) {
       this.memory.set(id, d);
       return;
     }
     this.cache.set(id, d);
-    await this.store!.putBinary(this.key(id), serializeDepthMap(d, { float16: true }));
+    await this.store!.putBinary(this.key(id), serialized ?? serializeDepthMap(d, { float16: true }));
   }
 
   /** Ids written through this instance (or found in the store by `scan`). */

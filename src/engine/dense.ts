@@ -9,13 +9,30 @@
  * GPU scheduling (one command buffer in flight, retries of dropped work) is done inside
  * PatchMatchGPU; between views the engine waits while the page is hidden.
  *
+ * CPU/GPU overlap (`DenseDeps.createHelpers`, the memory plan's `overlap`; `EngineConfig.denseOverlap`
+ * false = serial): on a real GPU the PatchMatch kernels were only ≈ 18–33 % of the depth-map stage,
+ * the rest serial CPU work on this thread between GPU passes (e2e/README "Dense on the real GPU":
+ * object-real fast 37.7 s = view loads 7.5, PatchMatch 14.8 of which 6.6 s GPU, halo filter 9.9,
+ * store 4.1). With CPU helper workers (src/engine/cpu-pool.ts) while the GPU computes view i:
+ *  - the next view's missing images (ref + sources, at most `overlap.decodes` at a time; only when
+ *    the image LRU holds both views' images) are decoded, undistorted and rolling-shutter corrected
+ *    on the workers (`decodeDenseView`, src/engine/dense-jobs.ts);
+ *  - the final maps of earlier views get their halo / sky mask and float16 serialisation on a
+ *    worker (`haloStoreJob` on a copy: this thread keeps its map) and are written to the store,
+ *    at most `overlap.maps` maps behind the GPU (without workers, only the store write overlaps).
+ * The jobs run the same code as the serial path and the maps are put in view order, so the depth
+ * maps and the fused cloud are bit-identical (src/engine/dense-overlap.test.ts, .gpu.test.ts).
+ * Every pass drains its writes before the next pass reads them and before `dense/progress`
+ * advances, and a failed / cancelled run waits for the writes in flight, so resume sees only
+ * complete maps. A failing worker job falls back to this thread.
+ *
  * Limits: cancel is seen between views, so its latency is one PatchMatch view (estimated 4–15 s
  * per 1600 px view on an iPhone). Stored depth maps peak at ≈ 2.2 × views × px × 12 B of
  * IndexedDB (≈ 6 GB at `max`); iOS does not expose free disk, so a quota error mid-dense is not
  * predicted — it rejects densify, which then resumes from `dense/progress`.
  */
 import type { CameraIntrinsics, CancelToken, PointCloud, Pose, ProgressCallback, RGBAImage, TriangleMesh } from '../core/types';
-import { removeDepthHalos, worldUpInCamera } from '../dense/depth-filter';
+import { applyDepthHaloMask, removeDepthHalos, worldUpInCamera } from '../dense/depth-filter';
 import { fuseDepthMaps } from '../dense/fusion';
 import { patchMatchCPU } from '../dense/patchmatch-cpu';
 import { PatchMatchGPU } from '../dense/patchmatch-gpu';
@@ -23,14 +40,14 @@ import { filterPointCloud, footprintDownsample } from '../dense/pointcloud';
 import { simplifyMesh } from '../dense/simplify';
 import { tsdfMesh } from '../dense/tsdf';
 import type { DenseView, DepthMap, DepthMapStore, PatchMatchOptions } from '../dense/types';
-import { undistortImage, undistortedCamera } from '../dense/undistort';
-import { rsCorrectPinholeImage } from '../sfm/rolling-shutter';
+import { undistortedCamera } from '../dense/undistort';
 import { neighboursFromSelection, selectSourceViews, type SourceViewSelection } from '../dense/view-selection';
 import { getGPU } from '../gpu/device';
 import { median } from '../math/stats';
 import type { DenseOptions, MeshOptions, QualityPreset } from '../workers/protocol';
+import { correctDenseView, decodeDenseView, denseColourThumbnail, denseViewRS, type DenseHelpers } from './dense-jobs';
 import { EngineDepthStore } from './depth-store';
-import { fitSize, resizeRGBA } from './frame-ingest';
+import { fitSize } from './frame-ingest';
 import { LruCache, decodeStoredImage, rgbaBytes } from './image-cache';
 import { MB, formatBreakdown, planDense, type DensePlan } from './memory';
 import type { DenseMetaRecord, EngineStore } from './persistence';
@@ -40,6 +57,7 @@ import type { EngineConfig, SparseModel } from './types';
 
 const now = (): number => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+const noop = (): void => undefined;
 
 /** Lazily created, self-tested PatchMatchGPU (null ⇒ CPU fallback). */
 export class PatchMatchHolder {
@@ -141,6 +159,14 @@ export interface DenseDeps {
    */
   gravityAligned?: boolean;
   gravityCam?: ReadonlyMap<number, ArrayLike<number> | null>;
+  /**
+   * CPU helper workers of the depth-map stage (CPU/GPU overlap, see the module comment): their
+   * number and a factory (`CpuPool.create`). runDensify creates them only when the memory plan
+   * gives the overlap room, and disposes them when the depth maps end. Absent / 0 / a null
+   * factory result ⇒ every CPU step runs on this thread.
+   */
+  cpuWorkers?: number;
+  createHelpers?: (workers: number) => DenseHelpers | null;
 }
 
 /**
@@ -273,6 +299,87 @@ function emptyDepth(): DepthMap {
   return { width: 0, height: 0, depth: new Float32Array(0), normal: new Float32Array(0), cost: new Float32Array(0) };
 }
 
+/**
+ * Depth-map writes in flight (CPU/GPU overlap). `push`: a write counted against `wait`'s limit;
+ * `track`: background work (deletes of used maps, view decodes) that is only drained. The first
+ * failure is rethrown by the next `wait` / `drain`; `settle` waits for everything and ignores
+ * failures (clean-up after an error).
+ */
+class PendingWrites {
+  private readonly writes = new Set<Promise<void>>();
+  private readonly background = new Set<Promise<void>>();
+  private failed = false;
+  private error: unknown;
+
+  private add(set: Set<Promise<void>>, p: Promise<void>): void {
+    const q: Promise<void> = p.then(
+      () => {
+        set.delete(q);
+      },
+      (e: unknown) => {
+        set.delete(q);
+        if (!this.failed) {
+          this.failed = true;
+          this.error = e;
+        }
+      },
+    );
+    set.add(q);
+  }
+
+  push(p: Promise<void>): void {
+    this.add(this.writes, p);
+  }
+
+  track(p: Promise<void>): void {
+    this.add(this.background, p);
+  }
+
+  private rethrow(): void {
+    if (this.failed) throw this.error;
+  }
+
+  /** Wait until at most `limit` writes are in flight. */
+  async wait(limit: number): Promise<void> {
+    while (this.writes.size > Math.max(0, limit)) await Promise.race(this.writes);
+    this.rethrow();
+  }
+
+  /** Wait for every write and background job. */
+  async drain(): Promise<void> {
+    await this.settle();
+    this.rethrow();
+  }
+
+  async settle(): Promise<void> {
+    while (this.writes.size || this.background.size) await Promise.race([...this.writes, ...this.background]);
+  }
+}
+
+/** Counting semaphore (decodes in flight on helper workers). */
+class Slots {
+  private free: number;
+  private readonly waiting: (() => void)[] = [];
+
+  constructor(n: number) {
+    this.free = n;
+  }
+
+  async acquire(): Promise<void> {
+    if (this.free > 0) {
+      this.free--;
+      return;
+    }
+    await new Promise<void>((r) => this.waiting.push(r));
+  }
+
+  release(): void {
+    const next = this.waiting.shift();
+    if (next) next();
+    else this.free++;
+  }
+}
+
 function isDeviceLost(e: unknown): boolean {
   const m = String((e as Error)?.message ?? e);
   // 'instance destroyed': the worker's device-loss handler (recoverGPU) reset the holder under us
@@ -323,9 +430,9 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   if (multiScale) stats.denseMultiScale = 1;
   // ½-res ('half') views are decoded and undistorted at half size with their own LRU; resume keys
   // and progress include the pass kinds.
-  // colour-guided halo / sky clean-up of the final depth maps before fusion. It runs on this thread
-  // between GPU passes (~150–250 ms per 0.5 MP map); overlapping it and the store with the next
-  // view's GPU passes is the next speed-up (docs/research/dense-tuning.md "Dense on a real GPU").
+  // colour-guided halo / sky clean-up of the final depth maps before fusion (~150–250 ms per 0.5 MP
+  // map on one core): on a CPU helper worker while the next views compute when the plan allows,
+  // else on this thread between GPU passes
   const halo = preset.haloFilter === false ? null : removeDepthHalos;
   if (halo) stats.haloFilter = 1;
   // sky test orientation per view (frames are not always upright: canonical orientation, portrait lock)
@@ -343,6 +450,9 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
     }
     return best;
   };
+  // CPU/GPU overlap (module comment): helper workers only with a factory
+  const overlapOn = deps.config.denseOverlap !== false;
+  const workers = overlapOn && deps.createHelpers ? Math.max(0, Math.floor(deps.cpuWorkers ?? 0)) : 0;
   const planFor = (size: number): DensePlan => {
     const d = largest(size);
     return planDense({
@@ -358,6 +468,7 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
       haloFilter: !!halo,
       tsdfMaxBlocks: preset.tsdfMaxBlocks,
       fusionStep: preset.fusionStep ?? (Number.isFinite(presetStep) && presetStep >= 1 ? presetStep : undefined),
+      overlap: overlapOn ? { workers } : null,
     });
   };
   let plan = planFor(maxSize);
@@ -380,9 +491,16 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
       plan.fits ? 'info' : 'warn',
       `dense memory plan (${images.length} views ${d.width}×${d.height}, budget ${deps.memoryBudgetMB} MB, peak ≈ ${Math.round(plan.peakBytes / MB)} MB, storage ≈ ${Math.round(plan.storageBytes / MB)} MB): ` +
         plan.stages.map((st) => `${st.stage} ${formatBreakdown(st.parts, st.bytes)}`).join('; ') +
-        `; fusion step ${plan.fusionStep}, ≤ ${plan.fusionMaxPoints} points (≈ ${plan.expectedPoints} expected), ${plan.fusionMaxNeighbours} neighbours`,
+        `; fusion step ${plan.fusionStep}, ≤ ${plan.fusionMaxPoints} points (≈ ${plan.expectedPoints} expected), ${plan.fusionMaxNeighbours} neighbours` +
+        `; overlap ${overlapOn ? `${plan.overlap.maps} maps / ${plan.overlap.decodes} decodes in flight, ${workers} helper workers` : 'off'}`,
     );
   }
+  // CPU helper workers (created with the depth maps below, only when the plan uses them); decodes
+  // and halo filters go to them until a job fails (then this thread does them)
+  let helpers: DenseHelpers | null = null;
+  let decodeOnHelpers = false;
+  let haloOnHelpers = false;
+  const decodeSlots = new Slots(Math.max(1, plan.overlap.decodes));
 
   // ---- geometry of the undistorted views (no pixels yet)
   const geom = images.map((im) => {
@@ -411,26 +529,37 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   const colourBytesPerView = plan.colourBytes / Math.max(1, geom.length);
   const colour = new Map<number, RGBAImage>();
   const geomById = new Map(geom.map((g) => [g.id, g]));
-  // wall-time breakdown of the depth-map stage (ms; logged at its end)
+  // wall-time breakdown of the depth-map stage (ms; logged at its end): `load`, `halo`, `store` are
+  // what this thread spends on (or waits for) view images, the halo filter and map writes
   const perf = { decodes: 0, load: 0, inputs: 0, compute: 0, upload: 0, gpu: 0, gpuTs: 0, readback: 0, halo: 0, store: 0 };
+  // a keyframe decoded at `size`, undistorted, rolling-shutter corrected (+ its colour thumbnail
+  // within `thumbBytes`): on a helper worker when there is one, else here — the same code
+  const decodeView = async (id: number, size: number, thumbBytes: number): Promise<{ image: RGBAImage; cam: CameraIntrinsics; thumb: RGBAImage | null }> => {
+    const g = geomById.get(id)!;
+    if (helpers && decodeOnHelpers) {
+      const stored = await deps.store.getFrameImage(id);
+      if (!stored) throw new Error(`keyframe image ${id} missing`);
+      await decodeSlots.acquire();
+      try {
+        if (helpers && decodeOnHelpers) return await helpers.denseView(stored, g.distorted, size, denseViewRS(model, id), thumbBytes);
+      } catch (e) {
+        decodeOnHelpers = false;
+        deps.log('warn', `dense: keyframe decoding on a CPU helper worker failed, decoding on the engine thread (${(e as Error)?.message ?? e})`);
+      } finally {
+        decodeSlots.release();
+      }
+    }
+    const und = await loadDenseViewImage(deps.store, model, id, g.distorted, size);
+    return { image: und.image, cam: und.cam, thumb: thumbBytes > 0 ? denseColourThumbnail(und.image, thumbBytes) : null };
+  };
   const loadView = (id: number): Promise<DenseView> =>
     cache.getOrLoad(id, async () => {
-      const tl = now();
       perf.decodes++;
-      const g = geomById.get(id)!;
-      const und = await loadDenseViewImage(deps.store, model, id, g.distorted, maxSize);
-      const view: DenseView = { id, cam: und.cam, pose: g.pose, image: und.image };
-      if (!colour.has(id)) {
-        // colour thumbnail of the SAME (rolling-shutter corrected) image: fusion / TSDF sample it
-        // at the projection with the frame-stamp pose
-        const w = und.image.width,
-          h = und.image.height;
-        const s = Math.min(1, Math.sqrt(colourBytesPerView / (4 * w * h)));
-        const fs = fitSize(w, h, Math.max(64, Math.floor(s * Math.max(w, h))));
-        colour.set(id, resizeRGBA(und.image, fs.width, fs.height));
-      }
-      perf.load += now() - tl;
-      return view;
+      // colour thumbnail of the SAME (rolling-shutter corrected) image: fusion / TSDF sample it at
+      // the projection with the frame-stamp pose
+      const und = await decodeView(id, maxSize, colour.has(id) ? 0 : colourBytesPerView);
+      if (und.thumb && !colour.has(id)) colour.set(id, und.thumb);
+      return { id, cam: und.cam, pose: geomById.get(id)!.pose, image: und.image };
     });
   // ½-resolution views of the multi-scale pass: decoded and undistorted at half the size (exact
   // §2-rule pinhole of the full view), cached separately (¼ of the bytes: all views usually fit)
@@ -438,13 +567,15 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   const halfCache = new LruCache<number, DenseView>(multiScale ? plan.imageCacheBytes : 0, (v) => rgbaBytes(v.image));
   const loadHalfView = (id: number): Promise<DenseView> =>
     halfCache.getOrLoad(id, async () => {
-      const tl = now();
       perf.decodes++;
-      const g = geomById.get(id)!;
-      const und = await loadDenseViewImage(deps.store, model, id, g.distorted, halfSize);
-      perf.load += now() - tl;
-      return { id, cam: und.cam, pose: g.pose, image: und.image };
+      const und = await decodeView(id, halfSize, 0);
+      return { id, cam: und.cam, pose: geomById.get(id)!.pose, image: und.image };
     });
+  // view-image bytes per pass resolution (largest camera): the prefetch bound
+  const imageBytesAt = (size: number): number => {
+    const d = largest(size);
+    return 4 * d.width * d.height;
+  };
 
   // ---- depth maps
   // Resident maps are bounded explicitly: the pass stores keep ONE full map (write-through to
@@ -478,28 +609,117 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
   const tDepth = now();
   // GPU upload-cache counters for the log below (read before the instance is freed)
   let pmCache: PatchMatchGPU['cacheStats'] | null = null;
+  // Full-resolution passes alternate direction (serpentine, the last one forward): the next pass
+  // starts with the views the image LRU (and PatchMatchGPU's upload caches) still hold.
+  const passOrder = (pass: number): typeof ordered => {
+    const fullBefore = passKinds.slice(pass + 1).filter((k) => k !== 'half').length;
+    return passKinds[pass] !== 'half' && fullBefore % 2 === 1 ? [...ordered].reverse() : ordered;
+  };
+  // overlap: map writes (and halo filters on helpers) in flight behind the GPU
+  const writes = new PendingWrites();
+  const mapsInFlight = overlapOn ? plan.overlap.maps : 0;
+  // The next view's missing images are decoded on helper workers during this view's GPU passes —
+  // only when the image LRU holds this view's and the next view's images together (the cached
+  // ones of the next view are touched first, so the prefetch evicts neither).
+  const prefetch = (kind: PassKind, next: (typeof ordered)[number], inUse: number[]): void => {
+    if (!helpers || !decodeOnHelpers) return;
+    const c = kind === 'half' ? halfCache : cache;
+    const ids = [next.id, ...sel.get(next.id)!.sources];
+    if (new Set([...inUse, ...ids]).size * imageBytesAt(kind === 'half' ? halfSize : maxSize) > c.capacityBytes) return;
+    const load = kind === 'half' ? loadHalfView : loadView;
+    // tracked: settled before the helpers are disposed (a failure here is retried by the view's own load)
+    for (const id of ids) if (c.get(id) === undefined) writes.track(load(id).then(noop, noop));
+  };
+  // halo filter + serialisation of a final map on a helper worker (mask applied to this thread's
+  // map); a failed worker job filters this thread's map here instead (same result)
+  const haloOnHelper = (id: number, pose: Pose, dm: DepthMap, ref: DenseView, serialize: boolean): Promise<{ map: DepthMap; stored?: ArrayBuffer }> => {
+    const skyUp = skyUpOf(id, pose);
+    return helpers!.haloStore(dm, { image: ref.image, cam: ref.cam, options: skyUp ? { skyUp } : {} }, serialize).then(
+      (r) => {
+        if (r.haloError !== undefined) deps.log('warn', `depth halo filter failed: ${r.haloError}`);
+        else if (r.mask) applyDepthHaloMask(dm, r.mask);
+        return { map: dm, stored: r.stored };
+      },
+      (e: unknown) => {
+        haloOnHelpers = false;
+        deps.log('warn', `dense: halo filter on a CPU helper worker failed, filtering on the engine thread (${(e as Error)?.message ?? e})`);
+        let map = dm;
+        const th = now();
+        try {
+          map = skyUp ? halo!(dm, ref.image, ref.cam, { skyUp }) : halo!(dm, ref.image, ref.cam);
+        } catch (e2) {
+          deps.log('warn', `depth halo filter failed: ${(e2 as Error)?.message ?? e2}`);
+        }
+        perf.halo += now() - th;
+        return { map };
+      },
+    );
+  };
+  // Map writes: the put CALLS keep the view order whenever the maps get ready. A store keeps its
+  // last map resident, and a later read of that one sees it unquantised (float32 normals / cost,
+  // not the float16 store copy): the serial order keeps the results bit-identical.
+  let putTurn: Promise<void> = Promise.resolve();
+  const putInOrder = (store: EngineDepthStore, id: number, ready: Promise<{ map: DepthMap; stored?: ArrayBuffer }>): Promise<void> => {
+    const turn = putTurn;
+    let called!: () => void;
+    putTurn = new Promise<void>((r) => (called = r));
+    return turn
+      .then(() => ready)
+      .then(
+        (m) => {
+          const p = store.put(id, m.map, m.stored);
+          called();
+          return p;
+        },
+        (e: unknown) => {
+          called();
+          throw e;
+        },
+      );
+  };
+  let helperMs: DenseHelpers['busyMs'] | null = null;
   try {
+    if (workers > 0 && (plan.overlap.decodes > 0 || (halo && plan.overlap.maps > 0))) {
+      try {
+        helpers = deps.createHelpers!(workers);
+      } catch (e) {
+        deps.log('debug', `dense: no CPU helper workers (${(e as Error)?.message ?? e})`);
+      }
+      if (helpers && helpers.size === 0) {
+        helpers.dispose();
+        helpers = null;
+      }
+      decodeOnHelpers = !!helpers && plan.overlap.decodes > 0;
+      haloOnHelpers = !!helpers && !!halo && plan.overlap.maps > 0;
+    }
+    stats.denseHelperWorkers = helpers?.size ?? 0;
     for (let pass = resumePass; pass < passes; pass++) {
       const kind = passKinds[pass];
       // maps of the previous pass this pass reads: the reference's (prior) and, geometric, the sources'
       const reads = (id: number): number[] => (pass === 0 ? [] : kind === 'geo' ? [id, ...sel.get(id)!.sources] : [id]);
       await setProgress(pass);
-      cur = new EngineDepthStore(backend, `pm${pass}`, 0);
-      const have = new Set(persistent && pass === resumePass ? await cur.scan() : []);
-      // Full-resolution passes alternate direction (serpentine, the last one forward): the next
-      // pass starts with the views the image LRU (and PatchMatchGPU's upload caches) still hold.
-      const fullBefore = passKinds.slice(pass + 1).filter((k) => k !== 'half').length;
-      const order = kind !== 'half' && fullBefore % 2 === 1 ? [...ordered].reverse() : ordered;
+      const store = new EngineDepthStore(backend, `pm${pass}`, 0);
+      cur = store;
+      const have = new Set(persistent && pass === resumePass ? await store.scan() : []);
+      const order = passOrder(pass);
       // last reference (index in `order`) that reads each previous-pass map
       const lastUse = new Map<number, number>();
       order.forEach((g, i) => reads(g.id).forEach((id) => lastUse.set(id, i)));
-      const releasePrev = async (i: number): Promise<void> => {
-        if (!prev) return;
-        for (const id of reads(order[i].id)) {
+      // (the resident copies go at once, in view order — the caches' contents stay those of the
+      // serial path —, the store deletes complete with the promise)
+      const releasePrev = (i: number): Promise<void> => {
+        const ps: Promise<void>[] = [];
+        for (const id of prev ? reads(order[i].id) : []) {
           if (lastUse.get(id) !== i) continue;
           srcDepth.delete(id);
-          await prev.delete(id);
+          ps.push(prev!.delete(id));
         }
+        return Promise.all(ps).then(noop);
+      };
+      // the view computed after order[i]: the next one not stored yet, else the next pass's first
+      const nextView = (i: number): { kind: PassKind; view: (typeof ordered)[number] } | null => {
+        for (let j = i + 1; j < order.length; j++) if (!have.has(order[j].id)) return { kind, view: order[j] };
+        return pass + 1 < passes && ordered.length ? { kind: passKinds[pass + 1], view: passOrder(pass + 1)[0] } : null;
       };
       for (let i = 0; i < order.length; i++) {
         const g = order[i];
@@ -512,9 +732,23 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
         }
         const s = sel.get(g.id)!;
         const load = kind === 'half' ? loadHalfView : loadView;
-        const ref = await load(g.id);
+        const tl = now();
+        let ref: DenseView;
         const srcs: DenseView[] = [];
-        for (const sid of s.sources) srcs.push(await load(sid));
+        if (helpers && decodeOnHelpers) {
+          // decoded in parallel on the helpers (all settled before the helpers are disposed)
+          const ps = [g.id, ...s.sources].map((id) => load(id));
+          for (const p of ps) writes.track(p.then(noop, noop));
+          const vs = await Promise.all(ps);
+          ref = vs[0];
+          srcs.push(...vs.slice(1));
+        } else {
+          ref = await load(g.id);
+          for (const sid of s.sources) srcs.push(await load(sid));
+        }
+        perf.load += now() - tl;
+        const next = nextView(i);
+        if (next) prefetch(next.kind, next.view, next.kind === kind ? [g.id, ...s.sources] : []);
         const range = { min: s.depthMin, max: s.depthMax };
         let geometric: { prior: DepthMap; sourceDepths: DepthMap[] } | undefined;
         const ti = now();
@@ -576,36 +810,55 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
           perf.gpuTs += lt.gpuMs ?? 0;
         }
         geometric = undefined;
-        const th = now();
-        if (halo && pass === passes - 1) {
-          try {
-            const skyUp = skyUpOf(g.id, g.pose);
-            dm = skyUp ? halo(dm, ref.image, ref.cam, { skyUp }) : halo(dm, ref.image, ref.cam);
-          } catch (e) {
-            deps.log('warn', `depth halo filter failed: ${(e as Error)?.message ?? e}`);
+        if (halo && pass === passes - 1 && haloOnHelpers) {
+          writes.push(putInOrder(store, g.id, haloOnHelper(g.id, g.pose, dm, ref, store.persistent)));
+        } else {
+          const th = now();
+          if (halo && pass === passes - 1) {
+            try {
+              const skyUp = skyUpOf(g.id, g.pose);
+              dm = skyUp ? halo(dm, ref.image, ref.cam, { skyUp }) : halo(dm, ref.image, ref.cam);
+            } catch (e) {
+              deps.log('warn', `depth halo filter failed: ${(e as Error)?.message ?? e}`);
+            }
           }
+          perf.halo += now() - th;
+          writes.push(putInOrder(store, g.id, Promise.resolve({ map: dm })));
         }
+        // at most `mapsInFlight` maps behind the GPU (0: this map is written before the next view)
         const tp = now();
-        perf.halo += tp - th;
-        await cur.put(g.id, dm);
-        await releasePrev(i);
+        await writes.wait(mapsInFlight);
+        if (mapsInFlight > 0) writes.track(releasePrev(i));
+        else await releasePrev(i);
         perf.store += now() - tp;
         done++;
         const label = kind === 'half' ? 'photometric ½' : kind === 'photo' ? 'photometric' : `geometric ${pass - passKinds.indexOf('geo') + 1}`;
         report('depth_maps', done / total, `${label} ${done}/${total} (${Math.round(now() - tv)} ms)`);
         await tick();
       }
+      // every map of this pass is stored before the next pass reads them / the progress advances
+      const tw = now();
+      await writes.drain();
+      perf.store += now() - tw;
       if (prev) await prev.clear();
       srcDepth.clear();
       halfCache.clear();
-      prev = cur;
+      prev = store;
     }
     pmCache = pm ? pm.cacheStats : null;
   } finally {
+    // nothing may still write after densify returns or rejects (a resume must see complete maps
+    // only, and a later run's clean-up must not race a late write)
+    await writes.settle();
     // PatchMatchGPU's buffers (≈ 32 B per reference px + 5 B per source px: ~140 MB at 1600 px) are
     // not needed for fusion / meshing, nor kept after a cancel or failure: free them (recreated by
     // the next densify)
     if (pm) deps.holder.reset();
+    if (helpers) {
+      helperMs = { ...helpers.busyMs };
+      helpers.dispose();
+      helpers = null;
+    }
   }
   if (skipped) stats.denseResumedMaps = skipped;
   const depthMapsMs = now() - tDepth;
@@ -617,6 +870,7 @@ export async function runDensify(deps: DenseDeps, opts: DenseOptions = {}, progr
       `dense depth maps ${s(depthMapsMs)} s: view loads ${s(perf.load)} s (${perf.decodes} decodes), pass inputs ${s(perf.inputs)} s, ` +
         `PatchMatch ${s(perf.compute)} s (upload ${s(perf.upload)}, GPU passes ${s(perf.gpu)}${perf.gpuTs > 0 ? ` [GPU timestamps ${s(perf.gpuTs)}]` : ''}, readback ${s(perf.readback)}), ` +
         `halo filter ${s(perf.halo)} s, store ${s(perf.store)} s` +
+        (helperMs ? `; CPU helper workers (${stats.denseHelperWorkers}): decodes ${s(helperMs.denseView)} s, halo filter + serialise ${s(helperMs.haloStore)} s` : '') +
         (pmCache ? `; GPU upload caches: images ${pmCache.imageHits} hits / ${pmCache.imageMisses} uploads, depth maps ${pmCache.depthHits} / ${pmCache.depthMisses}` : ''),
     );
   }
@@ -725,10 +979,8 @@ export async function rebuildColourViews(store: EngineStore, model: SparseModel,
  * thumbnails (fusion / TSDF), in-session and after a reload alike.
  */
 export function denseViewImage(rgba: RGBAImage, distorted: CameraIntrinsics, maxSize: number, model: SparseModel, id: number): { image: RGBAImage; cam: CameraIntrinsics } {
-  const und = undistortImage(rgba, distorted, maxSize);
-  const rs = model.rollingShutter;
-  const w = rs ? rs.omega[id] : undefined;
-  return { cam: und.cam, image: rs && w ? rsCorrectPinholeImage(und.image, und.cam, w, rs, rs.nu?.[id] ?? null) : und.image };
+  // the same code as the CPU helper workers' (src/engine/dense-jobs.ts)
+  return correctDenseView(rgba, distorted, maxSize, denseViewRS(model, id));
 }
 
 /**
@@ -738,8 +990,7 @@ export function denseViewImage(rgba: RGBAImage, distorted: CameraIntrinsics, max
 export async function loadDenseViewImage(store: EngineStore, model: SparseModel, id: number, distorted: CameraIntrinsics, maxSize: number): Promise<{ image: RGBAImage; cam: CameraIntrinsics }> {
   const stored = await store.getFrameImage(id);
   if (!stored) throw new Error(`keyframe image ${id} missing`);
-  const c = undistortedCamera(distorted, maxSize);
-  return denseViewImage(await decodeStoredImage(stored, c.width, c.height), distorted, maxSize, model, id);
+  return decodeDenseView(stored, distorted, maxSize, denseViewRS(model, id));
 }
 
 export interface MeshDeps {

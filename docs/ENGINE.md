@@ -20,7 +20,12 @@ UI screens ◀──progress / results──────────      ├─
 
 All heavy work runs in the worker: the UI thread only shows video, the viewer and
 the UI. WebGPU is used from the worker. The engine class itself is
-thread-agnostic so the test harness can run it on the main thread.
+thread-agnostic so the test harness can run it on the main thread. For refine and densify
+the engine worker spawns CPU helper workers (nested; `src/engine/cpu-pool.ts`,
+`EngineConfig.cpuWorkers`, hardware threads − 2 ≤ 3, so 2 on an iPhone) for pure jobs whose
+results are applied in the engine's own order: pair verification, vocabulary quantisation and
+rolling-shutter hypotheses (refine); keyframe decoding and the final depth maps' halo filter +
+serialisation (densify).
 
 ## 2. `PhotogrammetryEngine` (`src/engine/engine.ts`)
 
@@ -151,6 +156,13 @@ alternate direction so the image LRU (sized up to every view when the plan allow
 PatchMatchGPU's upload caches stay warm. A fused cloud above the preset's `maxPoints` is merged
 with a footprint-adaptive LOD (cells ∝ each point's radius). Details: research/dense-tuning.md "Dense on a
 real GPU".
+
+CPU/GPU overlap (`EngineConfig.denseOverlap`, default on; `src/engine/dense.ts`): while the GPU computes a
+view, the CPU helper workers decode, undistort and rolling-shutter correct the next view's missing images
+and halo-filter + serialise the final maps of earlier views, whose store writes complete in the background
+(≤ `DensePlan.overlap.maps` maps behind the GPU; put in view order). The memory plan grants one map and
+one decode in flight before the image LRU grows, more only from the remaining headroom; every pass drains
+its writes before the next reads them or `dense/progress` advances. Bit-identical to the serial path.
 
 ### Splat
 Gaussian splatting (`src/engine/splat.ts` over `src/splat`, research/splat-tuning.md "Engine splat stage"), after

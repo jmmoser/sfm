@@ -577,7 +577,8 @@ offset, gravity, metric scale), GPS Sim3 alignment, compass yaw → world frame 
 **Dense**: undistort keyframes (≤ 1600 px by preset) → source-view selection →
 PatchMatch at ½ resolution (multi-scale) → PatchMatch (photometric) for all views →
 PatchMatch (geometric consistency) → halo / sky filter → fusion → filtered coloured
-point cloud → optional TSDF mesh.
+point cloud → optional TSDF mesh. Keyframe decoding and the halo filter run on CPU helper
+workers while the GPU computes the next views (bit-identical results; docs/ENGINE.md).
 
 **Splat**: dense (else sparse) cloud → 3D Gaussians → WebGPU training against all keyframes
 (MCMC densification, depth supervision from the dense maps, per-view colour correction).
