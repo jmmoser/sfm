@@ -20,7 +20,8 @@
  * the scale needs band-limited (0.3–3 Hz) acceleration ≥ 0.08 m/s² RMS (`excitationRms`), so
  * tripod-smooth motion comes out `reliable: false` (as does the gyro time offset of a smooth
  * constant-rate pan); segments are
- * split at keyframe gaps > 3 s and IMU gaps > 250 ms. `estimateTimeOffset` costs ∝ keyframes ×
+ * split at keyframe gaps > 3 s and IMU gaps > 250 ms, and the gravity skips keyframe intervals
+ * with an IMU gap (a capture continued later: one session, several segments). `estimateTimeOffset` costs ∝ keyframes ×
  * grid points (±250 ms at 2 ms, evaluated twice: 2000 keyframes ≈ 1 s per grid pass). When the
  * device hardly rotates, an uncompensated horizontal accelerometer bias b tilts gravity by ≈ b/g.
  *
@@ -760,6 +761,12 @@ export interface GravityOptions {
   correlationS: number;
   /** Gyro bias (rad/s) to remove before integration, e.g. `TimeOffsetResult.gyroBias`. */
   gyroBias: ArrayLike<number> | null;
+  /**
+   * IMU gaps (ms) that break the attitude between two keyframes (default 250, as the scale's
+   * segments): the samples inside such an interval are not used, except within 100 ms of its
+   * keyframes.
+   */
+  maxImuGapMs: number;
 }
 
 /** Gravity estimate in the reconstruction frame. */
@@ -775,13 +782,17 @@ export interface GravityResult {
   source: 'accelG' | 'gravityCam';
 }
 
-const DEFAULT_GRAVITY: GravityOptions = { offsetMs: 0, g0: G0, magnitudeSigma: 0.5, minSamples: 20, correlationS: 0.5, gyroBias: null };
+const DEFAULT_GRAVITY: GravityOptions = { offsetMs: 0, g0: G0, magnitudeSigma: 0.5, minSamples: 20, correlationS: 0.5, gyroBias: null, maxImuGapMs: 250 };
 
 /**
  * Gravity direction: weighted mean of the world-frame specific force f = R_wd(t)·accelG over
  * all IMU samples in the keyframe span (the motion acceleration integrates to Δv/T ≈ 0 over a
  * capture), weights 1/(1 + ((|f| − g)/σ)²) favour quasi-static samples. down = −mean/|mean|.
- * Falls back to the mean of R_wc·gravityCam over keyframes when no accelG is available.
+ * Samples between two keyframes whose IMU has a gap (> `maxImuGapMs`: a capture continued later,
+ * EngineOptions.extend) are skipped except within 100 ms of the keyframes: the gyro does not
+ * carry the attitude across the gap, and interpolating the unobserved rotation over the interval
+ * tilted gravity by degrees (e2e: 5.4° with a 10 s gap). Falls back to the mean of
+ * R_wc·gravityCam over keyframes when no accelG is available.
  */
 export function estimateGravity(
   keyframes: readonly InertialKeyframe[],
@@ -797,6 +808,31 @@ export function estimateGravity(
   let cnt = 0;
   if (gyro.n >= 2) {
     const att = new AttitudeInterpolator(kf, gyro, o.offsetMs);
+    // keyframe intervals the IMU does not cover continuously
+    const tau = att.tau;
+    const st = gyro.t;
+    const broken = new Uint8Array(Math.max(0, kf.length - 1));
+    for (let k = 0, i = 0; k + 1 < kf.length; k++) {
+      while (i + 1 < st.length && st[i + 1] <= tau[k]) i++;
+      for (let j = i; j + 1 < st.length && st[j] < tau[k + 1]; j++) {
+        if (st[j + 1] - st[j] > o.maxImuGapMs) {
+          broken[k] = 1;
+          break;
+        }
+      }
+    }
+    const anyBroken = broken.includes(1);
+    const usable = (tm: number): boolean => {
+      if (!anyBroken || !(tm > tau[0] && tm < tau[tau.length - 1])) return true;
+      let lo = 0,
+        hi = tau.length - 1;
+      while (hi - lo > 1) {
+        const mid = (lo + hi) >> 1;
+        if (tau[mid] <= tm) lo = mid;
+        else hi = mid;
+      }
+      return !(broken[lo] && tm > tau[lo] + 100 && tm < tau[lo + 1] - 100);
+    };
     const R = new Float64Array(9);
     let sx = 0,
       sy = 0,
@@ -807,7 +843,7 @@ export function estimateGravity(
       fz: number[] = [],
       fw: number[] = [];
     for (const s of imu) {
-      if (!s.accelG || !(s.t >= t0 && s.t <= t1)) continue;
+      if (!s.accelG || !(s.t >= t0 && s.t <= t1) || !usable(s.t)) continue;
       att.rotationAt(s.t, R);
       const a = s.accelG;
       const x = R[0] * a[0] + R[1] * a[1] + R[2] * a[2];
