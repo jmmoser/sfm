@@ -589,9 +589,13 @@ are defined in `e2e/lib/e2e-checks.mjs` (`CHECKS`). Initial values:
 The yard dense limits are lower because even with exact poses the dense stage reaches only
 0.23–0.34 completeness on that scene (see the reference run above). A check that applies but
 has no value fails; for example, a missing trajectory fails `ateRelative`. Dense checks are
-skipped with `--no-dense`. The object-isolation checks `meshFocusOutside`, `meshFocusCompleteness`,
-`objectRoiIoU` and `objectRoiContainsFocus` (1 = the box contains `meta.focus` − 1 cm) apply to mesh runs;
-they have no limits in the shipped file yet (set them from a measured object-real baseline).
+skipped with `--no-dense`. The object-isolation checks `meshFocusOutside`, `objectRoiIoU` and
+`objectRoiContainsFocus` (1 = the box contains `meta.focus` − 1 cm) apply to mesh runs with the object box on
+(skipped with `--no-mesh` or `--no-object-roi`), `meshFocusCompleteness` to every mesh run. object-real has the
+object box acceptance as limits: IoU ≥ 0.6, the box contains `meta.focus` − 1 cm, mesh vertices outside
+`meta.focus` ± 2 cm ≤ 5 %. `meshFocusCompleteness` has no limit: compare it with a `--no-object-roi` baseline run
+(within 0.01), and compare `voxelSize` / `meshingMs` rather than `tsdfCoarsenLevels` (the bounded TSDF takes its
+auto voxel from the depths inside the box, so the coarsening ladder starts elsewhere).
 
 The exit code is 0 when every pipeline finished without errors and every enforced check passed,
 1 otherwise, and 2 for usage errors. Mock runs report the checks but do not enforce them unless
@@ -865,7 +869,8 @@ that what these datasets were built for is caught (checked on the stored runs: t
 object-real also `expl` and the rotation-only `final3`; `final4` / `rst2` pass with a 2–6× margin, completeness
 0.35 vs 0.28 on yard-real): registration ≥ 0.95, ATE / extent
 ≤ 7e-4 / 1e-3, rotation p50 ≤ 0.25° / 0.3°, focal ≤ 0.5 / 1 %, scale ≤ 2.5 / 5 %, gravity ≤ 0.5°, heading ≤ 3°,
-dense accuracy p50 ≤ 6e-4 of the extent (0.8 mm) / 2 cm, completeness ≥ 0.98 / 0.28.
+dense accuracy p50 ≤ 6e-4 of the extent (0.8 mm) / 2 cm, completeness ≥ 0.98 / 0.28; object-real also the
+object box checks above.
 
 Refine time (SwiftShader host, two runs in parallel): object-real 77 s (baseline 65 s: ≈ 25 BAs of the
 rolling-shutter passes, two live-model re-adjustments, the per-image focal rounds), yard-real 65 s (baseline

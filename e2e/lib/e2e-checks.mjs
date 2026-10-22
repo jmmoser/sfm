@@ -38,10 +38,11 @@ const abs = (v) => (typeof v === 'number' ? Math.abs(v) : v);
 
 /**
  * Named check values from computeMetrics output. `when` decides whether a check applies:
- *   'always', 'dense' (dense cloud requested), 'mesh' (mesh requested), 'metric' / 'gravity' /
- *   'north' (claimed by the result). The mesh / object-box checks score object isolation against
- *   meta.focus (metrics `focus` / `objectRoi`); objectRoiContainsFocus is 1 when the box contains
- *   meta.focus shrunk by 1 cm, else 0.
+ *   'always', 'dense' (dense cloud requested), 'mesh' (mesh requested), 'objectRoi' (mesh requested
+ *   with the object box on, i.e. not --no-object-roi), 'metric' / 'gravity' / 'north' (claimed by
+ *   the result). The mesh / object-box checks score object isolation against meta.focus (metrics
+ *   `focus` / `objectRoi`); objectRoiContainsFocus is 1 when the box contains meta.focus shrunk by
+ *   1 cm, else 0. A requested box that the engine did not propose fails them (IoU 0).
  */
 export const CHECKS = {
   registrationRate: { label: 'registration rate (of input)', when: 'always', value: (m) => m.registration?.rateOfInput ?? m.registration?.rate ?? null },
@@ -56,16 +57,16 @@ export const CHECKS = {
   densePrecision: { label: 'dense precision', when: 'dense', value: (m) => m.dense?.precision ?? null },
   denseCompleteness: { label: 'dense completeness', when: 'dense', value: (m) => m.dense?.completeness ?? null },
   denseFscore: { label: 'dense F-score', when: 'dense', value: (m) => m.dense?.fscore ?? null },
-  meshFocusOutside: { label: 'mesh vertices outside focus ± 2 cm', when: 'mesh', value: (m) => m.focus?.outsideFraction ?? null },
+  meshFocusOutside: { label: 'mesh vertices outside focus ± 2 cm', when: 'objectRoi', value: (m) => m.focus?.outsideFraction ?? null },
   meshFocusCompleteness: { label: 'mesh completeness in focus box', when: 'mesh', value: (m) => m.focus?.completeness ?? null },
-  objectRoiIoU: { label: 'object box IoU with focus', when: 'mesh', value: (m) => m.objectRoi?.iou ?? null },
-  objectRoiContainsFocus: { label: 'object box ⊇ focus − 1 cm', when: 'mesh', value: (m) => (m.objectRoi ? (m.objectRoi.containsFocusShrunk ? 1 : 0) : null) },
+  objectRoiIoU: { label: 'object box IoU with focus', when: 'objectRoi', value: (m) => m.objectRoi?.iou ?? null },
+  objectRoiContainsFocus: { label: 'object box ⊇ focus − 1 cm', when: 'objectRoi', value: (m) => (m.objectRoi ? (m.objectRoi.containsFocusShrunk ? 1 : 0) : null) },
 };
 
 /**
- * Evaluate thresholds. ctx = { dense: bool (dense requested), mesh: bool (mesh requested), claims:
- * {metric, gravityAligned, northAligned} (from the result), sensors: {imu, gps, heading} (streams
- * that were passed) }.
+ * Evaluate thresholds. ctx = { dense: bool (dense requested), mesh: bool (mesh requested),
+ * objectRoi: bool (mesh requested with the object box on), claims: {metric, gravityAligned,
+ * northAligned} (from the result), sensors: {imu, gps, heading} (streams that were passed) }.
  * Returns [{ name, label, value, limit, status: 'pass' | 'fail' | 'skip', reason? }].
  * A check that applies but has no value (e.g. no trajectory) FAILS. `claims` thresholds
  * (e.g. { metric: true }) require the result to claim that property when the sensors needed
@@ -87,11 +88,13 @@ export function runChecks(metrics, thresholds, ctx) {
       def.when === 'always' ||
       (def.when === 'dense' && !!ctx.dense) ||
       (def.when === 'mesh' && !!ctx.mesh) ||
+      (def.when === 'objectRoi' && !!ctx.mesh && !!ctx.objectRoi) ||
       (def.when === 'metric' && claimed.metric) ||
       (def.when === 'gravity' && claimed.gravity) ||
       (def.when === 'north' && claimed.north);
     if (!applies) {
-      const reason = def.when === 'dense' ? 'no dense run' : def.when === 'mesh' ? 'no mesh run' : `not claimed (${def.when})`;
+      const reason =
+        def.when === 'dense' ? 'no dense run' : def.when === 'mesh' || (def.when === 'objectRoi' && !ctx.mesh) ? 'no mesh run' : def.when === 'objectRoi' ? 'object box off' : `not claimed (${def.when})`;
       out.push({ name, label: def.label, value: null, limit, status: 'skip', reason });
       continue;
     }

@@ -99,9 +99,17 @@ describe('thresholds + checks', () => {
   const spec = thresholdsJson as unknown as Record<string, Record<string, unknown>>;
 
   it('the shipped thresholds only use known check names and the requested initial values', () => {
-    for (const scope of ['default', 'object', 'yard']) {
-      for (const k of Object.keys(spec[scope])) if (k !== 'claims') expect(Object.keys(CHECKS)).toContain(k);
+    const datasets = spec.datasets as Record<string, Record<string, unknown>>;
+    for (const limits of [spec.default, spec.object, spec.yard, ...Object.values(datasets)]) {
+      for (const k of Object.keys(limits)) if (k !== 'claims') expect(Object.keys(CHECKS)).toContain(k);
     }
+    // object-real: the object box acceptance (IoU ≥ 0.6, ⊇ focus − 1 cm, ≤ 5 % mesh outside focus ± 2 cm)
+    const or = resolveThresholds(spec, 'object', 'object-real');
+    expect(or.limits.objectRoiIoU).toEqual({ min: 0.6 });
+    expect(or.limits.objectRoiContainsFocus).toEqual({ min: 1 });
+    expect(or.limits.meshFocusOutside).toEqual({ max: 0.05 });
+    expect(or.limits.meshFocusCompleteness).toBeUndefined();
+    expect(resolveThresholds(spec, 'yard', 'yard-real').limits.objectRoiIoU).toBeUndefined();
     const o = resolveThresholds(spec, 'object', 'synth40-object');
     expect(o.limits.registrationRate).toEqual({ min: 0.9 });
     expect(o.limits.ateRelative).toEqual({ max: 0.01 });
@@ -145,22 +153,29 @@ describe('thresholds + checks', () => {
     expect(noImu.find((c) => c.name === 'claims.metric')!.status).toBe('skip');
   });
 
-  it('mesh / object-box checks (not in the shipped thresholds yet): skip without a mesh run, judge the focus scores', () => {
+  it('mesh / object-box checks: skip without a mesh run (box checks also with the box off), judge the focus scores', () => {
     const th = { limits: { meshFocusOutside: { max: 0.05 }, meshFocusCompleteness: { min: 0.9 }, objectRoiIoU: { min: 0.6 }, objectRoiContainsFocus: { min: 1 } }, claims: {} };
     const ctx = { dense: true, claims: null, sensors: { imu: true, gps: false, heading: false } };
     expect(runChecks(fakeMetrics(), th, ctx).every((c) => c.status === 'skip' && c.reason === 'no mesh run')).toBe(true);
+    expect(runChecks(fakeMetrics(), th, { ...ctx, objectRoi: true }).every((c) => c.status === 'skip' && c.reason === 'no mesh run')).toBe(true);
     const good = fakeMetrics({
       focus: { margin: 0.02, tau: 0.0136, numPoints: 1000, numOutside: 20, outsideFraction: 0.02, numGtEvaluated: 500, completeness: 0.95 },
       objectRoi: { present: true, iou: 0.72, focusCoverage: 1, containsFocusShrunk: true, shrink: 0.01, confidence: 0.9, planeZGt: 0.75 },
     });
-    expect(runChecks(good, th, { ...ctx, mesh: true }).map((c) => c.status)).toEqual(['pass', 'pass', 'pass', 'pass']);
+    const on = { ...ctx, mesh: true, objectRoi: true };
+    expect(runChecks(good, th, on).map((c) => c.status)).toEqual(['pass', 'pass', 'pass', 'pass']);
+    // the box requested but not proposed: the box checks fail
     const none = fakeMetrics({ focus: { ...good.focus!, outsideFraction: 0.6 }, objectRoi: { ...good.objectRoi!, present: false, iou: 0, containsFocusShrunk: false } });
-    const by = Object.fromEntries(runChecks(none, th, { ...ctx, mesh: true }).map((c) => [c.name, c]));
+    const by = Object.fromEntries(runChecks(none, th, on).map((c) => [c.name, c]));
     expect(by.meshFocusOutside).toMatchObject({ status: 'fail', value: 0.6 });
     expect(by.objectRoiIoU).toMatchObject({ status: 'fail', value: 0 });
     expect(by.objectRoiContainsFocus).toMatchObject({ status: 'fail', value: 0 });
+    // --no-object-roi (the unbounded baseline): only the completeness is judged
+    const off = Object.fromEntries(runChecks(none, th, { ...ctx, mesh: true, objectRoi: false }).map((c) => [c.name, c]));
+    expect(off.meshFocusCompleteness.status).toBe('pass');
+    for (const k of ['meshFocusOutside', 'objectRoiIoU', 'objectRoiContainsFocus']) expect(off[k]).toMatchObject({ status: 'skip', reason: 'object box off' });
     // no metrics (e.g. no meta.focus) → missing
-    expect(runChecks(fakeMetrics(), th, { ...ctx, mesh: true }).every((c) => c.status === 'fail' && c.reason === 'missing')).toBe(true);
+    expect(runChecks(fakeMetrics(), th, on).every((c) => c.status === 'fail' && c.reason === 'missing')).toBe(true);
   });
 
   it('metricsInput builds the e2e/metrics.mjs result format', () => {

@@ -14,14 +14,16 @@ export interface Thresholds { limits: Record<string, Limit>; claims: Record<stri
 export interface CheckResult { name: string; label: string; value: number | boolean | null; limit: Limit; status: 'pass' | 'fail' | 'skip'; reason?: string }
 export interface CheckContext {
   dense: boolean;
-  /** Mesh requested (mesh / object-box checks apply). */
+  /** Mesh requested (mesh checks apply). */
   mesh?: boolean;
+  /** Mesh requested with the object box on (`MeshOptions.objectRoi` not false: object-box checks apply). */
+  objectRoi?: boolean;
   claims: { metric?: boolean; gravityAligned?: boolean; northAligned?: boolean } | null;
   sensors: { imu: boolean; gps: boolean; heading: boolean };
 }
 export function metricsInput(r: unknown, opts?: { pointsFile?: string | null }): MetricsInput;
 export function resolveThresholds(spec: unknown, scene: string, name: string): Thresholds;
-export const CHECKS: Record<string, { label: string; when: 'always' | 'dense' | 'mesh' | 'metric' | 'gravity' | 'north'; value: (m: Metrics) => number | null }>;
+export const CHECKS: Record<string, { label: string; when: 'always' | 'dense' | 'mesh' | 'objectRoi' | 'metric' | 'gravity' | 'north'; value: (m: Metrics) => number | null }>;
 export function runChecks(metrics: Metrics, thresholds: Thresholds, ctx: CheckContext): CheckResult[];
 export function formatChecks(checks: CheckResult[]): string;
 export function table(rows: (string | number)[][], alignLeft?: number[]): string;

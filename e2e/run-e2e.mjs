@@ -208,6 +208,7 @@ async function runDataset(browser, name, opts, outRoot, thresholdsSpec) {
   const ctx = {
     dense: cfg.densify !== false,
     mesh: !!cfg.mesh,
+    objectRoi: !!cfg.mesh && cfg.mesh.objectRoi !== false,
     claims: input.metric,
     sensors: {
       imu: cfg.useImu !== false,
