@@ -16,9 +16,15 @@
  * Extensions over ENGINE.md (superset, nothing removed): the `visibility` request (workers get
  * no `visibilitychange`; the engine must not submit GPU work while the page is hidden), the
  * `close` request (let go of a session before it is deleted),
- * `EngineOptions.resume` (re-open a persisted session after a worker respawn), optional
- * FramePump metadata on `FrameInput`, `SessionSummary` carries the stored models, the Gaussian
- * splatting stage (`splat`, `splatModel`, export 'ply-splat', `ProgressEvent.detail`).
+ * `EngineOptions.resume` (re-open a persisted session after a worker respawn) and `extend`
+ * (continue a stored capture: "Add more views"; `InitResult.resumedKeyframes` / `captureMemory` /
+ * `storedModel`, `LiveUpdate.modelRebuild`),
+ * optional FramePump metadata on `FrameInput`, `SessionSummary` carries the stored models, the
+ * Gaussian splatting stage (`splat`, `splatModel`, export 'ply-splat', `ProgressEvent.detail`).
+ *
+ * Times: FrameInput and LiveUpdate times are on the page's performance.now() base. The engine
+ * stores a capture on its session time base (FrameInput time + the capture segment's shift, see
+ * `extend`), which is what SparseResult camera times (`t`) are on.
  */
 import type {
   CameraIntrinsics,
@@ -62,6 +68,15 @@ export interface EngineOptions {
    * EngineClient when it re-initialises a respawned worker).
    */
   resume?: boolean;
+  /**
+   * Extension, with `resume`: continue the stored capture — also a finished one ("Add more views")
+   * — with new frames: the capture is reopened (tracking restarts and relocalises against the
+   * rebuilt live model), its stored mode and quality are kept (different `mode` / `quality` are
+   * ignored), only the sparse model is loaded (not the dense cloud / mesh), and the new frames are
+   * shifted onto the session time base after the stored capture (EngineStateRecord.timeSegments).
+   * The next `refine` covers every keyframe and invalidates the later stages, as always.
+   */
+  extend?: boolean;
 }
 
 export interface InitResult {
@@ -69,6 +84,18 @@ export interface InitResult {
   adapter?: string;
   /** Why the engine runs on the CPU although a GPU was preferred. */
   fallbackReason?: string;
+  /** Extension (`resume`): keyframes restored from the store (absent: nothing restored). */
+  resumedKeyframes?: number;
+  /**
+   * Extension (`resume`): capture memory after the restore and the cap above which the engine adds
+   * no more keyframes (MB) — how much room a continued capture has.
+   */
+  captureMemory?: { usedMB: number; capMB: number };
+  /**
+   * Extension (`extend`): the stored sparse model (decimated like LiveUpdate.sparse; cameras without
+   * times), for the capture view until the rebuilt live model arrives.
+   */
+  storedModel?: { sparse: { positions: Float32Array; colors: Uint8Array }; cameras: LiveCamera[] };
 }
 
 export interface HeadingSample {
@@ -146,7 +173,11 @@ export type TrackingState = 'initializing' | 'tracking' | 'lost';
 export interface LiveCamera {
   pose: Pose;
   intrinsics: CameraIntrinsics;
-  /** Capture time of the keyframe on the IMU clock (camera time + estimated camera–IMU offset), ms. */
+  /**
+   * Capture time of the keyframe on the IMU clock (camera time + estimated camera–IMU offset), ms,
+   * on the page's FrameInput time base: keyframes of an earlier capture segment (a scan continued
+   * after a reload, `EngineOptions.extend`) come out before the current segment's.
+   */
   t?: number;
   /**
    * Physical up in the camera frame (unit): −gravity when known, else up for a phone held in the
@@ -190,6 +221,13 @@ export interface LiveUpdate {
   /** With `cameras`: the engine's gyro bias estimate (rad/s, device frame, subtracted from ω); null = none yet. */
   gyroBias?: [number, number, number] | null;
   timings: Record<string, number>;
+  /**
+   * Extension (`resume`): the restored capture's live model is still being rebuilt — keyframes
+   * re-added / total; its model update comes when it is done. Meanwhile at most
+   * `maxMappingBacklog` new keyframes are added (later keyframe frames are skipped,
+   * `timings.rebuildLimited`).
+   */
+  modelRebuild?: { done: number; total: number };
   /** Per-frame diagnostics for the capture debug overlay. */
   debug?: LiveDebug;
 }

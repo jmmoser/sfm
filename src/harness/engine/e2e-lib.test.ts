@@ -50,6 +50,7 @@ describe('parseArgs', () => {
     const nv = parseArgs(['object-real', '--nvs', '--nvs-views', '8']);
     expect(nv.nvs).toBe(true);
     expect(nv.nvsViews).toBe(8);
+    expect(parseArgs(['object-real', '--extend-at', '0.6', '--extend-skip-s', '2']).config).toMatchObject({ extendAt: 0.6, extendSkipS: 2 });
   });
 
   it('rejects bad input', () => {
@@ -60,6 +61,8 @@ describe('parseArgs', () => {
     expect(() => parseArgs(['--export', 'obj'])).toThrow(/unknown format/);
     expect(() => parseArgs(['--set', '__proto__.x=1'])).toThrow(/bad --set key/);
     expect(() => parseArgs(['--set', 'a=notjson'])).toThrow(/not JSON/);
+    expect(() => parseArgs(['--extend-at', '1'])).toThrow(/fraction/);
+    expect(() => parseArgs(['--extend-skip-s', '-1'])).toThrow(/seconds/);
   });
 });
 

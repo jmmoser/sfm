@@ -440,3 +440,48 @@ describe('MockEngine', () => {
     expect((await e.splatModel())!.model.count).toBe(1);
   });
 });
+
+describe('MockEngine: continue a stored scan (init with resume + extend)', () => {
+  async function capture(e: MockEngine, t0: number, keyframes: number): Promise<{ t: number; last: LiveUpdate }> {
+    let t = t0;
+    let last: LiveUpdate | null = null;
+    for (let i = 0; i < 400 && (last?.numKeyframes ?? 0) < keyframes; i++) {
+      t += 100;
+      last = await e.processFrame(frame(t));
+    }
+    return { t, last: last! };
+  }
+
+  it('continues the scan held in memory after its last keyframe; refine covers every keyframe', async () => {
+    const e = new MockEngine({ speed: 40, sessions: async () => null, unconnectedImages: 2 });
+    await e.init({ mode: 'object', quality: 'fast', sessionId: 'x', persist: true });
+    const first = await capture(e, 1000, 8);
+    await e.finishCapture();
+    const s1 = await e.refine();
+    expect(s1.stats).toMatchObject({ unconnectedImages: 2, registeredImages: (s1.stats.images as number) - 2 });
+    const sAt = e.scanProgress;
+    // a reloaded page: the clock restarts
+    const init = await e.init({ mode: 'scene', quality: 'max', sessionId: 'x', persist: true, resume: true, extend: true });
+    expect(init.resumedKeyframes).toBe(first.last.numKeyframes);
+    expect(init.captureMemory!.capMB).toBeGreaterThan(init.captureMemory!.usedMB);
+    expect(e.captureFinished).toBe(false);
+    expect(e.scanProgress).toBeCloseTo(sAt, 1);
+    const second = await capture(e, 500, first.last.numKeyframes + 4);
+    expect(second.last.numKeyframes).toBe(first.last.numKeyframes + 4);
+    const s2 = await e.refine();
+    expect(s2.stats.images).toBeGreaterThanOrEqual(second.last.numKeyframes);
+  });
+
+  it('rebuilds a stored scan from its session record and rejects an unknown one', async () => {
+    const meta = { id: 's3', name: 'Vase', createdAt: 1, updatedAt: 2, mode: 'object' as const, status: 'meshed' as const, numFrames: 0, stats: { keyframes: 14, quality: 'fast' } };
+    const e = new MockEngine({ speed: 50, sessions: async () => ({ getSession: async (id: string) => (id === 's3' ? meta : null) }) as never });
+    const init = await e.init({ mode: 'object', quality: 'balanced', sessionId: 's3', persist: true, resume: true, extend: true });
+    expect(init.resumedKeyframes).toBe(14);
+    // the stored model for the capture view (the engine's InitResult.storedModel)
+    expect(init.storedModel!.cameras).toHaveLength(14);
+    expect(init.storedModel!.sparse.positions.length).toBeGreaterThan(0);
+    const { last } = await capture(e, 100, 16);
+    expect(last.numKeyframes).toBe(16);
+    await expect(e.init({ mode: 'object', quality: 'fast', sessionId: 'gone', persist: true, resume: true, extend: true })).rejects.toThrow(/no stored capture/);
+  });
+});

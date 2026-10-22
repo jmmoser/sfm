@@ -100,6 +100,13 @@ function printTimings(r, log) {
   if (r.sparse) {
     log(`sparse: ${r.sparse.numCameras} cameras (${r.sparse.images.length} mapped via ${r.sparse.mapping}), ${r.sparse.pointsCount} points, metric ${JSON.stringify(r.sparse.metric)}${r.sparse.intrinsicsNote ? `; NOTE ${r.sparse.intrinsicsNote}` : ''}`);
   }
+  if (r.extend) {
+    const x = r.extend;
+    log(
+      `extend: reload after ${x.firstFrames} frames (first refine ${x.first.registeredImages ?? '–'} of ${x.first.keyframes} keyframes${x.first.error ? `, ${x.first.error}` : ''}), ${x.skippedFrames} skipped, resumed at #${x.resumeIndex} with ${x.resumedKeyframes ?? '–'} keyframes; ` +
+        `second segment ${x.secondKeyframes ?? '–'} keyframes, ${x.secondRegisteredLive ?? '–'} registered live, ${x.secondRegisteredFinal ?? '–'} in the final model`,
+    );
+  }
   if (r.dense) log(`dense: ${r.dense.count} points${r.dense.file ? ` → ${r.dense.file}` : ''}`);
   if (r.mesh) log(`mesh: ${r.mesh.vertexCount} vertices, ${r.mesh.triangleCount} triangles`);
   if (r.splat) {

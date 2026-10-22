@@ -57,7 +57,9 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
   /** Stages of steps that are not part of this run: already built earlier ('done', no time) or not requested ('skipped'). */
   function initStates(): void {
     const r = app.results;
-    const built: Record<ProcessingStep, boolean> = resultsStale ? { refine: false, densify: false, mesh: false } : { refine: !!r.sparse, densify: !!r.dense, mesh: !!r.mesh };
+    // (a refine — also again, after "Add more views" — replaces every later stage)
+    const built: Record<ProcessingStep, boolean> =
+      resultsStale || steps.includes('refine') ? { refine: false, densify: false, mesh: false } : { refine: !!r.sparse, densify: !!r.dense, mesh: !!r.mesh };
     for (const s of STAGES) {
       const run = steps.includes(s.step);
       states.set(s.id, { id: s.id, status: run ? 'pending' : built[s.step] ? 'done' : 'skipped', progress: run ? 0 : 1, startedAt: null, endedAt: null });
@@ -348,8 +350,12 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
           app.results.sparse = sparse;
           app.results.stats = { ...app.results.stats, ...sparse.stats };
           clearDenseResume(); // refine deletes the depth maps of the old poses
-          // … and the splats + their checkpoints (trained for the old poses)
+          // … the dense cloud and mesh of a refine run again ("Add more views"), and the splats +
+          // their checkpoints (trained for the old poses)
+          app.results.dense = null;
+          app.results.mesh = null;
           app.results.splat = null;
+          delete app.results.toProcess;
           clearSplatResume(app.results.stats);
           completeStep('refine');
           endRun('done');

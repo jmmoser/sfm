@@ -15,7 +15,8 @@
  *    connection died, so `requestAdapter()` returns null in that realm —, a stuck init or
  *    repeated frame timeouts): pending requests reject with EngineCrashedError, the worker is
  *    terminated and RESPAWNED, and the last `init` / `loadSession` is replayed with
- *    `resume: true` (docs/research/ios-webgpu.md §5 recovery state machine). Respawns are
+ *    `resume: true` (an init with `extend` keeps it until finishCapture / refine resolved: the
+ *    continued capture is reopened again) (docs/research/ios-webgpu.md §5 recovery state machine). Respawns are
  *    capped (3 per 60 s); after repeated GPU failures the engine is re-initialised with
  *    `preferGPU: false` (CPU tier).
  *  - Page visibility is forwarded (`visibility` request): the worker cannot see
@@ -355,11 +356,25 @@ export class EngineClient implements EngineLike {
   }
 
   async finishCapture(): Promise<void> {
+    const s = this.setup;
     await this.call('finishCapture', undefined, { timeoutMs: this.opts.inactivityTimeoutMs, inactivity: true });
+    this.captureEnded(s);
   }
 
-  refine(onProgress?: ProgressCallback): Promise<SparseResult> {
-    return this.call('refine', undefined, { onProgress });
+  async refine(onProgress?: ProgressCallback): Promise<SparseResult> {
+    const s = this.setup;
+    const res = await this.call('refine', undefined, { onProgress });
+    this.captureEnded(s);
+    return res;
+  }
+
+  /**
+   * A continued capture (init with `extend`) ended: a later replay restores the session as stored
+   * (`resume` only) instead of reopening its capture again (which would keep the capture state
+   * from being released before the dense stage).
+   */
+  private captureEnded(s: Setup | null): void {
+    if (s && s === this.setup && s.kind === 'init' && s.options.extend) delete s.options.extend;
   }
 
   densify(options?: DenseOptions, onProgress?: ProgressCallback): Promise<PointCloud> {

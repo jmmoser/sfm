@@ -8,7 +8,10 @@
  * the next one runs in light mode — no mesh, at most LIGHT_MODE_MAX_POINTS shown, no prepared
  * exports (one in flight is discarded, none is made meanwhile) — and everything comes back when it
  * stops, the view matching the layer pill at once; opened from Home's card for a build that stored
- * nothing, the viewer points to Build.
+ * nothing, the viewer points to Build. "Add more views": the card for
+ * photos refine could not connect (dismissed per refine) and the Build sheet item open the confirm
+ * sheet (saying which stages Finish rebuilds), whose button requests the capture permissions
+ * inside its tap.
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import { getGPU } from '../../gpu/device';
@@ -126,6 +129,7 @@ function fakeApp(engine: FakeEngine, splat: SplatResult | null) {
     wakeLock,
     busy: false,
     loadedSessionId: 's1' as string | null,
+    config: { mode: 'object', quality: 'fast', autoDense: true },
     env: { webgpu: 'available', webgl: true, share: false },
     debug: {} as { viewer?: unknown },
     journal: new RunJournal(null),
@@ -463,5 +467,65 @@ describe('viewer screen: photoreal build', () => {
     engine.model = payload(70);
     engine.builds[1].resolve(info(70));
     if (hw) await waitFor(() => screen.el.dataset.splats === 'ready' && viewer.getStats().splatLayer?.gaussians === 70);
+  });
+});
+
+describe('viewer screen: add more views', () => {
+  it('photos refine could not connect: a card offers Add more views (dismissed per refine); the sheet asks for permissions in its tap', async () => {
+    const engine = new FakeEngine();
+    const app = fakeApp(engine, null);
+    Object.assign(app.env, { secureContext: true, camera: true, indexedDB: true });
+    app.results.stats = { unconnectedImages: 3, refineMs: 1234 };
+    const patches: unknown[] = [];
+    let perms = 0;
+    const started: string[] = [];
+    Object.assign(app as unknown as Record<string, unknown>, {
+      updateSession: async (_id: string | null, patch: unknown): Promise<void> => {
+        patches.push(patch);
+      },
+      requestCapturePermissions: (): Promise<unknown> => {
+        perms++;
+        return Promise.resolve({});
+      },
+      startExtendScan: (id: string): boolean => {
+        started.push(id);
+        return true;
+      },
+    });
+    const screen = mount(app);
+    await loaded(app, screen);
+    await waitFor(() => q('unconnected-photos')!.hidden === false);
+    expect(q('unconnected-photos')!.textContent).toMatch(/3 photos could not be connected/);
+    await tap('unconnected-extend');
+    await waitFor(() => !!q('sheet-extend'));
+    expect(q('sheet-extend')!.textContent).toMatch(/processed again/);
+    // what Finish rebuilds: the refine and (auto-dense) the dense cloud — said as it is
+    expect(q('sheet-extend')!.textContent).toMatch(/the 3D model and the dense cloud are rebuilt/);
+    q('extend-start')!.click();
+    // the capture permissions are requested synchronously inside the tap, then the capture opens
+    expect(perms).toBe(1);
+    expect(started).toEqual(['s1']);
+    await closeSheets();
+
+    // dismissed: hidden for this refine, remembered with the session
+    q('unconnected-dismiss')!.click();
+    expect(q('unconnected-photos')!.hidden).toBe(true);
+    expect(patches).toContainEqual({ stats: { unconnectedNoticeRefineMs: 1234 } });
+    leave(screen);
+    const again = mount(app);
+    await loaded(app, again);
+    expect(q('unconnected-photos')!.hidden).toBe(true);
+    leave(again);
+
+    // a new refine shows it again; the Build sheet offers Add more views too
+    app.results.stats = { ...app.results.stats, refineMs: 999 };
+    const third = mount(app);
+    await loaded(app, third);
+    await waitFor(() => q('unconnected-photos')!.hidden === false);
+    await tap('tool-build');
+    await tap('build-extend');
+    await waitFor(() => !!q('sheet-extend'));
+    q('extend-start')!.click();
+    expect(started).toEqual(['s1', 's1']);
   });
 });

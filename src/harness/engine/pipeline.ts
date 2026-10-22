@@ -10,6 +10,10 @@
  * The live summary carries the object coverage of the last live cameras (`live.coverage`, the
  * capture screen's ring: src/app/coverage.ts) and, with `liveTrace`, of every model update.
  *
+ * `extendAt` (a capture continued after a page reload, EngineOptions.extend): the first segment's
+ * frames → finishCapture → refine → re-init with `{ sessionId, resume, extend }` → the remaining
+ * frames (after `extendSkipS`) with every time rebased to start at 500 ms → the steps above.
+ *
  * Every step is guarded: a failure is recorded in `errors` and the steps that depend on it are
  * skipped, so a partial result is always returned. Big outputs (PLY files) are streamed to
  * Node through `window.__e2eWrite` when the runner installed it (e2e/run-e2e.mjs).
@@ -39,6 +43,7 @@ import {
   HeadingNorthEmulator,
   cleanGeoFix,
   compassHeading,
+  extensionSplit,
   gravityDownAt,
   hfovLongSideDeg,
   latestAtOrBefore,
@@ -201,7 +206,8 @@ function resolveConfig(c: HarnessConfig, meta: DatasetMeta | null): ResolvedHarn
     mesh: c.mesh ?? false,
     splat: c.splat ?? false,
     exports: c.exports ?? false,
-    persist: c.persist ?? false,
+    // a continued capture is restored from the session store
+    persist: (c.persist ?? false) || (c.extendAt ?? null) !== null,
     preferGPU: c.preferGPU ?? true,
     engineConfig: c.engineConfig ?? null,
     mockSpeed: c.mockSpeed ?? 4,
@@ -218,6 +224,8 @@ function resolveConfig(c: HarnessConfig, meta: DatasetMeta | null): ResolvedHarn
     liveTrace: c.liveTrace ?? false,
     debugDump: c.debugDump ?? false,
     dumpSession: c.dumpSession ?? false,
+    extendAt: c.extendAt ?? null,
+    extendSkipS: c.extendSkipS ?? 0,
   };
 }
 
@@ -421,8 +429,10 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
       if (curStep === 'finishCapture' || curStep === 'capture') onProgress(curStep)(p);
     });
 
+    let initOpts: EngineOptions | null = null;
     try {
       const opts: EngineOptions = { mode: cfg.mode, quality: cfg.quality, persist: cfg.persist, preferGPU: cfg.preferGPU };
+      initOpts = opts;
       if (cfg.hfovPriorDegUsed !== null) opts.hfovPriorDeg = cfg.hfovPriorDegUsed;
       if (cfg.persist) opts.sessionId = sessionId = `e2e-${cfg.dataset}-${Date.now().toString(36)}`;
       // Extension field understood by src/engine (EngineConfig); structured-cloned to the worker.
@@ -437,8 +447,69 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
     }
 
     // ---- capture ----
-    const plan = planFrames(ds.frames, { startFrame: cfg.startFrame, frameStride: cfg.frameStride, fps: cfg.fps, datasetFps: ds.meta.fps, maxFrames: cfg.maxFrames });
-    log(`[harness] replaying ${plan.length} of ${ds.frames.length} frames (start ${cfg.startFrame}, stride ${cfg.frameStride}${cfg.fps ? `, ${cfg.fps} Hz pump` : ''})`);
+    const planned = planFrames(ds.frames, { startFrame: cfg.startFrame, frameStride: cfg.frameStride, fps: cfg.fps, datasetFps: ds.meta.fps, maxFrames: cfg.maxFrames });
+    // extendAt: the first segment, then the second one after the "reload"
+    const split = cfg.extendAt !== null ? extensionSplit(planned, cfg.extendAt, cfg.extendSkipS) : null;
+    if (cfg.extendAt !== null && !split) fail('extend', new Error(`extendAt ${cfg.extendAt} (skip ${cfg.extendSkipS} s) leaves fewer than 2 frames on a side of ${planned.length}`));
+    const plan = split ? split.feed : planned;
+    const splitK = split ? split.splitK : -1;
+    if (split) {
+      result.extend = {
+        firstFrames: split.splitK,
+        resumeIndex: plan[split.splitK].index,
+        skippedFrames: split.skipped,
+        rebaseMs: round(split.rebaseMs, 1),
+        first: { keyframes: 0, registeredLive: 0, registeredImages: null, refineMs: 0, error: null },
+        init: null,
+        resumedKeyframes: null,
+        secondKeyframes: null,
+        secondRegisteredLive: null,
+        secondRegisteredFinal: null,
+      };
+    }
+    log(
+      `[harness] replaying ${plan.length} of ${ds.frames.length} frames (start ${cfg.startFrame}, stride ${cfg.frameStride}${cfg.fps ? `, ${cfg.fps} Hz pump` : ''})` +
+        (split ? `; extend: reload after ${split.splitK} frames, ${split.skipped} skipped, the rest rebased by −${Math.round(split.rebaseMs)} ms` : ''),
+    );
+    /**
+     * extendAt: end the first segment like the app (finishCapture, refine), then the "reload": a new
+     * engine restores the session and reopens its capture. False when the run cannot go on.
+     */
+    const continueAfterReload = async (): Promise<boolean> => {
+      const ext = result.extend!;
+      const tf = performance.now();
+      curStep = 'finishCapture';
+      try {
+        await eng.finishCapture();
+        const ll = lastLive as LiveUpdate | null;
+        ext.first.keyframes = ll?.numKeyframes ?? 0;
+        ext.first.registeredLive = ll?.numRegistered ?? 0;
+        curStep = 'refine-first';
+        const s1 = await eng.refine(onProgress('refine-first'));
+        const ri = s1.stats.registeredImages;
+        ext.first.registeredImages = typeof ri === 'number' ? ri : s1.cameras.length;
+        log(`[harness] extend: first segment ${ext.first.keyframes} keyframes (${ext.first.registeredLive} live), refined ${ext.first.registeredImages} (${Math.round(performance.now() - tf)} ms)`);
+      } catch (e) {
+        // (the continued capture still covers it: the final refine sees every keyframe)
+        ext.first.error = `${(e as Error)?.name ?? 'Error'}: ${(e as Error)?.message ?? e}`;
+        log(`[harness] extend: first segment refine failed (${ext.first.error}); continuing`);
+      }
+      ext.first.refineMs = round(performance.now() - tf, 1);
+      try {
+        // (the stored-model preview is not kept: the report is JSON)
+        const { storedModel, ...init } = await eng.init({ ...initOpts!, resume: true, extend: true });
+        ext.init = init;
+        ext.resumedKeyframes = init.resumedKeyframes ?? 0;
+        log(
+          `[harness] extend: re-init restored ${ext.resumedKeyframes} keyframes (preview ${storedModel ? storedModel.sparse.positions.length / 3 : 0} points), capture memory ${JSON.stringify(init.captureMemory ?? null)}`,
+        );
+      } catch (e) {
+        fail('extend re-init', e);
+        return false;
+      }
+      curStep = 'capture';
+      return true;
+    };
     const refs: DeliveredRef[] = [];
     const frameMs: number[] = [];
     const keyframeMs: number[] = [];
@@ -466,6 +537,10 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
 
     for (let k = 0; k < plan.length; k++) {
       const f = plan[k];
+      if (k === splitK && !(await continueAfterReload())) {
+        captureOk = false;
+        break;
+      }
       let dec: Decoded;
       try {
         dec = await pending!;
@@ -481,13 +556,21 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
         break;
       }
       const t = f.t;
-      const imu = cfg.useImu ? samplesBetween(ds.imu, k === 0 ? t - 1000 : prevT, t) : [];
+      // second segment of extendAt: a reloaded page's clock (every time rebased), fresh sensors
+      const rebase = split && k >= splitK ? split.rebaseMs : 0;
+      const fresh = k === 0 || k === splitK;
+      let imu = cfg.useImu ? samplesBetween(ds.imu, fresh ? t - 1000 : prevT, t) : [];
+      let geo = cfg.useGps ? cleanGeoFix(latestAtOrBefore(ds.geo, t)) : null;
+      if (rebase) {
+        imu = imu.map((s) => ({ ...s, t: s.t - rebase }));
+        geo = geo && geo.t >= plan[splitK].t - 1000 ? { ...geo, t: geo.t - rebase } : null;
+      }
       const input: FrameInput = {
         bitmap: dec.bitmap,
-        t,
+        t: t - rebase,
         screenAngle: ds.meta.screenAngle,
         imu,
-        geo: cfg.useGps ? cleanGeoFix(latestAtOrBefore(ds.geo, t)) : null,
+        geo,
         heading: null,
         index: k,
         segment: 0,
@@ -642,6 +725,14 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
         d.afterCapture = { keyframes: debugKeyframes(eng), pairs: debugPairs(eng) };
       }
       log(`[harness] mapping queue drained: ${result.live.keyframes} keyframes, ${result.live.registered} registered live, ${result.live.points} points (${result.live.unsolicitedUpdates} background updates)`);
+      const ext = result.extend;
+      if (ext && ext.resumedKeyframes !== null) {
+        // LiveCamera.t is on the page's clock: the restored keyframes come out before the rebased one
+        const lc = lastCams as LiveUpdate | null;
+        ext.secondKeyframes = result.live.keyframes - ext.resumedKeyframes;
+        ext.secondRegisteredLive = lc?.cameras ? lc.cameras.filter((c) => typeof c.t === 'number' && c.t >= 0).length : null;
+        log(`[harness] extend: second segment ${ext.secondKeyframes} keyframes, ${ext.secondRegisteredLive ?? '?'} registered live`);
+      }
     } catch (e) {
       mark('finishCapture', t0);
       fail('finishCapture', e);
@@ -668,6 +759,10 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
       summarizeSparse(sparse, ds, refs);
     } catch (e) {
       fail('sparse-summary', e);
+    }
+    if (result.extend && result.sparse) {
+      const second = new Set(plan.slice(splitK).map((f) => f.index));
+      result.extend.secondRegisteredFinal = result.sparse.images.filter((im) => second.has(im.index)).length;
     }
     const sp = result.sparse;
     if (sp) {

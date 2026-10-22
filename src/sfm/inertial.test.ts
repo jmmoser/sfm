@@ -219,6 +219,24 @@ describe('estimateGravity', () => {
     });
   }
 
+  it('a capture continued after a gap (EngineOptions.extend): the samples between the segments are not used', () => {
+    const { imu, kf } = scenario('orbit', 24, -30);
+    // the middle 3 s are missing (keyframes and IMU) and the rest comes 10 s later: a second
+    // segment whose IMU starts 1.5 s before its first keyframe (frames before the first keyframe)
+    const ts = kf.keyframes.map((k) => k.t).sort((a, b) => a - b);
+    const cut0 = ts[Math.floor(ts.length / 2)],
+      cut1 = cut0 + 3000,
+      shift = 10_000;
+    const keyframes = kf.keyframes.filter((k) => k.t < cut0 || k.t >= cut1).map((k) => (k.t >= cut1 ? { ...k, t: k.t + shift } : k));
+    const imu2 = imu.filter((s) => s.t < cut0 || s.t >= cut1 - 1500).map((s) => (s.t >= cut1 - 1500 ? { ...s, t: s.t + shift } : s));
+    const fixed = angleDeg(estimateGravity(keyframes, imu2, { offsetMs: -30 })!.down, kf.downRec);
+    // the attitude interpolated across the gap (no IMU there) tilts gravity
+    const across = angleDeg(estimateGravity(keyframes, imu2, { offsetMs: -30, maxImuGapMs: Infinity })!.down, kf.downRec);
+    if (LOG) console.log('gravity err deg with a segment gap: skipped', fixed.toFixed(3), 'interpolated', across.toFixed(3));
+    expect(fixed).toBeLessThan(1);
+    expect(across).toBeGreaterThan(2 * fixed);
+  });
+
   it('falls back to per-keyframe gravityCam', () => {
     const { kf } = scenario('orbit', 23, 0);
     for (const k of kf.keyframes) {

@@ -29,6 +29,10 @@ export const USAGE = `usage: node e2e/run-e2e.mjs [object|yard|all|<dataset> ...
   --no-thresholds               report the checks but never fail on them
   --enforce                     enforce thresholds also for --engine mock (off by default: mock metrics are meaningless)
   --mapping inline|background   src/engine EngineConfig.mapping (sent as engineConfig; default: engine default)
+  --extend-at F                 continue the capture after a simulated page reload (EngineOptions.extend): at
+                                fraction F (0 < F < 1) of the frames finishCapture + refine, re-init with
+                                resume + extend (persist on), the rest with every time rebased to start near 0
+  --extend-skip-s S             seconds of frames skipped after the --extend-at split (default 0)
   --mock-speed X                MockEngine time multiplier (default 4)
   --set key=json                any other harness config field by dotted path (e.g. --set timeouts.frameMs=600000)
   --quiet                       log every 10th frame only     --verbose   page console + Vite logs
@@ -155,6 +159,20 @@ export function parseArgs(argv) {
       case '--enforce': o.enforce = true; break;
       case '--mock-speed': o.config.mockSpeed = num(0); break;
       case '--mapping': o.config.engineConfig = { ...(o.config.engineConfig ?? {}), mapping: oneOf(['inline', 'background']) }; break;
+      case '--extend-at': {
+        const s = next();
+        const v = Number(s);
+        if (!(v > 0 && v < 1)) throw new ArgError(`--extend-at needs a fraction in (0, 1), got ${s}`);
+        o.config.extendAt = v;
+        break;
+      }
+      case '--extend-skip-s': {
+        const s = next();
+        const v = Number(s);
+        if (!Number.isFinite(v) || v < 0) throw new ArgError(`--extend-skip-s needs seconds ≥ 0, got ${s}`);
+        o.config.extendSkipS = v;
+        break;
+      }
       case '--set': {
         const kv = next();
         const eq = kv.indexOf('=');

@@ -25,9 +25,9 @@ import type { DensePresetConfig, SplatPresetConfig } from './presets';
  * keep the extra fields, so they also arrive through the worker / EngineClient.
  */
 export type SparseCameraEx = SparseCamera & {
-  /** Capture time of the keyframe (ms, FrameInput.t). */
+  /** Capture time of the keyframe (ms, FrameInput.t on the session time base: + its segment's shift). */
   t?: number;
-  /** FrameInput.index of the frame that became this keyframe. */
+  /** FrameInput.index of the frame that became this keyframe (+ its segment's index offset). */
   frameIndex?: number;
 };
 
@@ -116,6 +116,12 @@ export interface EngineConfig {
   gyroGate?: boolean;
   /** Tolerance of the gyro gates (defaults: 5° + 0.3°/s × |Δt| + 5 % of the rotation). */
   gyroTolerance?: Partial<GyroToleranceOptions>;
+  /**
+   * Shift the frames of a restored / extended capture past the stored capture times (default true:
+   * `LiveSession` time segments, EngineStateRecord.timeSegments). false only in tests that prove
+   * the hazard (a reloaded page's performance.now() interleaves new IMU samples with stored ones).
+   */
+  extendTimeShift?: boolean;
   /**
    * Estimate the gyro bias / camera–IMU offset from the live keyframes every 10 registrations
    * during capture (default false; refine always calibrates once before the rolling-shutter estimation).
@@ -217,8 +223,9 @@ export interface EngineConfig {
 /** What the engine knows about one keyframe (persisted with its JPEG as the frame `info`). */
 export interface KeyframeRecord {
   id: number;
-  /** FrameInput.index (or the engine's frame counter). */
+  /** FrameInput.index (or the engine's frame counter), + an offset in a continued capture's segment. */
   frameIndex: number;
+  /** FrameInput.t on the session time base (+ the shift of its capture segment, EngineStateRecord.timeSegments). */
   t: number;
   /** Canonical full-resolution size. */
   width: number;

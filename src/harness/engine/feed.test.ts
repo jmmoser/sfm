@@ -1,10 +1,31 @@
 import { describe, expect, it } from 'vitest';
 import type { ImuSample } from '../../core/types';
 import { declination } from '../../sensors/wmm';
-import { HeadingNorthEmulator, cleanGeoFix, compassHeading, gravityDownAt, hfovLongSideDeg, latestAtOrBefore, numStats, planFrames, samplesBetween, upperBound } from './feed';
+import { HeadingNorthEmulator, cleanGeoFix, compassHeading, extensionSplit, gravityDownAt, hfovLongSideDeg, latestAtOrBefore, numStats, planFrames, samplesBetween, upperBound } from './feed';
 
 const frames = (n: number, fps: number, t0 = 10_000): { index: number; t: number }[] =>
   Array.from({ length: n }, (_, i) => ({ index: i, t: t0 + (1000 * i) / fps }));
+
+describe('extensionSplit (harness extendAt)', () => {
+  it('splits at the fraction, skips the given seconds and rebases the second segment to start near 0', () => {
+    const plan = frames(80, 10); // t = 10 000 … 17 900
+    const s = extensionSplit(plan, 0.6, 2)!;
+    expect(s.splitK).toBe(48);
+    // frames 48 … 67, within 2 s of frame 48 (t 14 800 … 16 799), are skipped
+    expect(s.skipped).toBe(20);
+    expect(s.feed.map((f) => f.index)).toEqual([...Array.from({ length: 48 }, (_, i) => i), ...Array.from({ length: 12 }, (_, i) => 68 + i)]);
+    expect(s.rebaseMs).toBe(16_300);
+    expect(s.feed[s.splitK].t - s.rebaseMs).toBe(500);
+    expect(extensionSplit(plan, 0.5)!.skipped).toBe(0);
+  });
+
+  it('refuses splits that leave fewer than 2 frames on a side', () => {
+    expect(extensionSplit(frames(40, 10), 0)).toBeNull();
+    expect(extensionSplit(frames(40, 10), 1)).toBeNull();
+    expect(extensionSplit(frames(3, 10), 0.5)).toBeNull();
+    expect(extensionSplit(frames(40, 10), 0.6, 30)).toBeNull();
+  });
+});
 
 describe('planFrames', () => {
   it('keeps everything by default, in time order', () => {

@@ -138,10 +138,22 @@ export interface HarnessConfig {
    * (src/harness/engine/replay.ts, e2e/splat-replay.mjs). Default false.
    */
   dumpSession?: boolean;
+  /**
+   * Continue the capture after a page reload (EngineOptions.extend, docs/ENGINE.md "Extend"): at
+   * this fraction (0 < f < 1) of the planned frames the harness finishes and refines the first
+   * segment, re-inits the engine with `{ sessionId, resume: true, extend: true }` (implies
+   * `persist`), skips `extendSkipS` seconds of frames and feeds the rest with every time (frame,
+   * IMU, GPS) rebased to start at 500 ms, like a reloaded page's performance.now(); then
+   * finishCapture, refine and the rest as usual (`result.extend`). Default null (off).
+   */
+  extendAt?: number | null;
+  /** Seconds of planned frames skipped after the `extendAt` split (default 0). */
+  extendSkipS?: number;
 }
 
 /** Config with every default filled in. */
-export interface ResolvedHarnessConfig extends Required<Omit<HarnessConfig, 'output' | 'fps' | 'maxFrames' | 'timeouts' | 'hfovPriorDeg' | 'engineConfig'>> {
+export interface ResolvedHarnessConfig extends Required<Omit<HarnessConfig, 'output' | 'fps' | 'maxFrames' | 'timeouts' | 'hfovPriorDeg' | 'engineConfig' | 'extendAt'>> {
+  extendAt: number | null;
   engineConfig: Record<string, unknown> | null;
   output: HarnessOutput | null;
   fps: number | null;
@@ -380,6 +392,8 @@ export interface HarnessResult {
   errors: HarnessError[];
   /** JS heap of the page (Chromium `performance.memory`, bytes) after each step. Worker memory not included. */
   memory: Record<string, number>;
+  /** With `extendAt`: the split, the first segment's refine and the second segment's keyframes. */
+  extend?: ExtendSummary | null;
   /**
    * With `liveTrace`: one entry per LiveUpdate with cameras (frame responses and background
    * model updates). `poses` are the registered keyframes' poses sorted by keyframe id; when
@@ -403,3 +417,22 @@ export interface HarnessResult {
   };
 }
 
+/** HarnessResult.extend (`extendAt`). */
+export interface ExtendSummary {
+  /** Frames delivered before the "reload" and the dataset frame index the second segment starts at. */
+  firstFrames: number;
+  resumeIndex: number;
+  /** Planned frames skipped after the split (`extendSkipS`). */
+  skippedFrames: number;
+  /** Subtracted from the dataset times of the second segment (ms). */
+  rebaseMs: number;
+  /** The first segment's finishCapture + refine (live counts after finishCapture). */
+  first: { keyframes: number; registeredLive: number; registeredImages: number | null; refineMs: number; error: string | null };
+  /** The re-init with resume + extend. */
+  init: InitResult | null;
+  resumedKeyframes: number | null;
+  /** Keyframes of the second segment: delivered, registered in the live model, in the final model. */
+  secondKeyframes: number | null;
+  secondRegisteredLive: number | null;
+  secondRegisteredFinal: number | null;
+}

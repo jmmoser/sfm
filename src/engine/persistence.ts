@@ -6,7 +6,8 @@
  * Layout (keys inside one session):
  *   frames                 keyframe image (JPEG Blob, or raw RGBA without a JPEG encoder) +
  *                          KeyframeRecord as the frame `info`
- *   value  engine/state    EngineStateRecord (options, orientation, counters, flags)
+ *   value  engine/state    EngineStateRecord (options, orientation, counters, capture time
+ *                          segments, flags)
  *   bin    kf/<id>/features   serializeFeatureSet
  *   bin    kf/<id>/colors     3 B per feature (sRGB)
  *   value  kf/<id>/pairs      verified pairs (a, id) found when keyframe id was mapped
@@ -297,7 +298,29 @@ export interface EngineStateRecord {
   gyroBias?: [number, number, number] | null;
   /** Rolling-shutter model applied by the last refine / live (canonical image); informational after a reload. */
   rollingShutter?: { axis: 'rows' | 'cols'; readoutMs: number } | null;
+  /**
+   * Capture segments after the first one (absent in older records, empty: one segment, shift 0).
+   * Stored capture times (keyframes, IMU, GPS) are on the SESSION time base: FrameInput times plus
+   * the shift of their segment. performance.now() restarts with every page load, so a capture
+   * continued after a reload (`EngineOptions.extend`) is shifted past everything stored.
+   */
+  timeSegments?: TimeSegmentRecord[];
+  /**
+   * Keyframes were added after the stored results (sparse / dense / mesh / splats) were made — a
+   * continued capture (`EngineOptions.extend`) — until the next refine replaces them; absent = false.
+   */
+  resultsStale?: boolean;
   updatedAt: number;
+}
+
+/** A capture segment on the session time base (EngineStateRecord.timeSegments). */
+export interface TimeSegmentRecord {
+  /** First keyframe id of the segment (the session's nextKeyframeId when it started). */
+  firstKeyframeId: number;
+  /** Added to every FrameInput time of the segment (frame, IMU, GPS, attitude), ms. */
+  shiftMs: number;
+  /** Wall-clock start (epoch ms). */
+  startedAt: number;
 }
 
 /** A verified pair as stored (oriented a → b). */
