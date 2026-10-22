@@ -9,7 +9,7 @@ export {
   type SplatDisplayState,
   type SplatInput,
 } from './viewer';
-export type { SplatLayerStats, SplatLayerOptions, SplatView } from './splat-layer';
+export type { SplatLayerStats, SplatLayerOptions, SplatView, SplatOffscreen, SplatOffscreenOptions, SplatFramePath } from './splat-layer';
 export { splatCameraFromView, splatCanvasSize, interactiveFrameSize } from './splat-camera';
 export { PointCloudMaterial, patchMeshMaterial, type PointsMaterialOptions } from './points-material';
 export { EDLPass, PICK_WINDOW_MAX, ZOOM_SIZE, type DepthWindow, type EDLSettings } from './edl';

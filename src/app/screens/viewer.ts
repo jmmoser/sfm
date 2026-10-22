@@ -4,13 +4,16 @@
  * metric models; on the points / mesh also while the splats are shown), Build sheet (dense cloud
  * / mesh with a quality picker, and the photoreal model: `engine.splat()` runs HERE with a
  * progress card and Cancel, the model is shown when it finishes), Export sheet (PLY points, PLY
- * mesh, GLB, Gaussian splats PLY / SPZ, COLMAP + images ZIP: the first tap builds the file through the
- * engine and shows its size, a second tap "Share / Save" calls saveFile directly in the tap
- * handler — iOS allows navigator.share only within ~5 s of a user activation), Info sheet
- * (scale source and uncertainty, gravity / north alignment with the yaw source — the compass
- * gives MAGNETIC north —, counts, reprojection error, engine memory, timings). A densify that
- * was interrupted (stats.denseResumablePass from loadSession, or cancelled / failed here) offers
- * "Resume dense reconstruction" (HUD + Build sheet): the engine continues from its stored maps.
+ * mesh, GLB, Gaussian splats PLY / SPZ, COLMAP + images ZIP: the first tap builds the file
+ * through the engine and shows its size, a second tap "Share / Save" calls saveFile directly in
+ * the tap handler — iOS allows navigator.share only within ~5 s of a user activation; with a splat
+ * model and an H.264 encoder also "Fly-through video (MP4)", which src/app/video-export.ts renders
+ * from the splat layer with progress and Cancel, stopped by a photoreal build, a hidden page or
+ * leaving), Info sheet (scale source and uncertainty, gravity / north alignment with the yaw
+ * source — the compass gives MAGNETIC north —, counts, reprojection error, engine memory,
+ * timings). A densify that was interrupted (stats.denseResumablePass from loadSession, or
+ * cancelled / failed here) offers "Resume dense reconstruction" (HUD + Build sheet): the engine
+ * continues from its stored maps.
  */
 import { saveFile } from '../../io/download';
 import type { SplatDisplayState, Viewer } from '../../viewer';
@@ -19,6 +22,7 @@ import { formatDistance } from '../../viewer/helpers';
 import type { ProgressEvent } from '../../core/types';
 import { isCancelledError, type ExportFormat, type QualityPreset } from '../../workers/protocol';
 import type { App, Results, Screen } from '../app';
+import { createVideoExport } from '../video-export';
 import { button, chip, group, iconButton, kvRow, progressBar, section, segmented, setButtonLabel, spinner, switchRow } from '../components/controls';
 import { confirmDialog } from '../components/dialog';
 import { openSheet, type SheetHandle } from '../components/sheet';
@@ -378,6 +382,8 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     splatState = st;
     if (closed) return;
     el.dataset.splats = st;
+    // (the fly-through video needs the loaded layer)
+    renderExports?.();
     if (st === 'unavailable') {
       if (!splatUnavailableToast) {
         splatUnavailableToast = true;
@@ -615,11 +621,27 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
    *  sheet. Time-limited because a share promise that never settles must not disable the button. */
   let sharingUntil = 0;
 
+  /** The fly-through video row of the Export sheet (own state: src/app/video-export.ts). */
+  const video = createVideoExport({
+    app,
+    openFrames: (o) => viewer?.openSplatFrames(o) ?? null,
+    blocked: () =>
+      building
+        ? 'Not while the photoreal model is being built'
+        : !viewer || splatState === 'unavailable'
+          ? 'The photoreal model cannot be shown in this browser'
+          : splatFetching || splatState !== 'ready'
+            ? 'Loading the photoreal model…'
+            : null,
+    rerender: () => renderExports?.(),
+  });
+
   function openExport(): void {
     if (!ready) return;
     const list = h('div', { class: 'export-list' });
     const render = (): void => {
-      replaceChildren(list, ...EXPORTS.map((e) => exportRow(e)));
+      const videoRow = video.row();
+      replaceChildren(list, ...EXPORTS.map((e) => exportRow(e)), ...(videoRow ? [videoRow] : []));
     };
     const sheet: SheetHandle = openSheet({
       title: 'Export',
@@ -770,6 +792,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     void app.wakeLock.acquire();
     // the previous model's layer is freed while the trainer runs (the points / mesh show meanwhile)
     const wasSplats = display.layer === 'splats';
+    video.cancel();
     releaseSplats();
     let built = false;
     jobBar.set(-1);
@@ -795,6 +818,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       splatVersion++;
       exports.delete('ply-splat');
       exports.delete('spz');
+      video.invalidate();
       void app.updateSession(sessionId, { stats: { splatGaussians: res.count, splatIterations: res.iterations, splatQuality: q } });
       if (closed) return;
       renderExports?.();
@@ -902,6 +926,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
         app.busy = false;
         void app.wakeLock.release();
       }
+      video.dispose();
       if (app.debug.viewer === viewer) app.debug.viewer = undefined;
       viewer?.dispose();
       viewer = null;

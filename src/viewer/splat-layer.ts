@@ -14,6 +14,18 @@
  * upscaled (bilinear), the still view at full size. Intersections beyond the reservation (the
  * farthest are dropped for that frame) grow it up to `maxIntersections` and redraw.
  *
+ * Offscreen frames (`openOffscreen`, the fly-through video): the same renderer and presenter draw
+ * SplatCameras at a fixed size outside the visible canvas, one command buffer per frame awaited
+ * (count readback + onSubmittedWorkDone) before the next, no new pipelines. While a session is open
+ * the viewer's own frames are not drawn (the canvas keeps its last frame; it is redrawn on close),
+ * and the per-pixel buffers are sized to the video frame. A frame waits while the page is hidden,
+ * and is drawn again when the page was hidden while it ran (dropped work) or when it overflowed the
+ * intersection reservation. Frame source: `new VideoFrame(OffscreenCanvas 'webgpu')`. The first
+ * frame of an 'auto' session checks it against a copy of the same texture (PSNR ≥ 35 dB), because
+ * WebKit's VideoFrame-from-WebGPU-canvas path is unverified. The fallback copies the texture into a
+ * MAP_READ buffer and builds the frame from those bytes ('RGBX' / 'BGRX' with the 256-byte row
+ * stride, 3.9 MB per 720p frame).
+ *
  * Pipelines are compiled when the model is set. While the page is hidden nothing is submitted
  * (iOS may drop such work); on return the frame is redrawn. A device loss rebuilds the layer on
  * the new device from the host copy of the model (twice), then reports 'unavailable' (the next
@@ -25,7 +37,7 @@
 import { getGPU, type GPUContext } from '../gpu/device';
 import { SplatPresenter } from '../splat/present';
 import { SplatRenderer } from '../splat/renderer';
-import type { SplatModel } from '../splat/types';
+import type { SplatCamera, SplatModel } from '../splat/types';
 import { interactiveFrameSize, splatCameraFromView, splatCanvasSize } from './splat-camera';
 
 export type SplatLayerState = 'loading' | 'ready' | 'lost' | 'unavailable';
@@ -47,6 +59,38 @@ export interface SplatLayerOptions {
   onInvalidate?: () => void;
   /** Accept a software adapter (tests). */
   allowSoftware?: boolean;
+}
+
+/** Where an offscreen session's VideoFrames come from. */
+export type SplatFramePath = 'canvas' | 'readback';
+
+export interface SplatOffscreenOptions {
+  width: number;
+  height: number;
+  /** sRGB background in [0, 1] (default black). */
+  background?: [number, number, number];
+  /** 'auto' (default): the canvas path when the session's first frame verifies, else the readback. */
+  path?: 'auto' | SplatFramePath;
+}
+
+/** Offscreen frames of the layer's model (`SplatLayer.openOffscreen`). */
+export interface SplatOffscreen {
+  readonly width: number;
+  readonly height: number;
+  /** Source of the VideoFrames (null until the first `videoFrame`). */
+  readonly path: SplatFramePath | null;
+  /** Why the canvas path is not used (null while it is, or before the first frame). */
+  readonly fallbackReason: string | null;
+  /** Submit → done of the last frame and of all frames so far (ms; redraws not counted). */
+  readonly lastFrameMs: number;
+  readonly totalFrameMs: number;
+  readonly frames: number;
+  /** Draws `cam` (world frame, OpenCV, `width` × `height`) as a VideoFrame; the caller closes it. */
+  videoFrame(cam: SplatCamera, timestampUs: number, durationUs?: number): Promise<VideoFrame>;
+  /** Draws `cam` and reads it back (RGBA8, rows top to bottom; tests, quality checks). */
+  pixels(cam: SplatCamera): Promise<{ width: number; height: number; data: Uint8Array }>;
+  /** Frees the session's GPU resources; the viewer draws again. */
+  close(): void;
 }
 
 /** What a frame shows (from the viewer). */
@@ -108,6 +152,8 @@ export class SplatLayer {
   private lastView: SplatView | null = null;
   private pending: SplatView | null = null;
   private inFlight = false;
+  /** An offscreen session (video export) is open: the viewer's own frames wait. */
+  private offscreenOpen = false;
   private countBuf: GPUBuffer | null = null;
   private countDevice: GPUDevice | null = null;
   /** The canvas texture can be copied (readPixels / screenshots). */
@@ -265,7 +311,7 @@ export class SplatLayer {
   draw(view: SplatView): void {
     if (!this.ready || !this.visible) return;
     this.lastView = view;
-    if (typeof document !== 'undefined' && document.hidden) {
+    if ((typeof document !== 'undefined' && document.hidden) || this.offscreenOpen) {
       this.lastSig.fill(NaN);
       return;
     }
@@ -386,6 +432,241 @@ export class SplatLayer {
     } finally {
       buffer.destroy();
     }
+  }
+
+  /**
+   * Opens an offscreen session at `width` × `height` (video export). Throws when the layer is not
+   * ready or a session is already open. See the file header.
+   */
+  openOffscreen(o: SplatOffscreenOptions): SplatOffscreen {
+    if (!this.ready || !this.presenter || !this.countBuf) throw new Error('the photoreal model is not loaded');
+    if (this.offscreenOpen) throw new Error('an offscreen session is already open');
+    const W = Math.round(o.width);
+    const H = Math.round(o.height);
+    if (!(W >= 16 && H >= 16 && W <= 4096 && H <= 4096)) throw new Error(`offscreen size ${W}×${H}`);
+    const layer = this;
+    const device0 = this.gpu.device;
+    const bg = o.background ?? [0, 0, 0];
+    const bgra = this.format === 'bgra8unorm';
+    const bytesPerRow = Math.ceil((4 * W) / 256) * 256;
+    let path: SplatFramePath | null = o.path === 'canvas' || o.path === 'readback' ? o.path : null;
+    let fallbackReason: string | null = null;
+    let closed = false;
+    let hiddenDuring = false;
+    let wake: (() => void) | null = null;
+    const onVis = (): void => {
+      if (document.hidden) hiddenDuring = true;
+      else wake?.();
+    };
+    document.addEventListener('visibilitychange', onVis);
+    const rb = device0.createBuffer({ size: bytesPerRow * H, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST, label: 'splat-offscreen-readback' });
+    let texture: GPUTexture | null = null;
+    let canvas: OffscreenCanvas | null = null;
+    let ctx: GPUCanvasContext | null = null;
+    const stats = { lastFrameMs: 0, totalFrameMs: 0, frames: 0 };
+    this.offscreenOpen = true;
+
+    const check = (): void => {
+      if (closed) throw new DOMException('offscreen session closed', 'AbortError');
+      if (layer.disposed || layer.gpu.device !== device0 || !layer.renderer || !layer.presenter || !layer.countBuf) throw new Error('the photoreal model was unloaded or the GPU device was lost');
+    };
+    const whenVisible = async (): Promise<void> => {
+      while (typeof document !== 'undefined' && document.hidden && !closed) await new Promise<void>((res) => (wake = res));
+      wake = null;
+    };
+    const ownTexture = (): GPUTexture => {
+      texture ??= device0.createTexture({ size: [W, H], format: layer.format, usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC, label: 'splat-offscreen' });
+      return texture;
+    };
+    /** The WebGPU OffscreenCanvas (null when it cannot be created / configured here). */
+    const canvasContext = (): GPUCanvasContext | null => {
+      if (ctx || canvas) return ctx;
+      try {
+        canvas = new OffscreenCanvas(W, H);
+        const c = canvas.getContext('webgpu');
+        if (c) {
+          c.configure({ device: device0, format: layer.format, alphaMode: 'opaque', usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC });
+          ctx = c;
+        }
+      } catch (e) {
+        fallbackReason = `OffscreenCanvas webgpu: ${(e as Error)?.message ?? e}`;
+      }
+      if (!ctx && !fallbackReason) fallbackReason = 'OffscreenCanvas has no webgpu context';
+      return ctx;
+    };
+
+    /** Draws one frame into `target` (+ the readback copy), awaited; drawn again after dropped work or an overflow. */
+    const render = async (cam: SplatCamera, target: 'canvas' | 'texture', readback: boolean): Promise<void> => {
+      if (cam.width !== W || cam.height !== H) throw new Error(`camera ${cam.width}×${cam.height} for a ${W}×${H} session`);
+      for (;;) {
+        // one heavy command buffer in flight: a viewer frame finishes first
+        while (layer.inFlight) await new Promise((r) => setTimeout(r, 2));
+        await whenVisible();
+        check();
+        const r = layer.renderer!;
+        if (r.maxWidth !== W || r.maxHeight !== H) r.setMaxSize(W, H);
+        const tex = target === 'canvas' ? ctx!.getCurrentTexture() : ownTexture();
+        const enc = device0.createCommandEncoder({ label: 'splat-offscreen' });
+        const color = r.encodeFrame(enc, cam, { background: bg, countTo: { buffer: layer.countBuf!, offset: 0 } });
+        layer.presenter!.encode(enc, tex.createView(), W, H, { buffer: color, width: W, height: H }, false);
+        if (readback) enc.copyTextureToBuffer({ texture: tex }, { buffer: rb, bytesPerRow }, { width: W, height: H });
+        hiddenDuring = false;
+        const t0 = performance.now();
+        device0.queue.submit([enc.finish()]);
+        layer.inFlight = true;
+        const countBuf = layer.countBuf!;
+        let n = -1;
+        try {
+          const [count] = await Promise.all([
+            countBuf.mapAsync(GPUMapMode.READ, 0, 4).then(() => {
+              const v = new Uint32Array(countBuf.getMappedRange(0, 4))[0];
+              countBuf.unmap();
+              return v;
+            }),
+            device0.queue.onSubmittedWorkDone(),
+          ]);
+          n = count;
+        } finally {
+          layer.inFlight = false;
+        }
+        stats.lastFrameMs = performance.now() - t0;
+        check();
+        // the page was hidden while the GPU ran it: the work may have been dropped
+        if (hiddenDuring || document.hidden) continue;
+        const cap = r.isectCapacity;
+        if (n > cap && cap < layer.opts.maxIntersections && n * 4 <= device0.limits.maxStorageBufferBindingSize) {
+          // the farthest intersections were dropped: grow and draw the frame again
+          r.reserveIntersections(Math.min(layer.opts.maxIntersections, Math.ceil(n * 1.25)));
+          continue;
+        }
+        stats.totalFrameMs += stats.lastFrameMs;
+        stats.frames++;
+        return;
+      }
+    };
+
+    /** RGBA8 of the mapped readback buffer. */
+    const rgba = (src: Uint8Array): Uint8Array => {
+      const out = new Uint8Array(4 * W * H);
+      for (let y = 0; y < H; y++)
+        for (let x = 0; x < W; x++) {
+          const s = y * bytesPerRow + 4 * x;
+          const d = 4 * (y * W + x);
+          out[d] = src[bgra ? s + 2 : s];
+          out[d + 1] = src[s + 1];
+          out[d + 2] = src[bgra ? s : s + 2];
+          out[d + 3] = 255;
+        }
+      return out;
+    };
+
+    /** The readback-path VideoFrame of the frame just rendered with `readback`. */
+    const readbackFrame = async (timestamp: number, duration: number | undefined): Promise<VideoFrame> => {
+      await rb.mapAsync(GPUMapMode.READ);
+      try {
+        // (the constructor copies the bytes; the 256-byte-aligned row stride goes in the layout)
+        return new VideoFrame(rb.getMappedRange(), { format: bgra ? 'BGRX' : 'RGBX', codedWidth: W, codedHeight: H, timestamp, duration, layout: [{ offset: 0, stride: bytesPerRow }] });
+      } finally {
+        rb.unmap();
+      }
+    };
+
+    /** First frame of an 'auto' session: is the canvas VideoFrame the rendered image? */
+    const probeCanvas = async (cam: SplatCamera, timestamp: number, duration: number | undefined): Promise<VideoFrame | null> => {
+      if (!canvasContext()) return null;
+      let frame: VideoFrame | null = null;
+      try {
+        device0.pushErrorScope('validation');
+        let renderError: unknown = null;
+        await render(cam, 'canvas', true).catch((e) => (renderError = e));
+        const err = await device0.popErrorScope();
+        if (renderError) throw renderError;
+        if (err) throw new Error(err.message);
+        frame = new VideoFrame(canvas!, { timestamp, duration });
+        await rb.mapAsync(GPUMapMode.READ);
+        const direct = rgba(new Uint8Array(rb.getMappedRange()));
+        rb.unmap();
+        const c2 = new OffscreenCanvas(W, H).getContext('2d', { willReadFrequently: true });
+        if (!c2) throw new Error('no 2D canvas to check the frame');
+        c2.drawImage(frame, 0, 0, W, H);
+        const seen = c2.getImageData(0, 0, W, H).data;
+        let se = 0;
+        for (let i = 0; i < direct.length; i += 4) for (let c = 0; c < 3; c++) se += (seen[i + c] - direct[i + c]) ** 2;
+        const mse = se / (3 * W * H);
+        const psnr = mse > 0 ? 10 * Math.log10((255 * 255) / mse) : Infinity;
+        if (frame.codedWidth !== W || frame.codedHeight !== H || psnr < 35)
+          throw new Error(`the canvas VideoFrame differs from the rendered image (${frame.codedWidth}×${frame.codedHeight}, PSNR ${psnr.toFixed(1)} dB)`);
+        return frame;
+      } catch (e) {
+        frame?.close();
+        if (closed || (e as Error)?.name === 'AbortError') throw e;
+        fallbackReason = (e as Error)?.message ?? String(e);
+        return null;
+      }
+    };
+
+    const session: SplatOffscreen = {
+      width: W,
+      height: H,
+      get path() {
+        return path;
+      },
+      get fallbackReason() {
+        return fallbackReason;
+      },
+      get lastFrameMs() {
+        return stats.lastFrameMs;
+      },
+      get totalFrameMs() {
+        return stats.totalFrameMs;
+      },
+      get frames() {
+        return stats.frames;
+      },
+      async videoFrame(cam, timestampUs, durationUs) {
+        if (path === null) {
+          const f = await probeCanvas(cam, timestampUs, durationUs);
+          path = f ? 'canvas' : 'readback';
+          if (f) return f;
+        }
+        if (path === 'canvas') {
+          if (!canvasContext()) throw new Error(fallbackReason ?? 'no WebGPU OffscreenCanvas');
+          await render(cam, 'canvas', false);
+          return new VideoFrame(canvas!, { timestamp: timestampUs, duration: durationUs });
+        }
+        await render(cam, 'texture', true);
+        return readbackFrame(timestampUs, durationUs);
+      },
+      async pixels(cam) {
+        await render(cam, 'texture', true);
+        await rb.mapAsync(GPUMapMode.READ);
+        try {
+          return { width: W, height: H, data: rgba(new Uint8Array(rb.getMappedRange())) };
+        } finally {
+          rb.unmap();
+        }
+      },
+      close() {
+        if (closed) return;
+        closed = true;
+        wake?.();
+        document.removeEventListener('visibilitychange', onVis);
+        layer.offscreenOpen = false;
+        // (a frame still running keeps them until it completes: destroy defers the free)
+        rb.destroy();
+        texture?.destroy();
+        try {
+          ctx?.unconfigure();
+        } catch {
+          /* ignore */
+        }
+        if (!layer.disposed) {
+          layer.lastSig.fill(NaN);
+          layer.opts.onInvalidate?.();
+        }
+      },
+    };
+    return session;
   }
 
   stats(): SplatLayerStats {
