@@ -616,7 +616,7 @@ and extra methods that keep the documented call working are not listed.
 **Refine (after capture)**: extra pairs (sequential window, vocabulary-tree
 retrieval for loop closure, spatial neighbours) → verify (pairs and vocabulary on CPU helper
 workers) → refined live model → only when it is unhealthy, a full incremental SfM from scratch
-on the enriched graph (keep the better of live/offline model) → global
+on the enriched graph (gyro-aided registration as live; keep the better of live/offline model) → global
 BA with self-calibration → retriangulate → final BA → inertial alignment (time
 offset, gravity, metric scale: band-pass regression, or keyframe-interval preintegration when
 that lacks excitation, docs/research/imu-scale.md), GPS Sim3 alignment, compass yaw → world

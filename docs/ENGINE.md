@@ -186,7 +186,7 @@ correction → only when the live model is unhealthy (`liveModelHealth`: unregis
 no verified gyro, keyframes registered with the gyro-predicted rotation, gyro breaks / outliers,
 few explained correspondences, an unclosed loop — many split loop-like correspondences, or a
 loop-like split pair joining the two ends of the capture),
-`runIncrementalSfM` (gyro-checked registrations) and the better of live
+`runIncrementalSfM` (gyro-checked registrations, gyro-aided as live) and the better of live
 vs offline (gyro breaks, then registered images, then explained correspondences, then
 reprojection error; isolated gyro outliers deregistered) → final global BA (focal + principal point + k1 + k2) →
 per-image focal lengths (focus breathing; kept only if they help) → world alignment

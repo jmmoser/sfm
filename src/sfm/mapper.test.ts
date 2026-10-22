@@ -403,9 +403,13 @@ describe('predictRotation (gyro-aided registration with a known rotation)', () =
     // the "gyro": the truth 0.8° off; the pose check rejects rotations more than 5° from it
     const gyroR = turned(P2.R, 0.8);
     const checked: number[] = [];
+    const recovered: number[] = [];
     const opts = (ratio: number): Partial<MapperOptions> => ({
       knownRotationMinInlierRatio: ratio,
-      rotationCheck: { pose: (_id, pose) => (checked.push(rotationAngleBetween(pose.R, gyroR) / DEG), rotationAngleBetween(pose.R, gyroR) < 5 * DEG) },
+      rotationCheck: {
+        pose: (_id, pose) => (checked.push(rotationAngleBetween(pose.R, gyroR) / DEG), rotationAngleBetween(pose.R, gyroR) < 5 * DEG),
+        poseRecovered: (id) => recovered.push(id),
+      },
       predictRotation: () => ({ R: gyroR, sigmaRad: 1 * DEG }),
     });
     // without a predictor the rejected P3P pose is the end of it
@@ -421,14 +425,21 @@ describe('predictRotation (gyro-aided registration with a known rotation)', () =
     expect(strict.mapper.lastRegistration!.p3pInliers).toBeGreaterThanOrEqual(40);
     expect(strict.mapper.lastRegistration!.knownRotationInliers).toBe(32);
     expect(strict.mapper.numRotationRejects).toBe(1);
+    expect(strict.mapper.lastRegistration).toMatchObject({ p3pRotationRejected: true, knownRotationRejected: false });
+    expect(strict.mapper.numRotationRejectsRecovered).toBe(0);
     expect(strict.mapper.numKnownRotationRegistrations).toBe(0);
+    expect(recovered).toEqual([]);
     // … and enough at 0.4: registered with the true pose, the check passed it
     checked.length = 0;
     const { mapper, rec } = rig(400, t, opts(0.4));
     expect(mapper.registerNextImage(30)).toBe(true);
-    expect(mapper.lastRegistration).toMatchObject({ via: 'knownRotation', knownRotationInliers: 32 });
+    expect(mapper.lastRegistration).toMatchObject({ via: 'knownRotation', knownRotationInliers: 32, p3pRotationRejected: true, knownRotationRejected: false });
     expect(checked).toHaveLength(2);
     expect(checked[1]).toBeLessThan(1);
+    // the rejected P3P pose is counted, and reported as recovered (not a failed registration)
+    expect(mapper.numRotationRejects).toBe(1);
+    expect(mapper.numRotationRejectsRecovered).toBe(1);
+    expect(recovered).toEqual([30]);
     const img = rec.images.get(30)!;
     expect(rotationAngleBetween(img.pose.R, P2.R) / DEG).toBeLessThan(0.1);
     for (let k = 0; k < 3; k++) expect(Math.abs(img.pose.t[k] - P2.t[k])).toBeLessThan(0.01);

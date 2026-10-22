@@ -27,10 +27,12 @@
  *    models too; `initFallback` adds a last-resort level for forward motion.
  *  - registration: `absPoseMinNumInliers` AND `absPoseMinInlierRatio` gate acceptance (not only
  *    the RANSAC loop); degenerate poses are rejected (`poseIsUsable`). With a rotation predictor
- *    (`predictRotation`, the engine's gyro; off in the offline SfM) an image P3P cannot register
- *    is registered with that rotation known from ≥ 15 inliers when its baseline agrees with its
- *    best verified pair (`registerKnownRotation`); `registerNextImage`'s `solvers` lets a caller
- *    try P3P alone first (LiveMapper), `lastRegistration` reports what each call saw.
+ *    (`predictRotation`: the engine's gyro, live, in refine's pending retry and in its offline
+ *    SfM) an image P3P cannot register is registered with that rotation known from ≥ 15 inliers
+ *    when its baseline agrees with its best verified pair (`registerKnownRotation`);
+ *    `registerNextImage`'s `solvers` lets a caller try P3P alone first (LiveMapper),
+ *    `lastRegistration` reports what each call saw; a P3P pose `rotationCheck` rejected and the
+ *    known rotation then registered is reported (`numRotationRejectsRecovered`, `poseRecovered`).
  *  - local BA: `localBANumImages` neighbours BESIDES the new image (COLMAP's count includes it);
  *    observations of constant points subsampled to `localBAMaxConstantObsPerImage` per image
  *    (≈ 2.5× faster, accuracy unchanged in the tests); afterwards only the observations in the
@@ -83,6 +85,9 @@ export interface RegistrationDiagnostics {
   rotationChangeDeg: number;
   /** Known-rotation pose: angle (deg) between its baseline and the verified pair's (NaN: not checked). */
   pairBaselineDeg: number;
+  /** `rotationCheck.pose` rejected the P3P / the known-rotation pose of this call. */
+  p3pRotationRejected: boolean;
+  knownRotationRejected: boolean;
   /** The solver that registered the image; null: not registered. */
   via: 'p3p' | 'knownRotation' | null;
 }
@@ -203,11 +208,15 @@ export interface MapperOptions {
    * Optional checks of rotations against an independent sensor (the engine passes the gyro,
    * src/sfm/gyro.ts): `pair` vets the relative rotation x_b = R x_a of a candidate initial pair,
    * `pose` the absolute pose of an image about to be registered (PnP). Returning false rejects
-   * the pair / registration (the image stays unregistered and can be retried later).
+   * the pair / pose (the image stays unregistered and can be retried later — or, with
+   * `predictRotation`, a rejected P3P pose is followed by the known-rotation solver in the same
+   * call; when that registers the image, `poseRecovered(id)` tells the caller, so that its count of
+   * rejected poses is not read as failed registrations).
    */
   rotationCheck?: {
     pair?(a: number, b: number, R_ba: Mat3): boolean;
     pose?(id: number, pose: Pose, rec: Reconstruction): boolean;
+    poseRecovered?(id: number): void;
   };
   /**
    * Optional rotation prediction for registration (the engine passes the gyro once it is verified):
@@ -548,8 +557,10 @@ export class IncrementalMapper {
   private readonly numRegPerCamera = new Map<number, number>();
   /** Registered images of this model that are also registered in other models. */
   numSharedRegImages = 0;
-  /** Registrations / initial pairs rejected by `rotationCheck`. */
+  /** Poses (P3P or known-rotation candidates) and initial pairs rejected by `rotationCheck`. */
   numRotationRejects = 0;
+  /** Of them, P3P poses of images the known-rotation solver then registered in the same call. */
+  numRotationRejectsRecovered = 0;
   /** Images registered with the predicted rotation (`predictRotation`) after P3P failed. */
   numKnownRotationRegistrations = 0;
   /**
@@ -984,7 +995,7 @@ export class IncrementalMapper {
    */
   registerNextImage(id: number, solvers: { p3p?: boolean; knownRotation?: boolean } = {}): boolean {
     const t0 = now();
-    this.lastRegistration = { id, correspondences: 0, p3pInliers: NaN, knownRotationInliers: NaN, rotationChangeDeg: NaN, pairBaselineDeg: NaN, via: null };
+    this.lastRegistration = { id, correspondences: 0, p3pInliers: NaN, knownRotationInliers: NaN, rotationChangeDeg: NaN, pairBaselineDeg: NaN, p3pRotationRejected: false, knownRotationRejected: false, via: null };
     try {
       return this.registerNextImageImpl(id, solvers.p3p !== false, solvers.knownRotation !== false && !!this.opts.predictRotation);
     } finally {
@@ -1062,12 +1073,19 @@ export class IncrementalMapper {
       diag.p3pInliers = p3?.numInliers ?? 0;
       if (p3 && p3.numInliers >= o.absPoseMinNumInliers && p3.numInliers >= o.absPoseMinInlierRatio * n && poseIsUsable(p3.pose, p3.inlierMask, uv, n, o.absPoseMaxErrorPx)) {
         if (!o.rotationCheck?.pose || o.rotationCheck.pose(id, p3.pose, this.rec)) res = p3;
-        else this.numRotationRejects++;
+        else {
+          this.numRotationRejects++;
+          diag.p3pRotationRejected = true;
+        }
       }
       if (res) diag.via = 'p3p';
     }
     if (!res && useKnownRotation) res = this.registerKnownRotation(id, X, uv, n, cam);
     if (!res) return false;
+    if (diag.p3pRotationRejected) {
+      this.numRotationRejectsRecovered++;
+      o.rotationCheck?.poseRecovered?.(id);
+    }
     this.rec.registerImage(id, res.pose);
     this.onRegistered(id);
     const added = new Set<number>();
@@ -1127,6 +1145,7 @@ export class IncrementalMapper {
     if (pairDeg > o.knownRotationPairMaxDeg) return null;
     if (o.rotationCheck?.pose && !o.rotationCheck.pose(id, res.pose, this.rec)) {
       this.numRotationRejects++;
+      if (diag) diag.knownRotationRejected = true;
       return null;
     }
     this.numKnownRotationRegistrations++;
@@ -1942,8 +1961,8 @@ export class IncrementalMapper {
 
 /** Options accepted by `runIncrementalSfM` (mapper options + diagnostics hook). */
 export interface RunSfMOptions extends MapperOptions {
-  /** Called with per-model timings (diagnostics). */
-  onModel?: (rec: Reconstruction, timings: MapperTimings) => void;
+  /** Called with per-model timings and the model's mapper, e.g. its registration counters (diagnostics). */
+  onModel?: (rec: Reconstruction, timings: MapperTimings, mapper: IncrementalMapper) => void;
 }
 
 /**
@@ -2029,7 +2048,7 @@ export async function runIncrementalSfM(
         extractColors(rec, db);
         rec.updatePointErrors();
         models.push(rec);
-        opts.onModel?.(rec, mapper.timings);
+        opts.onModel?.(rec, mapper.timings, mapper);
       } else {
         // discard: release the registrations of this attempt
         for (const id of rec.registeredImageIds()) mapper.deregisterImage(id);

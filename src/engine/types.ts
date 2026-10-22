@@ -122,9 +122,9 @@ export interface EngineConfig {
    * re-triangulated its registered neighbours (`live.retriangulateNeighbours`) is registered with
    * its rotation predicted by the gyro from the registered keyframe nearest in time, from ≥ 15
    * inliers and a baseline that agrees with its best verified pair (`LiveSession.predictRotation`,
-   * `MapperOptions.predictRotation`; live and in refine's retry of the pending keyframes). A live
-   * model with such keyframes is checked by the offline SfM (`liveModelHealth`). Measurements:
-   * docs/research/real-capture-robustness.md "Phone-rate capture".
+   * `MapperOptions.predictRotation`; live, in refine's retry of the pending keyframes and in its
+   * offline SfM). A live model with such keyframes is checked by the offline SfM
+   * (`liveModelHealth`). Measurements: docs/research/real-capture-robustness.md "Phone-rate capture".
    */
   gyroAidedRegistration?: boolean;
   /**

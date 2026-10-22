@@ -2,10 +2,10 @@
  * Refine after capture (ENGINE.md "Refine"): vocabulary retrain / extend → candidate pairs
  * (sequential 10, retrieval 15, spatial 10) → match + verify → refined live model → unless it is
  * healthy (`liveModelHealth`), a full incremental SfM from scratch (live-refined intrinsics as the
- * initial guess) and the better of the live and the offline model (gyro breaks, registered
- * images, explained correspondences, mean reprojection error) → final global BA with
- * self-calibration (f, k1, k2), re-triangulation and filtering → world alignment (IMU gravity /
- * time offset / metric scale, GPS, compass; verified R_cam_device) → SparseModel.
+ * initial guess, gyro-aided registration as live) and the better of the live and the offline model
+ * (gyro breaks, registered images, explained correspondences, mean reprojection error) → final
+ * global BA with self-calibration (f, k1, k2), re-triangulation and filtering → world alignment
+ * (IMU gravity / time offset / metric scale, GPS, compass; verified R_cam_device) → SparseModel.
  *
  * The offline SfM can return several models: only the largest is kept (no merging); stats
  * `offlineModels` / `offlineDroppedImages` report the others, and `unconnectedImages` the
@@ -469,11 +469,15 @@ export const DEFAULT_LIVE_HEALTH_OPTIONS: Readonly<Omit<LiveHealthOptions, 'spli
  *    between the e2e closed models (≤ 190 loop-like / ≤ 1940 split correspondences of 168 k on
  *    yard-real: limits 420 / 2520; none on object-real) and the unclosed live models (≥ 1200
  *    loop-like, or 2950–5650 split);
- *  - and no loop-like split pair across ≥ `maxLoopSpan` of the capture. A phone-rate capture has
- *    fewer, shorter loop tracks: e2e yard-real at stride 3 from frame 1 registered 48/48 live and
- *    refine left its loop open in 2 of 6 runs (ATE 1.8e-2, rotation 2.4°) on only 47–69 loop-like
- *    correspondences (limit 150) — but on the loop's own pairs, keyframes 1–2 ↔ 42–44 (≈ 210 px
- *    apart); the closed models' loop-like pairs join keyframes 7 apart (14 of 81 at stride 1).
+ *  - and no loop-like split pair across ≥ `maxLoopSpan` of the capture: the two ends of a loop
+ *    the model did not close. A phone-rate capture has few, short loop tracks, so the counts above
+ *    miss it: e2e yard-real at stride 3 from frame 1 is mapped live with the focal 2.8 % long (the
+ *    self-calibration of the first ≈ 8 keyframes: weak geometry, far points), its loop's ends ≈ 11°
+ *    apart before refine; refine closed it in 11 of 13 runs (ATE 9.6e-4–1.0e-3) and left it open
+ *    in 2 (ATE 1.8e-2, rotation 2.4°) on only 47–69 loop-like correspondences (limit 150) — on the
+ *    loop's own pairs, keyframes 1–2 ↔ 42–44 (≈ 210 px). The closed models' loop-like pairs join
+ *    keyframes ≤ 17 % of the capture apart (yard-real: 14 of 81 at stride 1, 7 of 48 at stride 3);
+ *    a 12 px split across the capture in one closed model only costs the offline SfM's time.
  * Any doubt runs the offline SfM, as before: a wrong "unhealthy" only costs time.
  */
 export function liveModelHealth(
@@ -831,6 +835,12 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     ...(liveCam ? { intrinsics: { ...liveCam } } : {}),
     // gyro gate of registrations / initial pairs (active once R_cam_device is verified)
     rotationCheck: live.rotationCheck(),
+    // gyro-aided registration as live (EngineConfig.gyroAidedRegistration): at a phone's analysis
+    // rate the from-scratch SfM otherwise loses the keyframes the live mapper registered with it or
+    // with re-triangulated neighbours (e2e yard-real at stride 3 from frame 1: 3 models, the largest
+    // 32 of 48 keyframes; with it 1 model of 48), and so could never replace a live model whose
+    // loop did not close (docs/research/real-capture-robustness.md "Phone-rate capture")
+    ...(cfg.gyroAidedRegistration === false ? {} : { predictRotation: (id: number, r: Reconstruction) => live.predictRotation(id, r) }),
     ...(cfg.mapper ?? {}),
   };
   // the offline SfM checks the live model independently: skipped when the live model is healthy
@@ -843,13 +853,15 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   if (!health?.healthy) {
     const tOff = now();
     try {
+      const gyroAided = new Map<Reconstruction, number>();
       const models = await runIncrementalSfM(
         st.db,
-        mapperOpts,
+        { ...mapperOpts, onModel: (r, _t, m) => gyroAided.set(r, m.numKnownRotationRegistrations) },
         (e) => report('reconstruction', 0.1 + 0.85 * Math.max(0, e.progress), e.message),
         cancel,
       );
       offline = models[0] ?? null;
+      if (offline) stats.gyroAidedRegistrations = `${stats.gyroAidedRegistrations ?? '0 live, 0 in refine'}, ${gyroAided.get(offline) ?? 0} offline`;
       // only the largest model is kept: report what the others held (split frequency on real captures)
       stats.offlineModels = models.length;
       if (models.length > 1) {
@@ -931,6 +943,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   }
   stats.gyroRejectedPairs = live.stats.gyroRejectedPairs;
   stats.gyroRejectedPoses = live.stats.gyroRejectedPoses;
+  stats.gyroRecoveredPoses = live.stats.gyroRecoveredPoses;
   stats.forcedKeyframes = live.stats.forcedKeyframes;
   stats.heldKeyframes = live.stats.heldKeyframes;
   // final global BA with the principal point free (well constrained by the many views of a

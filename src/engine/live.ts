@@ -489,9 +489,14 @@ export class LiveSession {
     handEye: null as HandEyeResult | null,
     /** Keyframes forced by the hard rotation limit (fast pans). */
     forcedKeyframes: 0,
-    /** Verified pairs / registrations / initial pairs rejected by the gyro check. */
+    /**
+     * Verified pairs / initial pairs, and poses (P3P or known-rotation candidates, live and in
+     * refine) rejected by the gyro check. `gyroRecoveredPoses`: rejected P3P poses of keyframes the
+     * gyro-predicted rotation then registered in the same attempt (counted in gyroRejectedPoses too).
+     */
     gyroRejectedPairs: 0,
     gyroRejectedPoses: 0,
+    gyroRecoveredPoses: 0,
     /** Planar pairs whose two-fold ambiguity the gyro resolved (alternative branch taken). */
     gyroPlanarSwaps: 0,
     /** Live gyro calibrations (bias / time offset from the registered keyframes). */
@@ -635,7 +640,7 @@ export class LiveSession {
     const c = checkPoseRotation(gyro, r.t, pose.R, nbs, { tolerance: this.gyroTolerance() });
     if (!c || c.ok) return true;
     this.stats.gyroRejectedPoses++;
-    this.deps.log('debug', `registration of keyframe ${id} rejected by the gyro: rotation ${(c.errRad / DEG).toFixed(1)}° off (${c.disagree}/${c.agree + c.disagree} neighbours disagree)`);
+    this.deps.log('debug', `pose of keyframe ${id} rejected by the gyro: rotation ${(c.errRad / DEG).toFixed(1)}° off (${c.disagree}/${c.agree + c.disagree} neighbours disagree)`);
     return false;
   }
 
@@ -647,6 +652,7 @@ export class LiveSession {
         return g !== null;
       },
       pose: (id, pose, rec) => this.checkPoseGyro(id, pose, rec),
+      poseRecovered: () => void this.stats.gyroRecoveredPoses++,
     };
   }
 
@@ -662,11 +668,12 @@ export class LiveSession {
       const calls = a.calls.map((c) => {
         const parts: string[] = [];
         const count = (k: number): string => (k > 0 ? `${k}/${c.correspondences}` : `no pose (${c.correspondences} correspondences)`);
-        if (!Number.isNaN(c.p3pInliers)) parts.push(`P3P ${count(c.p3pInliers)}`);
+        if (!Number.isNaN(c.p3pInliers)) parts.push(`P3P ${count(c.p3pInliers)}${c.p3pRotationRejected ? ' rejected by the gyro' : ''}`);
         if (!Number.isNaN(c.knownRotationInliers)) {
           const notes: string[] = [];
           if (Number.isFinite(c.rotationChangeDeg)) notes.push(`moved ${c.rotationChangeDeg.toFixed(2)}°`);
           if (Number.isFinite(c.pairBaselineDeg)) notes.push(`baseline ${c.pairBaselineDeg.toFixed(1)}° off its best pair's`);
+          if (c.knownRotationRejected) notes.push('rejected by the gyro');
           parts.push(`known rotation ${count(c.knownRotationInliers)}${notes.length ? ` (${notes.join(', ')})` : ''}`);
         }
         return parts.length ? parts.join(', ') : `${c.correspondences} correspondences`;

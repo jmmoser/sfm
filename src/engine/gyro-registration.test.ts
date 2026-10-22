@@ -103,6 +103,10 @@ describe('LiveSession.predictRotation (gyro-aided registration)', () => {
     expect(rotationAngleBetween(ungated.predictRotation(30, rec)!.R, cap.frames[30].pose.R) / DEG).toBeLessThan(0.05);
     // wired into the live mapper unless disabled
     expect(session().mapper.opts.predictRotation).toBeTypeOf('function');
+    // a rejected P3P pose the known rotation then registered is reported apart from the rejections
+    const s = session();
+    s.mapper.opts.rotationCheck!.poseRecovered!(30);
+    expect(s.stats).toMatchObject({ gyroRejectedPoses: 0, gyroRecoveredPoses: 1 });
     expect(session({ gyroAidedRegistration: false }).mapper.opts.predictRotation).toBeUndefined();
     // an IMU gap (> 0.5 s) over the interval: no prediction
     const gap = session();

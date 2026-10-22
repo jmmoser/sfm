@@ -78,6 +78,7 @@ export function computeSelfMetrics(r, meta = {}) {
       deregisteredOutliers: outliers,
       rejectedPairs: num(st.gyroRejectedPairs),
       rejectedPoses: num(st.gyroRejectedPoses),
+      recoveredPoses: num(st.gyroRecoveredPoses),
     },
     explained: { live: num(st.liveExplained), offline: num(st.offlineExplained) },
     offlineSfM: typeof st.offlineSfM === 'string' ? st.offlineSfM : null,
