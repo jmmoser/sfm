@@ -255,6 +255,10 @@ refinePose(pose, X, xn, n, opts?: { iterations?: number; huberNormalized?: numbe
 solvePnPRansac(X: Float64Array /*3n*/, uv: Float64Array /*2n pixels*/, n, cam, opts?: {
   maxErrorPx?: number /*8*/; confidence?: number; maxIterations?: number; minInliers?: number; rng?: Rng })
   : { pose: Pose; inlierMask: Uint8Array; numInliers: number } | null
+translationKnownRotation(R, X, xn /*normalized 2n*/, count, idx?, w?): Vec3 | null   // linear, ≥ 2 points
+solvePnPKnownRotationRansac(X, uv, n, cam, R /*world-to-camera, e.g. gyro-predicted*/, opts?: { …solvePnPRansac's;
+  refineRotation?: boolean /*true: final 6-DOF refinement*/ })
+  : { pose: Pose; inlierMask: Uint8Array; numInliers: number; rotationChangeRad: number } | null   // 2-point LO-MSAC
 
 // triangulation.ts
 triangulateDLT(poses: Pose[], xn: Float64Array /*2n normalized*/, n, out?): Vec3 | null
