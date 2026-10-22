@@ -15,6 +15,12 @@
  * (drift) — rVFC captureTime vs MediaStreamTrackProcessor timestamps, buffer orientation, and the
  * main-thread cost of createImageBitmap(<video>) (full / downscaled) and new VideoFrame(<video>).
  * The report is part of "Copy".
+ *
+ * "Video export": `probeVideoExport` (src/app/video-export.ts) without a model. It reports the H.264
+ * codec the fly-through export would use (portrait / landscape 720p), whether a VideoFrame of a
+ * WebGPU OffscreenCanvas holds the rendered pixels (the 'canvas' frame path) or the export reads
+ * frames back, the encode time per 720p frame, and whether the MP4 decodes again. Also part of
+ * "Copy".
  */
 import { startBenchmark, type BenchRun } from '../bench/bench';
 import { STATUS_LABEL, estimateLine, formatMs, qualityName, reportClipboardText, verdict } from '../bench/report';
@@ -22,6 +28,7 @@ import { describeTest } from '../bench/scales';
 import { BENCH_TESTS, type BenchReport, type BenchScale, type BenchStatus, type BenchTestId, type BenchTestResult } from '../bench/types';
 import { CameraCapture } from '../../sensors/camera';
 import { runCameraTimingProbe, type CameraProbeReport } from '../../sensors/camera-probe';
+import { probeVideoExport, type VideoProbeReport } from '../video-export';
 import { MotionSensor } from '../../sensors/motion';
 import { collectDiagnostics, diagnosticsReportJSON, type SensorDiagnostics } from '../../sensors/diagnostics';
 import type { App, Screen } from '../app';
@@ -90,6 +97,7 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
   let closed = false;
   const motionTest: MotionTest = { state: 'idle' };
   const probe: CameraProbeState = { state: 'idle' };
+  const videoProbe: { state: 'idle' | 'running' | 'done'; report?: VideoProbeReport; error?: string } = { state: 'idle' };
   const probeVideo = h('video', { class: 'probe-video', playsinline: true, muted: true, autoplay: true, 'aria-label': 'Camera preview' });
   let probeCamera: CameraCapture | null = null;
   const body = h('div', { class: 'diag-body' }, h('div', { class: 'list-loading' }, spinner('md', 'Collecting diagnostics')));
@@ -116,6 +124,7 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
       diagnostics: diag,
       motionTest,
       cameraProbe: probe.report ?? (probe.error ? { error: probe.error } : null),
+      videoProbe: videoProbe.report ?? (videoProbe.error ? { error: videoProbe.error } : null),
     };
   }
 
@@ -449,6 +458,52 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
       });
   }
 
+  function runVideoProbe(): void {
+    if (videoProbe.state === 'running') return;
+    videoProbe.state = 'running';
+    videoProbe.report = undefined;
+    videoProbe.error = undefined;
+    render();
+    void probeVideoExport()
+      .then(
+        (r) => {
+          videoProbe.report = r;
+        },
+        (e) => {
+          videoProbe.error = (e as Error)?.message ?? String(e);
+        },
+      )
+      .finally(() => {
+        videoProbe.state = 'done';
+        if (!closed) render();
+      });
+  }
+
+  function videoSection(): HTMLElement {
+    const r = videoProbe.report;
+    const rows: HTMLElement[] = [];
+    if (r) {
+      rows.push(kvRow('H.264 encoder', r.codecPortrait ? chip(r.codecPortrait, 'good', 'check') : chip(r.webCodecs ? 'Not supported' : 'No WebCodecs', 'bad')));
+      rows.push(kvRow('Landscape', h('span', { class: 'mono', text: r.codecLandscape ?? '–' })));
+      rows.push(kvRow('Frame path', r.framePath === 'canvas' ? chip('WebGPU canvas', 'good', 'check') : r.framePath === 'readback' ? chip('Readback (slower)', 'warn') : chip('–', 'neutral')));
+      if (r.canvasNote) rows.push(h('div', { class: 'row row-note' }, h('span', { class: 'row-sub', text: r.canvasNote })));
+      if (r.msPerFrame !== null) rows.push(kvRow('Per 720p frame', h('span', { text: `${r.msPerFrame.toFixed(1)} ms (${r.frames} frames, ${formatBytes(r.bytes)})` })));
+      rows.push(kvRow('MP4 decodes', r.decoded === null ? chip('No decoder check', 'neutral') : chip(`${r.decoded} of ${r.frames} frames`, r.decoded === r.frames ? 'good' : 'bad')));
+      if (r.error) rows.push(kvRow('Probe', chip(r.error, 'bad')));
+    } else if (videoProbe.error) rows.push(kvRow('Probe', chip(videoProbe.error, 'bad')));
+    const btn = button({
+      label: videoProbe.state === 'running' ? 'Encoding test frames…' : 'Test video encoding',
+      icon: 'play',
+      variant: 'secondary',
+      size: 'md',
+      block: true,
+      disabled: videoProbe.state === 'running',
+      testId: 'diag-video-probe',
+      onClick: runVideoProbe,
+    });
+    return section('Video export', ...(rows.length ? [group(...rows)] : [h('p', { class: 'muted', text: 'Checks the fly-through MP4 export: codec, frame path and encode speed.' })]), btn);
+  }
+
   function probeSection(): HTMLElement {
     const rows: HTMLElement[] = [];
     const r = probe.report;
@@ -604,6 +659,7 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
     });
     sections.push(section('Motion', group(...motionRows), motionBtn));
     sections.push(probeSection());
+    sections.push(videoSection());
 
     const s = g.storage;
     sections.push(

@@ -22,7 +22,7 @@
  * `probeVideoExport` (Diagnostics) needs no model. It reports the codec, whether a VideoFrame of a
  * WebGPU OffscreenCanvas holds the rendered pixels (a cleared texture), the encode time per 720p
  * frame, and whether VideoDecoder reads the MP4 back. The first iPhone run thus tells which frame
- * path and codec the export will use.
+ * path and codec the export will use. Measurements so far: docs/research/flythrough-video.md.
  */
 import { saveFile } from '../io/download';
 import { Mp4Writer, readMp4 } from '../io/mp4';

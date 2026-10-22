@@ -24,7 +24,9 @@
  * them, and the avcC is built from the first SPS and PPS (without the High-profile chroma
  * extension, which decoders do not need).
  *
- * Limits: one video track, 32-bit sizes and offsets (files < 4 GiB).
+ * Limits: one video track, 32-bit sizes and offsets (files < 4 GiB). Checked against ffmpeg (files
+ * rewritten from libx264 clips, B-frames included, decode to identical frames):
+ * docs/research/flythrough-video.md.
  */
 
 export interface Mp4WriterOptions {

@@ -29,7 +29,8 @@ geo-referenced point cloud and mesh that you can measure and export.
   view with eye-dome lighting, an unlit mesh view, camera frustums, and a tap-to-measure tool
   (metric when scale is known).
 * **Exports**: PLY (points, mesh, and Gaussian splats in the common 3DGS layout), compact SPZ
-  splats (about 4× smaller than the PLY), GLB, and a COLMAP text model with images in a ZIP.
+  splats (about 4× smaller than the PLY), GLB, a COLMAP text model with images in a ZIP, and a
+  6–10 s fly-through MP4 of the splats along the capture path (H.264, encoded on the phone).
   Exports go through the iOS share sheet.
 * **Robust on iPhone**:
   * Memory planner that keeps the tab within ≤ 1.2 GB (iOS kills it at ~1.5–2 GB), with resume
@@ -136,6 +137,7 @@ node e2e/run-splat-gt.mjs object-real --cloud <dense-gt ply> --sparse 20000   # 
 npm run ui:smoke                     # full UI flow with the mock engine at iPhone size
 node e2e/ui/states.mjs               # UI edge states; also e2e/ui/layouts.mjs (sizes), bench.mjs
 E2E_GPU=host node e2e/ui/splat-shots.mjs <e2e run dir>   # viewer screenshots of a real run: splats / points / mesh
+E2E_GPU=host node e2e/ui/flythrough.mjs <e2e run dir>    # fly-through MP4 of a real run (API + UI), decoded and scored
 ```
 
 See [`e2e/README.md`](e2e/README.md) for options, dataset layout, metrics and recorded results.
@@ -188,6 +190,7 @@ UI ◀──────── progress / results ──────────
                                               │ splat: dense cloud → 3D Gaussians → WebGPU training
                                               │ (MCMC, colour correction, depth supervision)
                                               └ exports: PLY · splat PLY / SPZ · GLB · COLMAP ZIP
+                                                (fly-through MP4: rendered in the page from the viewer)
 ```
 
 * [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): goals, conventions, module contracts and

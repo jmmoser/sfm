@@ -39,7 +39,7 @@
  * ZSTD stub). Loading our files with `UnpackOptions.to = RFU` gave back the Z-up model within the
  * steps above, at SH degree 0 and 1 (300 random Gaussians each): positions 7.6 µm, log-scales
  * 0.031, alpha 0.002, f_dc 0.013, f_rest 0.035 and rotations 0.17°. That load includes the
- * reference's own RUB → RFU SH rotation.
+ * reference's own RUB → RFU SH rotation (docs/research/flythrough-video.md).
  *
  * `decodeSplatSPZ` reads versions 1–3 (v1: f16 positions; v2: (x, y, z) 8-bit quaternions) back
  * into the Z-up world. It is used for round trips and tests; version 4 (ZSTD) is refused.

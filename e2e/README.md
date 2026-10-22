@@ -1250,6 +1250,26 @@ the capture shows floaters and the sky shell as blurred blobs — why the app st
 the unlit mesh line up pixel for pixel at the same pose (the GPU test measures ≤ 0.06 px between Gaussian centroids
 and three.js's projection of their means).
 
+### Fly-through video (`e2e/ui/flythrough.mjs`)
+
+The same run directory and page set-up as splat-shots.mjs, then the fly-through MP4 export twice. First through its
+pieces in the page (src/app/video-export.ts: the camera path of the sparse model, the splat layer's offscreen
+frames, WebCodecs H.264, src/io/mp4.ts). That MP4 is decoded again with VideoDecoder: the frame count, the PSNR of
+every 10th decoded frame against the same pose read back directly (encode loss only), wall time per frame, peak JS
+heap and the layer's GPU memory. Then through the UI (Export → "Fly-through video (MP4)" → Prepare → Save, a
+download). Both files and `<name>-flythrough.json` go to `--out` (default `/tmp/sfm-flythrough/`), counted by
+ffprobe when it is installed. It fails outside 180–300 frames or below 34 dB, and warns above 100 ms per frame (the
+30 s / 300 frames target). It needs a hardware adapter and Chrome's H.264 encoder (Playwright's Chromium has none).
+`--probe` runs only the Diagnostics "Test video encoding" probe, in any browser.
+
+```sh
+E2E_GPU=host node e2e/ui/flythrough.mjs e2e/out/e2e/object-real-int-object --name object-real
+E2E_GPU=host node e2e/ui/flythrough.mjs e2e/out/e2e/yard-real-viewer-yard --name yard-real
+node e2e/ui/flythrough.mjs --probe       # SwiftShader Chromium: frame path 'canvas', no H.264 encoder
+```
+
+No host results yet.
+
 ## Breakthrough results (2026-10-20, Apple M4, Metal)
 
 **Final state** (`claude/breakthrough` after the review fixes and the depth-supervision default; `--tag final2`,

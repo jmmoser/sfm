@@ -25,7 +25,7 @@ source file headers. Measurements behind the defaults are dated reports in `docs
   calibration), accelerometer (gravity alignment, metric scale), compass (north),
   GPS (metric scale and geo-referencing at large scale).
 * Exports: PLY (points / mesh), GLB, COLMAP text model (+ images) in a ZIP, Gaussian splats
-  (INRIA PLY, SPZ).
+  (INRIA PLY, SPZ), and a fly-through MP4 video of the splats rendered on the device.
 
 ## 2. Conventions (MUST follow)
 
@@ -114,8 +114,10 @@ src/
   splat/                 3D Gaussian Splatting: WebGPU trainer + renderer, CPU reference,
                          splat PLY / SPZ, point-cloud initialisation, MCMC densification
   sensors/               camera capture, motion, compass, geolocation, wake lock, frame orientation
-  io/                    PLY / GLB / COLMAP export, ZIP writer, IndexedDB session storage, share/download
-  viewer/                three.js viewer (points as splats + EDL, mesh, cameras, measure tool)
+  io/                    PLY / GLB / COLMAP export, ZIP writer, MP4 (H.264) writer, IndexedDB session
+                         storage, share/download
+  viewer/                three.js viewer (points as splats + EDL, mesh, cameras, measure tool), WebGPU
+                         splat layer, fly-through camera path
   engine/                PhotogrammetryEngine (pipeline orchestration, runs in a worker)
   workers/               engine.worker.ts + typed message protocol
   app/                   mobile UI (vanilla TS + CSS), screens, state machine
@@ -507,6 +509,10 @@ interface ColmapModelInput { cameras: { id: number; cam: CameraIntrinsics }[];
   points: { id: number; xyz: ArrayLike<number>; color: ArrayLike<number>; error: number; track: { image: number; point2D: number }[] }[] }
 exportColmapText(model: ColmapModelInput): { name: string; data: string }[]   // cameras.txt, images.txt, points3D.txt
 createZip(files: { name: string; data: Uint8Array | string }[]): Uint8Array   // STORE, CRC32, UTF-8
+class Mp4Writer { constructor(o: { width: number; height: number; fps: number /*integer*/ });   // single-track H.264, faststart
+  setDecoderConfig(avcC: AllowSharedBufferSource): void; addChunk(data: Uint8Array, o: { key: boolean; timestampUs: number }): void;
+  finish(): Blob }                                     // chunks in decode order (VideoEncoder output)
+readMp4(data: Uint8Array): Mp4Info                     // box tree, avcC, timing, sample offsets (tests, e2e)
 class SessionStore { static open(): Promise<SessionStore>; … IndexedDB sessions, frame JPEG blobs, JSON & binary blobs }
 saveFile(data: Blob, filename: string): Promise<'shared' | 'downloaded'>    // Web Share (files) or <a download>
 ```
@@ -526,7 +532,12 @@ class Viewer {
   startMeasure(onResult: (distance: number, a: Vec3, b: Vec3) => void): void; stopMeasure(): void
   setUnits(metric: boolean): void
   resize(): void; dispose(): void; screenshot(): Promise<Blob>
+  openSplatFrames(o: { width: number; height: number; background?: [number, number, number] })
+    : SplatOffscreen | null   // offscreen VideoFrames / pixels of the splats at a fixed size (video export)
 }
+// flythrough.ts (pure): video camera path from the registered keyframes (capture order)
+buildFlythrough(cams: { pose: Pose; intrinsics: { width; height; f } }[], opts?: FlythroughOptions): FlythroughPath | null
+  // { mode: 'object' | 'scene'; width; height; fps; fx; fy; cx; cy; near; poses: Pose[] /*world-to-camera*/; … }
 ```
 
 ### 4.10 Contract deviations
