@@ -13,7 +13,8 @@
  * "Resume dense reconstruction" (HUD + Build sheet): the engine continues from its stored maps.
  * The photoreal progress card shows the engine's latest 'splat_preview' snapshot (tap: larger, in a
  * sheet) and "Use it now" once the training passed `finishFrom`: the engine stops there and the
- * model is stored like a finished one, its checkpoint kept so the Build sheet can continue it.
+ * model is stored like a finished one, its checkpoint kept so the Build sheet can continue it
+ * (model-info.ts splatBuildResume: Resume / Continue / Rebuild of an incomplete model).
  */
 import { saveFile } from '../../io/download';
 import type { SplatDisplayState, Viewer } from '../../viewer';
@@ -38,7 +39,9 @@ import {
   denseResumeQuality,
   memoryStatRows,
   northInfo,
+  splatBuildResume,
   splatContinuable,
+  splatInterruptedStats,
   splatIterationsText,
   splatPreviewCaption,
   splatProgressView,
@@ -517,7 +520,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       steps: ProcessingStep[];
       /** Runs here instead of the Processing screen (the photoreal build). */
       run?: (q: QualityPreset) => void;
-      /** Resumable at this quality: this button label ("Resume" / "Continue") + sub line. */
+      /** Resumable at this quality (or incomplete): this button label ("Resume" / "Continue" / "Rebuild") + sub line. */
       resume?: (q: QualityPreset) => { label: string; sub: string } | null;
       testId: string;
       disabled?: boolean;
@@ -583,14 +586,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
             rebuildDesc: (q) => `Retrains at ${qualityLabel(q)} quality.`,
             steps: [],
             run: (q) => void buildSplats(q),
-            resume: (q) => {
-              if (!splatResumable(r)) return null;
-              const rq = splatResumeQuality(r);
-              if (rq && rq !== q) return null;
-              if (splatContinuable(r) && r.splat)
-                return { label: 'Continue', sub: `Stopped early at ${splatIterationsText(r.splat.iterations, r.splat.stats.splatIterations)} — continues the training.` };
-              return { label: 'Resume', sub: 'Interrupted — continues from the saved training.' };
-            },
+            resume: (q) => splatBuildResume(r, q),
             testId: 'build-splat',
             disabled: !r.sparse || building || webgpuMissing(),
           }),
@@ -829,7 +825,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       clearSplatResume(r.stats);
       // ended by "Use it now": the engine kept the checkpoint, a later build continues from it
       const cont = res.stats.splatContinueFrom;
-      if (typeof cont === 'number') Object.assign(r.stats, { splatResumableIteration: cont, splatResumableQuality: q });
+      if (typeof cont === 'number') Object.assign(r.stats, { splatResumableIteration: cont, splatResumableQuality: q, splatContinuesModel: 1 });
       // a splat PLY prepared before holds the previous model
       splatVersion++;
       exports.delete('ply-splat');
@@ -842,7 +838,8 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       void loadSplats(true);
     } catch (e) {
       const r = app.results;
-      r.stats = { ...r.stats, splatInterrupted: 1, splatInterruptedQuality: q };
+      // (the checkpoint's iteration is not known any more: e.g. a continued run cancelled later on)
+      r.stats = splatInterruptedStats(r.stats, q);
       if (closed) return;
       if (isCancelledError(e) || cancelling) toast('Stopped. Resume continues from the saved training.', { tone: 'info', icon: 'splats' });
       else toast(`Couldn’t build the photoreal model: ${(e as Error)?.message ?? e}`, { tone: 'bad', durationMs: 9000 });

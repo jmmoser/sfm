@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { decodePLY, parseGLB, readZip } from '../io';
-import type { FrameInput, LiveUpdate } from '../workers/protocol';
+import type { FrameInput, LiveUpdate, SplatResult } from '../workers/protocol';
 import { MockEngine } from './mock-engine';
 import { MockScene, lookAt, poseCenter } from './mock-scene';
 
@@ -305,13 +305,49 @@ describe('MockEngine', () => {
     expect(info.stats).toMatchObject({ splatFinishedEarly: 1, splatContinueFrom: info.iterations, splatIterations: 3000 });
     const sum = await e.loadSession('s3');
     expect(sum.splat?.iterations).toBe(info.iterations);
-    expect(sum.stats).toMatchObject({ splatResumableIteration: info.iterations, splatResumableQuality: 'fast' });
+    expect(sum.stats).toMatchObject({ splatResumableIteration: info.iterations, splatResumableQuality: 'fast', splatContinuesModel: 1 });
     // continue: from there to the end, no longer resumable
     const done = await e.splat();
     expect(done.iterations).toBe(3000);
     expect(done.stats.splatResumedFrom).toBe(info.iterations);
     expect(done.stats.splatFinishedEarly).toBeUndefined();
-    expect((await e.loadSession('s3')).stats.splatResumableIteration).toBeUndefined();
+    const end = (await e.loadSession('s3')).stats;
+    expect(end.splatResumableIteration).toBeUndefined();
+    expect(end.splatContinuesModel).toBeUndefined();
+  });
+
+  it('a continued run cancelled later, or a new dense cloud, ends "continue" (review)', async () => {
+    const e = new MockEngine({ speed: 4, sessions: async () => null });
+    await e.init({ mode: 'object', quality: 'fast', sessionId: 's4' });
+    for (let i = 0; i < 40; i++) await e.processFrame(frame(100 + i * 400));
+    await e.refine();
+    await e.densify();
+    const endEarly = (): Promise<SplatResult> =>
+      e.splat(undefined, (p) => {
+        if (p.stage === 'splat_training') e.finishEarly('splat');
+      });
+    const early = await endEarly();
+    expect((await e.loadSession('s4')).stats.splatContinuesModel).toBe(1);
+    // continued, then cancelled further on: an interrupted run's checkpoint
+    const cancelled = await e
+      .splat(undefined, (p) => {
+        if (p.stage === 'splat_training' && p.detail && p.detail.iteration > early.iterations + 100) e.cancel();
+      })
+      .catch((x: unknown) => x);
+    expect((cancelled as Error).name).toBe('CancelledError');
+    const st = (await e.loadSession('s4')).stats;
+    expect(st.splatResumableIteration).toBeGreaterThan(early.iterations);
+    expect(st.splatContinuesModel).toBeUndefined();
+    // ended early again, then the dense cloud is rebuilt: its checkpoint is gone (a new run)
+    await e.splat({ restart: true }, (p) => {
+      if (p.stage === 'splat_training') e.finishEarly('splat');
+    });
+    expect((await e.loadSession('s4')).stats.splatContinuesModel).toBe(1);
+    await e.densify({ quality: 'balanced' });
+    const after = (await e.loadSession('s4')).stats;
+    expect(after.splatResumableIteration).toBeUndefined();
+    expect(after.splatContinuesModel).toBeUndefined();
+    expect((await e.loadSession('s4')).splat).not.toBeNull(); // the model stays
   });
 
   it('failOn makes a method fail (error UI)', async () => {
