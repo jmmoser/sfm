@@ -5,7 +5,8 @@
  *   JPEG (createImageBitmap, one frame decoded ahead) → FrameInput { bitmap, t, screenAngle, imu
  *   since the previous delivered frame, latest GPS fix / heading ≤ t, gravityDevice, index } →
  *   engine.processFrame (one frame in flight = FramePump back-pressure) → record the LiveUpdate
- *   → finishCapture → refine (progress) → [densify] → [mesh] → [splat] → [exports, sizes only].
+ *   → finishCapture → refine (progress) → [densify] → [mesh] → [splat] → [exports, sizes only;
+ *   the 'spz' one is also written as splats.spz next to splats.ply, for e2e/nvs.mjs --splat-file].
  *
  * Every step is guarded: a failure is recorded in `errors` and the steps that depend on it are
  * skipped, so a partial result is always returned. Big outputs (PLY files) are streamed to
@@ -772,6 +773,11 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
           const blob = await eng.exportModel(fm);
           result.exports[fm] = { bytes: blob.size, ms: round(performance.now() - tx, 1), type: blob.type };
           log(`[export] ${fm}: ${blob.size} bytes (${Math.round(performance.now() - tx)} ms)`);
+          if (fm === 'spz' && cfg.output && cfg.output.splat !== false && window.__e2eWrite) {
+            const path = `${result.config.output?.prefix ?? ''}splats.spz`;
+            await writeBinary(path, blob);
+            result.files.push(path);
+          }
         } catch (e) {
           const err = errorOf(`export ${fm}`, e);
           result.exports[fm] = { error: `${err.name}: ${err.message}` };

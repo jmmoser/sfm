@@ -513,6 +513,7 @@ cancels the long operation, and saves what was done.
 | `result.json` | Harness result plus the `metrics.mjs` input fields. See below. |
 | `sparse.ply`, `dense.ply`, `mesh.ply` | Streamed from the page through `window.__e2eWrite`. |
 | `splats.ply` | With `--splat`: `exportModel('ply-splat')` (INRIA 3DGS PLY, run world frame); `--nvs` scores it as the `splat` renderer. |
+| `splats.spz` | With `--splat` and the `spz` export (in the default export list): `exportModel('spz')` (SPZ v3); `nvs.mjs --splat-file splats.spz` scores the decoded SPZ. |
 | `metrics.json` | `computeMetrics` output, sparse-cloud accuracy, live-trajectory metrics and threshold checks (+ the `nvs` summary with `--nvs`). |
 | `nvs/nvs.json` | With `--nvs [--nvs-views N]`: the novel-view evaluation of the output (see "Novel-view evaluation"). |
 
@@ -1067,7 +1068,7 @@ Individual squares are within 0.2 px; the spread comes from MSAA.
 | `points-edl` | the same with Eye-Dome Lighting, the app default when there is no mesh |
 | `mesh-lit` | the `Viewer` drawing `mesh.ply` with vertex colours under the hemisphere light and headlight (the app default until the unlit switch below) |
 | `mesh-unlit` | the same unlit (vertex colours only), the app default since 2026-10 (Display sheet "Mesh lighting" off) |
-| `splat` | `splats.ply` (INRIA 3DGS PLY layout: `x y z nx ny nz f_dc_0..2 f_rest_* opacity scale_0..2 rot_0..3`, run world frame), drawn by `src/splat/nvs.ts` |
+| `splat` | `splats.ply` (INRIA 3DGS PLY layout: `x y z nx ny nz f_dc_0..2 f_rest_* opacity scale_0..2 rot_0..3`, run world frame), drawn by `src/splat/nvs.ts`; `--splat-file splats.spz`: the SPZ export, decoded (`decodeSplatSPZ`) and handed over as that PLY, output `<runDir>/nvs-spz/` |
 
 The splat module plugs in through
 `export async function createNvsRenderer({ ply, width, height }): Promise<{ render(cam), dispose?() }>`.

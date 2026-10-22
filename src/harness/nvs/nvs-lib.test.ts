@@ -461,6 +461,8 @@ describe('parseNvsArgs', () => {
     expect(d.testDataset).toBeNull();
     expect(d.common).toBe(false);
     expect(parseNvsArgs(['a', 'b', '--common']).common).toBe(true);
+    expect(d.splatFile).toBe('splats.ply');
+    expect(parseNvsArgs(['a', 'b', '--splat-file', 'splats.spz']).splatFile).toBe('splats.spz');
     expect(parseNvsArgs(['--help']).help).toBe(true);
   });
 
@@ -471,5 +473,6 @@ describe('parseNvsArgs', () => {
     expect(() => parseNvsArgs(['a', 'b', '--max-size', 'big'])).toThrow(/max-size/);
     expect(() => parseNvsArgs(['a', 'b', '--background', '1,2'])).toThrow(/background/);
     expect(() => parseNvsArgs(['a', 'b', '--bogus'])).toThrow(/unknown option/);
+    for (const bad of ['../splats.spz', 'splats.glb', 'x/y.ply']) expect(() => parseNvsArgs(['a', 'b', '--splat-file', bad])).toThrow(/splat-file/);
   });
 });
