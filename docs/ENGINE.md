@@ -22,6 +22,10 @@ All heavy work runs in the worker: the UI thread only shows video, the viewer an
 the UI. WebGPU is used from the worker. The engine class itself is
 thread-agnostic so the test harness can run it on the main thread.
 
+With the developer option "Record raw capture" a third worker records what the engine gets
+(§5): `src/workers/recorder.worker.ts` (JPEG encode + OPFS / IndexedDB writes), fed by a FrameTap
+on the main thread.
+
 ## 2. `PhotogrammetryEngine` (`src/engine/engine.ts`)
 
 ```ts
@@ -206,6 +210,10 @@ Request/response RPC with ids, plus unsolicited events:
   the compiled feature pipeline kept for the next init; answers whether the engine held it), `dispose`
 * events: `progress` (ProgressEvent, optional numeric `detail`), `live` (LiveUpdate), `log`, `error`
 * large typed arrays and ImageBitmaps are transferred, never copied.
+* App side, not a worker message: `EngineLike.setFrameTap(tap)` (EngineClient and MockEngine,
+  `src/app/frame-tap.ts`) lets an observer see every FrameInput just before it is sent — after
+  the busy check, while the pixels are still the caller's — and the answer afterwards; the tap may
+  hold back `processFrame`'s resolution (back-pressure), never the engine.
 
 ### Splat protocol (for the viewer / app UI)
 
@@ -227,7 +235,8 @@ MockEngine implements the same calls (a fast fake run whose model is one Gaussia
 
 ## 4. UI flow (`src/app`)
 
-Home (sessions, new scan, diagnostics) → Setup (mode, quality) → Permissions
+Home (sessions, new scan, diagnostics) → Setup (mode, quality, options; developer: debug overlay,
+VideoFrame grab, record raw capture — §5) → Permissions
 (one tap: motion → camera → location) → Capture (video, guidance, live sparse
 view, counters, finish) → Processing (stages + progress + cancel) → Viewer
 (splats / points / mesh layer pill, cameras, EDL, measure, export, run dense / mesh / photoreal). The splat
@@ -235,3 +244,24 @@ stage runs from the viewer itself ("Photoreal model" in the Build sheet → `spl
 `SplatTrainingDetail`, Cancel, Resume after an interruption), the model is fetched with `splatModel` into the
 viewer's WebGPU splat layer and shown by default, and the export sheet offers 'ply-splat' (src/viewer/splat-layer.ts,
 research/viewer-rendering.md).
+
+## 5. Raw capture recorder (developer option)
+
+Setup › Options › "Record raw capture" (off by default; `CaptureConfig.recordRaw`) records a
+capture for replay on a computer (format: `src/io/recording.ts`; replay and scoring: e2e/README.md
+"Raw capture recordings").
+
+* Capture → `App.startRecording` after the engine's init, before the FramePump starts; stopped
+  with the sensors (finish, cancel, leaving the screen). It installs `CaptureRecorder`
+  (`src/app/recorder.ts`) as the engine's FrameTap: per frame sent, a VideoFrame `clone()`, an
+  ImageBitmap blitted at ≤ 1280 px, or an RGBAImage copy goes with the FrameInput metadata to the
+  recorder worker, which writes a ≤ 1280 px JPEG and a `frames.jsonl` line (every FrameInput field
+  verbatim) to OPFS (`sfm-recordings/<id>/`, sync access handles, JPEGs in 64 MB packs) or to the
+  IndexedDB database `sfm-recordings`; the engine's answer goes to `live.jsonl`.
+* Bounds: ≤ 3 frames in the recorder worker (beyond that the frame's processFrame resolves only
+  when it caught up, so the FramePump skips frames as when the engine is busy and the recording
+  still equals the engine input); 1 GB of free origin quota to start, checked every 2 s; low
+  storage, a write error or a worker stuck for 8 s stop the recording (a toast), never the scan.
+* Diagnostics › "Raw capture recordings" (`src/app/screens/recordings.ts`): each recording with its
+  frames, duration and size; Export = ZIP parts of ≤ 200 MB (each: Prepare, then Share / Save
+  through `saveFile` in the tap), GPS left out unless "Include location"; Delete.

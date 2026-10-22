@@ -1,6 +1,7 @@
 /**
  * App shell: owns the engine (EngineClient or MockEngine), the session store, the shared
- * capture configuration and results, and hosts the screens behind the pure navigation state
+ * capture configuration and results, the raw capture recorder of a running scan (developer
+ * option, ./recorder.ts, loaded on demand), and hosts the screens behind the pure navigation state
  * machine of router.ts. Single document, no History API (see router.ts).
  */
 import type { PointCloud, TriangleMesh } from '../core/types';
@@ -26,6 +27,7 @@ import { createProcessingScreen } from './screens/processing';
 import { createSetupScreen } from './screens/setup';
 import { createViewerScreen } from './screens/viewer';
 import { prefetchViewer } from './viewer-loader';
+import type { CaptureRecorder, RecorderStartInfo } from './recorder';
 
 export interface Screen {
   readonly el: HTMLElement;
@@ -53,6 +55,11 @@ export interface CaptureConfig {
   videoFrameGrab: boolean;
   /** Capture shows the live point cloud full screen, following the phone, instead of the camera preview. */
   cloudView: boolean;
+  /**
+   * Developer option: record every frame sent to the engine (≤ 1280 px JPEG + the FrameInput
+   * verbatim) for desktop replay (./recorder.ts; export / delete in Diagnostics). Default off.
+   */
+  recordRaw: boolean;
   /**
    * Version of the stored defaults. Options saved before version 2 kept `videoFrameGrab: false`
    * from when it was opt-in: they get the current default once.
@@ -137,6 +144,8 @@ export class App {
   /** Bumped by each ensureSessionLoaded and by what supersedes it (new scan, release, delete): a stale load is not applied. */
   private loadSeq = 0;
   private permissions: Promise<CapturePermissionStatus> | null = null;
+  /** Raw capture recorder of the running scan (startRecording). */
+  private recorder: CaptureRecorder | null = null;
   private sessionsP: Promise<SessionStore | null> | null = null;
   private screen: Screen | null = null;
   private readonly host: HTMLElement;
@@ -334,6 +343,43 @@ export class App {
     const p = this.permissions;
     this.permissions = null;
     return p;
+  }
+
+  // ---- raw capture recorder (Setup › Options › Record raw capture; ./recorder.ts) -------------------
+
+  /**
+   * Record the frames the engine gets from now on (a FrameTap on the engine) until
+   * stopRecording. Never throws: when it cannot record (no OPFS / IndexedDB, too little storage)
+   * a toast says why and the scan goes on without it. The module is loaded on demand.
+   */
+  async startRecording(info: RecorderStartInfo): Promise<void> {
+    await this.stopRecording();
+    try {
+      const { CaptureRecorder } = await import('./recorder');
+      const rec = await CaptureRecorder.start(info, {
+        onStop: (reason, auto) => {
+          if (this.recorder === rec) {
+            this.recorder = null;
+            this.engine.setFrameTap(null);
+          }
+          if (auto) toast(`Raw capture recording stopped: ${reason}. The scan continues.`, { tone: 'warn', durationMs: 7000 });
+        },
+      });
+      this.recorder = rec;
+      this.engine.setFrameTap(rec);
+      toast('Recording raw capture — export or delete it in Diagnostics.', { tone: 'info', icon: 'storage' });
+    } catch (e) {
+      toast(`Raw capture recording is off: ${(e as Error)?.message ?? e}`, { tone: 'warn', durationMs: 7000 });
+    }
+  }
+
+  /** End the running recording (its last frames are written first). */
+  async stopRecording(): Promise<void> {
+    const rec = this.recorder;
+    if (!rec) return;
+    this.recorder = null;
+    this.engine.setFrameTap(null);
+    await rec.stop().catch((e: unknown) => console.warn('[app] stopping the recorder failed', e));
   }
 
   /** Begin a new scan from the Setup screen's tap handler. */

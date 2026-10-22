@@ -6,7 +6,8 @@
  * REAL PointCloud / TriangleMesh / Gaussian-splat objects and export Blobs encoded with src/io.
  *
  * Time base: the mock trajectory advances with the frame timestamps (`FrameInput.t`) times
- * `speed`, so pauses in frame delivery pause the scan.
+ * `speed`, so pauses in frame delivery pause the scan. A FrameTap (`setFrameTap`, the raw capture
+ * recorder) sees every accepted frame before the mock closes its pixels, like on EngineClient.
  */
 import type { MetricInfo, PointCloud, ProgressCallback, ProgressEvent, TriangleMesh } from '../core/types';
 import { createColmapZipBlob, encodeGLB, encodeMeshPLY, encodePLY, type ColmapModelInput } from '../io';
@@ -40,6 +41,7 @@ import {
   type TrackingState,
 } from '../workers/protocol';
 import { ABORT_REASON_PREFIX, Emitter, type AbortOutcome, type EngineErrorInfo, type EngineLike, type EngineStatus } from './engine-client';
+import { tapFrame, type FrameTap } from './frame-tap';
 import { MockScene, type MockSamples } from './mock-scene';
 
 export interface MockEngineOptions {
@@ -100,6 +102,7 @@ export class MockEngine implements EngineLike {
   /** The init / loadSession running now: a closeSession of its scan ends it (EngineClient: 'close' disposes the engine). */
   private pendingSetup: { id: string | null; closed: boolean } | null = null;
   private busy = false;
+  private frameTap: FrameTap | null = null;
   private hidden = false;
   private cancelled = false;
   private longOp = false;
@@ -242,6 +245,15 @@ export class MockEngine implements EngineLike {
   }
 
   async processFrame(f: FrameInput): Promise<LiveUpdate> {
+    // a frame rejected as busy never reaches the tap
+    return this.busy || !this.frameTap ? this.mockFrame(f) : tapFrame(this.frameTap, f, (x) => this.mockFrame(x));
+  }
+
+  setFrameTap(tap: FrameTap | null): void {
+    this.frameTap = tap;
+  }
+
+  private async mockFrame(f: FrameInput): Promise<LiveUpdate> {
     const b = f.bitmap as { close?: () => void };
     if (this.busy) {
       b.close?.();

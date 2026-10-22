@@ -15,6 +15,9 @@
  * (drift) — rVFC captureTime vs MediaStreamTrackProcessor timestamps, buffer orientation, and the
  * main-thread cost of createImageBitmap(<video>) (full / downscaled) and new VideoFrame(<video>).
  * The report is part of "Copy".
+ *
+ * "Raw capture recordings" (./recordings.ts): the recordings of Setup › Options › Record raw
+ * capture with their size — export as ZIP parts (share / save) or delete.
  */
 import { startBenchmark, type BenchRun } from '../bench/bench';
 import { STATUS_LABEL, estimateLine, formatMs, qualityName, reportClipboardText, verdict } from '../bench/report';
@@ -32,6 +35,7 @@ import { Disposer, h, replaceChildren } from '../dom';
 import { icon } from '../icons';
 import { formatBytes, formatDuration, type Tone } from '../format';
 import type { Route } from '../router';
+import { createRecordingsPanel } from './recordings';
 
 type ProbeMode = 'quick' | 'still';
 
@@ -96,6 +100,7 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
   const copyBtn = button({ label: 'Copy', icon: 'copy', variant: 'ghost', size: 'sm', testId: 'diag-copy', onClick: () => void copy() });
   copyBtn.disabled = true;
   const benchHost = h('div', { class: 'bench', 'data-testid': 'bench' });
+  const recordings = createRecordingsPanel(app);
 
   const el = h(
     'div',
@@ -619,6 +624,7 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
       ),
     );
 
+    sections.push(recordings.el);
     sections.push(section('Memory', group(...memoryHints(g))));
     if (g.errors.length) sections.push(section('Probe errors', h('pre', { class: 'code-block', text: g.errors.join('\n') })));
     // Re-rendering replaces the focused control (e.g. the motion test button): keep focus on it.
@@ -637,6 +643,7 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
       d.listen(document, 'visibilitychange', () => {
         if (document.hidden && benchRun) cancelBench('the app went to the background');
       });
+      void recordings.refresh();
       void collectDiagnostics({ gpu: 'adapter' })
         .then((r) => {
           if (closed) return;
@@ -653,6 +660,7 @@ export function createDiagnosticsScreen(app: App, _route: Extract<Route, { scree
       benchRun?.cancel('Diagnostics was closed');
       probeCamera?.stop();
       if (benchTimer) clearInterval(benchTimer);
+      recordings.dispose();
       d.dispose();
     },
   };
