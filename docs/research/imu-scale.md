@@ -196,3 +196,187 @@ brackets):
 - On yard-real at stride 1 the IMU+GPS scale reads +0.7 %, +1.2 % and +2.4 % in three runs; the
   band-pass IMU estimate on the GT poses of the same keyframes reads −0.1 %. The reconstruction's local (acceleration-level) scale differs
   from its global Sim3 scale by 1–2 %. Not investigated.
+
+## 2026-10-22: review follow-up (time offset, accelerometer noise, gravity removal, retry order)
+
+A code review of the interval estimator found four gaps. All four were reproduced on the synthetic
+setups and fixed. "Before" is commit 484b78b; "after" is this change. Unless stated otherwise:
+12–30 seeds per cell, the setup of the 2026-10-21 sweep, offset/gyro bias/gravity estimated as in
+`computeWorldAlignment`.
+
+### 1. Time offset at the default (offset error biased the scale; σ ignored it)
+
+At 1–2 keyframes/s the band-pass offset search (`estimateTimeOffsetFromAcceleration`) fails for the
+same reason as the band-pass scale. A capture whose gyro offset is unobservable (smooth, near
+constant-rate rotation) therefore kept the default offset, and the interval scale was accepted there
+with a σ that ignored the offset error. An offset error decorrelates the two sides, so the scale reads
+high (one-sided, second order in the error).
+
+Before (interval scale at the true offset plus an injected error, 1.2 keyframes/s, 12 seeds):
+
+| case | 0 ms | 25 ms | 50 ms | 100 ms |
+|---|---|---|---|---|
+| orbit: err mean / rms (z rms) | +0.82 / 1.73 % (0.86) | +1.92 / 3.03 % (1.27) | +3.35 / 4.78 % (1.38) | +6.34 / 7.35 % (1.38) |
+| walk: err mean / rms (z rms) | +0.15 / 0.53 % (0.69) | +0.45 / 0.69 % (0.68) | +1.00 / 1.19 % (0.80) | +2.53 / 2.81 % (0.98) |
+
+Fix: `estimateTimeOffsetFromAcceleration` takes `method: 'intervals'`. It minimises the misfit
+1 − R² of the interval regression, with the span multiple and the source held fixed so that the misfit
+is smooth in the offset. The same decorrelation that biases the scale raises the misfit, so its
+minimum is also the least attenuated scale. `computeWorldAlignment` runs this search only when neither
+the gyro offset nor the band-pass acceleration offset is reliable and the band-pass scale is
+unreliable (`details.intervalTimeOffset`). In addition, the interval scale's σ now includes the larger
+relative scale change at offset ± σ_offset (`IntervalScaleOptions.offsetStdMs`, reported as
+`intervals.offsetSensitivity`). σ_offset is the gyro or acceleration offset's own σ, or
+`WorldAlignmentOptions.timeOffsetStdMs` = 25 ms for the default offset (ios-sensors.md §1.8 expects
+10–20 ms of latency). The extra cost is the search (≈ 0.13 s, against ≈ 0.27 s for the band-pass
+search that already runs in that case) and two more interval fits.
+
+After (`computeWorldAlignment` with the gyro offset forced unreliable and the band-pass scale disabled,
+so that the interval path decides; default offset = truth + error, 1.2 keyframes/s, 12 seeds):
+
+| case | 0 ms | 25 ms | 50 ms | 100 ms |
+|---|---|---|---|---|
+| orbit: metric, err rms (z rms) | 11/12, 1.36 % (0.69) | 11/12, 1.36 % (0.69) | 11/12, 1.36 % (0.69) | 9/12, 1.47 % (0.74) |
+| walk: metric, err rms (z rms) | 12/12, 0.56 % (0.54) | 12/12, 0.56 % (0.54) | 12/12, 0.56 % (0.54) | 12/12, 0.56 % (0.54) |
+
+Where the search succeeds, the offset is found to 3.5–4.3 ms rms (walk and orbit), and the scale no
+longer depends on the default's error. The orbits the search cannot resolve (1 of 12 up to 50 ms, 3
+at 100 ms) keep the default offset; the 25 ms prior then puts σ at 7.8–37 %, so they are rejected
+rather than accepted with a biased scale. At 2 keyframes/s with a 50 ms error: orbit rms 0.86 % (z
+0.60), walk rms 0.48 % (z 0.62). σ is conservative here (z rms 0.5–0.7), partly because without a
+reliable gyro offset there is no gyro-bias estimate either. Unit tests:
+`inertial.test.ts` "time offset from the interval regression …", `world.test.ts` "… without a gyro
+time offset …".
+
+### 2. Accelerometer noise level (κ assumed 0.05 m/s²)
+
+κ was computed for a fixed noise of 0.05 m/s² per sample. A noisier device passed the 2 % gate with
+a biased scale. Before, with 0.15 m/s² at 1.2 keyframes/s (12 seeds): orbit 12/12 reliable, mean
++2.75 %, rms 3.50 %, max +7.10 %; walk 12/12, mean +1.36 %, rms 2.00 %. The reviewer's 20-seed probe
+had a max of +9.0 % on the orbit.
+
+Fix: `accelNoiseLevel` measures the white-noise level from the samples, as a robust (MAD) 8th
+difference of consecutive samples. Its gain |2 sin(π f Δt)|⁸ against √12870 for white noise makes it
+measure the 15–30 Hz band of a 60 Hz stream. κ uses max(measured, `accelNoiseFloor` = 0.05). The order
+matters: the e2e datasets carry 0.1 mm of 8–12 Hz positional tremor (≈ 0.4 m/s²), and a 4th difference
+reads their configured 0.040 m/s² as 0.058–0.060. Orders 6 / 8 / 10 read 0.042 / 0.0394 / 0.039.
+Synthetic recovery (no tremor): 0.0102 / 0.0495 / 0.1485 (orbit) and 0.0111 / 0.0502 / 0.1497 (walk)
+for 0.01 / 0.05 / 0.15.
+
+After, at 1.2 keyframes/s with 0.15 m/s² (20 seeds): 0/20 reliable on both the orbit and the walk
+(κ 2–8 %). At 2 keyframes/s: walk 20/20 reliable, mean +0.92 %, rms 1.78 %, z rms 0.75; orbit 1/20.
+With 0.01 and 0.05 m/s² practically nothing changes (the floor applies), and z rms is 0.48–0.55 at
+0.01 (σ conservative). On the e2e datasets the measured level is 0.039 < floor, so κ is unchanged there. The
+floor stays because a device that low-passes its output would read low. κ is still not corrected:
+with a measured level it could be, but only after a real recording shows that the 15–30 Hz level is
+the low-frequency level.
+
+### 3. Gravity removal: `accel` against `accelG`
+
+'auto' used `accel` (= 9.81 · CMDeviceMotion.userAcceleration) whenever it is present. Its gravity
+comes from CoreMotion's attitude filter, which can lag during exactly the slow accelerations the
+interval estimator relies on (ios-sensors.md §1.6). Every validation input (extras-testutil, the e2e
+imu.json) makes `accel` exact plus white noise, so this was untested.
+
+Fix: with source 'auto' and both fields present (and gravity known), `accelG` − g is refitted at the
+same span. The `accel` estimate is kept with σ = hypot(σ_accel, d), where d = ln(s_accel / s_accelG).
+|d| > 3 · hypot(σ_accel, σ_accelG) makes the result unreliable ("accel and accelG scales disagree").
+The result's source reads 'accel+accelG'. Why `accel` is kept rather than `accelG` or the mean: an
+attitude error δθ of the vision-anchored attitude enters the world acceleration as |a|·δθ for `accel`,
+but as g·δθ for `accelG` − g, 10–30× more. On e2e yard-real stride 3 the two agree to 0.20 % on the GT
+poses (+0.93 / +0.73 %) but differ by 2.36 % on the reconstructed ones (+0.47 % ± 1.6 % / −1.88 % ±
+2.5 %). Their mean would carry the reconstruction's rotation error into every estimate; it gave
+−0.71 % ± 2.36 % there, and −1.93 % fused with GPS in an e2e run.
+
+Synthetic, both sources exact (20 seeds): the errors correlate at ρ 0.85–0.94, d rms is 0.2–0.6 %, and
+|d| / combined σ is ≤ 1.2. A CoreMotion-like lag, `accel` minus k × EMA_τ(accel) in the device frame
+(12 seeds, 1.2 keyframes/s):
+
+| case | accel only: rel, err mean | cross-checked: rel (disagree), err mean, z rms / max |
+|---|---|---|
+| orbit k 0.1, τ 1 s | 12/12, −1.37 % | 12/12 (0), −1.37 %, 0.68 / 1.52 |
+| walk k 0.1, τ 1 s | 12/12, −5.21 % | 4/12 (8), −4.46 %, 1.12 / 1.29 |
+| orbit k 0.1, τ 3 s | 12/12, +0.82 % | 12/12 (0), +0.82 %, 0.45 / 0.82 |
+| walk k 0.1, τ 3 s | 12/12, −1.99 % | 12/12 (0), −1.99 %, 0.95 / 1.41 |
+| orbit k 0.3, τ 1 s | 12/12, −4.43 % | 5/12 (0), −3.49 %, 0.81 / 0.89 |
+| walk k 0.3, τ 1 s | 12/12, −11.69 % | 0/12 (12) |
+| orbit k 0.3, τ 3 s | 12/12, +2.78 % | 10/12 (0), +2.57 %, 0.62 / 0.83 |
+| walk k 0.3, τ 3 s | 12/12, −4.32 % | 8/12 (4), −3.66 %, 0.98 / 1.29 |
+
+Accepted estimates stay honest (z max ≤ 1.52); large errors are rejected. This model of the lag is a
+guess: neither source has been validated on a real iPhone recording, and that remains the first thing
+to do with one. Unit test: `inertial.test.ts` "cross-checks the gravity removal …".
+
+### 4. Retry order (object-real decided by a 10 % margin on κ)
+
+On object-real at strides 1–2 the interval estimate was rejected only by κ (2.21 / 2.32 % against the
+2 % gate). If κ dipped below the gate, the interval estimate (+1.36 % ± 2.44 % offline) would have
+made `metric` true, so refine's `lowExcitationRetry` (+0.30 % ± 2.0 %) would no longer run. Fix:
+`lowExcitationRetry` now also runs when the scale is the interval estimate alone (no GPS), and the
+retry's σ (`lowExcitationSigma`) is smaller. `runRefine` keeps the retry only when its σ is smaller.
+The exception is an interval estimate whose time offset came from the interval search, since the
+relaxed re-run would fall back to the default offset. Unit test: `review.test.ts` "replaces a
+keyframe-interval IMU scale only when …".
+
+### Synthetic sweep (final code)
+
+As in the 2026-10-21 table (30 seeds per cell), interval estimate only:
+
+| case | rel | err mean / rms / max | σ mean | z rms | κ mean |
+|---|---|---|---|---|---|
+| orbit 0.8 Hz | 9 | +1.69 / 2.81 / 5.67 % | 4.01 % | 0.79 | 2.37 % |
+| orbit 1.2 Hz | 30 | +0.66 / 1.15 / 2.39 % | 1.64 % | 0.66 | 0.80 % |
+| orbit 2 Hz | 30 | +0.19 / 0.67 / 1.60 % | 0.93 % | 0.74 | 0.34 % |
+| orbit 3 Hz | 30 | −0.01 / 0.56 / 1.12 % | 0.71 % | 0.79 | 0.22 % |
+| orbit 4 Hz | 30 | +0.34 / 0.76 / 2.40 % | 0.70 % | 1.05 | 0.28 % |
+| walk 0.8 Hz | 30 | +0.03 / 0.72 / 2.20 % | 1.09 % | 0.67 | 0.32 % |
+| walk 1.2 Hz | 30 | +0.06 / 0.65 / 1.36 % | 0.94 % | 0.72 | 0.37 % |
+| walk 2 Hz | 30 | +0.26 / 0.62 / 1.56 % | 0.80 % | 0.81 | 0.33 % |
+| walk 3 Hz | 30 | +0.05 / 0.83 / 1.85 % | 0.66 % | 1.34 | 0.29 % |
+| walk 4 Hz | 30 | +0.15 / 0.58 / 1.21 % | 0.64 % | 0.89 | 0.28 % |
+
+The errors are those of 2026-10-21, since the estimate is the same `accel` fit. σ is 2–15 % larger
+(the d term), so z rms is slightly lower.
+
+### e2e (sparse, CPU features)
+
+Same command as on 2026-10-21. "before" is the 2026-10-21 "after" column (commit 484b78b). The
+stride-1/2 runs and the object-real runs were made one revision before the final cross-check rule. Their
+decisions do not depend on that rule: the band-pass estimate is reliable on them, or the interval
+estimate is rejected by κ. yard-real stride 3, whose result depends on it, was re-run twice on the
+final code.
+
+| run | registered | ATE / extent | scale source (method) | claimed σ | scale error | z |
+|---|---|---|---|---|---|---|
+| yard-real s1 | 81 | 5.33e-4 | IMU+GPS (band-pass) | 1.3 % | +1.13 % | +0.87 |
+| yard-real s2 | 62 | 4.06e-4 | IMU+GPS (band-pass) | 1.1 % | +1.18 % | +1.03 |
+| yard-real s3, run 1 | 48 | 5.10e-4 | IMU+GPS (intervals, accel+accelG) | 2.9 % | −1.43 % | −0.50 |
+| yard-real s3, run 2 | 48 | 5.05e-4 | IMU+GPS (intervals, accel+accelG) | 2.8 % | −1.35 % | −0.48 |
+| object-real s1 | 89 | 2.68e-4 | IMU (band-pass, low-excitation retry) | 2.0 % | +0.33 % | +0.17 |
+| object-real s2 | 83 | 2.92e-4 | IMU (band-pass, low-excitation retry) | 2.3 % | −0.52 % | −0.23 |
+| object-real s3 | 50 | 5.99e-4 | IMU (band-pass, low-excitation retry) | 3.2 % | +1.10 % | +0.34 |
+
+- Stride 1 and 2 are unchanged within run-to-run noise (yard-real s1 before: +0.74 / +1.17 / +2.40 %
+  in three runs; object-real s1 before +0.30 / +0.32 %). Every run has a reliable gyro offset (−25 ms),
+  so finding 1 does not show here. The measured accelerometer noise is 0.039 m/s², below the floor, so
+  finding 2 does not show either. On object-real the interval estimate is still rejected by κ (2.21 /
+  2.32 / 4.2 %), and the retry decides as before.
+- yard-real stride 3 still takes its scale from the IMU (fused with GPS) and meets the acceptance
+  (|error| ≤ 2.5 %, z ≤ 2). The IMU estimate itself is unchanged (+0.47 % offline, as before). But its σ
+  grew from 1.6 % to 2.8–2.9 %, because the cross-check difference d = 2.3–2.4 % (accelG reading the
+  reconstruction's rotation errors) enters σ. The GPS scale (−6.4 % ± 5.5 %) therefore gets more weight:
+  −1.4 % instead of −0.05 %. The rejected alternative, the mean of the two sources, gave −1.93 % (z
+  −0.85) in one run.
+- Alignment time on yard-real s3: 0.23–0.29 s (0.2–0.3 s before).
+
+### Limits and follow-ups
+
+- No real iPhone recording has been checked. Which gravity removal is right, the 15–30 Hz noise level,
+  and the camera–IMU offset all need one. The cross-check makes the result honest, not more precise.
+  With a recording that shows CoreMotion's gravity is good during slow accelerations, the d term could
+  be dropped. With a gyro-smoothed attitude (SfM rotation noise averaged over many keyframes), accelG
+  could become a sharper check.
+- The band-pass estimate at a default offset still ignores the offset's σ (unchanged here). So does the
+  low-excitation retry, which re-runs at the default offset. The retry is therefore not allowed to
+  replace an interval estimate whose offset came from the interval search.
+- κ is bounded, measured and in σ, but still not corrected.
