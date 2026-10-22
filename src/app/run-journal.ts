@@ -16,9 +16,16 @@
  *
  * Light mode: while `kills[step] ≥ 1` for the scan, its next densify / mesh / photoreal build runs
  * with a lighter page (the displayed cloud cut to LIGHT_MODE_MAX_POINTS, no mesh in the 3D view,
- * prepared export files dropped); the engine's memory plan is unchanged, so splat checkpoints stay
- * valid. A clean run of a step resets its count; a cancel or an error keeps it; a run of another
- * scan starts with no counts.
+ * prepared export files dropped and no new ones made until the build stops); the engine's memory
+ * plan is unchanged, so splat checkpoints stay valid. A clean run of a step resets its count; a
+ * cancel or an error keeps it; a run of another scan starts with no counts.
+ *
+ * Copy: Home cannot know whether the engine stored anything of the run (depth maps, a splat
+ * checkpoint: `loadSession` reports them), so the card says "continues … or starts again", and
+ * mentions the lighter view only when the scan has a dense cloud (a sparse scan's view is already
+ * small). Opening the scan (`open`: the card's Resume or its list item) hands the interruption to
+ * the screen it opens (`takeOpened`, in memory, once): the viewer then points to Build when it has
+ * no resume card for that run (`resumeHint`: nothing was stored, a dense rebuild, or a mesh).
  *
  * The page's own unload (reload, tab close) fires `pagehide` (not persisted) and then a
  * visibilitychange to hidden: that hidden is not recorded (`pageHide`; until `pageshow` or the page
@@ -26,10 +33,12 @@
  * that launches while another one runs would report that run as interrupted (no cross-tab lock).
  *
  * Every storage access is in try/catch: unavailable, throwing or corrupt storage gives no card and
- * no light mode. Pure helpers (parse / begin / end / recover / copy) are unit-tested in
+ * no light mode. Pure helpers (parse / begin / end / recover / copy / resumeHint) are unit-tested in
  * run-journal.test.ts.
  */
 import type { QualityPreset } from '../workers/protocol';
+import type { Results } from './app';
+import { denseResumable, splatResumable } from './model-info';
 
 export const RUN_JOURNAL_KEY = 'sfm.run.v1';
 
@@ -187,20 +196,48 @@ const STEP_PHRASE: Record<RunStep, string> = {
   splat: 'Building the photoreal model',
 };
 
+/** What Resume does (Home cannot know whether depth maps / a splat checkpoint were stored: both cases). */
 const RESUME_TEXT: Record<RunStep, string> = {
-  refine: 'Resume processes it again from the saved photos.',
-  densify: 'Resume continues from the saved depth maps, with a lighter 3D view meanwhile to save memory.',
-  mesh: 'Resume opens the scan to build the mesh again, with a lighter 3D view meanwhile to save memory.',
-  splat: 'Resume continues from the saved training, with a lighter 3D view meanwhile to save memory.',
+  refine: 'Resume processes it again from the saved photos',
+  densify: 'Resume continues from the depth maps saved so far, or starts again if none were saved',
+  mesh: 'Resume opens the scan to build the mesh again',
+  splat: 'Resume continues from the training saved so far, or starts again if none was saved',
 };
 
-/** Title and text of the Home card ("stopped", never a claimed cause: closing a visible tab looks like a kill). */
-export function interruptionCopy(it: Pick<RunInterruption, 'name' | 'step' | 'kind'>): { title: string; body: string } {
+/**
+ * Title and text of the Home card ("stopped", never a claimed cause: closing a visible tab looks
+ * like a kill). `hasDense`: the scan has a dense cloud (session status dense / meshed) — only then
+ * does light mode show a lighter 3D view (a sparse scan's preview is already small).
+ */
+export function interruptionCopy(it: Pick<RunInterruption, 'name' | 'step' | 'kind'> & { hasDense: boolean }): { title: string; body: string } {
   const where =
     it.kind === 'evicted'
       ? 'stopped while the app was in the background — iOS closes background apps to free memory, so keep the app open while it processes.'
       : 'stopped while the app was open — iOS may have run out of memory, or the app was closed.';
-  return { title: `Processing of “${it.name}” stopped`, body: `${STEP_PHRASE[it.step]} ${where} ${RESUME_TEXT[it.step]}` };
+  const lighter = it.step !== 'refine' && it.hasDense ? ', with a lighter 3D view meanwhile to save memory' : '';
+  return { title: `Processing of “${it.name}” stopped`, body: `${STEP_PHRASE[it.step]} ${where} ${RESUME_TEXT[it.step]}${lighter}.` };
+}
+
+/**
+ * The viewer's hint (a toast whose action opens the Build sheet) for a scan opened from its
+ * interruption (`takeOpened`) when no resume card of its own covers that run: nothing was stored
+ * (a densify before its first depth map, a photoreal build before its first checkpoint), a dense
+ * rebuild (the previous cloud is shown) or a mesh. null: the dense / photoreal resume card offers
+ * it (or a refine, which Processing reruns).
+ */
+export function resumeHint(step: RunStep, r: Pick<Results, 'sparse' | 'dense' | 'stats'>): string | null {
+  switch (step) {
+    case 'refine':
+      return null;
+    case 'densify':
+      if (denseResumable(r)) return null;
+      return r.dense ? 'Rebuilding the dense cloud stopped — the previous one is shown.' : 'The dense cloud stopped before any depth maps were saved — build it again.';
+    case 'mesh':
+      return 'The mesh was not finished — build it again.';
+    case 'splat':
+      if (splatResumable(r)) return null;
+      return 'The photoreal model stopped before any training was saved — build it again.';
+  }
 }
 
 /** The open run of this page: stage changes / beats while it runs, `end` when it stopped. */
@@ -217,6 +254,8 @@ export class RunJournal {
   private current: { handle: RunHandle; sessionId: string; step: RunStep; startedAt: number; stage: string; wroteAt: number } | null = null;
   /** The page is being unloaded (pagehide, not persisted): its last visibilitychange is not recorded. */
   private unloading = false;
+  /** The interruption whose scan was just opened (`open`), for the screen it opens (`takeOpened`). */
+  private opened: RunInterruption | null = null;
 
   constructor(
     private readonly storage: JournalStorage | null,
@@ -270,6 +309,24 @@ export class RunJournal {
     if (rec?.interrupted) this.write({ ...rec, interrupted: null });
   }
 
+  /**
+   * Scan `sessionId` is opened (the card's Resume or its list item): when it is the interrupted
+   * one, the card is answered (`acknowledge`) and the interruption is handed to the screen it opens.
+   */
+  open(sessionId: string): void {
+    const it = this.interruption();
+    if (it?.sessionId !== sessionId) return;
+    this.opened = it;
+    this.acknowledge();
+  }
+
+  /** What `open` handed over, for the screen of scan `sessionId` (once; null: not opened from an interruption). */
+  takeOpened(sessionId: string | null): RunInterruption | null {
+    const it = this.opened;
+    this.opened = null;
+    return it && it.sessionId === sessionId ? it : null;
+  }
+
   /** The scan was deleted: drop its record. */
   forget(sessionId: string): void {
     if (this.read()?.sessionId === sessionId) this.write(null);
@@ -283,6 +340,7 @@ export class RunJournal {
 
   /** A long operation starts (no storage: a handle that does nothing). */
   begin(run: Omit<RunStart, 'visible'> & { visible?: boolean }): RunHandle {
+    this.opened = null;
     if (!this.storage) return NO_RUN;
     const visible = run.visible ?? !(typeof document !== 'undefined' && document.hidden);
     const now = this.now();

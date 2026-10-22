@@ -252,13 +252,19 @@ interrupted?}:
 At App start an open entry becomes an interruption: **killed** when the page was visible at the last write
 (likely memory or a crash — a closed tab looks the same, so the copy says "stopped"), **evicted** when it
 was hidden; `kills[step]` is incremented. Home shows a "run interrupted" card (testId `run-interrupted`)
-naming the scan and the step until it is resumed or dismissed (or the next run starts). Resume opens the scan
-through the normal OPEN_SESSION route: Processing for a captured scan (refine), otherwise the viewer, whose
-dense / photoreal resume card continues from the stored depth maps / splat checkpoint (`loadSession` stats).
+naming the scan and the step until it is resumed or dismissed (or the next run starts). Home cannot see
+whether depth maps or a splat checkpoint were stored, so the card says Resume "continues from what was saved
+so far, or starts again". Resume opens the scan through the normal OPEN_SESSION route: Processing for a
+captured scan (refine), otherwise the viewer, whose dense / photoreal resume card continues from the stored
+depth maps / splat checkpoint (`loadSession` stats). Opening the scan hands the interruption to that screen
+(`RunJournal.open` / `takeOpened`, in memory): when no resume card covers it (nothing was stored yet, a
+dense rebuild, a mesh), the viewer shows a toast whose action opens the Build sheet.
 
 While `kills[step] ≥ 1` for the scan, its next densify / mesh / photoreal build runs in **light mode**: the
 3D view shows at most 1.5 M points of the dense cloud (the existing `decimate`), no mesh, and the viewer's
-prepared export files are dropped; the full view returns when the build stops. The engine's memory plan is
-unchanged, so splat checkpoints stay valid (lowering `memoryBudgetMB` after a second kill is a later step).
-The MockEngine mirrors the engine's stored progress in the session record's stats, so e2e/ui/states.mjs
-kills runs with a page reload (`killed-dense`, `killed-splat`, `evicted-refine`).
+prepared export files are dropped (an export in flight is discarded when it lands; Export makes none until
+the build stops); the full view returns when the build stops. The card mentions the lighter view only for a
+scan with a dense cloud. The engine's memory plan is unchanged, so splat checkpoints stay valid (lowering
+`memoryBudgetMB` after a second kill is a later step). The MockEngine mirrors the engine's stored progress
+in the session record's stats, so e2e/ui/states.mjs kills runs with a page reload (`killed-dense`,
+`killed-splat`, `evicted-refine`, `killed-splat-early`).

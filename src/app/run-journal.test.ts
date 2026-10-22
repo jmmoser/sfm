@@ -1,7 +1,8 @@
 /**
  * Run journal (run-journal.ts): kill / eviction classification at launch, kill counts per step and
  * scan, light mode, closing on success / cancel / reported error, and storage that is missing,
- * throwing or corrupt (no card). A "launch" is a new RunJournal over the same storage.
+ * throwing or corrupt (no card); the card copy, the hand-over to the screen a scan opens in and the
+ * viewer's Build hint. A "launch" is a new RunJournal over the same storage.
  */
 import { describe, expect, it } from 'vitest';
 import {
@@ -14,10 +15,12 @@ import {
   lightModeFor,
   parseRunRecord,
   recoverRecord,
+  resumeHint,
   type JournalStorage,
   type RunRecord,
   type RunStart,
 } from './run-journal';
+import type { Results } from './app';
 
 class MemStorage implements JournalStorage {
   readonly map = new Map<string, string>();
@@ -296,17 +299,76 @@ describe('run journal: the Home card', () => {
   });
 
   it('copy: names the scan and the step, says where it stopped, never claims the cause', () => {
-    const killed = interruptionCopy({ name: 'Garden wall', step: 'densify', kind: 'killed' });
+    const killed = interruptionCopy({ name: 'Garden wall', step: 'densify', kind: 'killed', hasDense: false });
     expect(killed.title).toContain('Garden wall');
     expect(killed.body).toMatch(/dense cloud stopped while the app was open/);
-    expect(killed.body).toMatch(/saved depth maps/);
-    const evicted = interruptionCopy({ name: 'Yard', step: 'refine', kind: 'evicted' });
+    const evicted = interruptionCopy({ name: 'Yard', step: 'refine', kind: 'evicted', hasDense: true });
     expect(evicted.body).toMatch(/^Reconstructing the scan stopped while the app was in the background/);
     expect(evicted.body).not.toMatch(/lighter/); // refine has no light mode
-    expect(interruptionCopy({ name: 'Bench', step: 'splat', kind: 'killed' }).body).toMatch(/photoreal model.*saved training/);
     // a closed tab looks like a kill: memory is only a possibility, and never in the title
     expect(killed.title).toBe('Processing of “Garden wall” stopped');
     expect(killed.body).toMatch(/may have run out of memory, or the app was closed/);
+  });
+
+  it('copy: Resume never promises stored progress Home cannot see; the lighter view only with a dense cloud (review)', () => {
+    // a kill before the first depth map / checkpoint stored nothing: the card must not promise one
+    const dense = interruptionCopy({ name: 'Garden wall', step: 'densify', kind: 'killed', hasDense: false }).body;
+    expect(dense).toMatch(/continues from the depth maps saved so far, or starts again if none were saved\.$/);
+    const splat = interruptionCopy({ name: 'Bench', step: 'splat', kind: 'killed', hasDense: true }).body;
+    expect(splat).toMatch(/photoreal model.*continues from the training saved so far, or starts again if none was saved, with a lighter 3D view/);
+    // a sparse-only scan's preview is already small: no "lighter" claim
+    expect(dense).not.toMatch(/lighter/);
+    expect(interruptionCopy({ name: 'Bench', step: 'splat', kind: 'evicted', hasDense: false }).body).not.toMatch(/lighter/);
+    expect(interruptionCopy({ name: 'Wall', step: 'densify', kind: 'killed', hasDense: true }).body).toMatch(/lighter 3D view meanwhile to save memory\.$/);
+    expect(interruptionCopy({ name: 'Wall', step: 'mesh', kind: 'killed', hasDense: true }).body).toMatch(/build the mesh again, with a lighter/);
+  });
+
+  it('opening the interrupted scan answers the card and hands the interruption to the screen it opens, once', () => {
+    const st = new MemStorage();
+    kill(st, start({ step: 'splat', stage: 'splat_prepare', quality: 'fast' }));
+    const j = new RunJournal(st);
+    // another scan opened: nothing answered, nothing handed over
+    j.open('other');
+    expect(j.interruption()).not.toBeNull();
+    expect(j.takeOpened('other')).toBeNull();
+    j.open('s1');
+    expect(j.interruption()).toBeNull();
+    expect(j.lightMode('s1', 'splat')).toBe(true); // the kill count stays
+    expect(j.takeOpened('s1')).toMatchObject({ sessionId: 's1', step: 'splat', stage: 'splat_prepare', quality: 'fast', kind: 'killed' });
+    expect(j.takeOpened('s1')).toBeNull();
+    // handed to another scan's screen: dropped
+    kill(st);
+    const j2 = new RunJournal(st);
+    j2.open('s1');
+    expect(j2.takeOpened('s2')).toBeNull();
+    expect(j2.takeOpened('s1')).toBeNull();
+    // a run that starts drops a hand-over nobody took
+    kill(st);
+    const j3 = new RunJournal(st);
+    j3.open('s1');
+    j3.begin(start({ step: 'refine', stage: 'matching' }));
+    expect(j3.takeOpened('s1')).toBeNull();
+    // no storage: nothing to open
+    const none = new RunJournal(null);
+    none.open('s1');
+    expect(none.takeOpened('s1')).toBeNull();
+  });
+
+  it('resumeHint: the viewer points to Build only when no resume card covers the interrupted run (review)', () => {
+    const sparse = {} as NonNullable<Results['sparse']>;
+    const dense = { count: 10 } as NonNullable<Results['dense']>;
+    // nothing stored: the build starts over
+    expect(resumeHint('splat', { sparse, dense: null, stats: {} })).toMatch(/before any training was saved/);
+    expect(resumeHint('densify', { sparse, dense: null, stats: {} })).toMatch(/before any depth maps were saved/);
+    // a checkpoint / depth maps were stored (loadSession) or the run was stopped here: the resume card offers it
+    expect(resumeHint('splat', { sparse, dense, stats: { splatResumableIteration: 500 } })).toBeNull();
+    expect(resumeHint('splat', { sparse, dense, stats: { splatInterrupted: 1 } })).toBeNull();
+    expect(resumeHint('densify', { sparse, dense: null, stats: { denseResumablePass: 1 } })).toBeNull();
+    // a dense rebuild: the previous cloud is shown and no dense-resume card exists
+    expect(resumeHint('densify', { sparse, dense, stats: { denseResumablePass: 1 } })).toMatch(/previous one is shown/);
+    // the viewer has no mesh resume card; refine runs in Processing
+    expect(resumeHint('mesh', { sparse, dense, stats: {} })).toMatch(/mesh was not finished — build it again/);
+    expect(resumeHint('refine', { sparse: null, dense: null, stats: {} })).toBeNull();
   });
 });
 

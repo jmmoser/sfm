@@ -33,7 +33,8 @@
  *   memory-limit     the engine's capture memory cap → "Memory limit reached — finish scan now?",
  *                    Continue (tracking only) adds no keyframes, Finish works
  *   dense-resume     an interrupted densify (loadSession stats.denseResumablePass) → "Resume dense
- *                    reconstruction" in the viewer + Build sheet; a densify cancelled here too
+ *                    reconstruction" in the viewer + Build sheet; a densify cancelled here too (the
+ *                    Stop closes its run journal entry: no "run interrupted" card after a reload)
  *   dense-resume-quality  the interrupted run used another preset than the scan (stats
  *                    denseResumableQuality): the resume uses that preset
  *   info-sheet       Model info: magnetic-north note for compass yaw, engine memory section
@@ -60,6 +61,9 @@
  *                    points shown, no mesh) → the full cloud and the mesh come back
  *   evicted-refine   the page goes to the background during refine, then is killed → the card says it
  *                    stopped in the background; Resume reconstructs the scan
+ *   killed-splat-early  killed while the photoreal build prepares (no checkpoint yet) on a sparse scan →
+ *                    the card promises no saved training and no lighter view; Resume → no splat-resume
+ *                    card, a hint whose Build opens the Build sheet
  * Every other scenario must not show the "run interrupted" card (a watcher in each page).
  * Usage: node e2e/ui/states.mjs [name ...] [--verbose]
  */
@@ -103,9 +107,10 @@ const SCENARIOS = [
   'killed-dense',
   'killed-splat',
   'evicted-refine',
+  'killed-splat-early',
 ];
 /** Scenarios that kill a run on purpose: the only ones where the "run interrupted" card may appear. */
-const EXPECTS_RUN_CARD = new Set(['killed-dense', 'killed-splat', 'evicted-refine']);
+const EXPECTS_RUN_CARD = new Set(['killed-dense', 'killed-splat', 'evicted-refine', 'killed-splat-early']);
 const args = process.argv.slice(2).filter((a) => !a.startsWith('--'));
 // A misspelled name would run nothing and still pass.
 const unknown = args.filter((a) => !SCENARIOS.includes(a));
@@ -773,6 +778,15 @@ await scenario('dense-resume', async () => {
   await page.waitForSelector('.viewer-screen', { timeout: 20000 });
   await by(page, 'dense-resume').waitFor({ state: 'visible', timeout: 10000 });
   check(true, 'a densify cancelled in Processing is resumable from the viewer');
+  // the Stop closed the run in the journal: the next launch reports no interruption
+  check((await journal(page))?.step === null, 'the stopped densify is closed in the run journal');
+  await page.reload();
+  await by(page, 'session-item').first().waitFor({ timeout: 15000 });
+  await sleep(500);
+  check((await by(page, 'run-interrupted').count()) === 0, 'no "run interrupted" card after a Processing Stop');
+  await by(page, 'session-item').first().tap();
+  await viewerLoaded(page);
+  await by(page, 'dense-resume').waitFor({ state: 'visible', timeout: 10000 });
   await by(page, 'dense-resume-button').tap();
   await page.waitForSelector('.processing', { timeout: 20000 });
   await page.waitForSelector('.viewer-screen', { timeout: 120000 });
@@ -1352,6 +1366,39 @@ await scenario('evicted-refine', async () => {
   await page.waitForSelector('.viewer-screen:not(.screen-exit)', { timeout: 120000 });
   const done = await journal(page);
   check(done?.step === null && !done?.interrupted, `the refine finished and closed the journal (${JSON.stringify(done)})`);
+  await context.close();
+});
+
+await scenario('killed-splat-early', async () => {
+  const id = 'seed-killed-splat-early';
+  const { page, context } = await newPage();
+  // slow stages: the build is still preparing (no checkpoint) when the page is killed
+  await page.goto(`${base}?mock=1&mockSpeed=0.25`);
+  await by(page, 'new-scan').waitFor();
+  await seedSession(page, { id, name: 'Old gate', mode: 'object', status: 'sparse', stats: { quality: 'fast', keyframes: 24 } });
+  await page.reload();
+  await by(page, 'session-item').first().tap();
+  await viewerLoaded(page);
+  await by(page, 'tool-build').tap();
+  await by(page, 'build-splat').tap();
+  await by(page, 'splat-progress').waitFor({ state: 'visible', timeout: 10000 });
+  check((await journal(page))?.stage === 'splat_prepare', 'the run journal holds the preparing photoreal build');
+  await killPage(page);
+  check(typeof (await storedStats(page, id))?.splatResumableIteration !== 'number', 'no checkpoint was stored');
+  const card = by(page, 'run-interrupted');
+  await card.waitFor({ timeout: 15000 });
+  const text = (await card.textContent()) ?? '';
+  check(/or starts again if none was saved/.test(text) && !/lighter/.test(text), `the card promises no saved training and, for a sparse scan, no lighter view ("${text}")`);
+  await by(page, 'run-interrupted-resume').tap();
+  await viewerLoaded(page);
+  const hint = page.locator('.toast:not(.hide)', { hasText: 'before any training was saved' });
+  await hint.waitFor({ timeout: 10000 });
+  check(await by(page, 'splat-resume').isHidden(), 'nothing to resume: no splat-resume card');
+  await sleep(400);
+  await shot(page, 'state-killed-splat-early');
+  await hint.locator('.toast-action').tap();
+  await by(page, 'sheet-build').waitFor({ timeout: 5000 });
+  check((await by(page, 'build-splat').count()) === 1, 'the hint opens the Build sheet with the photoreal build');
   await context.close();
 });
 

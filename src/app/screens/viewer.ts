@@ -15,9 +15,12 @@
  * The photoreal build is a run in the run journal (src/app/run-journal.ts), so a kill during it
  * shows Home's "run interrupted" card on the next launch. After such a kill the next build runs in
  * light mode (`data-light` on the screen): the 3D view shows at most LIGHT_MODE_MAX_POINTS of the
- * dense cloud and no mesh (the mesh layer is not offered), and the prepared export files are
- * dropped; the full cloud and the mesh come back when the build stops. The engine's memory plan is
- * unchanged, so the splat checkpoints stay valid.
+ * dense cloud and no mesh (the mesh layer is not offered), the prepared export files are dropped
+ * (an export still in flight is discarded when it lands) and Export makes none until the build
+ * stops; the full cloud and the mesh come back when it stops. The engine's memory plan is
+ * unchanged, so the splat checkpoints stay valid. Opened from Home's card (`RunJournal.takeOpened`)
+ * with no resume card for the interrupted run (nothing was stored, a dense rebuild, a mesh), a
+ * toast points to Build (`resumeHint`).
  */
 import { saveFile } from '../../io/download';
 import type { SplatDisplayState, Viewer } from '../../viewer';
@@ -34,7 +37,7 @@ import { Disposer, h, replaceChildren } from '../dom';
 import { exportFilename, formatBytes, formatCount, formatDuration, modeLabel, qualityLabel } from '../format';
 import { icon, type IconName } from '../icons';
 import type { ProcessingStep, Route } from '../router';
-import { LIGHT_MODE_MAX_POINTS, type RunHandle } from '../run-journal';
+import { LIGHT_MODE_MAX_POINTS, resumeHint, type RunHandle } from '../run-journal';
 import { decimate } from './capture';
 import {
   builtQuality,
@@ -85,9 +88,8 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   let ready = false;
   let measuring = false;
   const display: DisplayState = { layer: 'points', cameras: true, edl: true, grid: true, meshLighting: false };
+  /** Prepared export files; an export landing after its entry was dropped (light mode, a rebuild) is discarded. */
   const exports = new Map<ExportFormat, ExportState>();
-  /** Bumped when a photoreal build replaces the model: a splat PLY prepared before is stale. */
-  let splatVersion = 0;
   /** The viewer's splat layer ('none' until a model is set; 'unavailable': no WebGPU / failed). */
   let splatState: SplatDisplayState = 'none';
   /** engine.splatModel() is being fetched. */
@@ -106,6 +108,8 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   let lightFromMesh = false;
   /** The run journal's entry of the running photoreal build. */
   let splatRun: RunHandle | null = null;
+  /** Home's "run interrupted" card (or list item) opened this scan: what stopped (hintInterrupted). */
+  const interrupted = app.journal.takeOpened(route.sessionId);
   /** Splats cannot be built here (no WebGPU in this browser; the engine would reject). */
   const webgpuMissing = (): boolean => app.env.webgpu === 'unsupported' || app.env.webgpu === 'no-adapter';
 
@@ -415,6 +419,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     if (!light) return;
     light = false;
     delete el.dataset.light;
+    renderExports?.();
     if (!viewer) return;
     const r = app.results;
     if (lightSubset && r.dense) viewer.setPointCloud(r.dense);
@@ -422,6 +427,19 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     if (lightFromMesh && display.layer === 'points' && r.mesh) display.layer = 'mesh';
     lightSubset = false;
     lightFromMesh = false;
+    // the view matches the layer pill at once (a splat model reload after a stop can take a while)
+    applyDisplay();
+  }
+
+  /** Opened from an interruption that no resume card covers (see the header): point to Build. */
+  function hintInterrupted(): void {
+    if (!interrupted || (interrupted.step === 'splat' && webgpuMissing())) return;
+    const msg = resumeHint(interrupted.step, app.results);
+    if (!msg) return;
+    const onClick = (): void => {
+      if (!closed) openBuild();
+    };
+    toast(msg, { tone: 'info', durationMs: 9000, action: { label: 'Build', onClick } });
   }
 
   let splatUnavailableToast = false;
@@ -693,7 +711,11 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     let action: HTMLElement;
     let sub = av.sub;
     if (!av.ok) action = chip('Unavailable', 'neutral');
-    else if (st.status === 'building') action = h('span', { class: 'export-building' }, spinner('sm'), h('span', { text: 'Preparing…' }));
+    else if (light) {
+      // a light-mode build (after a kill): no export file is made in the page meanwhile
+      action = chip('After the build', 'neutral');
+      sub = 'Made once the photoreal build stops (saves memory meanwhile)';
+    } else if (st.status === 'building') action = h('span', { class: 'export-building' }, spinner('sm'), h('span', { text: 'Preparing…' }));
     else if (st.status === 'ready' && st.blob) {
       sub = `${filename} · ${formatBytes(st.blob.size)}`;
       const blob = st.blob;
@@ -743,17 +765,19 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
   }
 
   async function prepare(format: ExportFormat): Promise<void> {
-    const version = splatVersion;
-    exports.set(format, { status: 'building' });
+    if (light) return;
+    const pending: ExportState = { status: 'building' };
+    exports.set(format, pending);
     renderExports?.();
+    let done: ExportState;
     try {
-      const blob = await app.engine.exportModel(format);
-      // a photoreal build replaced the model meanwhile: the file may hold the previous one
-      if (format === 'ply-splat' && version !== splatVersion) exports.delete(format);
-      else exports.set(format, { status: 'ready', blob });
+      done = { status: 'ready', blob: await app.engine.exportModel(format) };
     } catch (e) {
-      exports.set(format, { status: 'error', error: (e as Error)?.message ?? String(e) });
+      done = { status: 'error', error: (e as Error)?.message ?? String(e) };
     }
+    // Dropped meanwhile — a light-mode build started (its page must not hold the file) or a
+    // photoreal build replaced the model (the splat PLY may hold the previous one): discarded.
+    if (exports.get(format) === pending) exports.set(format, done);
     if (!closed) renderExports?.();
   }
 
@@ -848,8 +872,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       for (const k of ['splatPrepareMs', 'splatTrainMs', 'splatFinishMs']) if (typeof res.stats[k] === 'number') timings[k] = res.stats[k] as number;
       r.stats = { ...r.stats, ...timings, splatQuality: q };
       clearSplatResume(r.stats);
-      // a splat PLY prepared before holds the previous model
-      splatVersion++;
+      // a splat PLY prepared before (or still being prepared) holds the previous model
       exports.delete('ply-splat');
       void app.updateSession(sessionId, { stats: { splatGaussians: res.count, splatIterations: res.iterations, splatQuality: q } });
       if (closed) return;
@@ -934,6 +957,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     if (!app.env.webgl) {
       replaceChildren(canvasHost, h('div', { class: 'viewer-nogl' }, icon('warning', { size: 28 }), h('p', { text: 'WebGL is not available, so the model cannot be displayed. You can still export it.' })));
       applyContent(true);
+      hintInterrupted();
       return;
     }
     try {
@@ -945,6 +969,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       replaceChildren(canvasHost, h('div', { class: 'viewer-nogl' }, icon('warning', { size: 28 }), h('p', { text: `The 3D view could not start: ${(e as Error)?.message ?? e}` })));
     }
     applyContent(true);
+    hintInterrupted();
   }
 
   return {

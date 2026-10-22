@@ -78,7 +78,7 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
   }
   /** Light mode of the running densify / mesh (a run of that step was killed): a lighter preview. */
   let light = false;
-  /** The light-mode subset of the dense cloud shown (kept: the same subset is not uploaded twice). */
+  /** The light-mode subset of the dense cloud shown (kept while light: not decimated twice; dropped when light ends). */
   let lightView: { src: PointCloud; pc: PointCloud } | null = null;
   /** Light mode for step `s` of this scan; true when it changed (the preview must be shown again). */
   function setLight(s: ProcessingStep): boolean {
@@ -86,7 +86,10 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
     if (on === light) return false;
     light = on;
     if (on) preview.dataset.light = '1';
-    else delete preview.dataset.light;
+    else {
+      delete preview.dataset.light;
+      lightView = null;
+    }
     return true;
   }
   /** What the preview shows of the dense cloud: in light mode at most LIGHT_MODE_MAX_POINTS. */

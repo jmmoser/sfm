@@ -7,8 +7,9 @@
  * a long run of a stored scan that never ended — iOS killed the app while it was open, or evicted
  * it in the background. It names the scan and the step; Resume opens the scan exactly like its list
  * item (OPEN_SESSION: Processing for a captured scan, else the viewer with its dense / photoreal
- * resume card), which acknowledges the card (the kill count stays: the retry runs in light mode).
- * Shown once the session list loaded; dropped when the scan no longer exists.
+ * resume card, or a hint pointing to Build when nothing of the run was stored), which acknowledges
+ * the card (`RunJournal.open`; the kill count stays: the retry runs in light mode). Shown once the
+ * session list loaded; dropped when the scan no longer exists.
  */
 import type { SessionMeta, StorageEstimateInfo } from '../../io/storage';
 import type { App, Screen } from '../app';
@@ -106,8 +107,9 @@ export function createHomeScreen(app: App): Screen {
       toast(`This capture was interrupted with ${plural(n, 'photo')} — at least ${MIN_KEYFRAMES} are needed.`, { tone: 'warn' });
       return;
     }
-    // opening the interrupted scan (its card's Resume, or its list item) answers the card
-    if (app.journal.interruption()?.sessionId === s.id) app.journal.acknowledge();
+    // opening the interrupted scan (its card's Resume, or its list item) answers the card and
+    // tells the screen it opens what stopped
+    app.journal.open(s.id);
     app.navigate({ type: 'OPEN_SESSION', sessionId: s.id, status: s.status, numFrames: n });
   }
 
@@ -121,7 +123,7 @@ export function createHomeScreen(app: App): Screen {
       replaceChildren(interruptHost);
       return;
     }
-    const copy = interruptionCopy({ ...it, name: s.name });
+    const copy = interruptionCopy({ ...it, name: s.name, hasDense: s.status === 'dense' || s.status === 'meshed' });
     const card = banner({
       tone: 'warn',
       title: copy.title,
