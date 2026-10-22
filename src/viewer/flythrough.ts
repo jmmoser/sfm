@@ -7,29 +7,43 @@
  * "Novel views: held-out and off-trajectory"). So the path hugs the trajectory and the view
  * direction follows the photos.
  *
- * Modes ('auto': object when the optical axes converge, src/geometry/convergence.ts):
- *  - object: an orbit about the vertical axis through the optical-axis convergence point, swept
- *    at a constant rate over the azimuth range the keyframes cover (all of it, and several turns
- *    for a multi-loop capture). The radius and height follow the keyframes, smoothed over azimuth
- *    (Gaussian local-linear fit, σ 12°), so a steady orbit is an arc at the median radius and
- *    elevation, while a capture that rises or wanders keeps hugging it. The orientation is the
- *    keyframes' smoothed over azimuth (σ 15°) in the frame that turns with the orbit, so the
- *    camera keeps facing the object the way the user aimed it.
+ * Modes (`mode`; 'auto': `convergenceMode` of src/geometry/convergence.ts, the engine's own test,
+ * with `depth` as the scene depth):
+ *  - object: an orbit about the vertical axis through the optical-axis convergence point. The
+ *    capture is cut into passes, runs of keyframes in capture order whose azimuth moves one way: a
+ *    turn back by more than 10°, an azimuth gap over 24° or a jump over 6 keyframe steps between
+ *    neighbours starts a new one. Keyframes nearer the axis than 0.3 × the median horizontal
+ *    radius, or more than 75° above or below the centre (top-down shots, whose azimuth means
+ *    nothing), belong to no pass. The pass that covers the most azimuth is replayed in capture
+ *    order: its radius, height and azimuth are smoothed over the arc length (Gaussian local-linear,
+ *    σ = max(keyframe step, 8° of orbit at the median radius)). So the orbit is circular where the
+ *    capture is and follows a rise or a wander, and it never averages two rings or sweeps an
+ *    azimuth no photo covers. The orientation is the keyframes' in the frame that turns with the
+ *    orbit, smoothed over σ 15° of orbit, so the camera keeps facing the object the way the user
+ *    aimed it. A pass under 20° of azimuth: scene mode.
  *  - scene: a centripetal Catmull-Rom spline through the keyframe centres. The centres are first
  *    smoothed (local-linear in arc length, σ = the median keyframe step) and decimated to that
- *    spacing. The spline is arc-length parameterised; orientations are low-pass averaged
- *    quaternions (Gaussian over the keyframe sequence, σ 0.7 keyframes: ROT_SIGMA_KEYFRAMES).
- * Both modes level the horizon to `up` (the camera's x axis stays horizontal) and keep the
- * smoothed view direction.
+ *    spacing. Orientations are low-pass averaged quaternions (Gaussian over the keyframe sequence,
+ *    σ 0.7 keyframes: ROT_SIGMA_KEYFRAMES).
+ * The path parameter advances, per keyframe step, by the larger of the step's length and λ × its
+ * turning (λ = translation limit / maxTurn: the time the step needs at those limits, in metres), so
+ * a pan from one spot advances along the path instead of collapsing into one point. Both modes
+ * level the horizon to `up` (the camera's x axis stays horizontal) and keep the smoothed view
+ * direction.
  *
  * Timing: each piece of path costs the time it needs at the speed limits, and the clip plays it
  * at that rate. The limits are: translation ≤ 0.2 · depth per s (scene; depth = the typical viewing
- * distance, `viewingDepth`), view rotation ≤ 30 °/s (scene: ≤ 1.8× the clip's typical turning rate,
- * ≥ 10 °/s, so quick pans in the capture do not jerk), and orbit ≤ 40 °/s (object; the view rotation
- * then counts only beyond the orbit's own turning). The duration is clamped to 6–10 s. A
- * longer capture is cropped to its middle part (`coverage`); a shorter one plays slower. The start
- * and end ease in and out over ≤ 0.6 s (smoothstep speed ramps), so frame steps never exceed the
- * cruise step.
+ * distance, `viewingDepth`) or ≤ the orbit's speed at the median radius (object), orbit ≤ 40 °/s
+ * (object), and view rotation ≤ 30 °/s (object: beyond the orbit's own turning; scene: ≤ 1.8× the
+ * path's typical turning per metre at the translation limit, ≥ 10 °/s, so quick pans in the capture
+ * do not jerk). The clip is 6–10 s; a shorter path plays slower. In a longer one the pans —
+ * stretches where the rotation limit sets the pace — are shortened first: one that would take more
+ * than a quarter of the clip is replayed in a quarter (or as fast as 90 °/s at its peak allows)
+ * with smoothstep speed ramps, unless the path has almost nothing else to show (< 0.5 s; a pan from
+ * one spot). Then it is cropped to the most central window that shows ≥ 90 % of the most
+ * translation any window shows (`coverage`). So an out-and-back walk shows walking, not 10 s of
+ * turning on the spot. The start and end ease in and out over ≤ 0.6 s (smoothstep speed ramps), so
+ * frame steps never exceed the cruise step.
  *
  * Video frame: portrait when the photos' long side is vertical (physical up = `up`), else
  * landscape; 1280 × 720 by default. The focal length is the smallest that keeps the frame inside
@@ -37,7 +51,7 @@
  * constrained parts of the splats).
  */
 import type { CameraIntrinsics, Pose, Vec3 } from '../core/types';
-import { opticalAxisConvergence } from '../geometry/convergence';
+import { convergenceMode, opticalAxisConvergence } from '../geometry/convergence';
 import { mat3ToQuat, quatToMat3 } from '../math/rotation';
 import { median } from '../math/stats';
 import type { SplatCamera } from '../splat/types';
@@ -50,13 +64,43 @@ const DEG = Math.PI / 180;
  */
 const ROT_SIGMA_KEYFRAMES = 0.7;
 /**
- * Scene mode: the view-rotation limit is lowered to PAN_FACTOR × the shown part's median turning
- * rate (at the translation limit), but not below MIN_TURN (rad/s). Quick pans then turn at most ~2×
- * as fast as the rest of the clip: 1.8 leaves room for the eased start and end, which lower the
- * per-frame median.
+ * Scene mode: the view-rotation limit is lowered to PAN_FACTOR × the path's median turning rate
+ * (per metre, at the translation limit), but not below MIN_TURN (rad/s). Quick pans then turn at
+ * most ~2× as fast as the rest of the clip: 1.8 leaves room for the eased start and end, which
+ * lower the per-frame median. It is computed once over the whole path (not over the shown part,
+ * which it selects).
  */
 const PAN_FACTOR = 1.8;
 const MIN_TURN = 10 * DEG;
+/**
+ * A path longer than the clip: a pan may take at most PAN_SHARE of the clip, replayed with
+ * smoothstep ramps over PAN_RAMP of its time at each end and at most FAST_TURN (rad/s) at its
+ * peak; not when the rest of the path takes less than MIN_REST_SEC. Pans closer than
+ * PAN_MERGE_SEC are one.
+ */
+const PAN_SHARE = 0.25;
+const PAN_RAMP = 0.3;
+const FAST_TURN = 90 * DEG;
+const MIN_REST_SEC = 0.5;
+const PAN_MERGE_SEC = 0.25;
+/**
+ * A path longer than the clip: the clip is the most central window that shows at least this share
+ * of the most translation a window can show (so it is not centred on a pan).
+ */
+const WINDOW_SHARE = 0.9;
+/** Object mode passes and smoothing (see the file header). */
+const ORBIT_MIN_RADIUS = 0.3;
+const ORBIT_MAX_ELEVATION = 75 * DEG;
+const ORBIT_GAP = 24 * DEG;
+const ORBIT_MAX_JUMP_STEPS = 6;
+const ORBIT_REVERSAL = 10 * DEG;
+/** The azimuth must move this far from a pass's start before its direction counts. */
+const ORBIT_DIRECTION = 5 * DEG;
+const ORBIT_SIGMA_POS = 8 * DEG;
+const ORBIT_SIGMA_ROT = 15 * DEG;
+const ORBIT_MIN_SWEEP = 20 * DEG;
+/** Samples of the dense path (cost table). */
+const SAMPLES = 2000;
 
 export type FlythroughMode = 'object' | 'scene';
 
@@ -68,7 +112,7 @@ export interface FlythroughCamera {
 }
 
 export interface FlythroughOptions {
-  /** 'auto' (default): 'object' when the optical axes converge, else 'scene'. */
+  /** 'auto' (default): `convergenceMode` of the cameras (with `depth` as the scene depth). */
   mode?: FlythroughMode | 'auto';
   /** Video size: long and short side (default 1280 × 720). */
   longSide?: number;
@@ -86,7 +130,7 @@ export interface FlythroughOptions {
   depth?: number;
   /** Scene mode: fastest translation per second as a fraction of `depth` (default 0.2). */
   maxSpeedPerDepth?: number;
-  /** Fastest view rotation (default 30 °/s). */
+  /** Fastest view rotation (default 30 °/s; long pans in a cropped clip: see the file header). */
   maxTurnDegPerSec?: number;
   /** Object mode: fastest orbit (default 40 °/s). */
   maxOrbitDegPerSec?: number;
@@ -110,7 +154,7 @@ export interface FlythroughPath {
   poses: Pose[];
   /** Object mode: the orbit centre (optical-axis convergence point); null in scene mode. */
   centre: Vec3 | null;
-  /** Part of the capture the clip shows (fraction of the path, 0–1). */
+  /** Part of the capture the clip shows: its first and last frame's place in the keyframes (capture order, 0–1). */
   coverage: [number, number];
   /** Typical viewing distance used (world units). */
   depth: number;
@@ -168,6 +212,8 @@ const unit = (a: ArrayLike<number>): V3 => {
   const l = norm(a) || 1;
   return [a[0] / l, a[1] / l, a[2] / l];
 };
+/** Angle wrapped to (−π, π]. */
+const wrapPi = (a: number): number => a - 2 * Math.PI * Math.ceil((a - Math.PI) / (2 * Math.PI));
 
 function centreOf(p: Pose): V3 {
   const { R, t } = p;
@@ -207,7 +253,8 @@ export function rotationDistance(A: ArrayLike<number>, B: ArrayLike<number>): nu
 /**
  * Gaussian-weighted local-linear fit of `d`-vectors `ys` (flat) over the sample positions `xs`,
  * evaluated at `x0` (σ `sigma`). Unbiased at the ends and on linear trends, unlike a moving
- * average.
+ * average. A small ridge on the slope keeps it continuous where the weighted samples barely
+ * spread (beside a gap); the nearest sample only where no sample has weight.
  */
 function localLinear(xs: ArrayLike<number>, ys: ArrayLike<number>, d: number, x0: number, sigma: number, out: Float64Array): Float64Array {
   let s0 = 0;
@@ -229,12 +276,9 @@ function localLinear(xs: ArrayLike<number>, ys: ArrayLike<number>, d: number, x0
       t1[j] += w * dx * ys[d * k + j];
     }
   }
-  const det = s0 * s2 - s1 * s1;
-  for (let j = 0; j < d; j++) {
-    if (s0 < 1e-9) out[j] = ys[d * nearest + j];
-    else if (det > 1e-9 * s0 * s0 * sigma * sigma) out[j] = (s2 * t0[j] - s1 * t1[j]) / det;
-    else out[j] = t0[j] / s0;
-  }
+  const s2r = s2 + 1e-3 * s0 * sigma * sigma;
+  const det = s0 * s2r - s1 * s1;
+  for (let j = 0; j < d; j++) out[j] = s0 < 1e-9 ? ys[d * nearest + j] : (s2r * t0[j] - s1 * t1[j]) / det;
   return out;
 }
 
@@ -297,6 +341,17 @@ export function easedProgress(tau: number, r: number): number {
   return Math.min(1, Math.max(0, p / (1 - r)));
 }
 
+let panEase: { tau: Float64Array; p: Float64Array } | null = null;
+
+/** Inverse of `easedProgress(·, PAN_RAMP)`: the normalised time at which a pan has turned `p`. */
+function panTime(p: number): number {
+  if (!panEase) {
+    const tau = Float64Array.from({ length: 513 }, (_, i) => i / 512);
+    panEase = { tau, p: Float64Array.from(tau, (t) => easedProgress(t, PAN_RAMP)) };
+  }
+  return interp(panEase.p, panEase.tau, p);
+}
+
 /** Centripetal Catmull-Rom point between P1 and P2 (knots from |ΔP|^½). */
 function catmullRom(P0: V3, P1: V3, P2: V3, P3: V3, s: number): V3 {
   const kn = (a: V3, b: V3): number => Math.max(1e-9, Math.sqrt(norm(sub(b, a))));
@@ -333,22 +388,173 @@ function interp(xs: ArrayLike<number>, ys: ArrayLike<number>, x: number): number
   return ys[lo] + (ys[hi] - ys[lo]) * w;
 }
 
-/** A dense path: `samples` parameter values with their positions and the cost (s) of each step. */
+/** First index with xs[i] ≥ x (xs ascending). */
+function upperIndex(xs: Float64Array, x: number): number {
+  let lo = 0;
+  let hi = xs.length - 1;
+  if (x <= xs[0]) return 0;
+  if (x > xs[hi]) return hi;
+  while (hi - lo > 1) {
+    const m = (lo + hi) >> 1;
+    if (xs[m] < x) lo = m;
+    else hi = m;
+  }
+  return hi;
+}
+
+/**
+ * A dense path: SAMPLES + 1 parameter values and what each step (sample i − 1 → i; index 0 unused)
+ * needs: its translation, its rotation against the turn limit and any further time.
+ */
 interface DensePath {
-  /** Cumulative cost (s at the speed limits) per sample. */
-  cost: Float64Array;
-  /** Path parameter per sample, ascending (scene: arc length; object: sweep fraction). */
   param: Float64Array;
-  /**
-   * Scene mode: the cost table with view-rotation limit `w` (rad/s), and the rotation rate of each
-   * sample step when played at the translation limit (rad/s; NaN where nothing moves).
-   */
-  costWith?: (w: number) => Float64Array;
-  rates?: Float64Array;
+  dl: Float64Array;
+  dr: Float64Array;
+  /** Time a step needs besides translation and rotation (s; object: the orbit limit). */
+  fixed: Float64Array;
+  /** Translation limit (world units / s; 0: rotation only). */
+  vmax: number;
+  /** Place in the capture (keyframe index / (n − 1)) at a parameter value. */
+  progress(x: number): number;
   /** Position at a parameter value. */
   position(x: number): V3;
   /** Smoothed, levelled world-to-camera rotation at a parameter value. */
   rotation(x: number): Float64Array;
+}
+
+interface DensifyOptions {
+  vmax: number;
+  progress(x: number): number;
+  /** The rotation that counts against the turn limit (default: the view rotation). */
+  turning?: (x: number, R: Float64Array) => Float64Array;
+  /** Further time a step needs (s). */
+  extra?: (x0: number, x1: number) => number;
+}
+
+/** Samples a parameterised path between `x0` and `x1` (see DensePath). */
+function densify(x0: number, x1: number, position: (x: number) => V3, rotation: (x: number) => Float64Array, o: DensifyOptions): DensePath {
+  const S = SAMPLES;
+  const param = new Float64Array(S + 1);
+  const dl = new Float64Array(S + 1);
+  const dr = new Float64Array(S + 1);
+  const fixed = new Float64Array(S + 1);
+  const turning = o.turning ?? ((_x: number, R: Float64Array): Float64Array => R);
+  let prevP = position(x0);
+  let prevR = turning(x0, rotation(x0));
+  param[0] = x0;
+  for (let i = 1; i <= S; i++) {
+    const x = x0 + ((x1 - x0) * i) / S;
+    param[i] = x;
+    const P = position(x);
+    const R = turning(x, rotation(x));
+    dl[i] = norm(sub(P, prevP));
+    dr[i] = rotationDistance(R, prevR);
+    fixed[i] = o.extra ? o.extra(param[i - 1], x) : 0;
+    prevP = P;
+    prevR = R;
+  }
+  return { param, dl, dr, fixed, vmax: o.vmax, progress: o.progress, position, rotation };
+}
+
+/**
+ * Scene mode: the view-rotation limit, PAN_FACTOR × the median turning rate at the translation
+ * limit over the whole path's arc length, within [MIN_TURN, turn] (`turn` with no translation).
+ */
+function typicalTurnLimit(d: DensePath, turn: number): number {
+  if (!(d.vmax > 0)) return turn;
+  const idx: number[] = [];
+  let total = 0;
+  for (let i = 1; i < d.dl.length; i++)
+    if (d.dl[i] > 0) {
+      idx.push(i);
+      total += d.dl[i];
+    }
+  if (!idx.length) return turn;
+  const rate = (i: number): number => (d.dr[i] * d.vmax) / d.dl[i];
+  idx.sort((a, b) => rate(a) - rate(b));
+  let acc = 0;
+  let med = rate(idx[idx.length - 1]);
+  for (const i of idx) {
+    acc += d.dl[i];
+    if (acc >= total / 2) {
+      med = rate(i);
+      break;
+    }
+  }
+  return Math.min(turn, Math.max(MIN_TURN, PAN_FACTOR * med));
+}
+
+/**
+ * Cumulative time of the samples at the limits (rotation limit `w`), with the pans of a path longer
+ * than `budget` shortened, and the shown window [a, b] of it (see the file header).
+ */
+function timeline(d: DensePath, w: number, budget: number): { cost: Float64Array; a: number; b: number } {
+  const S = d.dl.length - 1;
+  const lin = (i: number): number => (d.vmax > 0 ? d.dl[i] / d.vmax : 0);
+  const turning = (i: number): boolean => d.dr[i] / w > Math.max(lin(i), d.fixed[i]);
+  const c = new Float64Array(S + 1);
+  let total = 0;
+  for (let i = 1; i <= S; i++) {
+    c[i] = Math.max(lin(i), d.fixed[i], d.dr[i] / w, 1e-12);
+    total += c[i];
+  }
+  if (total > budget) {
+    // pans: runs of steps whose rotation sets the pace, joined across short gaps
+    const runs: [number, number][] = [];
+    for (let i = 1; i <= S; i++) {
+      if (!turning(i)) continue;
+      let j = i;
+      while (j < S && turning(j + 1)) j++;
+      const prev = runs[runs.length - 1];
+      let gap = Infinity;
+      if (prev) {
+        gap = 0;
+        for (let k = prev[1] + 1; k < i; k++) gap += c[k];
+      }
+      if (gap < PAN_MERGE_SEC) prev[1] = j;
+      else runs.push([i, j]);
+      i = j;
+    }
+    const sum = (v: Float64Array, [i0, i1]: [number, number]): number => {
+      let acc = 0;
+      for (let k = i0; k <= i1; k++) acc += v[k];
+      return acc;
+    };
+    const cap = PAN_SHARE * budget;
+    const longest = runs.map((run) => ({ run, cost: sum(c, run) })).sort((x, y) => y.cost - x.cost || x.run[0] - y.run[0]);
+    for (const { run, cost: was } of longest) {
+      if (total <= budget || was <= cap || total - was < MIN_REST_SEC) continue;
+      const angle = sum(d.dr, run);
+      const L = Math.max(cap, angle / (FAST_TURN * (1 - PAN_RAMP)));
+      if (!(L < was)) continue;
+      // replayed in L: the turned fraction follows the eased progress of the pan's time
+      let acc = 0;
+      let tPrev = 0;
+      for (let k = run[0]; k <= run[1]; k++) {
+        acc += d.dr[k];
+        const t = L * panTime(Math.min(1, acc / angle));
+        c[k] = Math.max(lin(k), d.fixed[k], t - tPrev, 1e-12);
+        tPrev = t;
+      }
+      total += sum(c, run) - was;
+    }
+  }
+  const cost = new Float64Array(S + 1);
+  for (let i = 1; i <= S; i++) cost[i] = cost[i - 1] + c[i];
+  total = cost[S];
+  if (total <= budget) return { cost, a: 0, b: total };
+  // the most central window with at least WINDOW_SHARE of the most translation any window shows
+  const moved = new Float64Array(S + 1);
+  for (let i = 1; i <= S; i++) moved[i] = moved[i - 1] + d.dl[i];
+  const span = total - budget;
+  const G = 400;
+  const shown = Float64Array.from({ length: G + 1 }, (_, g) => interp(cost, moved, (span * g) / G + budget) - interp(cost, moved, (span * g) / G));
+  let most = 0;
+  for (const v of shown) most = Math.max(most, v);
+  let bestG = -1;
+  for (let g = 0; g <= G; g++) if (shown[g] >= WINDOW_SHARE * most && (bestG < 0 || Math.abs(g - G / 2) < Math.abs(bestG - G / 2))) bestG = g;
+  const a = (span * bestG) / G;
+  return { cost, a, b: a + budget };
 }
 
 // ------------------------------------------------------------------------------- builder
@@ -368,51 +574,31 @@ export function buildFlythrough(cams: readonly FlythroughCamera[], o: Flythrough
   const steps: number[] = [];
   for (let k = 1; k < n; k++) steps.push(norm(sub(C[k], C[k - 1])));
   const conv = opticalAxisConvergence(poses);
-  const objectOk = !!conv.point && conv.converging;
-  let mode: FlythroughMode = o.mode === 'object' || o.mode === 'scene' ? o.mode : objectOk ? 'object' : 'scene';
+  let mode: FlythroughMode = o.mode === 'object' || o.mode === 'scene' ? o.mode : convergenceMode(conv, o.depth ?? 0);
   if (mode === 'object' && !conv.point) mode = 'scene';
   let ext = 0;
   for (const c of C) ext = Math.max(ext, norm(sub(c, C[0])));
-  const depth = o.depth && o.depth > 0 ? o.depth : objectOk ? conv.distMedian : Math.max(5 * (median(steps) || 0), 0.1 * ext, 1e-3);
+  const depth = o.depth && o.depth > 0 ? o.depth : mode === 'object' ? conv.distMedian : Math.max(5 * (median(steps) || 0), 0.1 * ext, 1e-3);
 
-  let path: DensePath | null = mode === 'object' ? objectPath(poses, C, conv.point!, up, orbitRate, turn) : null;
+  let path: DensePath | null = mode === 'object' ? objectPath(poses, C, steps, conv.point!, up, orbitRate, turn) : null;
   if (!path) {
     mode = 'scene';
     path = scenePath(poses, C, steps, up, (o.maxSpeedPerDepth ?? 0.2) * depth, turn);
   }
 
-  // timing: the middle of the path when it needs more than maxS, eased start and end
-  // (T − 0.6 s plays the path at the limits: shorter paths play slower over minS, longer ones are cropped)
+  // timing: T − 0.6 s plays the path at the limits (eased start and end); shorter paths play
+  // slower over minS, longer ones are cropped
   const rampSec = 0.6;
-  const timing = (cost: Float64Array): { T: number; r: number; a: number; b: number } => {
-    const total = cost[cost.length - 1];
-    const T = Math.min(maxS, Math.max(minS, total + rampSec));
-    const r = Math.min(0.15, rampSec / T);
-    const window = Math.min(total, T * (1 - r));
-    const a = 0.5 * (total - window);
-    return { T, r, a, b: a + window };
-  };
-  let tm = timing(path.cost);
-  if (path.costWith && path.rates) {
-    // scene: pans turn at most PAN_FACTOR times as fast as the shown part's typical turning (≥ MIN_TURN)
-    let w = turn;
-    for (let it = 0; it < 3; it++) {
-      const lo = upperIndex(path.cost, tm.a);
-      const hi = upperIndex(path.cost, tm.b);
-      const shown = Array.from(path.rates.subarray(lo, hi + 1)).filter(Number.isFinite);
-      const w2 = shown.length ? Math.min(turn, Math.max(MIN_TURN, PAN_FACTOR * median(shown))) : turn;
-      if (Math.abs(w2 - w) < 1e-6) break;
-      w = w2;
-      path.cost = path.costWith(w);
-      tm = timing(path.cost);
-    }
-  }
-  const { T, r, a, b } = tm;
+  const budget = maxS * (1 - Math.min(0.15, rampSec / maxS));
+  const w = mode === 'scene' ? typicalTurnLimit(path, turn) : turn;
+  const { cost, a, b } = timeline(path, w, budget);
+  const T = Math.min(maxS, Math.max(minS, b - a + rampSec));
+  const r = Math.min(0.15, rampSec / T);
   const N = Math.max(2, Math.round(T * fps));
   const out: Pose[] = [];
   for (let i = 0; i < N; i++) {
     const m = a + (b - a) * easedProgress(i / (N - 1), r);
-    const x = interp(path.cost, path.param, m);
+    const x = interp(cost, path.param, m);
     const R = path.rotation(x);
     const P = path.position(x);
     out.push({ R, t: Float64Array.of(-(R[0] * P[0] + R[1] * P[1] + R[2] * P[2]), -(R[3] * P[0] + R[4] * P[1] + R[5] * P[2]), -(R[6] * P[0] + R[7] * P[1] + R[8] * P[2])) });
@@ -440,8 +626,6 @@ export function buildFlythrough(cams: readonly FlythroughCamera[], o: Flythrough
   const width = portrait ? short : long;
   const height = portrait ? long : short;
   const f = (o.zoom ?? 1.05) * Math.max(height / 2 / Math.tan(median(halfV)), width / 2 / Math.tan(median(halfH)));
-  const L = path.param[path.param.length - 1] - path.param[0];
-  const toFrac = (x: number): number => (L > 0 ? (x - path.param[0]) / L : 0);
   return {
     mode,
     width,
@@ -454,23 +638,23 @@ export function buildFlythrough(cams: readonly FlythroughCamera[], o: Flythrough
     near: 0.02 * depth,
     poses: out,
     centre: mode === 'object' ? Float64Array.from(conv.point!) : null,
-    coverage: [toFrac(interp(path.cost, path.param, a)), toFrac(interp(path.cost, path.param, b))],
+    coverage: [path.progress(interp(cost, path.param, a)), path.progress(interp(cost, path.param, b))],
     depth,
   };
 }
 
-/** Scene mode: smoothed, decimated centres → centripetal Catmull-Rom; arc-length parameter. */
+/** Scene mode: smoothed, decimated centres → centripetal Catmull-Rom (path parameter: see the file header). */
 function scenePath(poses: Pose[], C: V3[], steps: number[], up: V3, vmax: number, turn: number): DensePath {
   const n = C.length;
   const s = new Float64Array(n);
   for (let k = 1; k < n; k++) s[k] = s[k - 1] + steps[k - 1];
   const len = s[n - 1];
   const qs = alignedQuats(poses.map((p) => p.R));
+  const keyIdx = Float64Array.from({ length: n }, (_, k) => k);
   if (len < 1e-9) {
     // no translation (a pan from one spot): the orientations alone, by keyframe index
-    const idx = Float64Array.from({ length: n }, (_, k) => k);
     const fixed: V3 = C[0];
-    return densify(idx, () => fixed, (x) => level(quatToMat3(quatAverage(idx, qs, x, ROT_SIGMA_KEYFRAMES)), up), 0, turn);
+    return densify(0, n - 1, () => fixed, (x) => level(quatToMat3(quatAverage(keyIdx, qs, x, ROT_SIGMA_KEYFRAMES)), up), { vmax: 0, progress: (x) => x / (n - 1) });
   }
   const step = median(steps.filter((v) => v > 0)) || len / Math.max(1, n - 1);
   const sigma = step;
@@ -507,11 +691,8 @@ function scenePath(poses: Pose[], C: V3[], steps: number[], up: V3, vmax: number
     knotU.push(u[u.length - 1]);
   }
   const uOfS = (x: number): number => interp(ctrlS, knotU, x);
-  // orientations are smoothed over the keyframe sequence (fractional keyframe index along the path)
-  const keyU = Float64Array.from(s, uOfS);
-  const keyIdx = Float64Array.from({ length: n }, (_, k) => k);
   const uArr = Float64Array.from(u);
-  const position = (x: number): V3 => {
+  const atU = (x: number): V3 => {
     const k = Math.min(pts.length - 1, Math.max(0, upperIndex(uArr, x)));
     const k0 = Math.max(0, k - 1);
     const w = uArr[k] > uArr[k0] ? (x - uArr[k0]) / (uArr[k] - uArr[k0]) : 0;
@@ -519,131 +700,131 @@ function scenePath(poses: Pose[], C: V3[], steps: number[], up: V3, vmax: number
     const p1 = pts[k];
     return [p0[0] + (p1[0] - p0[0]) * w, p0[1] + (p1[1] - p0[1]) * w, p0[2] + (p1[2] - p0[2]) * w];
   };
-  const rotation = (x: number): Float64Array => level(quatToMat3(quatAverage(keyIdx, qs, interp(keyU, keyIdx, x), ROT_SIGMA_KEYFRAMES)), up);
-  return densify(uArr, position, rotation, vmax, turn);
-}
-
-/** First index with xs[i] ≥ x (xs ascending). */
-function upperIndex(xs: Float64Array, x: number): number {
-  let lo = 0;
-  let hi = xs.length - 1;
-  if (x <= xs[0]) return 0;
-  if (x > xs[hi]) return hi;
-  while (hi - lo > 1) {
-    const m = (lo + hi) >> 1;
-    if (xs[m] < x) lo = m;
-    else hi = m;
-  }
-  return hi;
+  // path parameter per keyframe: max(arc length, λ · turning), so a pan from one spot still advances
+  const lam = vmax / turn;
+  const keyP = new Float64Array(n);
+  for (let k = 1; k < n; k++) keyP[k] = keyP[k - 1] + Math.max(steps[k - 1], lam * rotationDistance(poses[k].R, poses[k - 1].R));
+  const position = (x: number): V3 => atU(uOfS(interp(keyP, s, x)));
+  // orientations are smoothed over the keyframe sequence (fractional keyframe index along the path)
+  const rotation = (x: number): Float64Array => level(quatToMat3(quatAverage(keyIdx, qs, interp(keyP, keyIdx, x), ROT_SIGMA_KEYFRAMES)), up);
+  return densify(0, keyP[n - 1], position, rotation, { vmax, progress: (x) => interp(keyP, keyIdx, x) / (n - 1) });
 }
 
 /**
- * Cost table of a parameterised path: 2000 samples between the parameter ends; each step costs
- * max(translation / vmax, rotation / ω) seconds (vmax 0: rotation only), ω = `turn` here and
- * lowered by `buildFlythrough` through `costWith`.
+ * Object mode: the pass covering the most azimuth about the vertical through `centre`, replayed in
+ * cylindrical coordinates (see the file header). Null when no pass covers 20° of azimuth.
  */
-function densify(param: ArrayLike<number>, position: (x: number) => V3, rotation: (x: number) => Float64Array, vmax: number, turn: number): DensePath {
-  const x0 = param[0];
-  const x1 = param[param.length - 1];
-  const S = 2000;
-  const xs = new Float64Array(S + 1);
-  const dl = new Float64Array(S + 1);
-  const dr = new Float64Array(S + 1);
-  let prevP = position(x0);
-  let prevR = rotation(x0);
-  xs[0] = x0;
-  for (let i = 1; i <= S; i++) {
-    const x = x0 + ((x1 - x0) * i) / S;
-    xs[i] = x;
-    const P = position(x);
-    const R = rotation(x);
-    dl[i] = norm(sub(P, prevP));
-    dr[i] = rotationDistance(R, prevR);
-    prevP = P;
-    prevR = R;
-  }
-  const costWith = (w: number): Float64Array => {
-    const cost = new Float64Array(S + 1);
-    for (let i = 1; i <= S; i++) cost[i] = cost[i - 1] + Math.max(vmax > 0 ? dl[i] / vmax : 0, dr[i] / w, 1e-12);
-    return cost;
-  };
-  if (!(vmax > 0)) return { cost: costWith(turn), param: xs, position, rotation };
-  const rates = Float64Array.from(dl, (l, i) => (l > 0 ? (dr[i] * vmax) / l : NaN));
-  return { cost: costWith(turn), param: xs, position, rotation, costWith, rates };
-}
-
-/**
- * Object mode: orbit about the vertical through the convergence point over the azimuth range
- * covered. Null when the keyframes cover less than 20° of azimuth (no orbit to show).
- */
-function objectPath(poses: Pose[], C: V3[], centre: ArrayLike<number>, up: V3, orbitRate: number, turn: number): DensePath | null {
+function objectPath(poses: Pose[], C: V3[], steps: number[], centre: ArrayLike<number>, up: V3, orbitRate: number, turn: number): DensePath | null {
   const n = C.length;
-  // horizontal basis: e1 towards the first camera
-  const v0 = sub(C[0], centre);
-  let e1 = sub(v0, up.map((x) => x * dot(v0, up)) as V3);
-  if (norm(e1) < 1e-9) e1 = Math.abs(up[0]) < 0.9 ? cross(up, [1, 0, 0]) : cross(up, [0, 1, 0]);
-  e1 = unit(e1);
+  // horizontal basis: e1 towards the first camera off the axis
+  let e1: V3 | null = null;
+  for (const c of C) {
+    const v = sub(c, centre);
+    const hv = sub(v, up.map((x) => x * dot(v, up)) as V3);
+    if (norm(hv) > 1e-9) {
+      e1 = unit(hv);
+      break;
+    }
+  }
+  e1 ??= unit(Math.abs(up[0]) < 0.9 ? cross(up, [1, 0, 0]) : cross(up, [0, 1, 0]));
   const e2 = cross(up, e1);
-  const phi = new Float64Array(n);
-  const rh = new Float64Array(2 * n);
+  const az = new Float64Array(n);
+  const rad = new Float64Array(n);
+  const hgt = new Float64Array(n);
   for (let k = 0; k < n; k++) {
     const v = sub(C[k], centre);
-    const h = dot(v, up);
-    const a = Math.atan2(dot(v, e2), dot(v, e1));
-    if (k === 0) phi[k] = a;
-    else {
-      let d = a - (phi[k - 1] % (2 * Math.PI));
-      d = ((((d + Math.PI) % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI)) - Math.PI;
-      phi[k] = phi[k - 1] + d;
+    const x = dot(v, e1);
+    const y = dot(v, e2);
+    hgt[k] = dot(v, up);
+    rad[k] = Math.hypot(x, y);
+    az[k] = Math.atan2(y, x);
+  }
+  const rAll = median(Array.from(rad));
+  const valid = (k: number): boolean => rad[k] >= ORBIT_MIN_RADIUS * rAll && Math.atan2(Math.abs(hgt[k]), rad[k]) <= ORBIT_MAX_ELEVATION;
+  const maxJump = ORBIT_MAX_JUMP_STEPS * (median(steps.filter((v) => v > 0)) || Infinity);
+  // passes: keyframe runs (capture order) whose unwrapped azimuth moves one way
+  const passes: { ks: number[]; phi: number[] }[] = [];
+  let ks: number[] = [];
+  let phi: number[] = [];
+  /** Direction of the current pass (0: not yet known) and the index of its farthest azimuth. */
+  let dir = 0;
+  let far = 0;
+  for (let k = 0; k <= n; k++) {
+    const last = ks.length - 1;
+    const ok = k < n && valid(k);
+    const d = ok && last >= 0 ? wrapPi(az[k] - az[ks[last]]) : 0;
+    if (!ok || (last >= 0 && (Math.abs(d) > ORBIT_GAP || norm(sub(C[k], C[ks[last]])) > maxJump))) {
+      if (ks.length >= 2) passes.push({ ks, phi });
+      ks = ok ? [k] : [];
+      phi = ok ? [az[k]] : [];
+      dir = 0;
+      far = 0;
+      continue;
     }
-    rh[2 * k] = Math.hypot(dot(v, e1), dot(v, e2));
-    rh[2 * k + 1] = h;
+    const p = last >= 0 ? phi[last] + d : az[k];
+    if (dir !== 0 && dir * (phi[far] - p) > ORBIT_REVERSAL) {
+      // turned back: this pass ends at its farthest keyframe, the next one starts there
+      passes.push({ ks: ks.slice(0, far + 1), phi: phi.slice(0, far + 1) });
+      ks = ks.slice(far);
+      phi = phi.slice(far);
+      dir = 0;
+      far = 0;
+    }
+    ks.push(k);
+    phi.push(p);
+    if (dir === 0 && Math.abs(p - phi[0]) > ORBIT_DIRECTION) {
+      dir = Math.sign(p - phi[0]);
+      for (let j = 1; j < phi.length; j++) if (dir * (phi[j] - phi[far]) > 0) far = j;
+    } else if (dir !== 0 && dir * (p - phi[far]) > 0) far = phi.length - 1;
   }
-  let lo = 0;
-  let hi = 0;
-  for (let k = 1; k < n; k++) {
-    if (phi[k] < phi[lo]) lo = k;
-    if (phi[k] > phi[hi]) hi = k;
+  let best: { ks: number[]; phi: number[] } | null = null;
+  let bestSpan = 0;
+  for (const ps of passes) {
+    const span = Math.max(...ps.phi) - Math.min(...ps.phi);
+    if (span > bestSpan + DEG || (best && Math.abs(span - bestSpan) <= DEG && ps.ks.length > best.ks.length)) {
+      best = ps;
+      bestSpan = span;
+    }
   }
-  if (phi[hi] - phi[lo] < 20 * DEG) return null;
+  if (!best || bestSpan < ORBIT_MIN_SWEEP) return null;
+  const pass = best;
+  const K = pass.ks;
+  const m = K.length;
+  const sK = new Float64Array(m);
+  for (let j = 1; j < m; j++) sK[j] = sK[j - 1] + norm(sub(C[K[j]], C[K[j - 1]]));
+  const rMed = median(K.map((k) => rad[k]));
   // the orientation in the frame turning with the orbit: R0 = R · Rot(φ)
-  const R0s = poses.map((p, k) => mul3(p.R, rotAbout(up, phi[k])));
-  // smoothing is by azimuth: sort the keyframes by φ (a back-and-forth capture interleaves)
-  const order = Array.from({ length: n }, (_, k) => k).sort((x, y) => phi[x] - phi[y]);
-  const ph = Float64Array.from(order, (k) => phi[k]);
-  const rhs = new Float64Array(2 * n);
-  order.forEach((k, i) => rhs.set([rh[2 * k], rh[2 * k + 1]], 2 * i));
-  const qs = alignedQuats(order.map((k) => R0s[k]));
-  const sP = 12 * DEG;
-  const sQ = 15 * DEG;
-  const tmp = new Float64Array(2);
+  const R0s = K.map((k, j) => mul3(poses[k].R, rotAbout(up, pass.phi[j])));
+  const qs = alignedQuats(R0s);
+  const vmax = orbitRate * rMed;
+  const lam = vmax / turn;
+  const keyP = new Float64Array(m);
+  for (let j = 1; j < m; j++) keyP[j] = keyP[j - 1] + Math.max(sK[j] - sK[j - 1], lam * rotationDistance(R0s[j], R0s[j - 1]));
+  const passStep = median(Array.from(sK.subarray(1), (v, j) => v - sK[j]).filter((v) => v > 0)) || sK[m - 1] / Math.max(1, m - 1);
+  const sigP = Math.max(passStep, rMed * ORBIT_SIGMA_POS);
+  const sigQ = Math.max(passStep, rMed * ORBIT_SIGMA_ROT);
+  const cyl = new Float64Array(3 * m);
+  K.forEach((k, j) => cyl.set([rad[k], hgt[k], pass.phi[j]], 3 * j));
+  const tmp = new Float64Array(3);
+  /** Smoothed [radius, height, azimuth] at a parameter value (a shared buffer). */
+  const at = (x: number): Float64Array => localLinear(sK, cyl, 3, interp(keyP, sK, x), sigP, tmp);
   const position = (x: number): V3 => {
-    localLinear(ph, rhs, 2, x, sP, tmp);
-    const c = Math.cos(x);
-    const s = Math.sin(x);
-    return [centre[0] + tmp[0] * (c * e1[0] + s * e2[0]) + tmp[1] * up[0], centre[1] + tmp[0] * (c * e1[1] + s * e2[1]) + tmp[1] * up[1], centre[2] + tmp[0] * (c * e1[2] + s * e2[2]) + tmp[1] * up[2]];
+    const [r, h, f] = at(x);
+    const c = Math.cos(f);
+    const s = Math.sin(f);
+    return [centre[0] + r * (c * e1[0] + s * e2[0]) + h * up[0], centre[1] + r * (c * e1[1] + s * e2[1]) + h * up[1], centre[2] + r * (c * e1[2] + s * e2[2]) + h * up[2]];
   };
-  const rotation = (x: number): Float64Array => level(mulT3(quatToMat3(quatAverage(ph, qs, x, sQ)), rotAbout(up, x)), up);
-  // sweep in the capture's direction: from the end it started nearer to
-  const forward = Math.abs(phi[0] - phi[lo]) <= Math.abs(phi[0] - phi[hi]);
-  const a = forward ? phi[lo] : phi[hi];
-  const b = forward ? phi[hi] : phi[lo];
-  // cost: the orbit itself, or turning beyond it (the rotation in the orbit's turning frame)
-  const S = 2000;
-  const cost = new Float64Array(S + 1);
-  let prevR0 = mul3(rotation(a), rotAbout(up, a));
-  for (let i = 1; i <= S; i++) {
-    const x = a + ((b - a) * i) / S;
-    const R0 = mul3(rotation(x), rotAbout(up, x));
-    cost[i] = cost[i - 1] + Math.max(Math.abs(b - a) / S / orbitRate, rotationDistance(R0, prevR0) / turn);
-    prevR0 = R0;
-  }
-  // `interp` needs an ascending parameter: map the cost to the sweep fraction, then to φ
-  const frac = Float64Array.from({ length: S + 1 }, (_, i) => i / S);
-  return {
-    cost,
-    param: frac,
-    position: (f) => position(a + (b - a) * f),
-    rotation: (f) => rotation(a + (b - a) * f),
-  };
+  const orbit = (x: number): Float64Array => rotAbout(up, at(x)[2]);
+  const rotation = (x: number): Float64Array => level(mulT3(quatToMat3(quatAverage(keyP, qs, x, sigQ)), orbit(x)), up);
+  const keyK = Float64Array.from(K);
+  return densify(0, keyP[m - 1], position, rotation, {
+    vmax,
+    progress: (x) => interp(keyP, keyK, x) / (n - 1),
+    // the orbit itself, or turning beyond it (the rotation in the orbit's turning frame)
+    turning: (x, R) => mul3(R, orbit(x)),
+    extra: (x0, x1) => {
+      const f1 = at(x1)[2];
+      return Math.abs(f1 - at(x0)[2]) / orbitRate;
+    },
+  });
 }

@@ -282,6 +282,7 @@ alignSim3Ransac(src: Float64Array, dst: Float64Array, n, maxError: number, opts?
 // convergence.ts — where the cameras look (object centre for classification, coverage, crop, fly-through)
 opticalAxisConvergence(poses: Pose[]): { point: Vec3 | null; spreadRad: number; inFront: number;
   distMedian: number; offAxisMedian: number; converging: boolean }   // least-squares point closest to all optical axes
+convergenceMode(c: AxisConvergence, medianDepth: number): 'object' | 'scene'   // the engine's classifyScene and the fly-through's 'auto'
 ```
 
 ### 4.3 `src/ba`  (depends on math)
@@ -535,7 +536,8 @@ class Viewer {
   openSplatFrames(o: { width: number; height: number; background?: [number, number, number] })
     : SplatOffscreen | null   // offscreen VideoFrames / pixels of the splats at a fixed size (video export)
 }
-// flythrough.ts (pure): video camera path from the registered keyframes (capture order)
+// flythrough.ts (pure): video camera path from the registered keyframes (capture order); opts.mode
+// 'object' | 'scene' | 'auto' (convergenceMode); object: one azimuth pass replayed, scene: the walk
 buildFlythrough(cams: { pose: Pose; intrinsics: { width; height; f } }[], opts?: FlythroughOptions): FlythroughPath | null
   // { mode: 'object' | 'scene'; width; height; fps; fx; fy; cx; cy; near; poses: Pose[] /*world-to-camera*/; … }
 ```

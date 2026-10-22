@@ -5,7 +5,8 @@
  * Shared by the engine's object / scene classification (`classifyScene`, src/engine/live.ts),
  * the capture screen's coverage ring (src/app/coverage.ts), the object crop box
  * (src/dense/object-roi.ts) and the fly-through path (src/viewer/flythrough.ts), so all of them
- * agree on where "the object" is.
+ * agree on where "the object" is. `convergenceMode` is the object / scene decision itself, shared
+ * by `classifyScene` and the fly-through's 'auto' mode.
  *
  * The point P minimises Σ |(I − dᵢdᵢᵀ)(P − Cᵢ)|² over the camera centres Cᵢ and unit optical
  * axes dᵢ (third row of R, OpenCV frame). The 3×3 normal matrix is singular when every axis is
@@ -102,4 +103,15 @@ export function opticalAxisConvergence(poses: readonly Pose[]): AxisConvergence 
   const offAxisMedian = median(off);
   const converging = inFront >= 0.9 * n && offAxisMedian < 0.35 * distMedian;
   return { point: P, spreadRad, inFront, distMedian, offAxisMedian, converging };
+}
+
+/**
+ * Object or scene from the convergence: 'object' when the cameras converge (`converging`) on a
+ * point 0.3–2.5 × the median scene depth away (not checked when `medianDepth` is not positive).
+ */
+export function convergenceMode(c: AxisConvergence, medianDepth: number): 'object' | 'scene' {
+  if (!c.point || !c.converging) return 'scene';
+  const d = c.distMedian;
+  const depthOk = !(medianDepth > 0) || (d < 2.5 * medianDepth && d > 0.3 * medianDepth);
+  return depthOk ? 'object' : 'scene';
 }
