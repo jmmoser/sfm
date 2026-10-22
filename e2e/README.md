@@ -609,6 +609,12 @@ flagged in `sparse.intrinsicsNote`.
   (`keyframeTrace`), and after finishCapture and after refine the live model plus every verified
   pair (keyframe ids, frame indices, model, inliers, median triangulation angle, R, t). Comparing
   R / t with the GT relative pose separates wrong pairs from wrong registrations.
+* `--set 'densifyRepeat={"overlap":false}'` (any `DenseOptions`): after densify, the same sparse
+  model is densified again with these options and the clouds are compared bit for bit
+  (`result.denseRepeat`, log `densify repeat … bit-identical to the first` or the first
+  difference; stage timings under step `densifyRepeat`). Two separate runs cannot be compared
+  that way: the sparse model already differs between runs of the same code (see "Dense CPU/GPU
+  overlap" below).
 
 ### Checks and thresholds (`e2e/thresholds.json`)
 
@@ -825,6 +831,33 @@ p50 8.3 mm; yard-real balanced (6.3 M) P 0.962, C 0.494, F 0.653, p50 7.1 mm (co
 * `metrics-core` scores completeness on every ROI point now; accuracy and precision still use a ≤ `maxPoints`
   (3 M) strided subsample. Clouds above 3 M points only appear with the new point cap at balanced / max (the global
   voxel kept ≤ 2.3 M).
+
+### Dense CPU/GPU overlap (2026-10-22, SwiftShader, worker engine)
+
+```sh
+node e2e/run-e2e.mjs object-real --dense-size 480 --no-mesh --no-export --tag dov-<x> \
+     --set 'engineConfig={"featureBackend":"cpu","mapping":"inline"}' [--set 'densifyRepeat={"overlap":false}']
+```
+
+Base `18d73c9` ("before") vs the overlap ("after"), back to back, then one run with the same-model A/B
+(`densifyRepeat`). 4 shared cores (load 2.5–13); SwiftShader runs PatchMatch on the CPU, so it is 99 % of the
+stage and its time follows the host load. Engine thread = what the engine worker itself spends on each step.
+
+| run | depth maps s | engine thread: view loads / pass inputs / PatchMatch / halo / store s | helpers: decodes / halo + serialise s | fusion s | points | dense P / C / F | checks |
+|---|---|---|---|---|---|---|---|
+| before | 961.7 | 2.7 / 1.0 / 952.5 / 3.9 / 1.5 | — | 3.7 | 1 269 875 | 0.9995 / 0.9923 / 0.9959 | pass |
+| after | 819.2 | 0.2 / 1.6 / 816.5 / 0.0 / 0.1 | 5.2 / 3.3 | 4.2 | 1 269 989 | 0.9994 / 0.9921 / 0.9958 | pass |
+| A/B, overlap on | 1143.6 | 0.2 / 2.6 / 1139.6 / 0.0 / 0.2 | 5.9 / 5.2 | 5.3 | 1 269 253 | 0.9995 / 0.9928 / 0.9961 | pass |
+| A/B, overlap off (same model) | 1037.4 | 2.8 / 1.2 / 1027.1 / 4.6 / 1.7 | — | 8.4 | 1 269 253, bit-identical | (same cloud) | |
+
+Before / after differ in the sparse model (the captures diverge at the live initialisation, frame 10: 700 vs
+750 points, refine 12 079 vs 12 094 points), hence the 114-point difference; on one model the clouds are
+bit-identical. The wall-time differences are SwiftShader PatchMatch time (the same-model 'on' run took 10 %
+longer); the pass inputs (IndexedDB reads) rose 1.2 → 2.6 s with the overlap, the reads contending with the
+writes in flight. The overlap's effect on a real GPU is unmeasured: the M4 table above bounds it at ≈ −52 to
+−55 % depth maps at fast if the helpers keep up, and an `E2E_GPU=host` `densifyRepeat` A/B at fast and balanced
+is still to run.
+Analysis: ../docs/research/dense-tuning.md "CPU/GPU overlap of the depth-map stage".
 
 ### Real-capture baselines (2026-10, sparse, CPU features, worker engine)
 

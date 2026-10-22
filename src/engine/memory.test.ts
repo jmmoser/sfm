@@ -65,6 +65,55 @@ describe('planDense', () => {
     expect(fixed.fusionStep).toBe(2);
   });
 
+  it('CPU/GPU overlap: maps / decodes in flight only where the budget has room; the rest of the plan unchanged', () => {
+    const scenarios = [
+      ['fast', 40, 800, 600, 1200],
+      ['fast', 40, 800, 600, 600],
+      ['fast', 40, 360, 480, 1200],
+      ['balanced', 80, 1280, 960, 1200],
+      ['balanced', 80, 1280, 960, 850],
+      ['balanced', 80, 1280, 960, 600],
+      ['max', 150, 1600, 1200, 1200],
+      ['max', 150, 1600, 1200, 850],
+    ] as const;
+    for (const [q, views, w, h, budget] of scenarios) {
+      const base = planDense(denseInput(q, views, w, h, budget));
+      expect(base.overlap).toEqual({ maps: 0, decodes: 0 });
+      expect(base.stages[0].parts.overlap).toBeUndefined();
+      for (const workers of [0, 2, 3]) {
+        const ov = planDense({ ...denseInput(q, views, w, h, budget), overlap: { workers } });
+        const tag = `${q} ${w}×${h} ${budget} MB, ${workers} workers`;
+        expect(ov.fits, tag).toBe(base.fits);
+        if (base.fits) expect(ov.peakBytes, tag).toBeLessThanOrEqual(budget * MB);
+        // only the image LRU's growth may give way to it
+        expect(ov.imageCacheBytes, tag).toBeLessThanOrEqual(base.imageCacheBytes);
+        for (const k of ['sourceDepthCacheBytes', 'colourBytes', 'fusionMaxNeighbours', 'fusionStep', 'fusionMaxPoints', 'tsdfMaxBlocks'] as const) expect(ov[k], `${tag} ${k}`).toBe(base[k]);
+        expect(ov.overlap.maps).toBeLessThanOrEqual(workers > 0 ? Math.min(2, workers) : 1);
+        expect(ov.overlap.decodes).toBeLessThanOrEqual(Math.min(3, workers));
+        if (ov.overlap.decodes > 0) expect(ov.overlap.maps, tag).toBeGreaterThan(0);
+        if (ov.overlap.maps + ov.overlap.decodes === 0) expect(ov.stages[0].parts.overlap, tag).toBeUndefined();
+        else expect(ov.stages[0].parts.overlap, tag).toBeGreaterThan(0);
+      }
+    }
+    const plan = (q: 'fast' | 'balanced' | 'max', views: number, w: number, h: number, budget: number, workers: number) =>
+      planDense({ ...denseInput(q, views, w, h, budget), overlap: { workers } });
+    // room to spare (fast, 1.2 GB): two maps on helpers, two / three decodes
+    expect(plan('fast', 40, 800, 600, 1200, 2).overlap).toEqual({ maps: 2, decodes: 2 });
+    expect(plan('fast', 40, 800, 600, 1200, 3).overlap).toEqual({ maps: 2, decodes: 3 });
+    // no helpers: one map write in flight
+    expect(plan('fast', 40, 800, 600, 1200, 0).overlap).toEqual({ maps: 1, decodes: 0 });
+    // a 6 GB iPhone at balanced: one map, no decode; at max nothing is left (serial)
+    expect(plan('balanced', 80, 1280, 960, 850, 2).overlap).toEqual({ maps: 1, decodes: 0 });
+    const max850 = plan('max', 150, 1600, 1200, 850, 2);
+    expect(max850.overlap).toEqual({ maps: 0, decodes: 0 });
+    expect(max850.peakBytes).toBe(planDense(denseInput('max', 150, 1600, 1200, 850)).peakBytes);
+    // a map in flight with the halo filter on a helper: the engine's map + store copy, the worker's map + image copies + filter scratch
+    const one = plan('max', 150, 1600, 1200, 1200, 2);
+    expect(one.overlap).toEqual({ maps: 1, decodes: 1 });
+    const px = 1600 * 1200;
+    expect(one.stages[0].parts.overlap).toBe((MEM.depthMapPx + MEM.depthStoredPx + MEM.depthMapPx + MEM.rgbaPx + MEM.haloScratchPx) * px + MEM.viewDecodeFixed + MEM.viewDecodePx * px + 2 * MEM.cpuWorkerFixed);
+  });
+
   it('formats a breakdown largest first', () => {
     expect(formatBreakdown({ a: 3 * MB, b: 10 * MB, c: 1000 })).toBe('13 MB (b 10, a 3)');
   });

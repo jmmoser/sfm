@@ -411,17 +411,24 @@ function skyTest(dm: DepthMap, rgb: Uint8Array, o: HaloFilterOptions, borders: n
 export function removeDepthHalos(dm: DepthMap, image: RGBAImage, cam: CameraIntrinsics, options: Partial<HaloFilterOptions> = {}): DepthMap {
   const mask = depthHaloMask(dm, image, cam, options);
   const out: DepthMap = { width: dm.width, height: dm.height, depth: dm.depth.slice(), normal: dm.normal.slice(), cost: dm.cost.slice() };
-  if (!mask) return out;
+  if (mask) applyDepthHaloMask(out, mask);
+  return out;
+}
+
+/**
+ * Invalidate the pixels of a `depthHaloMask` bit mask IN PLACE (depth 0, normal 0, cost 2) — what
+ * `removeDepthHalos` does to its copy, for a mask computed elsewhere (a CPU helper worker).
+ */
+export function applyDepthHaloMask(dm: DepthMap, mask: Uint32Array): void {
   const n = dm.width * dm.height;
   for (let i = 0; i < n; i++) {
     if (!((mask[i >>> 5] >>> (i & 31)) & 1)) continue;
-    out.depth[i] = 0;
-    out.normal[3 * i] = 0;
-    out.normal[3 * i + 1] = 0;
-    out.normal[3 * i + 2] = 0;
-    out.cost[i] = 2;
+    dm.depth[i] = 0;
+    dm.normal[3 * i] = 0;
+    dm.normal[3 * i + 1] = 0;
+    dm.normal[3 * i + 2] = 0;
+    dm.cost[i] = 2;
   }
-  return out;
 }
 
 /**

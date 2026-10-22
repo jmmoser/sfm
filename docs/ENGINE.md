@@ -20,7 +20,12 @@ UI screens ◀──progress / results──────────      ├─
 
 All heavy work runs in the worker: the UI thread only shows video, the viewer and
 the UI. WebGPU is used from the worker. The engine class itself is
-thread-agnostic so the test harness can run it on the main thread.
+thread-agnostic so the test harness can run it on the main thread. For refine and densify
+the engine worker spawns CPU helper workers (nested; `src/engine/cpu-pool.ts`,
+`EngineConfig.cpuWorkers`, hardware threads − 2 ≤ 3, so 2 on an iPhone) for pure jobs whose
+results are applied in the engine's own order: pair verification, vocabulary quantisation and
+rolling-shutter hypotheses (refine); keyframe decoding and the final depth maps' halo filter +
+serialisation (densify).
 
 With the developer option "Record raw capture" a third worker records what the engine gets
 (§5): `src/workers/recorder.worker.ts` (JPEG encode + OPFS / IndexedDB writes), fed by a FrameTap
@@ -203,10 +208,20 @@ as before. The dense cloud and splats are never cropped. The app has no "mesh th
 (`MeshOptions.objectRoi: false` is used by the e2e `--no-object-roi` baseline only). The box is returned as
 `MeshResult.objectRoi`, persisted in `mesh/meta` (cleared with the mesh and by refine: it is in the refined
 world frame), reported as `SessionSummary.objectRoi` and passed to exports as `ExportSources.objectRoi`, for
-exports that will stand the object on the ground with its bottom centre `objectRoiPivot` at the origin (USDZ /
-GLB for AR). No export reads it yet: GLB and PLY are written in world coordinates. Stats: `objectRoi` (the box,
+the USDZ, which stands the object on the ground with the box's bottom centre (`objectRoiPivot`) at the origin
+(`selectArPivot`); GLB and PLY are written in world coordinates. Stats: `objectRoi` (the box,
 `none: <reason>` or `off`), `objectRoiConfidence`, `voxelSize`, `tsdfAutoVoxelSize`, `tsdfCoarsenLevels`,
 `tsdfBlocks`, `tsdfMaxBlocks`.
+
+CPU/GPU overlap (`src/engine/dense.ts`; `EngineConfig.denseOverlap`, default on, per run
+`DenseOptions.overlap`): while the GPU computes a view, the CPU helper workers decode, undistort and
+rolling-shutter correct the next view's missing images and halo-filter + serialise the final maps of
+earlier views, whose store writes complete in the background (≤ `DensePlan.overlap.maps` maps behind the
+GPU; put in view order). The memory plan grants one map and one decode in flight before the image LRU
+grows, more only from the remaining headroom; every pass drains its writes before the next reads them or
+`dense/progress` advances, and deletes a previous-pass map's stored copy only once the maps put up to its last
+reader have landed (a failed write or a kill leaves a resume every input). Bit-identical to the serial path
+(research/dense-tuning.md "CPU/GPU overlap").
 
 ### Splat
 Gaussian splatting (`src/engine/splat.ts` over `src/splat`, research/splat-tuning.md "Engine splat stage"), after

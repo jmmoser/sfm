@@ -294,6 +294,11 @@ export interface DenseOptions {
   maxImageSize?: number;
   /** Limit the number of reference views. */
   maxViews?: number;
+  /**
+   * CPU/GPU overlap of the depth-map stage for this run (default `EngineConfig.denseOverlap`, on):
+   * an A/B switch for timings — the results are bit-identical either way.
+   */
+  overlap?: boolean;
 }
 
 export interface MeshOptions {

@@ -621,7 +621,8 @@ PatchMatch at ½ resolution (multi-scale) → PatchMatch (photometric) for all v
 PatchMatch (geometric consistency) → halo / sky filter → fusion → filtered coloured
 point cloud → optional TSDF mesh (object mode with a gravity-aligned model: bounded to the automatic
 object box from the sparse model — orbit centre + support plane, `dense/object-roi.ts` — which the mesh
-result and `mesh/meta` carry for later ground-placed exports; the dense cloud and splats are not cropped).
+result and `mesh/meta` carry for later ground-placed exports; the dense cloud and splats are not cropped). Keyframe decoding and the halo filter run on CPU
+helper workers while the GPU computes the next views (bit-identical results; docs/ENGINE.md).
 
 **Splat**: dense (else sparse) cloud → 3D Gaussians → WebGPU training against all keyframes
 (MCMC densification, depth supervision from the dense maps, per-view colour correction; optional

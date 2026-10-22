@@ -49,14 +49,19 @@ export class EngineDepthStore implements DepthMapStore {
     return d;
   }
 
-  async put(id: number, d: DepthMap): Promise<void> {
+  /**
+   * Store a map. `serialized`: its `serializeDepthMap(d, { float16: true })`, already made (by a CPU
+   * helper worker); else it is serialised here. The map is resident (and listed by `ids`) at once;
+   * the IndexedDB write completes with the promise.
+   */
+  async put(id: number, d: DepthMap, serialized?: ArrayBuffer): Promise<void> {
     this.known.add(id);
     if (!this.persistent) {
       this.memory.set(id, d);
       return;
     }
     this.cache.set(id, d);
-    await this.store!.putBinary(this.key(id), serializeDepthMap(d, { float16: true }));
+    await this.store!.putBinary(this.key(id), serialized ?? serializeDepthMap(d, { float16: true }));
   }
 
   /** Ids written through this instance (or found in the store by `scan`). */
@@ -77,9 +82,19 @@ export class EngineDepthStore implements DepthMapStore {
 
   /** Delete one map (memory + store). */
   async delete(id: number): Promise<void> {
+    this.forget(id);
+    await this.deleteStored(id);
+  }
+
+  /** Drop one map's resident copy and listing (the first half of `delete`); the stored copy stays. */
+  forget(id: number): void {
     this.memory.delete(id);
     this.cache.delete(id);
     this.known.delete(id);
+  }
+
+  /** Delete one map's stored copy (the second half of `delete`, e.g. once a later write has landed). */
+  async deleteStored(id: number): Promise<void> {
     if (this.persistent) await this.store!.deleteBinary(this.key(id)).catch(() => undefined);
   }
 

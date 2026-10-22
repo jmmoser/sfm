@@ -174,10 +174,18 @@ export interface EngineConfig {
   refineOfflineSfM?: 'auto' | 'always';
   /**
    * CPU helper workers (nested in the engine worker) that verify refine's candidate pairs and
-   * quantise its vocabulary in parallel (default: hardware threads − 2, at most 3; 0 = everything
+   * quantise its vocabulary in parallel, and in densify decode the next views and halo-filter the
+   * final depth maps while the GPU runs (default: hardware threads − 2, at most 3; 0 = everything
    * on the engine thread). Same results either way.
    */
   cpuWorkers?: number;
+  /**
+   * CPU/GPU overlap of densify's depth-map stage (src/engine/dense.ts; default true): keyframe
+   * decoding ahead and the final maps' halo filter on the CPU helper workers, and map writes in
+   * flight, while the GPU computes the next views — within the memory plan's headroom. false =
+   * serial (every CPU step on the engine thread between GPU passes). Bit-identical results.
+   */
+  denseOverlap?: boolean;
   /** Per-image focal lengths tied to the shared focal in the final refinement (default true; kept only if it helps). */
   perImageFocal?: boolean;
   /** Prior σ of the per-image focal (relative, default 0.005) and the required reprojection improvement (default 0.005). */

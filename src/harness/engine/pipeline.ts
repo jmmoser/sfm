@@ -298,6 +298,7 @@ function resolveConfig(c: HarnessConfig, meta: DatasetMeta | null, recording = f
     hfovPriorDeg: prior,
     hfovPriorDegUsed: used,
     densify: c.densify ?? false,
+    densifyRepeat: c.densifyRepeat ?? null,
     mesh: c.mesh ?? false,
     splat: c.splat ?? false,
     exports: c.exports ?? false,
@@ -993,6 +994,25 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
     }
     if (abortReason !== null) return finalize();
 
+    // ---- densify again on the same sparse model (A/B) ----
+    if (cfg.densifyRepeat && cloud) {
+      curStep = 'densifyRepeat';
+      t0 = performance.now();
+      try {
+        const ropts: DenseOptions = { ...(typeof cfg.densify === 'object' ? cfg.densify : {}), ...cfg.densifyRepeat };
+        const again = await eng.densify(ropts, onProgress('densifyRepeat'));
+        mark('densifyRepeat', t0);
+        const difference = cloudDifference(cloud, again);
+        result.denseRepeat = { options: ropts, count: again.count, ms: Math.round(result.timings.densifyRepeat), identical: difference === null, ...(difference ? { difference } : {}) };
+        log(`[harness] densify repeat ${JSON.stringify(ropts)}: ${again.count} points (${Math.round(result.timings.densifyRepeat)} ms), ${difference ? `DIFFERENT: ${difference}` : 'bit-identical to the first'}`);
+        cloud = again;
+      } catch (e) {
+        mark('densifyRepeat', t0);
+        fail('densifyRepeat', e);
+      }
+    }
+    if (abortReason !== null) return finalize();
+
     // ---- mesh ----
     let mesh: TriangleMesh | null = null;
     if (cfg.mesh && cloud) {
@@ -1145,6 +1165,24 @@ export function startPipeline(config: HarnessConfig, log: (msg: string) => void 
       fail(`write ${name}`, e);
       return null;
     }
+  }
+
+  /** First difference between two clouds (count, then each attribute bit for bit), or null. */
+  function cloudDifference(a: PointCloud, b: PointCloud): string | null {
+    if (a.count !== b.count) return `count ${a.count} vs ${b.count}`;
+    const attrs: [string, ArrayLike<number> | undefined, ArrayLike<number> | undefined, number][] = [
+      ['positions', a.positions, b.positions, 3],
+      ['colors', a.colors, b.colors, 3],
+      ['normals', a.normals, b.normals, 3],
+      ['radii', a.radii, b.radii, 1],
+      ['confidence', a.confidence, b.confidence, 1],
+    ];
+    for (const [name, x, y, k] of attrs) {
+      if (!x !== !y) return `${name} present in only one`;
+      if (!x || !y) continue;
+      for (let i = 0; i < k * a.count; i++) if (!Object.is(x[i], y[i])) return `${name} of point ${Math.floor(i / k)}: ${x[i]} vs ${y[i]}`;
+    }
+    return null;
   }
 
   function cloudSummary(c: PointCloud): CloudSummary {

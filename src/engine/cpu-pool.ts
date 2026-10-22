@@ -1,21 +1,28 @@
 /**
- * Pool of CPU helper workers (src/workers/cpu.worker.ts) for refine's independent CPU jobs: the
- * two-view verification of the candidate pairs, the visual-word quantisation of the keyframes and
- * the rolling-shutter hypotheses (short subset BAs), which otherwise run one after another on the
- * engine worker's single thread (e2e Metal object-real / yard-real: 10–23 s, ≈ 7.5 s and ≈ 12 s of
- * refine). The jobs are pure and deterministic, so the results are those of the engine thread;
- * callers apply them in their own order.
+ * Pool of CPU helper workers (src/workers/cpu.worker.ts) for independent CPU jobs that otherwise
+ * run one after another on the engine worker's single thread:
+ *  - refine: the two-view verification of the candidate pairs, the visual-word quantisation of the
+ *    keyframes and the rolling-shutter hypotheses (short subset BAs) (e2e Metal object-real /
+ *    yard-real: 10–23 s, ≈ 7.5 s and ≈ 12 s of refine);
+ *  - densify (`DenseHelpers`, src/engine/dense-jobs.ts): keyframe decoding + undistortion +
+ *    rolling-shutter warp of the next views and the final maps' halo filter + float16
+ *    serialisation, while the engine thread drives the GPU PatchMatch passes.
+ * The jobs are pure and deterministic, so the results are those of the engine thread; callers
+ * apply them in their own order.
  *
  * Nested dedicated workers: Safari 15.5+ (docs/research/ios-platform.md). Without `Worker` in the
  * engine's scope (Node tests, old browsers) or when a worker cannot be created, `create` returns
  * null and the callers run the jobs inline; a worker that fails later rejects its jobs (callers fall
  * back to inline for them) and is not used again.
  */
-import type { CameraIntrinsics, FeatureSet, MatchPairs } from '../core/types';
+import type { CameraIntrinsics, FeatureSet, MatchPairs, RGBAImage } from '../core/types';
+import type { DepthMap } from '../dense/types';
 import type { TwoViewGeometryResult, TwoViewOptions } from '../geometry/twoview';
 import type { RollingShutterModel, RSBundleCost } from '../sfm/rolling-shutter';
 import type { VocabularyIndex } from '../sfm/vocab';
 import type { CpuWorkerRequest, CpuWorkerResponse } from '../workers/cpu.worker';
+import type { DenseHelpers, DenseViewRS, HaloJobInput, HaloStoreResult } from './dense-jobs';
+import type { StoredImage } from './persistence';
 
 interface PoolWorker {
   worker: Worker;
@@ -32,11 +39,11 @@ export function defaultCpuWorkers(): number {
   return Math.max(0, Math.min(3, hc - 2));
 }
 
-export class CpuPool {
+export class CpuPool implements DenseHelpers {
   private readonly workers: PoolWorker[];
   private nextId = 1;
   /** Compute time reported by the workers (ms), per operation. */
-  readonly busyMs = { verify: 0, quantize: 0, rsCost: 0 };
+  readonly busyMs = { verify: 0, quantize: 0, rsCost: 0, denseView: 0, haloStore: 0 };
   private readonly vocabKeys = new WeakMap<VocabularyIndex, number>();
   private nextVocabKey = 1;
   private readonly rsKeys = new WeakMap<RSBundleCost, number>();
@@ -61,9 +68,14 @@ export class CpuPool {
     });
   }
 
+  /** Whether this realm can create the workers (`Worker` exists: not in Node tests). */
+  static available(): boolean {
+    return typeof Worker !== 'undefined';
+  }
+
   /** A pool of `size` workers (default `defaultCpuWorkers()`), or null when workers are unavailable. */
   static create(size = defaultCpuWorkers()): CpuPool | null {
-    if (!(size >= 1) || typeof Worker === 'undefined') return null;
+    if (!(size >= 1) || !CpuPool.available()) return null;
     const workers: Worker[] = [];
     try {
       for (let k = 0; k < size; k++) workers.push(new Worker(new URL('../workers/cpu.worker.ts', import.meta.url), { type: 'module', name: `cpu-${k}` }));
@@ -156,6 +168,34 @@ export class CpuPool {
         return CpuPool.result<number>(r);
       }),
     );
+  }
+
+  /**
+   * `decodeDenseView` (+ `denseColourThumbnail` when `thumbBytes` > 0) on a worker: the stored
+   * keyframe is posted (a Blob is shared, raw RGBA copied), the images come back transferred.
+   */
+  async denseView(
+    stored: StoredImage,
+    distorted: CameraIntrinsics,
+    maxSize: number,
+    rs: DenseViewRS | null,
+    thumbBytes: number,
+  ): Promise<{ image: RGBAImage; cam: CameraIntrinsics; thumb: RGBAImage | null }> {
+    const w = this.pick();
+    const r = await this.post(w, { id: this.nextId++, op: 'denseView', stored, distorted, maxSize, rs, thumbBytes });
+    this.busyMs.denseView += r.ms;
+    return CpuPool.result<{ image: RGBAImage; cam: CameraIntrinsics; thumb: RGBAImage | null }>(r);
+  }
+
+  /**
+   * `haloStoreJob(copy of map, halo, serialize)` on a worker. The map and the image are COPIED (not
+   * transferred): the caller keeps its own, so a worker that fails never loses a depth map.
+   */
+  async haloStore(map: DepthMap, halo: HaloJobInput | null, serialize: boolean): Promise<HaloStoreResult> {
+    const w = this.pick();
+    const r = await this.post(w, { id: this.nextId++, op: 'haloStore', map, halo, serialize });
+    this.busyMs.haloStore += r.ms;
+    return CpuPool.result<HaloStoreResult>(r);
   }
 
   dispose(): void {

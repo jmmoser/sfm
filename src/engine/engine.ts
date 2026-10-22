@@ -979,6 +979,10 @@ export class PhotogrammetryEngine {
           residentBytes: resident,
           gravityAligned: sky.gravityAligned,
           gravityCam: sky.gravityCam,
+          // CPU/GPU overlap: helper workers for the depth-map stage (created there only when the
+          // memory plan allows, disposed when the depth maps end)
+          cpuWorkers: CpuPool.available() ? (this.config.cpuWorkers ?? defaultCpuWorkers()) : 0,
+          createHelpers: (n) => CpuPool.create(n),
         },
         opts ?? {},
         progress,

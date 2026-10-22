@@ -28,7 +28,7 @@ export {
   type SparsePointsInput,
 } from './view-selection';
 export { fuseDepthMaps, DEFAULT_FUSION_OPTIONS, type FusionOptions, type FusionStats } from './fusion';
-export { depthHaloMask, removeDepthHalos, worldUpInCamera, skyBorders, DEFAULT_HALO_FILTER_OPTIONS, type HaloFilterOptions } from './depth-filter';
+export { depthHaloMask, removeDepthHalos, applyDepthHaloMask, worldUpInCamera, skyBorders, DEFAULT_HALO_FILTER_OPTIONS, type HaloFilterOptions } from './depth-filter';
 export { DENSE_PRESETS, type DensePreset, type DenseQuality } from './presets';
 export { tsdfMesh, buildTsdfVolume, integrateDepthMap, TsdfVolume, type TsdfBounds, type TsdfOptions, type TsdfStats } from './tsdf';
 export { proposeObjectRoi, objectRoiPivot, type ObjectRoiInput, type ObjectRoiOptions, type ObjectRoiProposal } from './object-roi';
