@@ -672,7 +672,10 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   await tick();
   let liveRec: Reconstruction | null = null;
   if (live.mapper.initialized) {
-    // keyframes that never registered live get another chance with the enriched graph
+    // keyframes that never registered live get another chance with the enriched graph (with the
+    // live mapper's neighbour re-triangulation and gyro-aided registration)
+    const aided = live.mapper.incrementalMapper.numKnownRotationRegistrations,
+      retri = live.mapper.retriangulation.registered;
     for (const id of live.mapper.pendingIds()) {
       checkCancel(cancel, 'reconstruction');
       try {
@@ -681,6 +684,8 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
         /* stays unregistered */
       }
     }
+    stats.gyroAidedRegistrations = `${aided} live, ${live.mapper.incrementalMapper.numKnownRotationRegistrations - aided} in refine`;
+    stats.retriangulatedRegistrations = `${retri} live, ${live.mapper.retriangulation.registered - retri} in refine (${live.mapper.retriangulation.attempts} attempts)`;
     await live.mapper.incrementalMapper.iterativeGlobalRefinement(undefined, cancel, true);
     liveRec = live.mapper.reconstruction;
   }

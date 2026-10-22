@@ -15,6 +15,14 @@
  * `LiveMapper.addKeyframe`, vocabulary training / indexing, the R_cam_device hand-eye check,
  * 'auto' mode resolution, persistence and a `live` event with the decimated model.
  *
+ * Gyro-aided registration (`predictRotation`, once R_cam_device is verified): a keyframe P3P
+ * cannot register even after LiveMapper re-triangulated its neighbours is registered with the
+ * rotation the gyro propagates from the registered keyframe nearest in time. At a phone's 2–4
+ * analysed frames per second a fast pan rotates 30°+ between frames and the first keyframe past the
+ * map sees a few dozen triangulated points; P3P's 30-inlier floor used to lose tracking there for
+ * the rest of the capture (e2e yard-real at stride 3: 19/48 keyframes registered live, 48/48 now;
+ * docs/research/real-capture-robustness.md "Phone-rate capture").
+ *
  * Limits: there is one live model — when tracking is lost for good, later keyframes stay pending
  * (refine's offline SfM handles disconnected captures); the 'auto' decision is a heuristic. The
  * worker is single-threaded, so synchronous steps (LiveMapper global BA, vocabulary training at
@@ -411,6 +419,7 @@ export class LiveSession {
     this.mapper = new LiveMapper(this.state.db, this.state.graph, {
       hfovPriorDeg: deps.hfovPriorDeg ?? 69,
       rotationCheck: this.rotationCheck(),
+      ...(deps.config.gyroAidedRegistration === false ? {} : { predictRotation: (id: number, rec: Reconstruction) => this.predictRotation(id, rec) }),
       reportReprojError: false, // never read here; a full reprojection per keyframe
       ...(deps.config.live ?? {}),
     });
@@ -529,6 +538,38 @@ export class LiveSession {
       },
       pose: (id, pose, rec) => this.checkPoseGyro(id, pose, rec),
     };
+  }
+
+  /** Longest |Δt| (ms) over which `predictRotation` propagates a registered keyframe's rotation. */
+  private static readonly PREDICT_MAX_GAP_MS = 3000;
+
+  /**
+   * `MapperOptions.predictRotation` (gyro-aided registration; `EngineConfig.gyroAidedRegistration`):
+   * the rotation of keyframe `id` in `rec`'s frame, R̂ = R_c(t_n → t) · R_n from the registered
+   * keyframe n nearest in time (|Δt| ≤ 3 s, IMU-covered), with σ = 1° + 0.3°/s·|Δt| + 3 % of the
+   * gyro rotation (integration noise, the uncompensated bias and camera–IMU offset during capture,
+   * rolling shutter; the bias-compensated gyro is within 0.2–1.6° of the truth on the e2e captures).
+   * Null until R_cam_device is verified (`gyroForChecks`): a wrong mapping predicts wrong rotations.
+   */
+  predictRotation(id: number, rec: Reconstruction): { R: Mat3; sigmaRad: number } | null {
+    const gyro = this.gyroForChecks();
+    const r = this.state.records.get(id);
+    if (!gyro || !r) return null;
+    const near: { t: number; R: Mat3; dt: number }[] = [];
+    for (const rid of rec.registeredImageIds()) {
+      const rr = rid === id ? undefined : this.state.records.get(rid);
+      const im = rec.images.get(rid);
+      if (!rr || !im) continue;
+      const dt = Math.abs(rr.t - r.t);
+      if (dt <= LiveSession.PREDICT_MAX_GAP_MS) near.push({ t: rr.t, R: im.pose.R, dt });
+    }
+    near.sort((a, b) => a.dt - b.dt);
+    for (const nb of near) {
+      const G = gyro.relative(nb.t, r.t);
+      if (!G) continue;
+      return { R: mat3Mul(G, nb.R), sigmaRad: (1 + 0.3e-3 * nb.dt) * DEG + 0.03 * rotationAngle(G) };
+    }
+    return null;
   }
 
   /**

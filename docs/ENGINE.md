@@ -123,11 +123,16 @@ picks object vs scene after initialisation from the scene depth / baseline.
    previous 6 keyframes + retrieval candidates (+ spatial neighbours of the gyro-propagated
    pose of the last registered keyframe), verify, reject pairs whose rotation disagrees
    with the gyro, update the graph, `LiveMapper.addKeyframe` (registrations checked
-   against the gyro too).
+   against the gyro too). A keyframe at the edge of the map (after a fast pan at a phone's
+   2–4 analysed frames per second) first has its registered neighbours triangulated again —
+   its pairs turned their two-view tracks multi-view — and one P3P still cannot register
+   (fewer than 30 inliers) is registered with its gyro-predicted rotation from ≥ 15 inliers
+   (`EngineConfig.gyroAidedRegistration`).
 
 ### Refine
 Train/extend the vocabulary → candidate pairs (sequential 10, retrieval 15,
-spatial 10) → match + verify (+ gyro gate) → refine the live model → gyro calibration
+spatial 10) → match + verify (+ gyro gate) → refine the live model (pending keyframes retried
+with the enriched graph, as during capture) → gyro calibration
 (bias, camera–IMU offset) → rolling-shutter estimation on the live model (gyro rotation +
 translation from the neighbouring keyframes × point depth; 2 passes) and keypoint
 correction → only when the live model is unhealthy (`liveModelHealth`: unregistered keyframes,

@@ -117,6 +117,16 @@ export interface EngineConfig {
   /** Tolerance of the gyro gates (defaults: 5° + 0.3°/s × |Δt| + 5 % of the rotation). */
   gyroTolerance?: Partial<GyroToleranceOptions>;
   /**
+   * Gyro-aided registration (default true, active once R_cam_device is verified): a keyframe P3P
+   * cannot register (fewer than 30 inliers) is registered with its rotation predicted by the gyro
+   * from the registered keyframe nearest in time, from ≥ 15 inliers (`LiveSession.predictRotation`,
+   * `MapperOptions.predictRotation`; live and in refine's retry of the pending keyframes). With the
+   * LiveMapper's neighbour re-triangulation (`live.retriangulateNeighbours`) it keeps a phone-rate
+   * capture registered through fast pans (e2e yard-real at stride 3: 19/48 → 48/48 keyframes live;
+   * docs/research/real-capture-robustness.md "Phone-rate capture").
+   */
+  gyroAidedRegistration?: boolean;
+  /**
    * Estimate the gyro bias / camera–IMU offset from the live keyframes every 10 registrations
    * during capture (default false; refine always calibrates once before the rolling-shutter estimation).
    * Off because it changes the keyframe selection and measured equal or worse (yard-real ATE 7.0e-4

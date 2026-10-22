@@ -93,6 +93,67 @@ describe('LiveMapper', () => {
     expect(live.reconstruction.numRegisteredImages).toBe(30);
   });
 
+  it('re-triangulates the registered neighbours of a keyframe whose correspondences turned their two-view tracks multi-view', () => {
+    const scene = generateScene({ kind: 'walk', numImages: 30, seed: 6, numPoints: 6000, noisePx: 0.5, descriptors: false });
+    const { db } = buildSyntheticDatabase(scene, { verify: false });
+    const ids = db.frameIds();
+    const K = 14;
+    const point = (id: number, f: number): number => scene.featurePoint[ids.indexOf(id)][f];
+    // "New region" S: the points keyframes K − 2, K − 1 and K all see. After a fast pan only those
+    // keyframes overlap there: S is matched between K − 2 and K − 1 only until K arrives (two-view
+    // tracks, which the triangulator does not create points from), K sees just 10 other map points,
+    // and the keyframes after K overlap K and later ones (and S in K − 2 / K − 1).
+    const seen = (k: number): Set<number> => new Set(Array.from(scene.featurePoint[k]).filter((p) => p >= 0));
+    const s2 = seen(K - 2),
+      s1 = seen(K - 1);
+    const S = new Set([...seen(K)].filter((p) => s2.has(p) && s1.has(p)));
+    expect(S.size).toBeGreaterThan(200);
+    const filter = (j: number, id: number, inl: Uint32Array): Uint32Array | null => {
+      const near = j === ids[K - 2] || j === ids[K - 1];
+      if (id >= ids[K] && j < ids[K - 2]) return null;
+      const out: number[] = [];
+      let others = 0;
+      for (let k = 0; k < inl.length; k += 2) {
+        const inS = S.has(point(j, inl[k]));
+        if (id >= ids[K - 2] && j < ids[K - 2] && inS) continue;
+        if (id >= ids[K] && near && !inS && (id > ids[K] || others++ >= 10)) continue;
+        out.push(inl[k], inl[k + 1]);
+      }
+      return out.length >= 30 ? Uint32Array.from(out) : null;
+    };
+    const stream = (retriangulateNeighbours: number): { live: LiveMapper; atK: { registered: boolean; points: number } } => {
+      const graph = new CorrespondenceGraph();
+      const live = new LiveMapper(db, graph, { intrinsics: { ...scene.camera }, retriangulateNeighbours });
+      let atK = { registered: false, points: 0 };
+      for (const id of ids) {
+        graph.addImage(id, db.features.get(id)!.count);
+        for (const j of ids) {
+          if (j >= id) break;
+          const g = db.getTwoView(j, id);
+          const inl = g ? filter(j, id, g.inliers) : null;
+          if (inl) graph.addTwoView(j, id, inl);
+        }
+        const r = live.addKeyframe(id);
+        if (id === ids[K]) atK = { registered: r.registered, points: live.reconstruction.images.get(id)!.numVisiblePoints3D };
+      }
+      return { live, atK };
+    };
+    // as before: K sees 10 map points and the rest of the walk is lost
+    const off = stream(0);
+    expect(off.atK.registered).toBe(false);
+    expect(off.atK.points).toBeLessThanOrEqual(10);
+    expect(off.live.pendingIds()).toEqual(ids.slice(K));
+    // re-triangulated: K − 2 / K − 1 give S, K registers on it, and so does the rest
+    const { live: on, atK } = stream(6);
+    expect(atK.registered).toBe(true);
+    expect(atK.points).toBeGreaterThan(100);
+    expect(on.pendingIds()).toEqual([]);
+    const ev = evaluateReconstruction(on.reconstruction, scene);
+    expect(ev.numRegistered).toBe(30);
+    expect(ev.ateRelative).toBeLessThan(0.005);
+    expect(ev.maxRotErrorDeg).toBeLessThan(0.5);
+  });
+
   it('never initialises from pure rotation', () => {
     const db = rotationOnlyDb();
     const graph = new CorrespondenceGraph();
