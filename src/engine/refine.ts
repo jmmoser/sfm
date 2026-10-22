@@ -2,10 +2,12 @@
  * Refine after capture (ENGINE.md "Refine"): vocabulary retrain / extend → candidate pairs
  * (sequential 10, retrieval 15, spatial 10) → match + verify → refined live model → unless it is
  * healthy (`liveModelHealth`), a full incremental SfM from scratch (live-refined intrinsics as the
- * initial guess, gyro-aided registration as live) and the better of the live and the offline model
- * (gyro breaks, registered images, explained correspondences, mean reprojection error) → final
- * global BA with self-calibration (f, k1, k2), re-triangulation and filtering → world alignment
- * (IMU gravity / time offset / metric scale, GPS, compass; verified R_cam_device) → SparseModel.
+ * initial guess; gyro-aided registration after P3P failed on every candidate, unless the live model
+ * it checks holds such registrations) and the better of the live and the offline model (gyro
+ * breaks, registered images — the gyro-aided ones only for a model without an unclosed loop —,
+ * explained correspondences, mean reprojection error) → final global BA with self-calibration (f,
+ * k1, k2), re-triangulation and filtering → world alignment (IMU gravity / time offset / metric
+ * scale, GPS, compass; verified R_cam_device) → SparseModel.
  *
  * The offline SfM can return several models: only the largest is kept (no merging); stats
  * `offlineModels` / `offlineDroppedImages` report the others, and `unconnectedImages` the
@@ -458,8 +460,10 @@ export const DEFAULT_LIVE_HEALTH_OPTIONS: Readonly<Omit<LiveHealthOptions, 'spli
  *  - every keyframe of `keyframes` is registered, and at least `minImages`;
  *  - the gyro is verified (`gyro` not null) and the model has no gyro breaks or outliers;
  *  - no keyframe of the model was registered with the gyro-predicted rotation (`gyroAided`,
- *    IncrementalMapper.knownRotationImages): its rotation agrees with the gyro by construction, so
- *    the gyro checks are no evidence for it, and it makes "every keyframe registered" easy. A live
+ *    IncrementalMapper.knownRotationImages; only with EngineConfig.gyroAidedRegistration 'all'):
+ *    its rotation agrees with the gyro by construction, so the gyro checks are no evidence for it,
+ *    and it makes "every keyframe registered" easy (the offline SfM then runs without the gyro
+ *    path, as their independent check). A live
  *    model registered through the gyro path drifted unnoticed (e2e yard-real at stride 3 from frame
  *    1, the gyro path alone: 49/49 registered, 0.5 m / 3° apart at the loop's ends, ATE 6.9e-3, 16
  *    loop-like split correspondences — healthy by the other rules);
@@ -504,22 +508,76 @@ export function liveModelHealth(
   const explained = explainedCorrespondenceRatio(rec, db);
   if (!(explained >= o.minExplained)) return out(false, `${(100 * explained).toFixed(1)} % of the correspondences explained (< ${(100 * o.minExplained).toFixed(0)} %)`, explained);
   const sp = splitPairs(rec, db, opts.split);
-  const maxLoop = Math.max(o.maxLoopCorrespondences, o.maxLoopFraction * sp.correspondences);
-  const maxSplit = Math.max(o.maxSplitCorrespondences, o.maxSplitFraction * sp.correspondences);
-  const counts = `${sp.loopCorrespondences} correspondences on ${sp.loopPairs} loop-like and ${sp.splitCorrespondences} on ${sp.splitPairs} split pairs`;
-  if (sp.loopCorrespondences > maxLoop || sp.splitCorrespondences > maxSplit)
-    return out(false, `unclosed loop? ${counts} (limits ${Math.round(maxLoop)} / ${Math.round(maxSplit)})`, explained, sp);
-  const pos = new Map(keyframes.map((id, k) => [id, k]));
-  const span = (l: { a: number; b: number }): number => Math.abs((pos.get(l.a) ?? NaN) - (pos.get(l.b) ?? NaN));
-  const far = sp.loops.filter((l) => span(l) >= o.maxLoopSpan * keyframes.length);
-  if (far.length > 0)
-    return out(false, `unclosed loop? loop-like split pairs across the capture: ${far.map((l) => `${l.a}-${l.b} (${l.split})`).join(', ')}`, explained, sp);
+  const open = unclosedLoop(sp, keyframes, opts);
+  if (open) return out(false, open, explained, sp);
   return out(
     true,
-    `all ${n} keyframes registered, gyro-consistent (median ${gyro.medianErrDeg.toFixed(2)}°), ${(100 * explained).toFixed(1)} % explained, ${counts}`,
+    `all ${n} keyframes registered, gyro-consistent (median ${gyro.medianErrDeg.toFixed(2)}°), ${(100 * explained).toFixed(1)} % explained, ${splitCounts(sp)}`,
     explained,
     sp,
   );
+}
+
+function splitCounts(sp: SplitPairStats): string {
+  return `${sp.loopCorrespondences} correspondences on ${sp.loopPairs} loop-like and ${sp.splitCorrespondences} on ${sp.splitPairs} split pairs`;
+}
+
+/**
+ * The unclosed-loop rules of `liveModelHealth` on a model's `splitPairs`: too many correspondences
+ * on loop-like split pairs or on split pairs at all, or a loop-like split pair across ≥ maxLoopSpan
+ * of `keyframes` (capture order). Returns the symptom, or null when the model shows none.
+ */
+export function unclosedLoop(sp: SplitPairStats, keyframes: readonly number[], opts: Partial<LiveHealthOptions> = {}): string | null {
+  const o = { ...DEFAULT_LIVE_HEALTH_OPTIONS, ...opts };
+  const maxLoop = Math.max(o.maxLoopCorrespondences, o.maxLoopFraction * sp.correspondences);
+  const maxSplit = Math.max(o.maxSplitCorrespondences, o.maxSplitFraction * sp.correspondences);
+  if (sp.loopCorrespondences > maxLoop || sp.splitCorrespondences > maxSplit)
+    return `unclosed loop? ${splitCounts(sp)} (limits ${Math.round(maxLoop)} / ${Math.round(maxSplit)})`;
+  const pos = new Map(keyframes.map((id, k) => [id, k]));
+  const span = (l: { a: number; b: number }): number => Math.abs((pos.get(l.a) ?? NaN) - (pos.get(l.b) ?? NaN));
+  const far = sp.loops.filter((l) => span(l) >= o.maxLoopSpan * keyframes.length);
+  if (far.length > 0) return `unclosed loop? loop-like split pairs across the capture: ${far.map((l) => `${l.a}-${l.b} (${l.split})`).join(', ')}`;
+  return null;
+}
+
+/** What `liveModelBetter` compares of a model. */
+export interface ModelScore {
+  registered: number;
+  /** Gyro breaks without outliers (`gyroConsistency`). */
+  gyroBreaks: number;
+  /** Explained share of the verified correspondences, mean reprojection error (px). */
+  explained: number;
+  reprojError: number;
+  /** Registered images of the model registered with the gyro-predicted rotation. */
+  gyroAided: number;
+  /** `unclosedLoop` of the model (only needed when gyroAided > 0). */
+  unclosedLoop: string | null;
+}
+
+/**
+ * Refine's model choice: true when the live model is at least as good as the offline one — fewer
+ * gyro breaks, then more registered images, then (beyond `minExplainedGap`) a larger explained
+ * share, then a reprojection error no larger. Registrations with the gyro-predicted rotation (≥ 15
+ * inliers; their rotation agrees with the gyro by construction) count only for a model without an
+ * unclosed loop: a wrong one joining two fragments leaves the loop of a loop capture open, and
+ * they must not win the choice by registered images on their own (before the gyro path the
+ * offline SfM kept the largest P3P fragment). Not caught: a wrong join in a capture without a loop.
+ */
+export function liveModelBetter(live: ModelScore, offline: ModelScore, minExplainedGap: number): boolean {
+  if (live.gyroBreaks !== offline.gyroBreaks) return live.gyroBreaks < offline.gyroBreaks;
+  const counted = (m: ModelScore): number => m.registered - (m.unclosedLoop ? m.gyroAided : 0);
+  const lr = counted(live),
+    or = counted(offline);
+  if (lr !== or) return lr > or;
+  if (Math.abs(live.explained - offline.explained) > minExplainedGap) return live.explained > offline.explained;
+  return live.reprojError <= offline.reprojError;
+}
+
+/** The images of `ids` registered in `rec`. */
+function registeredOf(rec: Reconstruction, ids: Iterable<number>): number[] {
+  const out: number[] = [];
+  for (const id of ids) if (rec.images.get(id)?.registered) out.push(id);
+  return out;
 }
 
 /** Full refine pipeline. */
@@ -738,7 +796,7 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
         /* stays unregistered */
       }
     }
-    stats.gyroAidedRegistrations = `${aided} live, ${live.mapper.incrementalMapper.numKnownRotationRegistrations - aided} in refine`;
+    stats.gyroAidedRegistrations = live.mapper.opts.predictRotation ? `${aided} live, ${live.mapper.incrementalMapper.numKnownRotationRegistrations - aided} in refine` : 'off live';
     stats.retriangulatedRegistrations = `${retri} live, ${live.mapper.retriangulation.registered - retri} in refine (${live.mapper.retriangulation.attempts} attempts)`;
     await live.mapper.incrementalMapper.iterativeGlobalRefinement(undefined, cancel, true);
     liveRec = live.mapper.reconstruction;
@@ -830,38 +888,47 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   }
   checkCancel(cancel, 'reconstruction');
   const liveCam = liveRec && liveRec.numRegisteredImages >= 3 ? [...liveRec.cameras.values()][0] : undefined;
+  // keyframes registered with the gyro-predicted rotation (EngineConfig.gyroAidedRegistration 'all')
+  const liveAided = liveRec ? registeredOf(liveRec, live.mapper.incrementalMapper.knownRotationImages) : [];
   const mapperOpts: Partial<RunSfMOptions> = {
     hfovPriorDeg: live.mapper.opts.hfovPriorDeg,
     ...(liveCam ? { intrinsics: { ...liveCam } } : {}),
     // gyro gate of registrations / initial pairs (active once R_cam_device is verified)
     rotationCheck: live.rotationCheck(),
-    // gyro-aided registration as live (EngineConfig.gyroAidedRegistration): at a phone's analysis
-    // rate the from-scratch SfM otherwise loses the keyframes the live mapper registered with it or
-    // with re-triangulated neighbours (e2e yard-real at stride 3 from frame 1: 3 models, the largest
-    // 32 of 48 keyframes; with it 1 model of 48), and so could never replace a live model whose
-    // loop did not close (docs/research/real-capture-robustness.md "Phone-rate capture")
-    ...(cfg.gyroAidedRegistration === false ? {} : { predictRotation: (id: number, r: Reconstruction) => live.predictRotation(id, r) }),
+    // gyro-aided registration (EngineConfig.gyroAidedRegistration, default 'offline'): at a phone's
+    // analysis rate P3P alone splits the from-scratch SfM where the live mapper's re-triangulated
+    // neighbours carried it (e2e yard-real at stride 3 from frame 1: 3 models, the largest 32 of 48
+    // keyframes; with it 1 model of 48), so it could never replace a live model whose loop did not
+    // close (docs/research/real-capture-robustness.md "Phone-rate capture"). Not when the live
+    // model holds such registrations: the offline SfM is their independent check, so P3P only.
+    ...((cfg.gyroAidedRegistration ?? 'offline') !== 'off' && liveAided.length === 0
+      ? { predictRotation: (id: number, r: Reconstruction) => live.predictRotation(id, r) }
+      : {}),
     ...(cfg.mapper ?? {}),
   };
   // the offline SfM checks the live model independently: skipped when the live model is healthy
   const lc = consistency(liveRec);
-  const health = liveRec && cfg.refineOfflineSfM !== 'always' ? liveModelHealth(liveRec, st.db, order, lc, {}, live.mapper.incrementalMapper.knownRotationImages) : null;
+  const health = liveRec && cfg.refineOfflineSfM !== 'always' ? liveModelHealth(liveRec, st.db, order, lc, {}, liveAided) : null;
   stats.offlineSfM = health?.healthy ? `skipped: ${health.reason}` : health ? `run: ${health.reason}` : 'run';
   deps.log('info', `refine: offline SfM ${stats.offlineSfM}`);
   if (health?.split) deps.log('info', `refine: live model split pairs: ${health.split.detail.slice(0, 40).join('; ')}`);
   let offline: Reconstruction | null = null;
+  let offlineAided: number[] = [];
   if (!health?.healthy) {
     const tOff = now();
     try {
-      const gyroAided = new Map<Reconstruction, number>();
+      const gyroAided = new Map<Reconstruction, readonly number[]>();
       const models = await runIncrementalSfM(
         st.db,
-        { ...mapperOpts, onModel: (r, _t, m) => gyroAided.set(r, m.numKnownRotationRegistrations) },
+        { ...mapperOpts, onModel: (r, _t, m) => gyroAided.set(r, [...m.knownRotationImages]) },
         (e) => report('reconstruction', 0.1 + 0.85 * Math.max(0, e.progress), e.message),
         cancel,
       );
       offline = models[0] ?? null;
-      if (offline) stats.gyroAidedRegistrations = `${stats.gyroAidedRegistrations ?? '0 live, 0 in refine'}, ${gyroAided.get(offline) ?? 0} offline`;
+      if (offline) {
+        offlineAided = registeredOf(offline, gyroAided.get(offline) ?? []);
+        stats.gyroAidedRegistrations = `${stats.gyroAidedRegistrations ?? 'off live'}, ${mapperOpts.predictRotation ? offlineAided.length : 'off'} offline`;
+      }
       // only the largest model is kept: report what the others held (split frequency on real captures)
       stats.offlineModels = models.length;
       if (models.length > 1) {
@@ -897,24 +964,38 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   if (offline) stats.offlineExplained = Math.round(1000 * ox) / 1000;
   const fmtSplit = (sp: SplitPairStats): string =>
     `${(100 * sp.splitRatio).toFixed(2)} % of ${sp.correspondences} correspondences split; ${sp.splitCorrespondences} on ${sp.splitPairs} split pairs, ${sp.loopCorrespondences} on ${sp.loopPairs} loop-like`;
+  let liveSp: SplitPairStats | null = null,
+    offlineSp: SplitPairStats | null = null;
   if (liveRec) {
-    const sp = health?.split ?? splitPairs(liveRec, st.db);
-    stats.liveSplit = fmtSplit(sp);
-    if (!health?.split) deps.log('info', `refine: live model ${stats.liveSplit}; split pairs: ${sp.detail.slice(0, 40).join('; ')}`);
+    liveSp = health?.split ?? splitPairs(liveRec, st.db);
+    stats.liveSplit = fmtSplit(liveSp);
+    if (!health?.split) deps.log('info', `refine: live model ${stats.liveSplit}; split pairs: ${liveSp.detail.slice(0, 40).join('; ')}`);
   }
   if (offline) {
-    const sp = splitPairs(offline, st.db);
-    stats.offlineSplit = fmtSplit(sp);
-    deps.log('info', `refine: offline model ${stats.offlineSplit}; split pairs: ${sp.detail.slice(0, 40).join('; ')}`);
+    offlineSp = splitPairs(offline, st.db);
+    stats.offlineSplit = fmtSplit(offlineSp);
+    deps.log('info', `refine: offline model ${stats.offlineSplit}; split pairs: ${offlineSp.detail.slice(0, 40).join('; ')}`);
   }
   const minExplainedGap = cfg.modelChoiceExplainedGap ?? 0.015;
-  const liveBetter = (): boolean => {
-    if (lb !== ob) return lb < ob;
-    if (lr !== or) return lr > or;
-    if (Math.abs(lx - ox) > minExplainedGap) return lx > ox;
-    return le <= oe;
-  };
-  if (!offline || (liveRec && liveBetter())) {
+  const scoreOf = (n: number, breaks: number, explained: number, reproj: number, aided: readonly number[], sp: SplitPairStats | null): ModelScore => ({
+    registered: n,
+    gyroBreaks: breaks,
+    explained,
+    reprojError: reproj,
+    gyroAided: aided.length,
+    unclosedLoop: aided.length > 0 && sp ? unclosedLoop(sp, order) : null,
+  });
+  const ls = scoreOf(lr, lb, lx, le, liveAided, liveSp),
+    os = scoreOf(or, ob, ox, oe, offlineAided, offlineSp);
+  for (const [name, m] of [
+    ['live', ls],
+    ['offline', os],
+  ] as const) {
+    if (!m.unclosedLoop) continue;
+    stats[`${name}GyroAidedNotCounted`] = m.gyroAided;
+    deps.log('warn', `refine: ${m.gyroAided} gyro-aided registration(s) of the ${name} model not counted in the model choice (${m.unclosedLoop})`);
+  }
+  if (!offline || (liveRec && liveModelBetter(ls, os, minExplainedGap))) {
     chosen = liveRec!;
     which = 'live';
   } else {

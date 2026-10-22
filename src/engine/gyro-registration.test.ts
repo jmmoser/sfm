@@ -94,20 +94,22 @@ describe('LiveSession.predictRotation (gyro-aided registration)', () => {
     expect(live.predictRotation(40, model([11]))).not.toBeNull();
   });
 
-  it('needs the verified R_cam_device; works without the gyro gates; off with gyroAidedRegistration: false', () => {
+  it("needs the verified R_cam_device; works without the gyro gates; in the live mapper only with gyroAidedRegistration: 'all'", () => {
     const rec = model([25]);
     expect(session({}, false).predictRotation(30, rec)).toBeNull();
     // the gates off (A/B of the gyro checks) leaves the registration aid on
     const ungated = session({ gyroGate: false });
     expect(ungated.gyroForChecks()).toBeNull();
     expect(rotationAngleBetween(ungated.predictRotation(30, rec)!.R, cap.frames[30].pose.R) / DEG).toBeLessThan(0.05);
-    // wired into the live mapper unless disabled
-    expect(session().mapper.opts.predictRotation).toBeTypeOf('function');
+    // wired into the live mapper only on request (default 'offline': refine's offline SfM alone)
+    expect(session().mapper.opts.predictRotation).toBeUndefined();
+    expect(session({ gyroAidedRegistration: 'offline' }).mapper.opts.predictRotation).toBeUndefined();
+    expect(session({ gyroAidedRegistration: 'all' }).mapper.opts.predictRotation).toBeTypeOf('function');
     // a rejected P3P pose the known rotation then registered is reported apart from the rejections
     const s = session();
     s.mapper.opts.rotationCheck!.poseRecovered!(30);
     expect(s.stats).toMatchObject({ gyroRejectedPoses: 0, gyroRecoveredPoses: 1 });
-    expect(session({ gyroAidedRegistration: false }).mapper.opts.predictRotation).toBeUndefined();
+    expect(session({ gyroAidedRegistration: 'off' }).mapper.opts.predictRotation).toBeUndefined();
     // an IMU gap (> 0.5 s) over the interval: no prediction
     const gap = session();
     gap.state.imu.load(cap.imu.filter((s) => s.t < cap.frames[26].t || s.t > cap.frames[33].t));

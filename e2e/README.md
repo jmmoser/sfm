@@ -1107,24 +1107,41 @@ dense: the same with `--dense-size 480 --tag verify-dense480` (instead of `--no-
 #### Phone-like analysis rate (`--stride 3`, 2026-10-22, worker engine, CPU features)
 
 `node e2e/run-e2e.mjs <dataset> --stride 3 [--start 1|2] --no-dense --set 'engineConfig={"featureBackend":"cpu"}'`
-analyses 2 (yard) / 2.7 (object) frames per second, the rate a phone may reach. Before = claude/next-level b2377c7;
-after = re-triangulation of the registered neighbours of a keyframe at the edge of the map, then gyro-aided
-registration (live, in refine's retry and its offline SfM) and the offline SfM for live models with an unclosed loop,
-run back to back (every run, the diagnosis and the stride-1 checks: ../docs/research/real-capture-robustness.md
-"Phone-rate capture").
+analyses 2 (yard) / 2.7 (object) frames per second, the rate a phone may reach.
 
-| dataset | live kf reg | lost frames | offline SfM | ATE / extent | rot° p50 | failed checks |
-|---|---|---|---|---|---|---|
-| yard-real, before (5 runs) | 19/48 | 38 of 80 | run (29 not registered) | 5.1e-4 (offline) | 0.11 | – |
-| yard-real, after (5 runs) | 48/48 | 0 | skipped | 5.3e-4 (live) | 0.12 | – |
-| yard-real `--start 1`, before (4) | 20/49 | 38 | run | 6.6e-4 (offline, 33 of 49) | 0.22 | registrationRate, gravityErrorDeg |
-| yard-real `--start 1`, after (4) | 48/48 | 0 | 3 skipped, 1 run (open loop) | 9.6e-4–1.03e-3 (48 of 48) | 0.13–0.15 | 1 run ateRelative (1.03e-3) |
-| yard-real `--start 2`, before / after (2 + 2) | 20/51 / 34/51 | 39 / 17 | run | 1.70–1.78e-3 / 1.84–1.85e-3 (offline, 37 of 51) | 0.32–0.35 / 0.40 | registrationRate, ateRelative, rotErrDegMedian |
-| object-real, before / after (2 + 2) | 50/50 | 0 | skipped | 6.0e-4 / 6.0e-4 | 0.20 / 0.20 | – |
+- Before = claude/next-level 7598a6e.
+- After = the second-review state:
+  - re-triangulation of the registered neighbours of a keyframe at the edge of the map;
+  - gyro-aided registration only in refine's offline SfM (`gyroAidedRegistration: 'offline'`),
+    after P3P failed on every candidate, and refused when no verified pair checks the baseline;
+  - the offline SfM for live models with an unclosed loop.
+- Runs were back to back. Every run, the diagnosis and the stride-1 checks:
+  ../docs/research/real-capture-robustness.md "Phone-rate capture", "Second review".
+- The "gyro-aided" column is refine's `stats.gyroAidedRegistrations` in result.json (also
+  self-metrics `gyro.aidedRegistrations`); "off" = path not configured.
 
-`--start 2` loses the loop's corner both before and after (no map points to register on); its offline ATE spread is
-that of the before code (1.87e-3 with both new paths off). The stride-3 `scaleError` failure of 2026-10-21 is gone
-on both sides (the keyframe-interval IMU scale of claude/next-level).
+| dataset | live kf reg | lost frames | offline SfM | gyro-aided | ATE / extent | rot° p50 | failed checks |
+|---|---|---|---|---|---|---|---|
+| yard-real, before (3 runs) | 19/48 | 38 of 80 | run (29 not registered) | – | 5.10–5.12e-4 (offline) | 0.108–0.111 | – |
+| yard-real, after (4) | 48/48 | 0 | skipped | off live | 5.30–5.32e-4 (live) | 0.119 | – |
+| yard-real `--start 1`, before (4) | 20/49 | 38 | run (3 models) | – | 6.61e-4 (offline, 33 of 49) | 0.219–0.224 | registrationRate, gravityErrorDeg |
+| yard-real `--start 1`, after (4) | 48/48 | 0 | skipped | off live | 9.53–9.63e-4 (48 of 48; 7.0–7.2e-4 on the 32 common frames) | 0.135–0.139 | – |
+| yard-real `--start 1`, after, offline SfM forced (2) | 48/48 | 0 | run (1 model of 48; 3 with the path off) | 1 offline | 9.63e-4 (live kept) | 0.139 | – |
+| yard-real `--start 2`, before / after (2 + 2) | 20/51 / 34/51 | 39 / 17 | run | – / 0 offline | 1.78e-3 / 1.84e-3 (offline, 37 of 51) | 0.349 / 0.403 | registrationRate, ateRelative, rotErrDegMedian |
+| object-real, before / after (1 + 1) | 50/50 | 0 | skipped | – / off live | 6.00e-4 / 6.07e-4 | 0.192 / 0.188 | – |
+
+Accuracy is not accepted on these runs. ATE / extent and rotation p50 are worse than before at
+stride 3 in every yard phase:
+
+- from frame 0: ATE +4 %, rotation +7–10 %;
+- from frame 2: ATE +3 %, rotation +15 %;
+- from frame 1, on the 32 comparable frames: ATE +6–8 %, while the rotation p50 halves.
+
+`--start 1` sits at the 1e-3 `ateRelative` limit: 2 of 14 runs of this and the previous review
+state went over it (1.03e-3, 1.035e-3), and none of the 8 here did. The change delivers registration
+at a phone's rate (no lost frames), not accuracy. `--start 2` loses the loop's corner both before
+and after: it has no map points to register on. The stride-3 `scaleError` failure of 2026-10-21 is
+gone on both sides (the keyframe-interval IMU scale of claude/next-level).
 
 ### Refine performance on Metal (2026-10)
 

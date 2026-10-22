@@ -14,12 +14,15 @@
  *    them. After a fast pan analysed at 2 frames per second (e2e yard-real at stride 3) the
  *    keyframe past the pan saw 36 map points, 97 after re-triangulation; without it tracking was
  *    lost for the rest of the capture;
- *  - with `predictRotation` (the engine's gyro) a keyframe P3P cannot register on the
- *    re-triangulated map is registered with its rotation known, from as few as
- *    `knownRotationMinNumInliers` inliers (IncrementalMapper.registerKnownRotation) — only then:
- *    the order is P3P, re-triangulation, P3P again, known rotation;
+ *  - with `predictRotation` (the engine's gyro, opt-in live: EngineConfig.gyroAidedRegistration
+ *    'all') a keyframe P3P cannot register on the re-triangulated map is registered with its
+ *    rotation known, from as few as `knownRotationMinNumInliers` inliers if a verified pair checks
+ *    its baseline (IncrementalMapper.registerKnownRotation) — only then: the order is P3P,
+ *    re-triangulation, P3P again, known rotation. A P3P pose the gyro check rejected in one call of
+ *    an attempt that a later call registered is reported as recovered (`poseRecovered`);
  *  - every attempt is reported (`LiveKeyframeResult.registrations`: visible points before / after
- *    re-triangulation, P3P and known-rotation inliers) for the engine's debug log;
+ *    re-triangulation, P3P and known-rotation inliers, why the known rotation refused it) for the
+ *    engine's debug log;
  *  - keyframes that fail to register stay pending and are retried (relocalisation)
  *    when more of their features see triangulated points;
  *  - periodic time-bounded global BA with self-calibration (more often early on).
@@ -255,6 +258,9 @@ export class LiveMapper {
     att.registered = ok;
     this.timings.register += now() - t0;
     if (!ok) return false;
+    // P3P poses the gyro check rejected in an earlier call of this attempt did not end in a failed
+    // registration (the mapper reports those of the registering call itself)
+    for (const c of att.calls.slice(0, -1)) if (c.p3pRotationRejected) this.mapper.poseRecovered(id);
     if (retriangulated) this.retriangulation.registered++;
     this.pending.delete(id);
     const t1 = now();

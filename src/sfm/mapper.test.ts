@@ -347,36 +347,54 @@ describe('predictRotation (gyro-aided registration with a known rotation)', () =
   }
 
   const P2 = poseAt([0.4, 0.2, -0.3], rotvecToMat3(Float64Array.of(0.05, -0.04, 0.02)));
+  /**
+   * The verified pairs 0 → id (image 0: origin, R = I) of test images at `pose`: x_id = R x_0 + t,
+   * t = pose.t / |pose.t| (times `sign`), at a median triangulation angle `triAngleDeg`.
+   */
+  const pairs = (ids: number[], pose: Pose = P2, triAngleDeg = 3, sign = 1, config: 'calibrated' | 'planar' = 'calibrated'): FeatureDatabase => {
+    const db = new FeatureDatabase();
+    const nt = Math.hypot(pose.t[0], pose.t[1], pose.t[2]);
+    for (const id of ids) db.setTwoView(0, id, { config, inliers: new Uint32Array(400), R: pose.R, t: pose.t.map((v) => (sign * v) / nt), triAngle: triAngleDeg * DEG });
+    return db;
+  };
   const tests = [
     { id: 22, pose: P2, good: 26, bad: 6 }, // 81 % but 26 < 30 inliers: P3P rejects it
     { id: 24, pose: P2, good: 17, bad: 5 }, // 22 correspondences: below the P3P floor altogether
-    { id: 25, pose: P2, good: 14, bad: 30 }, // 32 %: below the known-rotation ratio (0.5)
+    { id: 25, pose: P2, good: 14, bad: 30 }, // 14 < 15 inliers, 32 % < the known-rotation ratio (0.5)
     { id: 26, pose: P2, good: 40, bad: 0, cluster: true }, // all in a 7 × 9 px patch
     { id: 27, pose: P2, good: 26, bad: 6 }, // prediction 20° off
     { id: 28, pose: P2, good: 26, bad: 6 }, // no prediction
   ];
 
   it('registers what P3P rejects only with a prediction it confirms, enough inliers, ratio and spread', () => {
+    const ids = tests.map((t) => t.id);
     // without a predictor: the P3P floor (30 inliers) applies as before
-    const base = rig(400, tests);
+    const base = rig(400, tests, {}, pairs(ids));
     for (const t of tests) expect(base.mapper.registerNextImage(t.id)).toBe(false);
     expect(base.mapper.registrable(24, 22)).toBe(false);
     // with one: the truth turned by 0.8° (σ 1°), 20° off for image 27, none for 28
     const asked: number[] = [];
     let recRef: Reconstruction | null = null;
-    const { mapper, rec } = rig(400, tests, {
-      predictRotation: (id, r) => {
-        asked.push(id);
-        recRef = r;
-        if (id === 28) return null;
-        return { R: turned(P2.R, id === 27 ? 20 : 0.8), sigmaRad: 1 * DEG };
-      },
-    });
+    const predictRotation: MapperOptions['predictRotation'] = (id, r) => {
+      asked.push(id);
+      recRef = r;
+      if (id === 28) return null;
+      return { R: turned(P2.R, id === 27 ? 20 : 0.8), sigmaRad: 1 * DEG };
+    };
+    const { mapper, rec } = rig(400, tests, { predictRotation }, pairs(ids));
     expect(mapper.registrable(24, 22)).toBe(true);
     expect(mapper.registrable(28, 22)).toBe(false); // no prediction
     expect(mapper.registrable(24, 14)).toBe(false); // < knownRotationMinNumInliers
     expect(recRef).toBe(rec);
-    for (const id of [25, 26, 27, 28]) expect(mapper.registerNextImage(id)).toBe(false);
+    for (const [id, why] of [
+      [25, 'noPose'], // no pose with 15 inliers
+      [26, 'rotationChange'], // the patch fixes no rotation: refined far off the prediction
+      [27, 'rotationChange'],
+      [28, 'noPrediction'], // P3P ran (32 correspondences) and failed: the reason is logged
+    ] as const) {
+      expect(mapper.registerNextImage(id)).toBe(false);
+      expect(mapper.lastRegistration!.knownRotationRefused).toBe(why);
+    }
     expect(mapper.numKnownRotationRegistrations).toBe(0);
     for (const [id, good] of [
       [22, 26],
@@ -391,7 +409,16 @@ describe('predictRotation (gyro-aided registration with a known rotation)', () =
     }
     expect(asked).toContain(22);
     expect(mapper.numKnownRotationRegistrations).toBe(2);
+    expect(mapper.lastRegistration).toMatchObject({ via: 'knownRotation', knownRotationRefused: null });
     expect(reconstructionInvariantErrors(rec, { graph: mapper.graph })).toEqual([]);
+    // without a verified pair that can check the baseline the known rotation is refused (fails
+    // closed) before its solver runs (no inliers counted, the RNG untouched)
+    const unchecked = rig(400, tests, { predictRotation }, pairs(ids, P2, 1));
+    for (const id of [22, 24]) {
+      expect(unchecked.mapper.registerNextImage(id)).toBe(false);
+      expect(unchecked.mapper.lastRegistration).toMatchObject({ knownRotationRefused: 'noPair', via: null });
+      expect(unchecked.mapper.lastRegistration!.knownRotationInliers).toBeNaN();
+    }
   });
 
   it('a P3P pose the rotation check rejects falls back to the known rotation: the true pose, or none when its inliers are too few a share', () => {
@@ -419,7 +446,7 @@ describe('predictRotation (gyro-aided registration with a known rotation)', () =
     expect(checked[0]).toBeGreaterThan(20); // P3P chose the wrong pose
     // with one: 32 of 72 (44 %) is too small a share for the default ratio (0.5) …
     checked.length = 0;
-    const strict = rig(400, t, opts(0.5));
+    const strict = rig(400, t, opts(0.5), pairs([30]));
     expect(strict.mapper.registerNextImage(30)).toBe(false);
     expect(strict.mapper.lastRegistration).toMatchObject({ correspondences: 72, via: null });
     expect(strict.mapper.lastRegistration!.p3pInliers).toBeGreaterThanOrEqual(40);
@@ -431,7 +458,7 @@ describe('predictRotation (gyro-aided registration with a known rotation)', () =
     expect(recovered).toEqual([]);
     // … and enough at 0.4: registered with the true pose, the check passed it
     checked.length = 0;
-    const { mapper, rec } = rig(400, t, opts(0.4));
+    const { mapper, rec } = rig(400, t, opts(0.4), pairs([30]));
     expect(mapper.registerNextImage(30)).toBe(true);
     expect(mapper.lastRegistration).toMatchObject({ via: 'knownRotation', knownRotationInliers: 32, p3pRotationRejected: true, knownRotationRejected: false });
     expect(checked).toHaveLength(2);
@@ -446,36 +473,69 @@ describe('predictRotation (gyro-aided registration with a known rotation)', () =
     expect(img.numPoints3D).toBe(32);
     expect([...mapper.knownRotationImages]).toEqual([30]);
     // P3P alone for this call (LiveMapper before re-triangulating): no fallback
-    const p3pOnly = rig(400, t, opts(0.4));
+    const p3pOnly = rig(400, t, opts(0.4), pairs([30]));
     expect(p3pOnly.mapper.registerNextImage(30, { knownRotation: false })).toBe(false);
     expect(p3pOnly.mapper.lastRegistration!.knownRotationInliers).toBeNaN();
     expect(p3pOnly.mapper.registerNextImage(30, { p3p: false })).toBe(true);
     expect(p3pOnly.mapper.lastRegistration!.p3pInliers).toBeNaN();
   });
 
-  it('the known-rotation pose must agree with the baseline of its best verified pair', () => {
+  it('the batch SfM tries every candidate with P3P before any with the known rotation', async () => {
+    // image 22: ranked first, P3P fails (26 < 30 inliers), the known rotation would register it;
+    // image 40: P3P registers it
+    const t = [
+      { id: 22, pose: P2, good: 26, bad: 6 },
+      { id: 40, pose: P2, good: 40, bad: 0 },
+    ];
+    const opts: Partial<MapperOptions> = { predictRotation: () => ({ R: turned(P2.R, 0.8), sigmaRad: 1 * DEG }) };
+    const { mapper } = rig(400, t, opts, pairs([22, 40]));
+    expect(await mapper.registerOneOf([22, 40])).toBe(40);
+    expect(mapper.lastRegistration).toMatchObject({ id: 40, via: 'p3p' });
+    expect(mapper.numKnownRotationRegistrations).toBe(0);
+    // only when no candidate registers by P3P: the known rotation
+    expect(await mapper.registerOneOf([22])).toBe(22);
+    expect(mapper.lastRegistration).toMatchObject({ id: 22, via: 'knownRotation' });
+    expect(mapper.findNextImages()).toEqual([]);
+    // without a predictor: P3P alone
+    const plain = rig(400, t, {}, pairs([22, 40])).mapper;
+    expect(await plain.registerOneOf([22])).toBe(-1);
+    expect(plain.lastRegistration!.knownRotationInliers).toBeNaN();
+  });
+
+  it('the known-rotation pose must agree with the baseline of its best verified pair, and is refused without one', () => {
     const t = [{ id: 22, pose: P2, good: 26, bad: 6 }];
     const opts: Partial<MapperOptions> = { predictRotation: () => ({ R: turned(P2.R, 0.8), sigmaRad: 1 * DEG }) };
-    // image 0 is at the origin with R = I: the pair 0 → 22 is (R2, t2 / |t2|)
-    const dir = (sign: number): Float64Array => P2.t.map((v) => (sign * v) / Math.hypot(P2.t[0], P2.t[1], P2.t[2]));
-    const withPair = (sign: number, triAngleDeg: number, config: 'calibrated' | 'planar' = 'calibrated') => {
-      const db = new FeatureDatabase();
-      db.setTwoView(0, 22, { config, inliers: new Uint32Array(400), R: P2.R, t: dir(sign), triAngle: triAngleDeg * DEG });
-      return rig(400, t, opts, db).mapper;
-    };
-    const right = withPair(1, 3);
+    const right = rig(400, t, opts, pairs([22])).mapper;
     expect(right.registerNextImage(22)).toBe(true);
     expect(right.lastRegistration!.pairBaselineDeg).toBeLessThan(1);
     // reversed baseline (a pose the rotation–translation coupling of far points allows): refused
-    const reversed = withPair(-1, 3);
+    const reversed = rig(400, t, opts, pairs([22], P2, 3, -1)).mapper;
     expect(reversed.registerNextImage(22)).toBe(false);
-    expect(reversed.lastRegistration).toMatchObject({ via: null, knownRotationInliers: 26 });
+    expect(reversed.lastRegistration).toMatchObject({ via: null, knownRotationInliers: 26, knownRotationRefused: 'baseline' });
     expect(reversed.lastRegistration!.pairBaselineDeg).toBeGreaterThan(170);
-    // a pair at too small a triangulation angle, or a planar one, says nothing about the baseline
-    for (const m of [withPair(-1, 1), withPair(-1, 3, 'planar')]) {
-      expect(m.registerNextImage(22)).toBe(true);
+    // a pair at too small a triangulation angle, or a planar one, says nothing about the baseline:
+    // nothing checks the translation, so the known rotation is refused (fails closed)
+    for (const db of [pairs([22], P2, 1), pairs([22], P2, 3, 1, 'planar'), new FeatureDatabase()]) {
+      const m = rig(400, t, opts, db).mapper;
+      expect(m.registerNextImage(22)).toBe(false);
+      expect(m.lastRegistration).toMatchObject({ via: null, knownRotationRefused: 'noPair' });
       expect(m.lastRegistration!.pairBaselineDeg).toBeNaN();
     }
+    // e2e fin2: a wrong pose inside every other gate (here 26 false matches consistent with the
+    // centre mirrored through image 0 and a rotation 1.5° off the truth, 0.7° from the prediction)
+    const W = poseAt([-0.4, -0.2, 0.3], turned(P2.R, 1.5));
+    const wrong = [{ id: 23, pose: P2, good: 0, bad: 6, wrong: { pose: W, count: 26 } }];
+    const checked = rig(400, wrong, opts, pairs([23])).mapper;
+    expect(checked.registerNextImage(23)).toBe(false);
+    expect(checked.lastRegistration).toMatchObject({ knownRotationInliers: 26, knownRotationRefused: 'baseline' });
+    expect(checked.lastRegistration!.rotationChangeDeg).toBeLessThan(3);
+    expect(checked.lastRegistration!.pairBaselineDeg).toBeGreaterThan(150);
+    // the same with only a low-parallax pair (the typical case past a pan towards far scenery):
+    // the pair check cannot run, and the pose is refused rather than accepted unchecked
+    const lowParallax = rig(400, wrong, opts, pairs([23], P2, 1)).mapper;
+    expect(lowParallax.registerNextImage(23)).toBe(false);
+    expect(lowParallax.lastRegistration).toMatchObject({ knownRotationRefused: 'noPair', via: null });
+    expect(lowParallax.numKnownRotationRegistrations).toBe(0);
   });
 
   it('LiveMapper: a keyframe that sees only a few map points (after a pan) and the walk after it register instead of staying pending', () => {

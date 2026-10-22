@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest';
 import { runIncrementalSfM } from '../sfm/mapper';
 import { buildSyntheticDatabase, evaluateReconstruction, generateScene } from '../sfm/synthetic';
-import { explainedCorrespondenceRatio, liveModelHealth, refinePrincipalPoint, splitPairs } from './refine';
+import { explainedCorrespondenceRatio, liveModelBetter, liveModelHealth, refinePrincipalPoint, splitPairs, unclosedLoop, type ModelScore } from './refine';
 import type { GyroConsistency } from '../sfm/gyro';
 
 describe('refinePrincipalPoint', () => {
@@ -122,6 +122,10 @@ describe('liveModelHealth (offline SfM skipped for a healthy live model)', () =>
     expect(Math.max(...far.split!.loops.map(span))).toBeGreaterThanOrEqual(10);
     expect(liveModelHealth(open, db, ids, gyro, { ...lax, maxLoopSpan: 1 }).healthy).toBe(true);
     expect(liveModelHealth(rec, db, ids, gyro, lax).healthy).toBe(true);
+    // the same rules for any model (refine's model choice): `unclosedLoop`
+    expect(unclosedLoop(sp, ids)).toMatch(/unclosed loop/);
+    expect(unclosedLoop(sp, ids, lax)).toMatch(/across the capture/);
+    expect(unclosedLoop(splitPairs(rec, db), ids)).toBeNull();
     // a keyframe the live model never registered
     const missing = rec.clone();
     missing.deregisterImage(ids[7]);
@@ -137,4 +141,28 @@ describe('liveModelHealth (offline SfM skipped for a healthy live model)', () =>
     // too few images to judge
     expect(liveModelHealth(rec, db, ids, gyro, { minImages: 40 }).healthy).toBe(false);
   }, 120_000);
+});
+
+describe('liveModelBetter (refine keeps the better of the live and the offline model)', () => {
+  const m = (o: Partial<ModelScore>): ModelScore => ({ registered: 48, gyroBreaks: 0, explained: 0.78, reprojError: 0.4, gyroAided: 0, unclosedLoop: null, ...o });
+  it('gyro breaks, then registered images, then explained correspondences, then reprojection error', () => {
+    expect(liveModelBetter(m({ registered: 48 }), m({ registered: 47, gyroBreaks: 1 }), 0.015)).toBe(true);
+    expect(liveModelBetter(m({ registered: 48 }), m({ registered: 32 }), 0.015)).toBe(true);
+    expect(liveModelBetter(m({ explained: 0.752 }), m({ explained: 0.78 }), 0.015)).toBe(false);
+    expect(liveModelBetter(m({ explained: 0.775, reprojError: 0.39 }), m({ explained: 0.78 }), 0.015)).toBe(true);
+  });
+
+  it('registrations with the gyro-predicted rotation count only for a model without an unclosed loop', () => {
+    // e2e yard-real at stride 3 from frame 1: a complete live model whose loop stayed open against
+    // an offline model joined by one gyro-aided registration that closed it — the tie on registered
+    // images goes to the explained correspondences (75.2 vs 78.0 %): offline
+    const openLive = m({ explained: 0.752 });
+    expect(liveModelBetter(openLive, m({ gyroAided: 1 }), 0.015)).toBe(false);
+    // a gyro-aided join that left the loop open (a wrong one in a loop capture): not counted, so it
+    // does not win by registered images (47 < 48)
+    expect(liveModelBetter(openLive, m({ gyroAided: 1, explained: 0.8, unclosedLoop: 'unclosed loop? …' }), 0.015)).toBe(true);
+    // the same for the live model's own (EngineConfig.gyroAidedRegistration 'all')
+    expect(liveModelBetter(m({ gyroAided: 2, unclosedLoop: 'unclosed loop? …' }), m({ registered: 47 }), 0.015)).toBe(false);
+    expect(liveModelBetter(m({ gyroAided: 2 }), m({ registered: 47 }), 0.015)).toBe(true);
+  });
 });

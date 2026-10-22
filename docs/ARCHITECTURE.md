@@ -609,14 +609,15 @@ and extra methods that keep the documented call working are not listed.
    last N keyframes + retrieval candidates, verify (two-view geometry), update the
    correspondence graph, then `LiveMapper` initialises / registers (P3P PnP; at the edge of
    the map — few map points, or P3P failed — the registered neighbours are re-triangulated
-   and P3P tried again; only then PnP with the gyro-predicted rotation, checked against the
-   keyframe's best verified pair) / triangulates / local BA. Emits live state: poses, sparse
-   points, tracking quality, user guidance.
+   and P3P tried again; opt-in, only then PnP with the gyro-predicted rotation, checked
+   against the keyframe's best verified pair and refused without one) / triangulates / local
+   BA. Emits live state: poses, sparse points, tracking quality, user guidance.
 
 **Refine (after capture)**: extra pairs (sequential window, vocabulary-tree
 retrieval for loop closure, spatial neighbours) → verify (pairs and vocabulary on CPU helper
 workers) → refined live model → only when it is unhealthy, a full incremental SfM from scratch
-on the enriched graph (gyro-aided registration as live; keep the better of live/offline model) → global
+on the enriched graph (P3P, then gyro-aided registration where P3P fails on every candidate;
+keep the better of live/offline model) → global
 BA with self-calibration → retriangulate → final BA → inertial alignment (time
 offset, gravity, metric scale: band-pass regression, or keyframe-interval preintegration when
 that lacks excitation, docs/research/imu-scale.md), GPS Sim3 alignment, compass yaw → world

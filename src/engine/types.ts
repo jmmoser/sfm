@@ -117,16 +117,26 @@ export interface EngineConfig {
   /** Tolerance of the gyro gates (defaults: 5° + 0.3°/s × |Δt| + 5 % of the rotation). */
   gyroTolerance?: Partial<GyroToleranceOptions>;
   /**
-   * Gyro-aided registration (default true, active once R_cam_device is verified; independent of
-   * `gyroGate`): a keyframe P3P cannot register (fewer than 30 inliers) even after the LiveMapper
-   * re-triangulated its registered neighbours (`live.retriangulateNeighbours`) is registered with
+   * Gyro-aided registration (active once R_cam_device is verified; independent of `gyroGate`): an
+   * image P3P cannot register (fewer than 30 inliers, or a pose the gyro rejects) is registered with
    * its rotation predicted by the gyro from the registered keyframe nearest in time, from ≥ 15
-   * inliers and a baseline that agrees with its best verified pair (`LiveSession.predictRotation`,
-   * `MapperOptions.predictRotation`; live, in refine's retry of the pending keyframes and in its
-   * offline SfM). A live model with such keyframes is checked by the offline SfM
-   * (`liveModelHealth`). Measurements: docs/research/real-capture-robustness.md "Phone-rate capture".
+   * inliers and a baseline that agrees with its best verified pair — refused without such a pair
+   * (`LiveSession.predictRotation`, `MapperOptions.predictRotation`).
+   *  - 'offline' (default): only in refine's offline SfM, after P3P failed on every candidate. It
+   *    joins what the phone-rate live map holds but P3P alone splits into fragments (e2e yard-real
+   *    at stride 3 from frame 1: 1 model of 48 keyframes instead of 3, the largest 32), so that an
+   *    open-loop live model can be replaced; the model choice counts such registrations only for a
+   *    model without an unclosed loop (`unclosedLoop`).
+   *  - 'all': also live and in refine's retry of the pending keyframes, after LiveMapper
+   *    re-triangulated the registered neighbours (`live.retriangulateNeighbours`) and P3P still
+   *    failed; a live model with such keyframes is checked by an offline SfM WITHOUT the gyro path
+   *    (`liveModelHealth`). Opt-in: it registered no keyframe live in any e2e run (re-triangulation
+   *    gives P3P its points), and nothing checks it against translational aliasing (false matches on
+   *    structure repeating along the walking direction shift the centre along the baseline).
+   *  - 'off': never.
+   * Measurements: docs/research/real-capture-robustness.md "Phone-rate capture".
    */
-  gyroAidedRegistration?: boolean;
+  gyroAidedRegistration?: 'off' | 'offline' | 'all';
   /**
    * Shift the frames of a restored / extended capture past the stored capture times (default true:
    * `LiveSession` time segments, EngineStateRecord.timeSegments). false only in tests that prove

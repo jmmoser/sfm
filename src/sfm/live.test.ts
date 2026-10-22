@@ -1,9 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { mat3Mul, mat3MulTranspose } from '../math/mat3';
+import { Rng } from '../math/random';
+import { rotvecToMat3 } from '../math/rotation';
 import { CorrespondenceGraph } from './correspondence-graph';
-import { LiveMapper, type LiveKeyframeResult } from './live';
+import { LiveMapper, type LiveKeyframeResult, type LiveMapperOptions } from './live';
 import { buildSyntheticDatabase, evaluateReconstruction, generateScene, lookPose } from './synthetic';
 import { ROTATION_ONLY_CAMERA, rotationOnlyDb } from './e2e-testutil';
+
+const DEG = Math.PI / 180;
 
 function smallStream(numImages: number, seed: number) {
   const scene = generateScene({ kind: 'orbit', numImages, seed, numPoints: 2500, noisePx: 0.5, outlierRatio: 0.2, descriptors: false, k1: 0.02 });
@@ -244,12 +248,11 @@ describe('LiveMapper', () => {
     expect(ev.maxRotErrorDeg).toBeLessThan(0.5);
   });
 
-  it('a walk with a 35° pan between keyframes: what P3P leaves pending registers after re-triangulation, with the gyro-predicted rotation when needed', () => {
+  it('a walk with a 35° pan between keyframes: what P3P leaves pending registers after re-triangulation, with the gyro-predicted rotation when a pair checks its baseline', () => {
     // Walk east through the yard looking north (yaw 90°); keyframe K − 2 is panned 35° (to 55°),
     // K − 1 and K turn further (to 38–38.5°, then 26°) and the walk goes on at 26°. K looks at a
     // region only K − 2 and K − 1 saw (two-view tracks; 0.5 m apart, houses 20–40 m away) plus a
     // sliver of the map — e2e yard-real at stride 3, the keyframes after its 33.7° pan.
-    const DEG = Math.PI / 180;
     const N = 26,
       K = 12;
     const walk = (yawK1: number) => {
@@ -261,18 +264,133 @@ describe('LiveMapper', () => {
       const scene = generateScene({ kind: 'walk', poses, seed: 6, numPoints: 9000, noisePx: 0.5, descriptors: false });
       return { scene, db: buildSyntheticDatabase(scene, { verify: false }).db };
     };
-    const stream = ({ scene, db }: ReturnType<typeof walk>, retriangulateNeighbours: number, gyro: boolean) => {
+    /** `gyro`: GT relative rotation from the registered keyframe nearest in capture order, turned `errDeg` about a seeded random axis. */
+    const stream = ({ scene, db }: ReturnType<typeof walk>, retriangulateNeighbours: number, gyro: { errDeg: number; seed: number } | null, opts: Partial<LiveMapperOptions> = {}) => {
       const ids = db.frameIds();
       const graph = new CorrespondenceGraph();
-      // the "gyro": GT relative rotation from the registered keyframe nearest in capture order
+      const rng = new Rng(gyro?.seed ?? 0);
       const predictRotation = (id: number, rec: LiveMapper['reconstruction']) => {
         let nb = -1;
         for (const r of rec.registeredImageIds()) if (r !== id && (nb < 0 || Math.abs(r - id) < Math.abs(nb - id))) nb = r;
         if (nb < 0) return null;
-        const R = mat3Mul(mat3MulTranspose(scene.poses[ids.indexOf(id)].R, scene.poses[ids.indexOf(nb)].R), rec.images.get(nb)!.pose.R);
-        return { R, sigmaRad: DEG };
+        const axis = Float64Array.of(rng.gaussian(), rng.gaussian(), rng.gaussian());
+        const e = (gyro!.errDeg * DEG) / Math.hypot(axis[0], axis[1], axis[2]);
+        const G = mat3MulTranspose(scene.poses[ids.indexOf(id)].R, scene.poses[ids.indexOf(nb)].R);
+        return { R: mat3Mul(mat3Mul(rotvecToMat3(axis.map((v) => v * e)), G), rec.images.get(nb)!.pose.R), sigmaRad: DEG };
       };
-      const live = new LiveMapper(db, graph, { intrinsics: { ...scene.camera }, retriangulateNeighbours, ...(gyro ? { predictRotation } : {}) });
+      const live = new LiveMapper(db, graph, { intrinsics: { ...scene.camera }, retriangulateNeighbours, ...(gyro ? { predictRotation } : {}), ...opts });
+      let atK: LiveKeyframeResult | null = null;
+      let kCentreErr = NaN;
+      for (const [k, id] of ids.entries()) {
+        graph.addImage(id, db.features.get(id)!.count);
+        for (const j of ids) {
+          if (j >= id) break;
+          const g = db.getTwoView(j, id);
+          if (g) graph.addTwoView(j, id, g.inliers);
+        }
+        const r = live.addKeyframe(id);
+        if (k === K) {
+          atK = r;
+          // K's centre right after its registration, in the GT frame of the keyframes registered so far
+          const ev = evaluateReconstruction(live.reconstruction, scene);
+          if (r.registered && ev.sim) {
+            const c = live.reconstruction.imageCenter(id),
+              { s, R, t } = ev.sim;
+            const g = scene.poses[k];
+            const gc = [0, 1, 2].map((q) => -(g.R[q] * g.t[0] + g.R[3 + q] * g.t[1] + g.R[6 + q] * g.t[2]));
+            kCentreErr = Math.hypot(...[0, 1, 2].map((q) => s * (R[3 * q] * c[0] + R[3 * q + 1] * c[1] + R[3 * q + 2] * c[2]) + t[q] - gc[q]));
+          }
+        }
+      }
+      const a = atK!.registrations.find((x) => x.id === ids[K])!;
+      return { live, a, ids, kCentreErr, ev: evaluateReconstruction(live.reconstruction, scene) };
+    };
+    // K − 1 at 38.5°: K sees 20 map points, 27 after re-triangulating K − 2 / K − 1 (small angles)
+    const w = walk(38.5);
+    const ids = w.db.frameIds();
+    const tri = (b: number): number => w.db.getTwoView(ids[b], ids[K])!.triAngle! / DEG;
+    expect(tri(K - 2)).toBeLessThan(1.5); // the pairs that see K's region: low parallax
+    expect(tri(K - 1)).toBeLessThan(1.5);
+    for (const retri of [0, 6]) {
+      const r = stream(w, retri, null); // P3P: 20 points, 27 after re-triangulation (< 30)
+      expect(r.a.visible).toBeLessThan(30);
+      expect(r.a.registered).toBe(false);
+      expect(r.live.pendingIds()).toEqual(ids.slice(K)); // lost for good
+    }
+    // the gyro path at the default pair threshold (1.5°): no pair checks K's baseline (median
+    // triangulation angles 1.26° / 0.57°), so K is refused before the solver runs (fails closed) …
+    const closed = stream(w, 0, { errDeg: 0, seed: 1 });
+    expect(closed.a.registered).toBe(false);
+    expect(closed.a.calls.at(-1)!.knownRotationRefused).toBe('noPair');
+    expect(closed.live.pendingIds()).toEqual(ids.slice(K)); // without re-triangulation: lost
+    // … and with re-triangulation K + 1 registers with the gyro rotation instead — its pair with
+    // K − 2 (1.8°) checks its baseline — and K by P3P after it
+    const next = stream(w, 6, { errDeg: 1, seed: 6 });
+    expect(next.a.registered).toBe(false);
+    expect(next.a.calls.at(-1)!.knownRotationRefused).toBe('noPair');
+    expect([...next.live.incrementalMapper.knownRotationImages]).toEqual([ids[K + 1]]);
+    expect(next.live.pendingIds()).toEqual([]);
+    expect(next.ev.numRegistered).toBe(N);
+    expect(next.ev.ateRelative).toBeLessThan(0.002);
+    expect(next.ev.maxRotErrorDeg).toBeLessThan(0.5);
+    // with those pairs admitted (their directions are exact here): re-triangulation off, 20 inliers
+    // all in the sliver (inlier spread < 5 % of the image): refused
+    const lowTri: Partial<LiveMapperOptions> = { knownRotationPairMinTriAngleDeg: 0.5 };
+    const sliver = stream(w, 0, { errDeg: 0, seed: 1 }, lowTri);
+    expect(sliver.a.registered).toBe(false);
+    expect(sliver.a.calls.at(-1)!.knownRotationRefused).toBe('spread');
+    // … and both together register K with the gyro-predicted rotation, then the rest of the walk —
+    // also with the gyro 1° off the truth
+    for (const gyro of [
+      { errDeg: 0, seed: 1 },
+      { errDeg: 1, seed: 2 },
+      { errDeg: 1, seed: 3 },
+      { errDeg: 1, seed: 4 },
+    ]) {
+      const both = stream(w, 6, gyro, lowTri);
+      expect(both.a.visibleRetriangulated).toBeGreaterThanOrEqual(15);
+      expect(both.a.visibleRetriangulated).toBeLessThan(30);
+      expect(both.a.registered).toBe(true);
+      expect(both.a.calls.at(-1)).toMatchObject({ via: 'knownRotation', knownRotationRefused: null });
+      expect(both.a.calls.at(-1)!.pairBaselineDeg).toBeLessThan(30);
+      expect(both.kCentreErr).toBeLessThan(0.05); // m, of a 0.5 m step
+      expect(both.live.pendingIds()).toEqual([]);
+      expect(both.ev.numRegistered).toBe(N);
+      expect(both.ev.ateRelative).toBeLessThan(0.002);
+      expect(both.ev.maxRotErrorDeg).toBeLessThan(0.5);
+    }
+    // K − 1 at 38°: re-triangulation alone gives P3P its 30 points — the gyro is not needed (nor used)
+    const w2 = walk(38);
+    expect(stream(w2, 0, null).live.pendingIds()).toEqual(w2.db.frameIds().slice(K));
+    const p3p = stream(w2, 6, { errDeg: 0, seed: 1 }, lowTri);
+    expect(p3p.a.registered).toBe(true);
+    expect(p3p.a.calls.at(-1)!.via).toBe('p3p');
+    expect(p3p.live.incrementalMapper.numKnownRotationRegistrations).toBe(0);
+    expect(p3p.ev.numRegistered).toBe(N);
+    expect(p3p.ev.maxRotErrorDeg).toBeLessThan(0.5);
+  });
+
+  it('a P3P pose the gyro check rejected in an earlier call of the attempt counts as recovered once the attempt registers', () => {
+    const scene = generateScene({ kind: 'walk', numImages: 20, seed: 6, numPoints: 6000, noisePx: 0.5, descriptors: false });
+    const { db } = buildSyntheticDatabase(scene, { verify: false });
+    const ids = db.frameIds();
+    const K = 10;
+    const run = (rejectFirst: number) => {
+      const graph = new CorrespondenceGraph();
+      let checksOfK = 0;
+      const recovered: number[] = [];
+      const live = new LiveMapper(db, graph, {
+        intrinsics: { ...scene.camera },
+        // the "gyro check" rejects the first `rejectFirst` poses of keyframe K
+        rotationCheck: { pose: (id) => id !== ids[K] || ++checksOfK > rejectFirst, poseRecovered: (id) => recovered.push(id) },
+        predictRotation: (id, rec) => {
+          let nb = -1;
+          for (const r of rec.registeredImageIds()) if (r !== id && (nb < 0 || Math.abs(r - id) < Math.abs(nb - id))) nb = r;
+          if (nb < 0) return null;
+          const G = mat3MulTranspose(scene.poses[ids.indexOf(id)].R, scene.poses[ids.indexOf(nb)].R);
+          return { R: mat3Mul(G, rec.images.get(nb)!.pose.R), sigmaRad: DEG };
+        },
+      });
       let atK: LiveKeyframeResult | null = null;
       for (const [k, id] of ids.entries()) {
         graph.addImage(id, db.features.get(id)!.count);
@@ -284,38 +402,33 @@ describe('LiveMapper', () => {
         const r = live.addKeyframe(id);
         if (k === K) atK = r;
       }
-      const a = atK!.registrations.find((x) => x.id === ids[K])!;
-      return { live, a, ids, ev: evaluateReconstruction(live.reconstruction, scene) };
+      return { live, a: atK!.registrations.find((x) => x.id === ids[K])!, recovered };
     };
-    // K − 1 at 38.5°: K sees 20 map points, 27 after re-triangulating K − 2 / K − 1 (small angles)
-    const w = walk(38.5);
-    for (const [retri, gyro] of [
-      [0, false],
-      [0, true], // 20 inliers, but all in the sliver (inlier spread < 5 % of the image): refused
-      [6, false], // 27 < 30 for P3P
+    // first P3P pose rejected; after re-triangulating the neighbours P3P registers K (a second call)
+    const once = run(1);
+    expect(once.a.registered).toBe(true);
+    expect(once.a.calls.map((c) => [c.via, c.p3pRotationRejected])).toEqual([
+      [null, true],
+      ['p3p', false],
+    ]);
+    // both P3P poses rejected (before and after re-triangulation), the known rotation registers K
+    const twice = run(2);
+    expect(twice.a.registered).toBe(true);
+    expect(twice.a.calls.map((c) => [c.via, c.p3pRotationRejected])).toEqual([
+      [null, true],
+      ['knownRotation', true],
+    ]);
+    // every rejected P3P pose of K is reported recovered, once: rejected − recovered = poses of
+    // keyframes that stayed unregistered (0 here)
+    for (const [r, n] of [
+      [once, 1],
+      [twice, 2],
     ] as const) {
-      const r = stream(w, retri, gyro);
-      expect(r.a.visible).toBeLessThan(30);
-      expect(r.a.registered).toBe(false);
-      expect(r.live.pendingIds()).toEqual(r.ids.slice(K)); // lost for good
+      expect(r.live.incrementalMapper.numRotationRejects).toBe(n);
+      expect(r.live.incrementalMapper.numRotationRejectsRecovered).toBe(n);
+      expect(r.recovered).toEqual(Array(n).fill(ids[K]));
+      expect(r.live.pendingIds()).toEqual([]);
     }
-    const both = stream(w, 6, true);
-    expect(both.a.visibleRetriangulated).toBeGreaterThanOrEqual(15);
-    expect(both.a.visibleRetriangulated).toBeLessThan(30);
-    expect(both.a.registered).toBe(true);
-    expect(both.a.calls.at(-1)!.via).toBe('knownRotation');
-    expect(both.live.pendingIds()).toEqual([]);
-    expect(both.ev.numRegistered).toBe(N);
-    expect(both.ev.maxRotErrorDeg).toBeLessThan(0.5);
-    // K − 1 at 38°: re-triangulation alone gives P3P its 30 points — the gyro is not needed (nor used)
-    const w2 = walk(38);
-    expect(stream(w2, 0, false).live.pendingIds()).toEqual(w2.db.frameIds().slice(K));
-    const p3p = stream(w2, 6, true);
-    expect(p3p.a.registered).toBe(true);
-    expect(p3p.a.calls.at(-1)!.via).toBe('p3p');
-    expect(p3p.live.incrementalMapper.numKnownRotationRegistrations).toBe(0);
-    expect(p3p.ev.numRegistered).toBe(N);
-    expect(p3p.ev.maxRotErrorDeg).toBeLessThan(0.5);
   });
 
   it('never initialises from pure rotation', () => {
