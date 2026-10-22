@@ -8,8 +8,10 @@
  * Time base: the mock trajectory advances with the frame timestamps (`FrameInput.t`) times
  * `speed`, so pauses in frame delivery pause the scan.
  */
-import type { MetricInfo, PointCloud, ProgressCallback, ProgressEvent, TriangleMesh } from '../core/types';
+import type { MetricInfo, PointCloud, ProgressCallback, ProgressEvent, RGBAImage, TriangleMesh } from '../core/types';
+import { buildColourAtlas } from '../dense/colour-atlas';
 import { createColmapZipBlob, encodeGLB, encodeMeshPLY, encodePLY, type ColmapModelInput } from '../io';
+import { encodeUSDZ, selectArPivot } from '../io/usdz';
 import { SessionStore, type SessionMeta } from '../io/storage';
 import { Rng } from '../math/random';
 import { encodeSplatPLY } from '../splat/ply';
@@ -708,6 +710,15 @@ export class MockEngine implements EngineLike {
         const ply = encodeSplatPLY(this.splatOut.model, { comments: [`exported by sfm mock engine: ${name}`] });
         return new Blob([ply as Uint8Array<ArrayBuffer>], { type: 'application/octet-stream' });
       }
+      case 'usdz': {
+        // the engine's recipe (src/engine/export.ts) with a small atlas
+        if (!this.meshModel) throw new Error('Build the mesh first');
+        const atlas = buildColourAtlas(this.meshModel, { size: 512 });
+        const jpeg = await mockJpeg(atlas.texture);
+        if (!jpeg) throw new Error('USDZ export needs OffscreenCanvas (JPEG encoding), which this browser lacks');
+        const usdz = encodeUSDZ({ mesh: atlas.mesh, uvs: atlas.uvs, texture: jpeg, pivot: selectArPivot(this.meshModel), name });
+        return new Blob([usdz as Uint8Array<ArrayBuffer>], { type: 'model/vnd.usdz+zip' });
+      }
     }
   }
 
@@ -967,4 +978,14 @@ export class MockEngine implements EngineLike {
   get captureFinished(): boolean {
     return this.captureDone;
   }
+}
+
+/** JPEG bytes of an RGBA image (null without OffscreenCanvas, e.g. in Node). */
+async function mockJpeg(img: RGBAImage): Promise<Uint8Array | null> {
+  if (typeof OffscreenCanvas === 'undefined') return null;
+  const c = new OffscreenCanvas(img.width, img.height);
+  const ctx = c.getContext('2d');
+  if (!ctx) return null;
+  ctx.putImageData(new ImageData(new Uint8ClampedArray(img.data), img.width, img.height), 0, 0);
+  return new Uint8Array(await (await c.convertToBlob({ type: 'image/jpeg', quality: 0.9 })).arrayBuffer());
 }

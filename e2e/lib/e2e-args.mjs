@@ -39,7 +39,7 @@ export class ArgError extends Error {}
 const ENGINES = ['worker', 'inline', 'mock'];
 const QUALITIES = ['fast', 'balanced', 'max'];
 const MODES = ['object', 'scene', 'auto'];
-const FORMATS = ['ply-points', 'ply-mesh', 'glb', 'colmap-zip', 'ply-splat'];
+const FORMATS = ['ply-points', 'ply-mesh', 'glb', 'colmap-zip', 'ply-splat', 'usdz'];
 
 function setPath(obj, path, val) {
   const ks = path.split('.');

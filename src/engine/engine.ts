@@ -1207,7 +1207,7 @@ export class PhotogrammetryEngine {
     if (!this.model && this.store) await this.ensureModel().catch(() => null);
     // load only what this format needs (a 4 M-point cloud is ≈ 140 MB, a mesh similar), and drop
     // persisted results again afterwards: the page holds its own copy
-    const needMesh = format === 'ply-mesh' || format === 'glb';
+    const needMesh = format === 'ply-mesh' || format === 'glb' || format === 'usdz';
     const needDense = format === 'ply-points' || (format === 'glb' && !this.hasMesh);
     const hadDense = !!this.denseCloud;
     const hadMesh = !!this.meshModel;
@@ -1222,6 +1222,7 @@ export class PhotogrammetryEngine {
         store: this.store,
         features: (id) => this.featuresOf(id),
         splat: () => this.splatModel(),
+        metric: this.sparse?.metric ?? null,
       });
     } finally {
       if (this.store?.persistent) {

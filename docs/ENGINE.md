@@ -77,7 +77,7 @@ class PhotogrammetryEngine {
   mesh(opts?, progress?, cancel?): Promise<TriangleMesh>
   splat(opts?: SplatOptions, progress?, cancel?): Promise<SplatResult>   // Gaussian splats (§2 "Splat")
   splatModel(): Promise<SplatModelPayload | null>                        // the stored splat model
-  exportModel(format: 'ply-points' | 'ply-mesh' | 'glb' | 'colmap-zip' | 'ply-splat'): Promise<Blob>
+  exportModel(format: 'ply-points' | 'ply-mesh' | 'glb' | 'colmap-zip' | 'ply-splat' | 'usdz'): Promise<Blob>
   loadSession(id: string, options?: Partial<EngineOptions>): Promise<SessionSummary>
   dispose(): void
   // worker / harness hooks: setHidden, flush, recoverGPU, memoryReport, releaseResultMemory,
@@ -234,4 +234,6 @@ view, counters, finish) → Processing (stages + progress + cancel) → Viewer
 stage runs from the viewer itself ("Photoreal model" in the Build sheet → `splat` with a progress card fed by
 `SplatTrainingDetail`, Cancel, Resume after an interruption), the model is fetched with `splatModel` into the
 viewer's WebGPU splat layer and shown by default, and the export sheet offers 'ply-splat' (src/viewer/splat-layer.ts,
-research/viewer-rendering.md).
+research/viewer-rendering.md). The export sheet's 'usdz' (AR model: the mesh simplified to ≤ 100 k triangles with its
+colours baked into a 2048² JPEG atlas, built in the engine worker) adds "View in AR" once prepared, on iPhone / iPad
+Safari only: a hidden `<a rel="ar">` on the Blob's URL opens AR Quick Look (src/app/ar-quicklook.ts).

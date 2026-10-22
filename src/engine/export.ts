@@ -1,17 +1,23 @@
 /**
  * Exports (ENGINE.md §2 `exportModel`): PLY points (dense if available, else sparse), PLY
  * mesh, GLB (mesh if available, else points), COLMAP text model + images in a ZIP, Gaussian
- * splats as an INRIA 3DGS PLY (appearance-normalised model of the splat stage).
+ * splats as an INRIA 3DGS PLY (appearance-normalised model of the splat stage), USDZ for AR
+ * Quick Look (the mesh simplified to ≤ 100 k triangles with its full-resolution colours baked
+ * into one 2048² JPEG atlas — src/dense/colour-atlas.ts —, Y-up metres, origin at the AR pivot:
+ * `selectArPivot`, which switches to the object ROI once `objectRoi` is supplied; ≈ 10–11 MB).
  *
  * Privacy: no export carries a location — there is no geo input here, coordinates are local
  * (ENU metres when aligned) and the keyframe JPEGs are canvas re-encodes (no EXIF). Keep it so.
  */
-import type { FeatureSet, PointCloud, RGBAImage, TriangleMesh } from '../core/types';
+import type { FeatureSet, MetricInfo, PointCloud, RGBAImage, TriangleMesh } from '../core/types';
+import { buildColourAtlas } from '../dense/colour-atlas';
 import { createColmapZipBlob, type ColmapArchiveImage, type ColmapModelInput } from '../io/colmap';
 import { encodeGLB } from '../io/glb';
 import { encodeMeshPLY, encodePLY } from '../io/ply';
+import { encodeUSDZ, selectArPivot, type ArPivotRoi } from '../io/usdz';
 import { encodeSplatPLY } from '../splat/ply';
 import type { ExportFormat, SplatModelPayload } from '../workers/protocol';
+import { encodeJpegRGBA } from './frame-ingest';
 import { isRGBAImage, type EngineStore } from './persistence';
 import type { SparseModel } from './types';
 
@@ -28,7 +34,25 @@ export interface ExportSources {
   splat?: () => Promise<SplatModelPayload | null>;
   /** Metadata comments for the files. */
   comments?: string[];
+  /** Scale / gravity alignment of the model (USDZ records whether it is metric). */
+  metric?: MetricInfo | null;
+  /** Object ROI of the mesh (src/dense/object-roi.ts), when trusted: the AR pivot (`selectArPivot`). */
+  objectRoi?: ArPivotRoi | null;
+  /** Texture encoder of the USDZ atlas (default: JPEG through OffscreenCanvas; tests inject one). */
+  encodeTexture?: (img: RGBAImage) => Promise<Blob | null>;
 }
+
+/** AR Quick Look budget (Apple: ≈ 100 k polygons and one 2048² texture set per model). */
+export const USDZ_MAX_TRIANGLES = 100_000;
+export const USDZ_TEXTURE_SIZE = 2048;
+/** JPEG quality of the USDZ atlas (≈ 1.5 MB at 2048²). */
+export const USDZ_JPEG_QUALITY = 0.9;
+/**
+ * USDZ material: 'diffuse' (AR Quick Look lights the photo colours, which contain shading
+ * already) or 'emissive' (flat, unlit-looking). Which reads better is open until the device
+ * check (docs/research/ios-platform.md §8); flip it here for that A/B.
+ */
+export const USDZ_MATERIAL: 'diffuse' | 'emissive' = 'diffuse';
 
 /** Uncompressed 24-bit BMP (COLMAP / FreeImage read it) for frames stored as raw RGBA. */
 export function encodeBMP(img: RGBAImage): Uint8Array {
@@ -159,6 +183,26 @@ export async function buildExport(format: ExportFormat, src: ExportSources): Pro
       const sp = src.splat ? await src.splat() : null;
       if (!sp || sp.model.count === 0) throw new Error('No Gaussian splats yet (run splat first)');
       return new Blob([encodeSplatPLY(sp.model, { antialiased: sp.antialiased, comments }) as Uint8Array<ArrayBuffer>], { type: 'application/octet-stream' });
+    }
+    case 'usdz': {
+      const mesh = src.mesh;
+      if (!mesh || mesh.triangleCount === 0) throw new Error('No mesh yet (run mesh first)');
+      // the pivot from the undecimated mesh (about uniform vertex density: see selectArPivot)
+      const pivot = selectArPivot(mesh, src.objectRoi);
+      const atlas = buildColourAtlas(mesh, { maxTriangles: USDZ_MAX_TRIANGLES, size: USDZ_TEXTURE_SIZE });
+      const img = await (src.encodeTexture ?? ((t: RGBAImage) => encodeJpegRGBA(t, USDZ_JPEG_QUALITY)))(atlas.texture);
+      if (!img) throw new Error('USDZ export needs OffscreenCanvas (JPEG encoding), which this browser lacks');
+      const usdz = encodeUSDZ({
+        mesh: atlas.mesh,
+        uvs: atlas.uvs,
+        texture: new Uint8Array(await img.arrayBuffer()),
+        textureType: img.type === 'image/png' ? 'image/png' : 'image/jpeg',
+        pivot,
+        metric: src.metric ? src.metric.metric : undefined,
+        name: src.name,
+        material: USDZ_MATERIAL,
+      });
+      return new Blob([usdz as Uint8Array<ArrayBuffer>], { type: 'model/vnd.usdz+zip' });
     }
     default:
       throw new Error(`Unknown export format ${String(format)}`);

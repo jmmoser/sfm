@@ -107,6 +107,8 @@ describe('MockEngine', () => {
     expect(names).toContain('sparse/0/cameras.txt');
     expect(names).toContain('sparse/0/images.txt');
     expect(names).toContain('sparse/0/points3D.txt');
+    // the USDZ atlas is JPEG-encoded with OffscreenCanvas (browser: src/app/ar-quicklook.gpu.test.ts)
+    await expect(e.exportModel('usdz')).rejects.toThrow(/OffscreenCanvas/);
   });
 
   it('back-pressure: a concurrent frame is rejected and its bitmap closed', async () => {
