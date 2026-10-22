@@ -7,7 +7,9 @@
  *
  * Decision logic:
  *  - time offset: gyro rotations (`estimateTimeOffset`); if unobservable (little angular
- *    acceleration), linear acceleration (`estimateTimeOffsetFromAcceleration`); else default;
+ *    acceleration), linear acceleration (`estimateTimeOffsetFromAcceleration` on the band-pass
+ *    regression, or — when that has no excitation either, as at 1–2 keyframes/s — on the
+ *    keyframe-interval regression); else the default (`timeOffsetMs`, σ `timeOffsetStdMs`);
  *  - gravity: IMU specific force (`estimateGravity`), else per-keyframe `gravityCam`. When the
  *    two point to opposite hemispheres the accelerometer samples carry the wrong sign (the
  *    platform sign self-check decided late or wrongly; `gravityCam` comes from the
@@ -26,8 +28,9 @@
  *    otherwise the less certain one (`details.yawFusion`, `yawSource`, warning);
  *  - scale: IMU (`estimateMetricScale`; when that is unreliable — e.g. too little band-limited
  *    excitation at phone keyframe rates of 1–2 /s — the keyframe-interval preintegration estimate
- *    `estimateMetricScaleFromIntervals`) and GPS, combined by inverse-variance weighting in
- *    log-scale when both are reliable and consistent (else the more certain one);
+ *    `estimateMetricScaleFromIntervals`, whose σ includes the scale's change over ± the offset's
+ *    σ) and GPS, combined by inverse-variance weighting in log-scale when both are reliable and
+ *    consistent (else the more certain one);
  *  - translation: GPS ⇒ local ENU at `originLatLonAlt`; otherwise the first camera (or the
  *    centroid) is put at the origin.
  */
@@ -118,6 +121,11 @@ export interface WorldAlignmentInput {
 export interface WorldAlignmentOptions {
   /** Camera–IMU offset used when it cannot be estimated (ms; also the search centre). Default 0. */
   timeOffsetMs: number;
+  /**
+   * 1-σ (ms) of `timeOffsetMs` when no offset can be estimated (default 25; docs/research/ios-sensors.md
+   * §1.8 expects 10–20 ms of IMU latency): propagated into the keyframe-interval scale's σ.
+   */
+  timeOffsetStdMs: number;
   timeOffset: Partial<TimeOffsetOptions>;
   gravity: Partial<GravityOptions>;
   scale: Partial<MetricScaleOptions>;
@@ -163,6 +171,7 @@ export interface WorldAlignmentOptions {
 
 const DEFAULT_WORLD: WorldAlignmentOptions = {
   timeOffsetMs: 0,
+  timeOffsetStdMs: 25,
   timeOffset: {},
   gravity: {},
   scale: {},
@@ -194,6 +203,11 @@ export interface WorldAlignment {
     timeOffset: TimeOffsetResult | null;
     /** Acceleration-based offset (computed only when the gyro-based one is unreliable). */
     accelTimeOffset: AccelTimeOffsetResult | null;
+    /**
+     * The same from the keyframe-interval regression (computed only when neither the gyro nor the
+     * band-pass acceleration offset is reliable and the band-pass scale is unreliable).
+     */
+    intervalTimeOffset: AccelTimeOffsetResult | null;
     /** Camera–IMU offset used (ms). */
     offsetMs: number;
     /** Where `offsetMs` comes from: gyro rotation, linear acceleration, or the default. */
@@ -203,7 +217,10 @@ export interface WorldAlignment {
     accelSignCorrected: boolean;
     /** Band-pass IMU scale (`estimateMetricScale`). */
     imuScale: MetricScaleResult | null;
-    /** Keyframe-interval IMU scale, computed only when `imuScale` is unreliable (else null). */
+    /**
+     * Keyframe-interval IMU scale, computed only when `imuScale` is unreliable (else null); its σ
+     * includes the scale's sensitivity to the offset's σ (`timeOffsetStdMs` for the default offset).
+     */
     imuScaleIntervals: MetricScaleResult | null;
     gps: GpsAlignment | null;
     /** Compass yaw (true north when `north` is 'true' or a GPS yaw exists, else magnetic). */
@@ -362,25 +379,49 @@ export function computeWorldAlignment(input: WorldAlignmentInput, options: Parti
       }
     }
   }
-  if (imu.length >= 2 && n >= 2 && offsetSource === 'default') warnings.push('camera–IMU time offset not observable; using the default');
   let imuScale: MetricScaleResult | null = null;
-  if (imu.length >= 2 && n >= 6) {
-    imuScale = estimateMetricScale(ikf, imu, {
-      gyroBias,
-      gravity: scaleGravity(),
-      ...o.scale,
-      offsetMs,
-    });
-    if (imuScale && !imuScale.reliable) warnings.push(`IMU scale unreliable: ${imuScale.reason}`);
-  }
+  const bandScale = (): MetricScaleResult | null => estimateMetricScale(ikf, imu, { gyroBias, gravity: scaleGravity(), ...o.scale, offsetMs });
+  if (imu.length >= 2 && n >= 6) imuScale = bandScale();
   // The band-pass estimate collapses at low keyframe rates (its excitation is the 0.3–3 Hz
   // acceleration as sampled at the keyframes); the interval estimate integrates the full-rate IMU.
   let imuScaleIntervals: MetricScaleResult | null = null;
+  let intervalTimeOffset: AccelTimeOffsetResult | null = null;
   if (imu.length >= 2 && n >= 6 && !(imuScale && imuScale.reliable)) {
-    imuScaleIntervals = estimateMetricScaleFromIntervals(ikf, imu, { gyroBias, gravity: scaleGravity(), ...o.intervalScale, offsetMs });
-    if (imuScaleIntervals && imuScaleIntervals.reliable)
+    // The band-pass offset search fails for the same reason; the interval regression's misfit
+    // observes the offset at these rates too (an offset error would bias the scale high).
+    if (offsetSource === 'default' && imu.length >= 4) {
+      intervalTimeOffset = estimateTimeOffsetFromAcceleration(ikf, imu, {
+        initialOffsetMs: o.timeOffsetMs,
+        searchRangeMs: o.timeOffset.searchRangeMs ?? 250,
+        method: 'intervals',
+        intervalScale: { gyroBias, gravity: scaleGravity(), ...o.intervalScale },
+      });
+      if (intervalTimeOffset && intervalTimeOffset.reliable) {
+        offsetMs = intervalTimeOffset.offsetMs;
+        offsetSource = 'accel';
+        if (gravity && gravity.source === 'accelG') {
+          const g2 = estimateGravity(ikf, imu, { gyroBias, ...o.gravity, offsetMs });
+          if (g2 && g2.source === 'accelG' && g2.reliable) gravity = g2;
+        }
+        imuScale = bandScale();
+      }
+    }
+  }
+  if (imu.length >= 2 && n >= 2 && offsetSource === 'default') warnings.push('camera–IMU time offset not observable; using the default');
+  if (imuScale && !imuScale.reliable) warnings.push(`IMU scale unreliable: ${imuScale.reason}`);
+  if (imu.length >= 2 && n >= 6 && !(imuScale && imuScale.reliable)) {
+    // σ includes the scale's sensitivity to the offset's own uncertainty
+    const offsetStdMs =
+      offsetSource === 'gyro'
+        ? timeOffset!.stdMs
+        : offsetSource === 'accel'
+          ? (intervalTimeOffset?.reliable ? intervalTimeOffset : accelTimeOffset)!.stdMs
+          : o.timeOffsetStdMs;
+    imuScaleIntervals = estimateMetricScaleFromIntervals(ikf, imu, { gyroBias, gravity: scaleGravity(), ...o.intervalScale, offsetMs, offsetStdMs });
+    const iv = imuScaleIntervals?.intervals;
+    if (imuScaleIntervals && iv && imuScaleIntervals.reliable)
       warnings.push(
-        `IMU scale from keyframe intervals (σ ${(100 * imuScaleIntervals.relUncertainty).toFixed(1)} %, span ${imuScaleIntervals.spanS!.toFixed(2)} s, R² ${imuScaleIntervals.r2.toFixed(3)})`,
+        `IMU scale from keyframe intervals (σ ${(100 * imuScaleIntervals.relUncertainty).toFixed(1)} % incl. κ ${(100 * iv.attenuation).toFixed(1)} % and offset ${(100 * iv.offsetSensitivity).toFixed(1)} %, span ${iv.spanS.toFixed(2)} s, R² ${imuScaleIntervals.r2.toFixed(3)}, ${imuScaleIntervals.source})`,
       );
     else if (imuScaleIntervals) warnings.push(`IMU interval scale unreliable: ${imuScaleIntervals.reason}`);
   }
@@ -606,6 +647,7 @@ export function computeWorldAlignment(input: WorldAlignmentInput, options: Parti
     details: {
       timeOffset,
       accelTimeOffset,
+      intervalTimeOffset,
       offsetMs,
       offsetSource,
       gravity,
