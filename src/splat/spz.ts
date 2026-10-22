@@ -302,6 +302,7 @@ async function pipeBytes(data: Uint8Array, t: CompressionStream | DecompressionS
 
 /** SPZ v3 file bytes of a model in the Z-up world (gzip via CompressionStream). */
 export async function encodeSplatSPZ(m: SplatModel, o: SpzEncodeOptions = {}): Promise<Uint8Array> {
+  if (typeof CompressionStream === 'undefined') throw new Error('The SPZ export needs CompressionStream (Safari 16.4 or later)');
   return pipeBytes(packSplatSPZ(m, o), new CompressionStream('gzip'));
 }
 

@@ -124,6 +124,19 @@ export async function renderFlythroughVideo(o: FlythroughVideoOptions): Promise<
   const t0 = performance.now();
   let alive = 0;
   let maxAlive = 0;
+  /** Resolves on the encoder's next `dequeue` event (Safari 17+, Chrome 106+), else after 4 ms. */
+  const dequeued = (): Promise<void> =>
+    new Promise((r) => {
+      const t = setTimeout(r, 4);
+      encoder.addEventListener?.(
+        'dequeue',
+        () => {
+          clearTimeout(t);
+          r();
+        },
+        { once: true },
+      );
+    });
   const throwIfStopped = (): void => {
     if (signal?.aborted) throw abortError();
     if (failure) throw failure instanceof Error || failure instanceof DOMException ? failure : new Error(String(failure));
@@ -135,7 +148,7 @@ export async function renderFlythroughVideo(o: FlythroughVideoOptions): Promise<
       throwIfStopped();
       // at most one raw frame: the encoder has taken the previous one before the next is drawn
       while (encoder.encodeQueueSize > 0) {
-        await new Promise((r) => setTimeout(r, 2));
+        await dequeued();
         throwIfStopped();
       }
       const ts = flythroughTimestampUs(path, i);
