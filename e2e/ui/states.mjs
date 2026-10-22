@@ -1134,15 +1134,22 @@ await scenario('splat-build', async () => {
   check(!/Stopped early/.test((await by(page, 'sheet-build').textContent()) ?? ''), 'the continued model is complete (no Continue)');
   await page.keyboard.press('Escape');
   await by(page, 'sheet-build').waitFor({ state: 'detached' });
-  await by(page, 'layer-switch').waitFor({ state: 'visible', timeout: 15000 });
-  const segs = await page.locator('[data-testid="layer-switch"] .segment').evaluateAll((els) => els.map((e) => e.dataset.value));
+  const segments = () => page.locator('[data-testid="layer-switch"] .segment').evaluateAll((els) => els.map((e) => e.dataset.value));
   if (hostGpu) {
+    await by(page, 'layer-switch').waitFor({ state: 'visible', timeout: 15000 });
+    const segs = await segments();
     check(segs.join(',') === 'splats,points', `layer pill Splats / Points (got ${segs})`);
     await page.waitForFunction(() => document.querySelector('[data-testid="layer-switch"]')?.dataset.layer === 'splats', null, { timeout: 30000 });
     await sleep(500);
     await shot(page, 'state-splat-shown');
     await audit(page, 'splats shown');
-  } else console.log(`[states] software adapter: layer pill ${segs}`);
+  } else {
+    // SwiftShader: the splat layer refuses the software adapter (for good, since the model ended
+    // early was loaded): the points stay, and the layer pill has nothing to switch to
+    await page.waitForFunction(() => document.querySelector('.viewer-screen')?.dataset.splats === 'unavailable', null, { timeout: 30000 });
+    const segs = await segments();
+    check((await by(page, 'layer-switch').isHidden()) && !segs.includes('splats'), `software adapter: splats refused, points only (layer pill hidden, segments ${segs})`);
+  }
   await by(page, 'tool-export').tap();
   await by(page, 'export-ply-splat').waitFor();
   check(!(await by(page, 'export-ply-splat').getAttribute('class'))?.includes('disabled'), 'export sheet offers the Gaussian-splat PLY');

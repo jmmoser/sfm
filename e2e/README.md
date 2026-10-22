@@ -536,7 +536,8 @@ The harness fields of `result.json` are:
   plan, checkpoints, …), `lastDetail` (the last training progress `detail`) and the `splats.ply` path; also
   copied to `metrics.json`. With `--splat-previews`: `previews` (iteration, arrival ms after the stage
   started, PSNR against that training photo, file) and `firstTrainingMs`; the summary line gives the first
-  arrival, the largest gap while training and the PSNR first → last.
+  arrival, the largest gap while training and the PSNR first → last, next to `stats.splatPreviewFinalPsnr`
+  (the trained model rendered from the same view in the same raw colours: what the previews converge to).
 
 The `metrics.mjs` fields are `intrinsics`, `images`, `metric`, `numInputImages` and `pointsFile`.
 To re-score a run, use `node e2e/metrics.mjs e2e/data/object e2e/out/e2e/object/result.json`.
@@ -1539,7 +1540,11 @@ E2E_GPU=host node e2e/run-e2e.mjs object-real --engine worker --splat --tag gr-b
 E2E_GPU=host node e2e/splat-replay.mjs e2e/out/e2e/object-real-gr-base --out e2e/out/replay/object \
   --variant before='{"colourCorrection":{},"geometry":false}' --variant ccoff='{"colourCorrection":false}'
 #   --variants FILE (name → overrides JSON), --tests held,sim3,<test datasets> (default: held, sim3 and every
-#   e2e/data/<dataset>-* set), --skip-nvs (train only), --nvs-only (score what is missing; resumes), --repeat N
+#   e2e/data/<dataset>-* set), --skip-nvs (train only), --nvs-only (score what is missing; resumes), --repeat N,
+#   --splat-previews (every variant trains with SplatOptions.preview, as the app does)
+# preview cost: two sequential invocations into the same --out, without and with previews (compare "stage s")
+E2E_GPU=host node e2e/splat-replay.mjs e2e/out/e2e/object-real-gr-base --out e2e/out/replay/previews --variant off='{}' --skip-nvs
+E2E_GPU=host node e2e/splat-replay.mjs e2e/out/e2e/object-real-gr-base --out e2e/out/replay/previews --variant on='{}' --splat-previews --skip-nvs
 ```
 
 * **Faithfulness**: the page (`harness.html`, `window.replaySplat`, src/harness/engine/replay.ts) loads the dump into
@@ -1549,7 +1554,9 @@ E2E_GPU=host node e2e/splat-replay.mjs e2e/out/e2e/object-real-gr-base --out e2e
   stage 59.8 s (59.7 s).
 * **Output**: `<out>/<variant>/{splats.ply, result.json (copied from the run), replay.json, nvs*/nvs.json}` and
   `<out>/summary.json`; the script prints full-frame PSNR per test set, the off-trajectory mean and the stage times.
-  `profile: true` in a variant adds per-pass GPU ms per iteration.
+  `profile: true` in a variant adds per-pass GPU ms per iteration. With `--splat-previews`, `replay.json` holds the
+  snapshots (`previews`: iteration, arrival ms, PSNR; `firstTrainingMs`) and the summary their count, first arrival,
+  largest gap while training and PSNR first → last → final model.
 * **Noise**: five replays of the unchanged stage spread 0.11 dB held-out (object 31.21–31.32, yard 31.07–31.14),
   up to 0.2 dB on single off-trajectory sets (yard +0.75 m: 20.48–20.68) and 0.05 (object) / 0.09 dB (yard) in the
   off-trajectory means (the GPU's float CAS adds make runs non-deterministic). Stage times are only comparable within a sequential run (see below): the

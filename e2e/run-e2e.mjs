@@ -114,6 +114,7 @@ function printTimings(r, log) {
       log(
         `splat previews: ${pv.length}, first at ${fmtNum(pv[0].ms / 1000, 1)} s (first iteration reported at ${first != null ? `${fmtNum(first / 1000, 1)} s` : '–'}), ` +
           `max gap while training ${gaps.length ? `${fmtNum(Math.max(...gaps) / 1000, 1)} s` : '–'}, PSNR vs the training photo ${fmtNum(pv[0].psnr, 2)} → ${fmtNum(pv[pv.length - 1].psnr, 2)} dB` +
+          `${s.splatPreviewFinalPsnr != null ? ` (final model ${fmtNum(s.splatPreviewFinalPsnr, 2)} dB)` : ''}` +
           `${pv[0].file ? ` → ${dirname(pv[0].file)}/` : ''}`,
       );
     }
