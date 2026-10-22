@@ -3,15 +3,18 @@
  * finish late and out of order (fake `DenseHelpers` running the worker code on structured-cloned
  * inputs after seeded random delays) and slow, delayed store writes, every PatchMatch pass map,
  * every fusion-filtered map and the fused cloud are bit-identical to the serial run
- * (`denseOverlap: false`); a failing helper falls back to the engine thread with the same output;
- * a cancel leaves no write behind, and the resume completes to the same cloud. CPU PatchMatch on
- * the tiny synthetic object (`denseFixture`), persistent depth backend (float16 store copies).
+ * (`denseOverlap: false`); a failing helper falls back to the engine thread with the same output,
+ * decoding there at most the plan's decodes at a time; a cancel leaves no write behind, and a
+ * failed store write (quota) deletes no input of an unstored view: both resumes complete to the
+ * same maps and cloud. CPU PatchMatch on the tiny synthetic object (`denseFixture`), persistent
+ * depth backend (float16 store copies).
  */
 import { describe, expect, it } from 'vitest';
-import type { PointCloud, ProgressEvent } from '../core/types';
+import type { PointCloud, ProgressEvent, RGBAImage } from '../core/types';
 import { Rng } from '../math/random';
 import { PatchMatchHolder, runDensify, type DenseDeps } from './dense';
 import { decodeDenseView, denseColourThumbnail, haloStoreJob, type DenseHelpers } from './dense-jobs';
+import { resizeRGBA } from './frame-ingest';
 import { MemoryEngineStore } from './persistence';
 import { denseFixture } from './testutil';
 import type { KeyframeRecord, SparseModel } from './types';
@@ -29,23 +32,27 @@ async function frameStore(n: number): Promise<{ store: MemoryEngineStore; model:
 
 /**
  * A "persistent" in-memory depth backend (float16 store copies, resume) whose writes take
- * `writeMs` (± random; `slowMs` for some keys) and are recorded.
+ * `writeMs` (± random; `slowMs` for some keys) and are recorded. The first write of a key in
+ * `failOnce` rejects (as IndexedDB's QuotaExceededError) and stores nothing.
  */
 function slowBackend(
   rng: Rng,
   writeMs: number,
   slowMs: Record<string, number> = {},
+  failOnce: Iterable<string> = [],
 ): { backend: MemoryEngineStore; writes: Map<string, Uint8Array>; order: string[]; count: () => number } {
   const backend = new MemoryEngineStore('depth');
   Object.defineProperty(backend, 'persistent', { value: true });
   const writes = new Map<string, Uint8Array>();
   const order: string[] = [];
+  const failing = new Set(failOnce);
   let n = 0;
   const put = backend.putBinary.bind(backend);
   backend.putBinary = async (key, data) => {
     const bytes = data instanceof ArrayBuffer ? new Uint8Array(data.slice(0)) : new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
     if (/^pm\d+\//.test(key)) order.push(key);
     await sleep(slowMs[key] ?? Math.floor(writeMs * (0.5 + rng.next())));
+    if (failing.delete(key)) throw Object.assign(new Error(`QuotaExceededError: writing ${key}`), { name: 'QuotaExceededError' });
     n++;
     if (/^(pm\d+|depth)\//.test(key)) writes.set(key, bytes);
     return put(key, data);
@@ -203,5 +210,96 @@ describe('runDensify: CPU/GPU overlap', () => {
     expect(resumed.stats.denseResumedMaps).toBe(stored);
     expectSameCloud(serial.cloud, resumed.cloud);
     for (const [k, v] of ref.writes) if (k.startsWith('pm2/') || k.startsWith('depth/')) expect(Buffer.from(ov.writes.get(k)!).equals(Buffer.from(v)), k).toBe(true);
+  }, 300_000);
+
+  it('a failed store write (quota) mid-pass keeps the inputs of every unstored view; the resume gives the same maps and cloud', async () => {
+    const { store, model } = await frameStore(6);
+    const ref = slowBackend(new Rng(21), 1);
+    const serial = await runDensify(deps(store, ref.backend, model, false), opts);
+    const ids = serial.views.map((v) => v.id);
+    // the third map of the photometric pass (maps before it landed, later ones still to come), and
+    // the last map of the final pass, its halo job slow on a helper (the view's prior and sources
+    // are last read by it: the maps a resume needs to recompute it)
+    const cases = [
+      { pass: 1, nth: 2, helpers: fakeHelpers(new Rng(22)) },
+      { pass: 2, nth: -1, helpers: fakeHelpers(new Rng(23), { haloDelaysMs: [5, 0, 400] }) },
+    ];
+    for (const { pass, nth, helpers } of cases) {
+      const failKey = ref.order.filter((k) => k.startsWith(`pm${pass}/`)).at(nth)!;
+      const ov = slowBackend(new Rng(24 + pass), 6, {}, [failKey]);
+      await expect(runDensify(deps(store, ov.backend, model, helpers), opts), failKey).rejects.toMatchObject({ name: 'QuotaExceededError' });
+      // every view without a map of the failed pass still has its previous-pass map (its prior)
+      const stored = new Set(await ov.backend.listBinaryKeys(`pm${pass}/`));
+      const prevStored = new Set(await ov.backend.listBinaryKeys(`pm${pass - 1}/`));
+      expect(stored.has(failKey), failKey).toBe(false);
+      for (const id of ids) if (!stored.has(`pm${pass}/${id}`)) expect(prevStored.has(`pm${pass - 1}/${id}`), `pm${pass - 1}/${id}`).toBe(true);
+
+      const resumed = await runDensify(deps(store, ov.backend, model, fakeHelpers(new Rng(30 + pass))), opts);
+      expect(resumed.stats.denseResumedPass).toBe(pass);
+      expect(resumed.stats.denseResumedMaps).toBe(stored.size);
+      expectSameCloud(serial.cloud, resumed.cloud);
+      // the failed pass's maps (stored before the failure or by the resume), later passes', the filtered maps
+      const fromPass = (k: string): boolean => k.startsWith('depth/') || Number(/^pm(\d+)\//.exec(k)?.[1] ?? -1) >= pass;
+      for (const [k, v] of ref.writes) if (fromPass(k)) expect(Buffer.from(ov.writes.get(k)!).equals(Buffer.from(v)), k).toBe(true);
+    }
+  }, 300_000);
+
+  it("after a failed helper decode, the engine thread decodes at most the plan's decodes at a time", async () => {
+    const { cam, images, model } = denseFixture(6);
+    // keyframes stored as Blobs (raw RGBA behind a size header, standing in for JPEGs) and a
+    // createImageBitmap + OffscreenCanvas stand-in that counts the decoded bitmaps alive at once
+    const store = new MemoryEngineStore('dense-overlap-blobs');
+    for (let id = 0; id < images.length; id++) {
+      const im = images[id];
+      const record = { id, frameIndex: id, t: 1000 + 100 * id, width: cam.width, height: cam.height } as unknown as KeyframeRecord;
+      await store.putFrame(id, new Blob([new Uint32Array([im.width, im.height]), new Uint8Array(im.data)]), record);
+    }
+    let live = 0;
+    let maxLive = 0;
+    const g = globalThis as Record<string, unknown>;
+    const saved = { createImageBitmap: g.createImageBitmap, OffscreenCanvas: g.OffscreenCanvas };
+    g.createImageBitmap = async (blob: Blob) => {
+      const buf = await blob.arrayBuffer();
+      const [width, height] = new Uint32Array(buf, 0, 2);
+      maxLive = Math.max(maxLive, ++live);
+      await sleep(4);
+      return { width, height, rgba: { width, height, data: new Uint8ClampedArray(buf, 8) }, close: () => void live-- };
+    };
+    g.OffscreenCanvas = class {
+      private img: RGBAImage | null = null;
+      constructor(
+        public width: number,
+        public height: number,
+      ) {}
+      getContext() {
+        return {
+          drawImage: (bmp: { rgba: RGBAImage }, _x: number, _y: number, w: number, h: number) => void (this.img = resizeRGBA(bmp.rgba, w, h)),
+          getImageData: () => ({ width: this.img!.width, height: this.img!.height, data: this.img!.data }),
+        };
+      }
+    };
+    try {
+      const serial = await runDensify(deps(store, slowBackend(new Rng(41), 1).backend, model, false), opts);
+      expect(maxLive).toBe(1);
+      maxLive = 0;
+      const failing = fakeHelpers(new Rng(42), { fail: true, maxDelayMs: 20 });
+      const logs: string[] = [];
+      const d = deps(store, slowBackend(new Rng(43), 1).backend, model, failing);
+      d.log = (_level, m) => void logs.push(m);
+      const fallback = await runDensify(d, opts);
+      const decodes = Number(/(\d+) decodes in flight/.exec(logs.join('\n'))?.[1]);
+      expect(decodes).toBeGreaterThanOrEqual(1);
+      expect(failing.calls.denseView).toBeGreaterThan(0);
+      expect(logs.some((m) => /decoding on a CPU helper worker failed/.test(m))).toBe(true);
+      // (a view's 1 + sources images were requested at once when the first job failed)
+      expect(maxLive).toBeGreaterThanOrEqual(1);
+      expect(maxLive).toBeLessThanOrEqual(decodes);
+      expectSameCloud(serial.cloud, fallback.cloud);
+    } finally {
+      for (const [k, v] of Object.entries(saved)) {
+        if (v === undefined) delete g[k];
+        else g[k] = v;
+      }
+    }
   }, 300_000);
 });

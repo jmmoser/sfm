@@ -82,9 +82,19 @@ export class EngineDepthStore implements DepthMapStore {
 
   /** Delete one map (memory + store). */
   async delete(id: number): Promise<void> {
+    this.forget(id);
+    await this.deleteStored(id);
+  }
+
+  /** Drop one map's resident copy and listing (the first half of `delete`); the stored copy stays. */
+  forget(id: number): void {
     this.memory.delete(id);
     this.cache.delete(id);
     this.known.delete(id);
+  }
+
+  /** Delete one map's stored copy (the second half of `delete`, e.g. once a later write has landed). */
+  async deleteStored(id: number): Promise<void> {
     if (this.persistent) await this.store!.deleteBinary(this.key(id)).catch(() => undefined);
   }
 

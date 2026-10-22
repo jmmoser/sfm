@@ -163,7 +163,9 @@ rolling-shutter correct the next view's missing images and halo-filter + seriali
 earlier views, whose store writes complete in the background (≤ `DensePlan.overlap.maps` maps behind the
 GPU; put in view order). The memory plan grants one map and one decode in flight before the image LRU
 grows, more only from the remaining headroom; every pass drains its writes before the next reads them or
-`dense/progress` advances. Bit-identical to the serial path (research/dense-tuning.md "CPU/GPU overlap").
+`dense/progress` advances, and deletes a previous-pass map's stored copy only once the maps put up to its last
+reader have landed (a failed write or a kill leaves a resume every input). Bit-identical to the serial path
+(research/dense-tuning.md "CPU/GPU overlap").
 
 ### Splat
 Gaussian splatting (`src/engine/splat.ts` over `src/splat`, research/splat-tuning.md "Engine splat stage"), after
