@@ -465,11 +465,13 @@ node e2e/run-e2e.mjs [object|yard|all|<dataset> ...] [--engine worker|inline|moc
      [--no-export | --export fmt,fmt] [--nvs] [--nvs-views N] [--mapping inline|background]
      [--timeout-min M] [--out DIR] [--tag NAME] [--thresholds FILE] [--no-thresholds]
      [--enforce] [--mock-speed X] [--set key=json ...] [--quiet] [--verbose] [--headed]
+     [--device desktop|phone|local-bridge] [--public-url URL] [--port N]
 
 node e2e/run-e2e.mjs all --engine mock                                  # plumbing check, ~40 s
 node e2e/run-e2e.mjs object --stride 4 --max-frames 40 --no-dense       # short real run
 node e2e/run-e2e.mjs yard --dense-size 480 --dense-views 30 --timeout-min 240
 E2E_GPU=host node e2e/run-e2e.mjs object-real --splat --nvs              # + Gaussian splats, scored as novel views
+node e2e/run-e2e.mjs object-real --device phone --splat                 # in Safari on an iPhone (see "On a real iPhone")
 ```
 
 Defaults: dataset `object`, engine `worker`, quality `fast`, every frame, all sensors, dense, mesh
@@ -537,14 +539,20 @@ registered and how many are in the final model (also logged as `extend: …`).
 | File | Content |
 |---|---|
 | `result.json` | Harness result plus the `metrics.mjs` input fields. See below. |
-| `sparse.ply`, `dense.ply`, `mesh.ply` | Streamed from the page through `window.__e2eWrite`. |
+| `sparse.ply`, `dense.ply`, `mesh.ply` | Streamed from the page through `window.__e2eWrite` (Playwright), or the HTTP bridge with `--device phone` / `local-bridge`. |
 | `splats.ply` | With `--splat`: `exportModel('ply-splat')` (INRIA 3DGS PLY, run world frame); `--nvs` scores it as the `splat` renderer. |
 | `metrics.json` | `computeMetrics` output, sparse-cloud accuracy, live-trajectory metrics and threshold checks (+ the `nvs` summary with `--nvs`). |
 | `nvs/nvs.json` | With `--nvs [--nvs-views N]`: the novel-view evaluation of the output (see "Novel-view evaluation"). |
 
 The harness fields of `result.json` are:
 
-* `config` (resolved), `dataset`, `engine` (init result, respawns, status changes).
+* `config` (resolved), `dataset`, `engine` (init result, respawns, status changes; `init.adapter` is
+  the engine's adapter string from its own realm).
+* `device` (`src/harness/engine/device.ts`): `userAgent`, `platform`, `hardwareConcurrency`, `devicePixelRatio`,
+  `screen`, `secureContext`, and the page's WebGPU `adapter` (vendor, architecture, description, features,
+  `limits.maxBufferSize` (the RAM class on Apple GPUs) and other limits; requested only, no device), or `adapterError`.
+* `runner`: `wallSeconds`, `error`; device runs add `device`, `waitSeconds` (until the page connected) and
+  `page` (its user agent and URL).
 * `timings`: harness steps in ms. `stageTimings`: per engine progress stage, with the
   `src/app/stages.ts` UI stage and its duration.
 * `frames`: one record per delivered frame, with the decision, guidance, tracking, counters,
@@ -636,10 +644,90 @@ The exit code is 0 when every pipeline finished without errors and every enforce
 ### By hand
 
 Open `harness.html?dataset=object&engine=mock&maxFrames=40&densify=1` on the dev server
-(`npm run dev`). It runs on load and shows the result. The query keys are `engine`, `quality`, `mode`, `stride`,
-`maxFrames`, `start`, `fps`, `imu`, `gps`, `heading`, `headingNorth`, `densify`, `mesh`, `exports` and `mockSpeed`.
-From the console, `await runPipeline({...})` returns the same `HarnessResult`. When `window.__e2eWrite`
-is missing, the dense cloud is embedded as base64 in `densePoints`.
+(`npm run dev`). It runs on load and shows the result. The query keys (`src/harness/engine/query.ts`) are
+`engine`, `quality`, `mode`, `stride`, `maxFrames`, `start`, `fps`, `imu`, `gps`, `heading`, `headingNorth`,
+`densify`, `mesh`, `splat`, `splatIterations` (implies `splat`), `exports`, `mockSpeed`, `engineConfig=<JSON object>`
+(e.g. `{"featureBackend":"cpu"}`) and `config=<JSON>`, a whole `HarnessConfig` that the single keys override.
+Malformed input stops the page with an error instead of running a default: bad JSON, an unknown `engine`,
+`quality`, `mode` or `headingNorth`, a number key that is not a number, `splatIterations` below 1. From the console,
+`await runPipeline({...})` returns the same `HarnessResult`. When `window.__e2eWrite` is missing, the dense
+cloud is embedded as base64 in `densePoints`.
+
+### On a real iPhone (`--device phone`)
+
+The same harness page runs in a Safari tab on the phone, on the phone's GPU (Metal), memory limits and jetsam.
+Nothing on the phone is automated: you open one URL and keep the tab in front. The results come back to the
+computer through an HTTP bridge on the dev server and are scored exactly like a desktop run. Needs Safari on
+iOS 26+ (WebGPU), the phone on the computer's network (or a tunnel), and the dataset in `e2e/data/` on the
+computer (the phone fetches it from the dev server).
+
+```sh
+# once: a certificate the phone trusts (WebGPU, motion sensors and storage need a secure context)
+brew install mkcert && mkcert -install
+mkdir -p e2e/out/cert && mkcert -cert-file e2e/out/cert/dev.pem -key-file e2e/out/cert/dev-key.pem \
+  "$(ipconfig getifaddr en0)" "$(scutil --get LocalHostName).local" localhost 127.0.0.1
+#   AirDrop "$(mkcert -CAROOT)/rootCA.pem" to the phone, install the profile (Settings > General > VPN & Device
+#   Management) and enable full trust (Settings > General > About > Certificate Trust Settings).
+
+export E2E_HTTPS_CERT=e2e/out/cert/dev.pem E2E_HTTPS_KEY=e2e/out/cert/dev-key.pem
+node e2e/run-e2e.mjs object-real --device phone --splat               # → e2e/out/e2e/object-real-phone/
+node e2e/run-e2e.mjs object-real --device phone --engine mock          # plumbing check (also works over plain HTTP)
+# or behind an HTTPS tunnel to the port (no certificate on the phone; Vite then listens on 127.0.0.1 only)
+node e2e/run-e2e.mjs yard-real --device phone --public-url https://<name>.trycloudflare.com --port 5180
+```
+
+* **What happens.** The runner starts Vite on `0.0.0.0:5180` (`--port`) with the bridge plugin
+  (`e2e/lib/e2e-bridge.mjs`; added to the runner's inline config only, `apply: 'serve'`, never in `vite.config.ts`
+  or a build) and prints `https://<LAN address>:5180/__e2e/go` for each dataset. That link redirects to
+  `harness.html?bridge=1&run=<id>&config=<the whole HarnessConfig>`. The page has no Playwright binding, so it
+  installs the fetch bridge (`src/harness/engine/bridge.ts`, the run's flow in `bridge-run.ts`): progress lines,
+  page errors and console warnings go to the runner's stdout; `sparse.ply`, `dense.ply`, `mesh.ply` and `splats.ply` are POSTed as raw bytes
+  (16 MB requests, no base64) into the run's directory; at the end the page posts `{ result, error }`. Then the
+  runner scores it with the desktop code (`scoreRun`: metrics, `thresholds.json` checks, `--nvs`, summary) and
+  moves on to the next dataset. The page shows a "Next run" link to `/__e2e/go`.
+* **Output.** The same layout as a desktop run, in `<dataset>-phone/` (the tag defaults to the device name;
+  `--tag` overrides it). `result.json` has the phone's `device` block (user agent, adapter, `maxBufferSize`,
+  `wakeLock`: whether the screen lock was held when the result was sent),
+  the engine's `init.adapter`, `stageTimings`, and for `--splat` `splat.stats.splatItPerSec` (ms per iteration
+  = 1000 / it/s) and `splatMemPeakMB`.
+* **Keep the phone awake.** Set Settings > Display & Brightness > Auto-Lock > Never for the session (and back
+  afterwards): a locked phone suspends the Safari tab, its timers, fetches and GPU work. The page also requests a
+  screen wake lock once the runner accepts it. Whether WebKit wants a tap for that is [U]; if the request fails,
+  the runner prints a warning and the page shows a "Keep the screen on" button that asks again. The page polls
+  the runner every 5 s. The runner warns after 60 s without contact (screen locked, Safari in the background,
+  or the tab was killed) and says when the page is back.
+* **Timeouts.** At `--timeout-min` the runner asks the page to abort and scores the partial result. If the
+  pipeline has not returned 90 s after the page saw the abort (an engine call that ignores it), the page sends
+  `harnessSnapshot()` with the error `timeout (snapshot of the unfinished run)`, as the desktop runner does. Only a
+  page that sends nothing within 120 s of the abort ends the run without a result.
+* **Reloads and second tabs.** Each tab keeps a random token in `sessionStorage`, and the runner remembers the
+  token of the tab that started the run. When that tab comes back during the run, it was reloaded (iOS reloads
+  a tab that jetsam killed, "A problem repeatedly occurred"), so the run fails with that message instead of
+  running again. Any other tab is refused and the run goes on, even when it is reloaded. This covers a second
+  tap on the link or a link opened in a new tab. Whether `sessionStorage` survives a WebContent kill is [U]; if
+  not, the reloaded tab is refused like a second tab and the run ends at the timeout. Once the result is in,
+  `/__e2e/go` shows "No e2e run is waiting" until the runner registers the next dataset (it may still be
+  scoring); reload it then.
+* **Security.** While the runner runs, the dev server is open to the whole LAN, just like `npm run dev`. The
+  run's random id (crypto, 128 bit) only stops other web origins: a page on another site cannot read it from
+  `/__e2e/go`'s redirect, so it cannot write files or post a result. It does not stop another host on the
+  network, which can `curl -i …/__e2e/go` and read the id from the `Location` header. The bridge writes only
+  under that run's output directory (`safeJoin`: no absolute paths, no `..`), at most 512 MB per request and
+  4 GiB on disk per run. It forgets the run once its result is in. Vite's Host check (plain HTTP only; Vite skips
+  it over HTTPS) allows IP addresses, localhost, this machine's host name and, with `--public-url`, the
+  tunnel's host name. Run it only on a network you trust.
+* **Proving the path without a phone.** `--device local-bridge` runs the identical server and page code with
+  headless Chromium here opening the `/__e2e/go` URL (no bindings; HTTPS too when `E2E_HTTPS_*` is set). On a
+  12-frame object set (`generate-synth.mjs object --frames 12`; 2026-10-22, SwiftShader) it matched the desktop
+  runner exactly: the mock engine gave byte-identical `sparse.ply` / `dense.ply` / `mesh.ply`, the worker engine
+  (`--no-dense --set 'engineConfig={"featureBackend":"cpu"}'`) a byte-identical `sparse.ply`, both identical
+  metrics and checks. The nightly CI runs `run-e2e.mjs all --engine mock --device local-bridge`. A renderer
+  crash or a closed page fails the run at once (as on the desktop), not at the timeout.
+* **Limits.** The phone loads the dev server's unbundled modules, so it measures the engine on real Metal and
+  real jetsam but not the production worker bundle (the cd7a534 class needs a built-harness run). Runs are
+  manual: note battery level, charger and thermal state with each result, and do not quote a warm phone's
+  numbers as sustained. Measured numbers go into a dated `docs/research/` report and a measured row under
+  "iPhone estimate (not measured)" below; none has been recorded yet.
 
 ### Engine end-to-end results (2026-10, SwiftShader)
 
@@ -1655,7 +1743,8 @@ and 34 % faster without it. The 1063 MB memory plan leaves 137 MB of the 1.2 GB 
 
 ### iPhone estimate (not measured)
 
-These are estimates scaled from the M4 means of the two runs, not measurements. Each M4 time is multiplied by
+These are estimates scaled from the M4 means of the two runs, not measurements (measure them with
+`run-e2e.mjs <dataset> --device phone --splat`, "On a real iPhone"). Each M4 time is multiplied by
 peak ratio / sustained fraction, using the given M4 GPU ≈ 1.26× A19 Pro and 1.76× A18 Pro peak, sustained at
 0.55–0.68 of peak: ×1.85–2.29 for an A19 Pro and ×2.59–3.20 for an A18 Pro. The factor is applied to every stage. That
 is optimistic for the CPU-bound parts (refine's bundle adjustment on the CPU pool, view decoding and undistortion in

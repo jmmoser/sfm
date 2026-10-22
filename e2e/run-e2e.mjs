@@ -6,13 +6,23 @@
  *        (<dataset> = any directory of e2e/data, e.g. the presets object-real / yard-real;
  *        the capture mode and thresholds follow its meta.scene)
  *        [--quality fast|balanced|max] [--stride N] [--max-frames N] [--no-dense] [--no-mesh]
- *        [--splat [--splat-iterations N] [--splat-max N]] [--nvs] [--timeout-min M] … (--help for every option)
+ *        [--splat [--splat-iterations N] [--splat-max N]] [--nvs] [--timeout-min M]
+ *        [--device desktop|phone|local-bridge [--public-url URL] [--port N]] … (--help for every option)
  *
  * Starts Vite (root = repo, free port) and Chromium with the WebGPU flags, opens harness.html
  * per dataset and calls window.runPipeline(config) (src/harness/engine): frames are decoded
  * from e2e/data/<dataset>/frames/*.jpg and fed to the engine with IMU / GPS / compass like the
  * FramePump would, then finishCapture → refine → densify → mesh → [splat] → exports. Progress is
- * streamed to stdout. Writes to e2e/out/e2e/<dataset>[-tag]/:
+ * streamed to stdout.
+ *
+ * --device phone runs the same page in Safari on an iPhone: Vite listens on 0.0.0.0 (HTTPS from
+ * E2E_HTTPS_CERT / E2E_HTTPS_KEY, e.g. mkcert; or on 127.0.0.1 behind --public-url, an HTTPS
+ * tunnel) with the HTTP bridge (e2e/lib/e2e-bridge.mjs); the runner prints <origin>/__e2e/go to
+ * open on the phone and waits for the page's result while logs and PLY files arrive through the
+ * bridge. --device local-bridge does the same with headless Chromium here opening the URL (CI and
+ * plumbing check of the phone path). Every device ends in the same scoreRun(): output layout,
+ * thresholds and summary. Writes to e2e/out/e2e/<dataset>[-tag]/ (device runs: the tag defaults to
+ * the device name, e.g. object-real-phone/):
  *   result.json   harness result + the e2e/metrics.mjs input fields (intrinsics, images, metric,
  *                 numInputImages, pointsFile) — re-score with `node e2e/metrics.mjs e2e/data/<d> result.json`
  *   sparse.ply / dense.ply / mesh.ply / splats.ply   (streamed from the page; splats with --splat)
@@ -32,13 +42,15 @@
  * scale source, device vs replay decisions) and every GT check is skipped ('no ground truth').
  */
 import { access, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { hostname, networkInterfaces } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadDataset, loadJSONIfExists } from './lib/dataset.mjs';
 import { computeMetrics, formatTable } from './lib/metrics-core.mjs';
 import { parsePoints } from './lib/points.mjs';
 import { ArgError, USAGE, parseArgs } from './lib/e2e-args.mjs';
-import { startHarnessBrowser } from './lib/e2e-browser.mjs';
+import { createBridge } from './lib/e2e-bridge.mjs';
+import { startBridgeBrowser, startBridgeServer, startHarnessBrowser } from './lib/e2e-browser.mjs';
 import { plyFromBase64 } from './lib/e2e-ply.mjs';
 import { SUMMARY_HEADER, fmtNum, formatChecks, metricsInput, resolveThresholds, runChecks, skipChecks, summaryRow, table } from './lib/e2e-checks.mjs';
 import { computeSelfMetrics, formatSelfTable, isGtFree } from './lib/self-metrics.mjs';
@@ -47,6 +59,8 @@ import { runNvs } from './nvs.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/** Default dev-server port of --device phone (fixed, so a bookmark on the phone keeps working). */
+const PHONE_PORT = 5180;
 
 async function exists(p) {
   try {
@@ -136,24 +150,46 @@ function printTimings(r, log) {
   if (r.exports && Object.keys(r.exports).length) {
     log(`exports: ${Object.entries(r.exports).map(([k, v]) => `${k} ${'bytes' in v ? `${fmtNum(v.bytes / 1048576, 2)} MB` : `ERROR ${v.error}`}`).join(', ')}`);
   }
+  if (r.device) {
+    const a = r.device.adapter;
+    const wl = r.device.wakeLock;
+    log(
+      `device: ${r.device.userAgent}; adapter ${a ? `${[a.vendor, a.architecture, a.description].filter(Boolean).join(' ') || '?'} (maxBufferSize ${fmtNum((a.limits.maxBufferSize ?? 0) / 1048576, 0)} MB)` : `none (${r.device.adapterError})`}` +
+        `${wl ? `; screen wake lock ${wl.active ? 'held' : `NOT held (${wl.error ?? 'released'})`} at the end` : ''}`,
+    );
+  }
   if (r.engine?.respawns) log(`WARNING: the engine worker was respawned ${r.engine.respawns} time(s) (state lost)`);
   for (const e of r.errors ?? []) log(`error [${e.step}] ${e.name}: ${e.message}`);
 }
 
-async function runDataset(browser, name, opts, outRoot, thresholdsSpec) {
-  const runName = opts.tag ? `${name}-${opts.tag}` : name;
+/** Output tag: --tag, else the device name for device runs. */
+function runTag(opts) {
+  return opts.tag ?? (opts.device && opts.device !== 'desktop' ? opts.device : null);
+}
+
+/** Dataset check, output directory (stale files removed) and the page config of one run. */
+async function prepareRun(name, opts, outRoot) {
+  const tag = runTag(opts);
+  const runName = tag ? `${name}-${tag}` : name;
   const log = (m) => console.log(`[${runName}] ${m}`);
   const dsDir = join(ROOT, 'e2e', 'data', name);
   if (!(await exists(join(dsDir, 'meta.json')))) {
     const known = ['object', 'yard', 'object-real', 'yard-real'].includes(name); // scenes and generator presets
     log(`dataset missing: ${dsDir} (generate it: node e2e/generate-synth.mjs ${known ? name : '<scene|preset> --name ' + name})`);
-    return { name: runName, result: null, metrics: null, checks: [], failed: true };
+    return { missing: { name: runName, result: null, metrics: null, checks: [], failed: true } };
   }
   const dir = join(outRoot, runName);
   await mkdir(dir, { recursive: true });
   for (const f of ['result.json', 'metrics.json', 'sparse.ply', 'dense.ply', 'mesh.ply', 'splats.ply']) await rm(join(dir, f), { force: true });
-
   const cfg = { ...structuredClone(opts.config), dataset: name, output: { prefix: `${runName}/` } };
+  return { name, runName, log, dsDir, dir, cfg };
+}
+
+/** Desktop: the page in headless Chromium here, driven through Playwright. */
+async function runDataset(browser, name, opts, outRoot, thresholdsSpec) {
+  const run = await prepareRun(name, opts, outRoot);
+  if (run.missing) return run.missing;
+  const { cfg, log } = run;
   log(`=== run ${JSON.stringify(cfg)}`);
   const t0 = Date.now();
   const { page, state, close } = await browser.openPage({
@@ -170,11 +206,61 @@ async function runDataset(browser, name, opts, outRoot, thresholdsSpec) {
     if (state.navigations > 0) log(`WARNING: the page navigated ${state.navigations} time(s) during the run (Vite optimiser reload?)`);
     await close();
   }
-  const wall = (Date.now() - t0) / 1000;
+  return scoreRun(run, res, (Date.now() - t0) / 1000, opts, thresholdsSpec);
+}
+
+/**
+ * Phone / local-bridge: register the run with the bridge, print (or open) its URL and wait for
+ * the page's result. `device` = { bridge, origins, browser (local-bridge only) } (startDevice).
+ */
+async function runDatasetOnDevice(device, name, opts, outRoot, thresholdsSpec) {
+  const run = await prepareRun(name, opts, outRoot);
+  if (run.missing) return run.missing;
+  const { cfg, log } = run;
+  const br = device.bridge.expectRun({ outDir: run.dir, prefix: cfg.output.prefix, config: cfg, log });
+  log(`=== run ${JSON.stringify(cfg)}`);
+  const go = device.origins.map((o) => `${o}/__e2e/go`);
+  const tell = () => {
+    if (!device.browser) log(`waiting for the phone: open ${go.join('  or  ')} in Safari (screen on, tab in front)`);
+  };
+  tell();
+  let local = null;
+  try {
+    if (device.browser) {
+      local = await device.browser.open(go[0], {
+        onConsole: (type, text) => {
+          if (type === 'error' || type === 'warning' || opts.verbose) log(`[page:${type}] ${text}`);
+        },
+        // a dead page posts nothing: fail now, as runOnPage does, not after --timeout-min + grace
+        onGone: (reason) => br.finish({ result: null, error: reason }),
+      });
+    }
+    void br.started.then((info) => log(`page connected: ${info?.userAgent ?? '?'}`));
+    const out = await br.wait({
+      timeoutMs: opts.timeoutMin * 60_000,
+      // a local page starts within the harness load time; a person may need a while
+      startTimeoutMs: device.browser ? 180_000 : Infinity,
+      remind: tell,
+    });
+    const files = [...br.files].map(([f, n]) => `${f} ${fmtNum(n / 1048576, 1)} MB`);
+    if (files.length) log(`received through the bridge: ${files.join(', ')}`);
+    return scoreRun(run, out, out.runMs / 1000, opts, thresholdsSpec, { device: opts.device, waitSeconds: Math.round(out.waitMs / 100) / 10, page: br.info });
+  } finally {
+    br.close();
+    await local?.close();
+  }
+}
+
+/**
+ * The scoring tail every device shares: result.json, PLY files, metrics, threshold checks,
+ * optional novel views, metrics.json. `res` = { result, error }; `runner` = extra fields of
+ * result.json `runner`.
+ */
+async function scoreRun({ name, runName, log, dsDir, dir, cfg }, res, wall, opts, thresholdsSpec, runner = {}) {
   const r = res.result;
   if (res.error) log(`run error: ${res.error}`);
   if (!r) {
-    await writeFile(join(dir, 'result.json'), JSON.stringify({ ok: false, error: res.error, config: cfg }, null, 2));
+    await writeFile(join(dir, 'result.json'), JSON.stringify({ ok: false, error: res.error, config: cfg, runner: { wallSeconds: wall, error: res.error, ...runner } }, null, 2));
     return { name: runName, result: null, metrics: null, checks: [], failed: true };
   }
   if (res.error) r.errors = [...(r.errors ?? []), { step: 'runner', name: 'Error', message: res.error }];
@@ -189,7 +275,7 @@ async function runDataset(browser, name, opts, outRoot, thresholdsSpec) {
     pointsFile = 'dense.ply';
   } else if (r.dense?.file) pointsFile = 'dense.ply';
   const input = metricsInput(r, { pointsFile });
-  await writeFile(join(dir, 'result.json'), JSON.stringify({ ...input, ...r, runner: { wallSeconds: wall, error: res.error } }, null, 1));
+  await writeFile(join(dir, 'result.json'), JSON.stringify({ ...input, ...r, runner: { wallSeconds: wall, error: res.error, ...runner } }, null, 1));
   printTimings(r, log);
   const dsMeta = JSON.parse(await readFile(join(dsDir, 'meta.json'), 'utf8'));
   if (isGtFree(dsMeta, await loadJSONIfExists(join(dsDir, 'frames.json')))) return scoreGtFree({ name, runName, dir, cfg, r, meta: dsMeta, wall, opts, thresholdsSpec, log });
@@ -291,6 +377,64 @@ async function scoreGtFree({ name, runName, dir, cfg, r, meta, wall, opts, thres
   return { name: runName, result: r, metrics, checks, enforced: false, failed: !r.ok };
 }
 
+/** Origins of a server on 0.0.0.0 as the phone can reach it: LAN IPv4 addresses, the mDNS name. */
+function lanOrigins(protocol, port) {
+  const out = [];
+  for (const list of Object.values(networkInterfaces())) {
+    for (const a of list ?? []) if (a.family === 'IPv4' && !a.internal) out.push(`${protocol}://${a.address}:${port}`);
+  }
+  const h = hostname();
+  out.push(`${protocol}://${h.includes('.') ? h : `${h}.local`}:${port}`);
+  return out;
+}
+
+/** E2E_HTTPS_CERT / E2E_HTTPS_KEY (PEM files) → Vite `server.https`, or null. */
+async function httpsFromEnv() {
+  const cert = process.env.E2E_HTTPS_CERT;
+  const key = process.env.E2E_HTTPS_KEY;
+  if (!cert && !key) return null;
+  if (!cert || !key) throw new ArgError('set both E2E_HTTPS_CERT and E2E_HTTPS_KEY (PEM files, e.g. from mkcert)');
+  try {
+    return { cert: await readFile(cert), key: await readFile(key) };
+  } catch (e) {
+    throw new ArgError(`cannot read E2E_HTTPS_CERT / E2E_HTTPS_KEY: ${e.message}`);
+  }
+}
+
+/** --device phone | local-bridge: the bridge, its dev server (+ the local Chromium). */
+async function startDevice(opts) {
+  const https = await httpsFromEnv();
+  const phone = opts.device === 'phone';
+  if (phone && !https && (!opts.publicUrl || opts.publicUrl.startsWith('http:'))) {
+    const why = 'the phone gets WebGPU, motion sensors and storage only in a secure context';
+    if (opts.config.engine !== 'mock') throw new ArgError(`--device phone needs HTTPS (${why}): set E2E_HTTPS_CERT / E2E_HTTPS_KEY (mkcert), or pass --public-url https://… of a tunnel to --port`);
+    console.warn(`[e2e] WARNING: plain HTTP (${why}); fine for --engine mock only`);
+  }
+  const bridge = createBridge();
+  // a tunnel client connects locally; a phone on the LAN needs every interface
+  const host = phone && !opts.publicUrl ? '0.0.0.0' : '127.0.0.1';
+  const allowedHosts = opts.publicUrl ? [new URL(opts.publicUrl).hostname] : phone ? [...new Set([hostname(), `${hostname()}.local`])] : [];
+  const server = await startBridgeServer({ root: ROOT, bridge, host, port: opts.port ?? (phone ? PHONE_PORT : null), https, allowedHosts, verbose: opts.verbose });
+  const origins = opts.publicUrl ? [opts.publicUrl] : phone ? lanOrigins(server.protocol, server.port) : [`${server.protocol}://127.0.0.1:${server.port}`];
+  let browser = null;
+  try {
+    if (!phone) browser = await startBridgeBrowser({ verbose: opts.verbose, headed: opts.headed });
+  } catch (e) {
+    await server.close();
+    throw e;
+  }
+  return {
+    bridge,
+    origins,
+    browser,
+    server,
+    close: async () => {
+      await browser?.close();
+      await server.close();
+    },
+  };
+}
+
 const isMain = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
   let opts;
@@ -317,17 +461,42 @@ if (isMain) {
     console.error(`error: cannot read thresholds ${thresholdsPath}: ${e.message}`);
     process.exit(2);
   }
-  const browser = await startHarnessBrowser({ root: ROOT, verbose: opts.verbose, headed: opts.headed });
-  console.log(`[e2e] harness at ${browser.base}/harness.html; output ${outRoot}`);
   const runs = [];
   let crashed = false;
-  try {
-    for (const d of opts.datasets) runs.push(await runDataset(browser, d, opts, outRoot, thresholdsSpec));
-  } catch (e) {
-    console.error(e);
-    crashed = true;
-  } finally {
-    await browser.close();
+  if (opts.device === 'desktop') {
+    const browser = await startHarnessBrowser({ root: ROOT, verbose: opts.verbose, headed: opts.headed });
+    console.log(`[e2e] harness at ${browser.base}/harness.html; output ${outRoot}`);
+    try {
+      for (const d of opts.datasets) runs.push(await runDataset(browser, d, opts, outRoot, thresholdsSpec));
+    } catch (e) {
+      console.error(e);
+      crashed = true;
+    } finally {
+      await browser.close();
+    }
+  } else {
+    let device;
+    try {
+      device = await startDevice(opts);
+    } catch (e) {
+      console.error(`error: ${e.message}`);
+      process.exit(e instanceof ArgError ? 2 : 1);
+    }
+    console.log(`[e2e] ${opts.device}: bridge server ${device.origins.join(', ')}; output ${outRoot}`);
+    if (opts.device === 'phone') {
+      console.log(
+        `[e2e] on the iPhone (iOS 26+, Safari tab, same network): open ${device.origins[0]}/__e2e/go, keep the screen on and Safari in front until the result is sent.` +
+          `${device.server.protocol === 'https' ? ' The phone must trust the certificate (mkcert root CA: Settings > General > About > Certificate Trust Settings).' : ''} Ctrl-C to stop.`,
+      );
+    }
+    try {
+      for (const d of opts.datasets) runs.push(await runDatasetOnDevice(device, d, opts, outRoot, thresholdsSpec));
+    } catch (e) {
+      console.error(e);
+      crashed = true;
+    } finally {
+      await device.close();
+    }
   }
   if (runs.length) {
     console.log('\n=== e2e summary ===');

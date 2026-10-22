@@ -26,5 +26,10 @@ export interface E2EArgs {
   headed: boolean;
   help: boolean;
   sets: [string, unknown][];
+  /** Where the harness runs: here (Playwright), a phone through the HTTP bridge, or the bridge driven by local Chromium. */
+  device: 'desktop' | 'phone' | 'local-bridge';
+  /** --device phone: HTTPS tunnel URL (no trailing slash). */
+  publicUrl: string | null;
+  port: number | null;
 }
 export function parseArgs(argv: string[]): E2EArgs;

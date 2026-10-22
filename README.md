@@ -117,12 +117,24 @@ To test on a phone you need HTTPS. Either:
   workflow in `.github/workflows/pages.yml` deploys `dist/`, or
 * run `npm run dev` behind any HTTPS tunnel.
 
+To run the engine harness on an iPhone and score it on the computer, use
+`node e2e/run-e2e.mjs object-real --device phone --splat` with an mkcert certificate
+(`E2E_HTTPS_CERT` / `E2E_HTTPS_KEY`) or `--public-url` of a tunnel, and open the printed `/__e2e/go` link in
+Safari. Logs, PLY files and the result come back through a dev-server bridge, and the run is scored like a
+desktop run (e2e/README.md "On a real iPhone").
+
 Scans (photos, models, GPS fixes) live in the origin's IndexedDB. On a shared origin such as
 `<user>.github.io/<repo>/`, every other project of that user can read them, so give a real deployment its
 own origin (custom domain). The production build ships only the app (the e2e harness pages are dev-server
 only), with a Content-Security-Policy and a versioned service worker (offline after the first visit).
 
-CI (`.github/workflows/ci.yml`) runs typecheck, unit tests and the build.
+CI (`.github/workflows/ci.yml`) runs typecheck, unit tests and the build on pushes to `main` and `claude/**` and
+on pull requests.
+The nightly workflow (`.github/workflows/nightly.yml`, scheduled or started by hand) runs the slow tier: the
+SwiftShader GPU tests in 6 shards (with a cached 40-frame `e2e/data/object`, so the engine worker test in
+`src/engine/engine.gpu.test.ts` runs instead of skipping), a mock-engine e2e smoke on 40-frame datasets
+(desktop runner and the phone bridge, `--device local-bridge`) and `npm run ui:smoke`. It installs Playwright's Chromium with
+`node e2e/ensure-chromium.mjs` unless the runner already has it (`PLAYWRIGHT_BROWSERS_PATH`).
 
 ### End-to-end evaluation with ground truth
 
