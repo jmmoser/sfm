@@ -527,7 +527,7 @@ The harness fields of `result.json` are:
 * `live`: keyframes, registered images, points, `timeToInit`, frame and keyframe ms stats, the
   last live cameras, and their `coverage`: the capture screen's object-mode ring
   (`src/app/coverage.ts`) — `stable`, `completeness`, covered sectors per elevation band
-  (`covered`: low < 10°, mid 10–40°, high > 40°, of 12 each), the `prompt` and the per-cell
+  (`covered`: low −10–10°, mid 10–40°, high > 40°, of 12 each), the `prompt` and the per-cell
   keyframe `counts`. Elevation bands need gravity (`useImu` + `useGravity`), else `elevation: false`
   (azimuth only). A scene capture usually stays `stable: false`.
 * `progress`: decimated progress events.

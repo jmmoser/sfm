@@ -7,15 +7,20 @@
  * keeps playing underneath — frames are grabbed from it.
  *
  * Guidance: the banner follows the engine's per-frame code through a GuidanceGate
- * (capture-policy.ts: priority + 2-frame confirmation + 1.5 s dwell, so it cannot flicker);
- * screen readers hear it only when its severity changes. 'too_dark' points at the torch (which
- * then pulses) when the camera has one. Copy uses the mode in effect (LiveUpdate.resolvedMode).
+ * (capture-policy.ts: priority + 2-frame confirmation + 1.5 s dwell, so it cannot flicker; a code
+ * no frame reported for 3 frames gives way). The gate is fed from the processFrame RESULT only:
+ * the engine's model updates (background mapping) repeat the previous frame's code under the
+ * in-flight frame's index. Screen readers hear the banner only when its severity changes.
+ * 'too_dark' points at the torch (which then pulses) when the camera has one. Copy uses the mode
+ * in effect (LiveUpdate.resolvedMode).
  *
  * Coverage (object mode, or auto once the engine resolved 'object'): a ring of which sides and
  * heights have registered keyframes (src/app/coverage.ts, components/coverage-ring.ts), recomputed
- * per live model update, with the phone's cell from the frame pose and a one-line prompt; azimuth
- * only without the motion sensor (no gravity, so no trusted elevation). After MIN_KEYFRAMES the
- * Finish hint shows the readiness ("Coverage 62 % · top not captured"); it never blocks Finish.
+ * per live model update, with the phone's cell from the frame pose (cleared while tracking is
+ * lost, or after 1 s without a pose) and a one-line prompt; azimuth only without the motion
+ * sensor (no gravity, so no trusted elevation). After MIN_KEYFRAMES the Finish hint shows the
+ * readiness ("Coverage 62 % · top not captured"); it never blocks Finish, and it is not a live
+ * region then (it changes per covered cell — the ring's prompt line announces what is missing).
  *
  * Pipeline: CameraCapture → FramePump (≤ 10 Hz, back-pressure: the next frame is grabbed only
  * after engine.processFrame resolved) → engine. WakeLock while capturing (acquired in the Start
@@ -69,6 +74,8 @@ interface FrameMeta {
 const MINI_POINTS = 20_000;
 const CLOUD_POINTS = 50_000;
 const MAX_CAMERAS = 80;
+/** The ring's phone marker is cleared after this long without a frame pose (ms). */
+const MARKER_STALE_MS = 1000;
 /** Cloud view: pose updates at most this often (ms) — the viewer renders next to the engine's GPU work. */
 const FOLLOW_FRAME_MS = 30;
 /** Below this much free origin quota a capture starts with a warning. */
@@ -237,6 +244,9 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     // after the minimum, object mode shows the coverage readiness (it never blocks Finish)
     const ready = enough && coverage && !ring.el.hidden ? coverageHint(coverage) : null;
     finishHint.hidden = (enough && !ready) || phase === 'starting' || phase === 'error';
+    // the readiness changes per covered cell: no live region (switched off before its first text)
+    const live = ready ? 'off' : 'polite';
+    if (finishHint.getAttribute('aria-live') !== live) finishHint.setAttribute('aria-live', live);
     if (!enough) finishHint.textContent = `${numKeyframes} / ${MIN_KEYFRAMES} keyframes — keep moving`;
     else if (ready && finishHint.textContent !== ready) finishHint.textContent = ready;
   }
@@ -565,11 +575,11 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
 
   // ---- guidance banner + coverage ring -----------------------------------------------------------
   const gate = new GuidanceGate();
-  /** LiveUpdate.frameIndex last fed to the gate (model updates repeat their frame's index). */
-  let gateFrame = -1;
   /** Mode in effect: the configured one, or what the engine resolved 'auto' to. */
   let modeInEffect: CaptureMode = cfg.mode;
   let coverage: Coverage | null = null;
+  /** performance.now() of the last frame pose (the ring's phone marker). */
+  let lastPoseAt = -Infinity;
   ring.el.hidden = modeInEffect !== 'object';
 
   function torchState(): TorchState {
@@ -593,6 +603,16 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     const ic: IconName = code === 'too_dark' ? 'torch' : g.tone === 'good' ? 'check' : g.tone === 'info' ? 'info' : 'warning';
     guidance.querySelector('.guidance-icon')!.replaceChildren(icon(ic, { size: 18 }));
     if (announce && g.title) guidanceSr.textContent = `${g.title}. ${g.detail}`;
+  }
+
+  /**
+   * One analysed frame's guidance (the processFrame result — never a model update, which repeats
+   * the previous frame's code under this frame's index and would confirm a one-frame blip).
+   */
+  function onFrameGuidance(u: LiveUpdate): void {
+    if (closed || phase !== 'running') return;
+    const s = gate.update(u.guidance, performance.now());
+    if (s.changed) renderGuidance(s.announce);
   }
 
   /** Coverage of the registered keyframes (per live model update); the ring only in object mode. */
@@ -627,11 +647,7 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     if (u.resolvedMode && u.resolvedMode !== modeInEffect) {
       modeInEffect = u.resolvedMode;
       updateCoverage();
-    }
-    if (phase === 'running' && u.frameIndex !== gateFrame) {
-      gateFrame = u.frameIndex;
-      const s = gate.update(u.guidance, performance.now());
-      if (s.changed) renderGuidance(s.announce);
+      if (gate.code) renderGuidance(); // the copy follows the mode
     }
     const live = phase === 'running';
     if (meta && u.overlay && live && !cloudView) drawOverlay(u.overlay, meta);
@@ -666,7 +682,11 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
       if (u.R_cam_device) latestRcd = Float64Array.from(u.R_cam_device);
       setAnchor(u.framePose.pose, u.framePose.t);
     }
+    // the phone marker: from the frame pose; none while lost (it would show where tracking was lost)
+    const t = performance.now();
+    if (u.framePose) lastPoseAt = t;
     if (u.framePose && coverage) ring.setCurrent(coverageCell(coverage, u.framePose.pose));
+    else if (u.tracking === 'lost' || t - lastPoseAt > MARKER_STALE_MS) ring.setCurrent(null);
     if (viewerDirty) scheduleViewer();
     // The engine marks every frame after its capture memory cap (in case the event was missed).
     if (u.timings?.memoryLimited) onMemoryLimit();
@@ -746,8 +766,9 @@ export function createCaptureScreen(app: App, route: Extract<Route, { screen: 'c
     const upright = orientation.observe({ width: f.width, height: f.height, screenAngle: f.screenAngle, t: f.t, raw: f.rawBuffer, screenAngleSince: f.screenAngleSince });
     inFlight = { width: f.width, height: f.height, screenAngle: f.screenAngle, upright };
     try {
-      await app.engine.processFrame(input);
+      const u = await app.engine.processFrame(input);
       frameErrors = 0;
+      onFrameGuidance(u);
     } catch (e) {
       onFrameError(e);
     } finally {

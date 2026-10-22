@@ -1140,6 +1140,7 @@ await scenario('coverage', async () => {
   const part = await covered();
   check(part >= 4 && part < 12, `partial orbit: some sectors covered (${part}), prompt "${await prompt()}"`);
   check(/^Coverage \d+ % · sides missing$/.test(await hint()), `partial orbit: the Finish hint shows the coverage ("${await hint()}")`);
+  check((await page.evaluate(() => document.querySelector('.finish-hint')?.getAttribute('aria-live'))) === 'off', 'the readiness hint is not a live region (it changes per covered cell)');
   check(await page.evaluate(() => document.querySelector('.coverage-marker')?.classList.contains('shown')), 'the phone is marked on the ring');
   await holdShot(page, 'state-coverage-partial');
   // the cloud view keeps the ring above the Overview / Follow buttons

@@ -16,16 +16,22 @@
  *    right axes otherwise.
  *  - per keyframe, d = C − centre: azimuth in the plane ⟂ up, referenced to the FIRST keyframe
  *    (12 sectors of 30°, sector 0 centred on it, counter-clockwise seen from above), and
- *    elevation asin(d̂ · up) in three bands: low < 10° (table height), mid 10–40° (a level loop:
- *    object-real spans 13–35°), high > 40° (looking down). Views from below the centre's horizon
- *    are left out of the bands. A cell is covered with ≥ 2 keyframes.
- *  - completeness: covered mid + high cells / 24 (the low band is a bonus — a table hides it).
- *    Azimuth only (`elevation: false`: no motion sensor, so up is a guess): covered sectors of
- *    any height / 12.
- *  - prompt (first rule that matches): not stable → 'locating'; in the band the user circles in
- *    (mid or high, the one with more keyframes) an empty run ≥ 3 sectors → 'other_side', fewer
- *    than 10 covered → 'fill_gaps'; the other band < 10 covered → 'look_down' (high missing) /
- *    'go_lower' (mid missing); else 'done'. Azimuth only: the same on the merged ring, then 'done'.
+ *    elevation asin(d̂ · up) in three bands: low −10–10° (the object's height: a camera there
+ *    scatters around the centre's horizon), mid 10–40° (a level loop: object-real spans 13–35°),
+ *    high > 40° (looking down). Views from further below are left out of the bands. A cell is
+ *    covered with ≥ 2 keyframes.
+ *  - two tiers for the prompt: level (low + mid, merged per sector) and high. Both low and mid
+ *    are a loop round the object's sides, at or a little above its centre — an object at eye
+ *    level (a bust, a plant, a person) is circled in the low band, and a loop straddling 10° fills
+ *    both — while the views from above (> 40°) are the measured weak axis (below). The tier the
+ *    user circles in is the one with more keyframes; `primaryBand` is its band with the most (the
+ *    ring's target band).
+ *  - completeness: covered sectors of the circled tier + of the other tier, / 24. Azimuth only
+ *    (`elevation: false`: no motion sensor, so up is a guess): covered sectors of any height / 12.
+ *  - prompt (first rule that matches): not stable → 'locating'; in the circled tier an empty run
+ *    ≥ 3 sectors → 'other_side', fewer than 10 covered → 'fill_gaps'; the other tier < 10 covered
+ *    → 'look_down' (high missing) / 'go_lower' (level missing); else 'done'. Azimuth only: the
+ *    same on the merged ring, then 'done'.
  *
  * Why these numbers: height is the measured weak axis — splat PSNR of held-out synthetic views
  * falls from 30 dB to 26.8 / 22.1 dB at +12 / +25 cm above the object-real orbit, which spans
@@ -47,6 +53,8 @@ export const COVERAGE_SECTORS = 12;
 export const COVERAGE_BANDS = 3;
 /** Upper edges of the low and mid bands (rad). */
 export const COVERAGE_BAND_EDGES: readonly [number, number] = [10 * DEG, 40 * DEG];
+/** Lower edge of the low band (rad): views from further below the centre's horizon are in no band. */
+export const COVERAGE_MIN_ELEVATION = -10 * DEG;
 /** Registered cameras (that also pass the orbit test) before the centre is trusted. */
 export const COVERAGE_MIN_CAMERAS = 6;
 
@@ -60,7 +68,7 @@ export interface CoverageOptions {
   minPerCell?: number;
 }
 
-/** A viewing position around the object: sector 0–11 and band 0–2 (−1 = below the horizon). */
+/** A viewing position around the object: sector 0–11 and band 0–2 (−1 = below the low band). */
 export interface CoverageCell {
   sector: number;
   band: number;
@@ -77,9 +85,9 @@ export interface Coverage {
   /** Azimuth basis: e1 towards the first keyframe, e2 = up × e1 (null until stable). */
   e1: Vec3 | null;
   e2: Vec3 | null;
-  /** counts[band][sector]: keyframes per cell (views below the horizon are not counted). */
+  /** counts[band][sector]: keyframes per cell (views below the low band are not counted). */
   counts: number[][];
-  /** Keyframes per sector at any height (incl. below the horizon) — the azimuth-only ring. */
+  /** Keyframes per sector at any height (incl. below the low band) — the azimuth-only ring. */
   sectors: number[];
   /** Covered cells per band (low, mid, high). */
   covered: [number, number, number];
@@ -87,8 +95,13 @@ export interface Coverage {
   coveredSectors: number;
   /** Keyframes a cell needs to count as covered (CoverageOptions.minPerCell). */
   minPerCell: number;
-  /** The band the user circles in: mid (1) unless more keyframes are high (2). */
-  primaryBand: 1 | 2;
+  /** The band the user circles in: the band with the most keyframes of the circled tier (see the header). */
+  primaryBand: 0 | 1 | 2;
+  /**
+   * Keyframes per sector of the circled tier (level: low + mid; high) — what 'other_side' /
+   * 'fill_gaps' test. Azimuth only: `sectors`.
+   */
+  loop: number[];
   /** 0–1, see the header. */
   completeness: number;
   prompt: CoveragePrompt;
@@ -111,9 +124,9 @@ function centreOf(p: Pose, out: Float64Array): Float64Array {
   return out;
 }
 
-/** Elevation band of an elevation (rad): 0 low, 1 mid, 2 high, −1 below the horizon. */
+/** Elevation band of an elevation (rad): 0 low, 1 mid, 2 high, −1 below the low band. */
 export function coverageBand(elevationRad: number): number {
-  if (!(elevationRad >= 0)) return -1;
+  if (!(elevationRad >= COVERAGE_MIN_ELEVATION)) return -1;
   return elevationRad < COVERAGE_BAND_EDGES[0] ? 0 : elevationRad < COVERAGE_BAND_EDGES[1] ? 1 : 2;
 }
 
@@ -175,6 +188,7 @@ function emptyCoverage(n: number, elevation: boolean, minPerCell: number): Cover
     coveredSectors: 0,
     minPerCell,
     primaryBand: 1,
+    loop: new Array<number>(COVERAGE_SECTORS).fill(0),
     completeness: 0,
     prompt: 'locating',
     currentCell: null,
@@ -232,17 +246,25 @@ export function computeCoverage(cams: readonly Pick<LiveCamera, 'pose' | 'upCam'
   for (let b = 0; b < COVERAGE_BANDS; b++) cov.covered[b] = cov.counts[b].filter((k) => k >= minPer).length;
   cov.coveredSectors = cov.sectors.filter((k) => k >= minPer).length;
   if (elevation) {
-    cov.completeness = (cov.covered[1] + cov.covered[2]) / (2 * COVERAGE_SECTORS);
-    const total = (row: number[]): number => row.reduce((a, b) => a + b, 0);
-    const primary = total(cov.counts[2]) > total(cov.counts[1]) ? 2 : 1;
-    const secondary = primary === 1 ? 2 : 1;
-    cov.primaryBand = primary;
-    if (largestGap(cov.counts[primary], minPer) >= 3) cov.prompt = 'other_side';
-    else if (cov.covered[primary] < 10) cov.prompt = 'fill_gaps';
-    else if (cov.covered[secondary] < 10) cov.prompt = secondary === 2 ? 'look_down' : 'go_lower';
+    const total = (row: readonly number[]): number => row.reduce((a, b) => a + b, 0);
+    const coveredOf = (row: readonly number[]): number => row.filter((k) => k >= minPer).length;
+    const [low, mid, high] = cov.counts;
+    const level = low.map((k, s) => k + mid[s]);
+    const fromAbove = total(high) > total(level);
+    const loop = fromAbove ? high : level;
+    const other = fromAbove ? level : high;
+    cov.primaryBand = fromAbove ? 2 : total(low) > total(mid) ? 0 : 1;
+    cov.loop = loop.slice();
+    const coveredLoop = coveredOf(loop),
+      coveredOther = coveredOf(other);
+    cov.completeness = (coveredLoop + coveredOther) / (2 * COVERAGE_SECTORS);
+    if (largestGap(loop, minPer) >= 3) cov.prompt = 'other_side';
+    else if (coveredLoop < 10) cov.prompt = 'fill_gaps';
+    else if (coveredOther < 10) cov.prompt = fromAbove ? 'go_lower' : 'look_down';
     else cov.prompt = 'done';
   } else {
     cov.completeness = cov.coveredSectors / COVERAGE_SECTORS;
+    cov.loop = cov.sectors.slice();
     if (largestGap(cov.sectors, minPer) >= 3) cov.prompt = 'other_side';
     else if (cov.coveredSectors < 10) cov.prompt = 'fill_gaps';
     else cov.prompt = 'done';

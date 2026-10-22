@@ -6,7 +6,7 @@ import { createObjectTrajectory, trajectoryPose, type ObjectTrajectoryOptions } 
 import { axisAngleToMat3 } from '../math/rotation';
 import { Rng } from '../math/random';
 import type { LiveCamera } from '../workers/protocol';
-import { COVERAGE_BAND_EDGES, computeCoverage, coverageBand, coverageCell, coverageSector, largestGap } from './coverage';
+import { COVERAGE_BAND_EDGES, COVERAGE_MIN_ELEVATION, computeCoverage, coverageBand, coverageCell, coverageSector, largestGap } from './coverage';
 
 const DEG = Math.PI / 180;
 
@@ -30,6 +30,12 @@ function orbitKeyframes(opts: Partial<ObjectTrajectoryOptions>, kfPerS = 3.6): L
 const OBJECT_REAL: Partial<ObjectTrajectoryOptions> = { shake: OBJECT_REAL_SHAKE };
 /** A capture that adds the higher loop the prompt asks for (spans ≈ 16–48° elevation). */
 const TWO_TIER: Partial<ObjectTrajectoryOptions> = { ...OBJECT_REAL, duration: 50, revolutions: 2.4, heightAbove: 0.3, heightAmplitude: 0.15 };
+/** The object's centre at camera height (a bust on a pedestal): ≈ −4…4° elevation. */
+const EYE_LEVEL: Partial<ObjectTrajectoryOptions> = { ...OBJECT_REAL, heightAbove: 0, heightAmplitude: 0.02 };
+/** A loop from above: ≈ 46–50° elevation. */
+const FROM_ABOVE: Partial<ObjectTrajectoryOptions> = { ...OBJECT_REAL, heightAbove: 0.5, heightAmplitude: 0.02 };
+
+const sum = (row: readonly number[]): number => row.reduce((a, b) => a + b, 0);
 
 /** The cameras in a world moved by the similarity X' = s Rs X + T (poses: R' = R Rsᵀ, t' = s t − R' T). */
 function sim3(cams: LiveCamera[], s: number, Rs: Float64Array, T: number[]): LiveCamera[] {
@@ -44,8 +50,9 @@ function sim3(cams: LiveCamera[], s: number, Rs: Float64Array, T: number[]): Liv
 }
 
 describe('coverage bins', () => {
-  it('bands at 10° / 40°, sectors centred on azimuth 0, circular gaps', () => {
-    expect([coverageBand(-0.01), coverageBand(0), coverageBand(9.9 * DEG), coverageBand(10 * DEG), coverageBand(39.9 * DEG), coverageBand(40 * DEG), coverageBand(NaN)]).toEqual([-1, 0, 0, 1, 1, 2, -1]);
+  it('bands at −10° / 10° / 40°, sectors centred on azimuth 0, circular gaps', () => {
+    const bands = [-10.1, -9.9, -0.01, 0, 9.9, 10, 39.9, 40].map((e) => coverageBand(e * DEG));
+    expect([...bands, coverageBand(NaN)]).toEqual([-1, 0, 0, 0, 0, 1, 1, 2, -1]);
     expect([coverageSector(0), coverageSector(-14 * DEG), coverageSector(14 * DEG), coverageSector(16 * DEG), coverageSector(-16 * DEG), coverageSector(2 * Math.PI)]).toEqual([0, 0, 0, 1, 11, 0]);
     expect(largestGap([2, 2, 0, 0, 2, 2, 2, 2, 2, 2, 0, 1], 2)).toBe(2);
     expect(largestGap([0, 2, 2, 2, 2, 2, 2, 2, 2, 0, 1, 0], 2)).toBe(4); // wraps around
@@ -79,6 +86,50 @@ describe('computeCoverage', () => {
     expect(cov.covered[2]).toBeGreaterThanOrEqual(10);
     expect(cov.prompt).toBe('done');
     expect(cov.completeness).toBeGreaterThan(0.9);
+  });
+
+  it('an object at eye level: the loop round it (low band, around the horizon) asks to look down, a loop from above completes it', () => {
+    const eye = orbitKeyframes(EYE_LEVEL);
+    const cov = computeCoverage(eye);
+    expect(cov.stable).toBe(true);
+    const el = Array.from(cov.elevationRad, (e) => e / DEG);
+    expect(Math.min(...el)).toBeLessThan(-1); // views below the centre's horizon count as low
+    expect(Math.max(...el)).toBeLessThan(10);
+    expect(cov.covered).toEqual([12, 0, 0]);
+    expect(cov.primaryBand).toBe(0);
+    // not 'other_side' after a full loop
+    expect(cov.prompt).toBe('look_down');
+    expect(cov.completeness).toBeCloseTo(0.5, 9);
+    const both = computeCoverage([...eye, ...orbitKeyframes(FROM_ABOVE)]);
+    expect(both.covered[0]).toBe(12);
+    expect(both.covered[1]).toBe(0);
+    expect(both.covered[2]).toBeGreaterThanOrEqual(10);
+    // not 'go_lower': the low loop is the lower loop
+    expect(both.prompt).toBe('done');
+    expect(both.completeness).toBeGreaterThan(0.9);
+  });
+
+  it('a loop from above asks to go lower; a loop at the object\'s height completes it', () => {
+    const above = orbitKeyframes(FROM_ABOVE);
+    const top = computeCoverage(above);
+    expect(top.covered[2]).toBe(12);
+    expect(top.primaryBand).toBe(2);
+    expect(top.prompt).toBe('go_lower');
+    expect(top.completeness).toBeCloseTo(0.5, 9);
+    const both = computeCoverage([...above, ...orbitKeyframes(EYE_LEVEL)]);
+    expect(both.prompt).toBe('done');
+    expect(both.completeness).toBeGreaterThan(0.9);
+  });
+
+  it('a loop straddling 10° is one loop: no false gaps between the low and mid bands', () => {
+    const cov = computeCoverage(orbitKeyframes({ ...OBJECT_REAL, heightAbove: 0.45 * Math.tan(10 * DEG), heightAmplitude: 0.025 }));
+    expect(cov.stable).toBe(true);
+    // both bands hold part of the loop, and each alone has a gap
+    expect(Math.min(sum(cov.counts[0]), sum(cov.counts[1]))).toBeGreaterThan(15);
+    expect(Math.max(largestGap(cov.counts[0], 2), largestGap(cov.counts[1], 2))).toBeGreaterThanOrEqual(3);
+    expect(cov.loop.every((k) => k >= 2)).toBe(true);
+    expect(cov.prompt).toBe('look_down');
+    expect(cov.completeness).toBeCloseTo(0.5, 9);
   });
 
   it('azimuth: referenced to the first keyframe, counter-clockwise seen from above (the orbit direction)', () => {
@@ -135,7 +186,7 @@ describe('computeCoverage', () => {
         expect(Math.abs(half.elevationRad[i] - e) / DEG).toBeLessThan(0.5);
         expect(Math.abs(Math.sin(half.azimuthRad[i] - ref.azimuthRad[i])) / DEG).toBeLessThan(0.5);
         // a different band only for a camera within 0.5° of a band edge
-        if (coverageBand(half.elevationRad[i]) !== coverageBand(e)) expect(Math.min(...COVERAGE_BAND_EDGES.map((b) => Math.abs(e - b))) / DEG).toBeLessThan(0.5);
+        if (coverageBand(half.elevationRad[i]) !== coverageBand(e)) expect(Math.min(...[COVERAGE_MIN_ELEVATION, ...COVERAGE_BAND_EDGES].map((b) => Math.abs(e - b))) / DEG).toBeLessThan(0.5);
       }
       expect(half.covered).toEqual(ref.covered);
       expect(half.prompt).toBe(ref.prompt);

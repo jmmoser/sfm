@@ -72,8 +72,33 @@ describe('GuidanceGate', () => {
     g.reset('good', 0);
     const shown = feed(g, ['move_slower', 'good', 'more_texture', 'good', 'translate_more', 'good', 'move_slower', 'good'], 2000);
     expect(shown.every((c) => c === 'good')).toBe(true);
-    // alternating codes that each persist one frame neither
-    expect(feed(g, ['move_slower', 'more_texture', 'move_slower', 'more_texture'], 3000).every((c) => c === 'good')).toBe(true);
+    // two frames of other codes that each persist one frame neither
+    expect(feed(g, ['move_slower', 'more_texture', 'good', 'more_texture', 'translate_more', 'good'], 3000).every((c) => c === 'good')).toBe(true);
+  });
+
+  it('a stale code gives way to the most frequent of the next 3 frames when none of them confirms', () => {
+    // tracking is back, but every other frame is blur-rejected: neither code persists 2 frames
+    const alternating = (n: number): Guidance[] => Array.from({ length: n }, (_, i) => (i % 2 ? 'move_slower' : 'good'));
+    const g = new GuidanceGate();
+    expect(g.update('tracking_lost', 0).code).toBe('tracking_lost');
+    const shown = feed(g, alternating(9), 2000);
+    expect(shown.slice(0, 3)).toEqual(['tracking_lost', 'tracking_lost', 'good']);
+    // then the single-frame blips do not reach the banner
+    expect(shown.slice(2).every((c) => c === 'good')).toBe(true);
+    // within the dwell the stale code waits for it (the most frequent is lower priority)
+    const d = new GuidanceGate();
+    d.update('tracking_lost', 0);
+    const early = feed(d, alternating(18), 100);
+    expect(early.indexOf('good')).toBe(14); // t = 1500
+    expect(early.slice(0, 14).every((c) => c === 'tracking_lost')).toBe(true);
+    // a higher-priority one replaces it at once: three frames of warnings, none twice in a row
+    const w = new GuidanceGate();
+    w.reset('good', 0);
+    expect(feed(w, ['move_slower', 'more_texture', 'move_slower'], 100)).toEqual(['good', 'good', 'move_slower']);
+    // ties go to the latest
+    const t = new GuidanceGate({ staleFrames: 2 });
+    t.reset('good', -5000);
+    expect(feed(t, ['more_texture', 'move_slower'], 0)).toEqual(['good', 'move_slower']);
   });
 
   it('a higher-priority code replaces a fresh one after its 2 frames; a lower one waits for the dwell', () => {

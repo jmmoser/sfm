@@ -113,9 +113,10 @@ optical-axis convergence of ≥ 8 registered keyframes) and reports it as `LiveU
 ### Frame flow (live)
 1. Rotate to the session's canonical orientation (first frame's θ) when needed;
    `R_cam_device` for the session follows from θ₀.
-2. Small RGBA copy (≤ 640 px) → sharpness; IMU angular speed + gyro rotation since the
-   last keyframe → blur/motion gate (`KeyframeSelector.gate`; relaxed when the hard
-   rotation limit forces a keyframe through a fast pan).
+2. Small RGBA copy (≤ 640 px) → sharpness and luma → `LowLightMonitor` ('too_dark', which
+   overrides 'tracking_lost'); IMU angular speed + gyro rotation since the last keyframe →
+   blur/motion gate (`KeyframeSelector.gate`; relaxed when the hard rotation limit forces a
+   keyframe through a fast pan).
 3. Features at the preset's working resolution (GPU path takes the ImageBitmap
    directly). Per-feature colours sampled from the small copy.
 4. Match to the last keyframe, guided by the gyro rotation homography
@@ -208,7 +209,10 @@ Request/response RPC with ids, plus unsolicited events:
   `export`, `loadSession`, `cancel`, `visibility` (page hidden / visible: pause GPU work), `close`
   (let go of a session before it is deleted: its engine is disposed and the CPU SIFT scratch freed,
   the compiled feature pipeline kept for the next init; answers whether the engine held it), `dispose`
-* events: `progress` (ProgressEvent, optional numeric `detail`), `live` (LiveUpdate), `log`, `error`
+* events: `progress` (ProgressEvent, optional numeric `detail`), `live` (LiveUpdate), `log`, `error`.
+  With background mapping (the default) the model (`sparse`, `cameras`) comes only in `live` model
+  updates sent when a keyframe is mapped: no `overlay` / `framePose`, the `frameIndex` of the frame
+  in flight and the previous frame's `guidance` — per-frame consumers use the `frame` responses.
 * large typed arrays and ImageBitmaps are transferred, never copied.
 
 ### Splat protocol (for the viewer / app UI)
@@ -240,13 +244,16 @@ stage runs from the viewer itself ("Photoreal model" in the Build sheet → `spl
 viewer's WebGPU splat layer and shown by default, and the export sheet offers 'ply-splat' (src/viewer/splat-layer.ts,
 research/viewer-rendering.md).
 
-Capture guidance (`src/app/screens/capture.ts`): the banner shows the engine's per-frame `guidance` through a
-`GuidanceGate` (`src/app/capture-policy.ts`): priority too_dark > tracking_lost > move_slower > more_texture >
-translate_more > initializing > good, a new code after 2 consecutive frames (too_dark / tracking_lost at once),
-and a shown code kept ≥ 1.5 s unless a higher-priority one replaces it; screen readers hear only severity
-changes. 'too_dark' points at the torch (which pulses) when the camera has one. In object mode — or auto once
-`resolvedMode` is 'object' — a coverage ring (`src/app/coverage.ts`, `components/coverage-ring.ts`) shows,
-per live model update, which of 12 azimuth sectors × 3 elevation bands (< 10°, 10–40°, > 40°) around the
-cameras' convergence point have ≥ 2 registered keyframes, the phone's cell from `framePose`, and one prompt
-(other side / gaps / raise the phone and look down / done); azimuth only without the motion sensor. After
-5 keyframes the Finish hint shows the readiness ("Coverage 62 % · top not captured"); it never blocks Finish.
+Capture guidance (`src/app/screens/capture.ts`): the banner shows the engine's per-frame `guidance` (from the
+`processFrame` results, not the model updates) through a `GuidanceGate` (`src/app/capture-policy.ts`): priority
+too_dark > tracking_lost > move_slower > more_texture > translate_more > initializing > good, a new code after 2
+consecutive frames (too_dark / tracking_lost at once), a shown code kept ≥ 1.5 s unless a higher-priority one
+replaces it, and a shown code no frame reported for 3 frames replaced by the most frequent of them (alternating
+codes never confirm); screen readers hear only severity changes. 'too_dark' points at the torch (which pulses)
+when the camera has one. In object mode — or auto once `resolvedMode` is 'object' — a coverage ring
+(`src/app/coverage.ts`, `components/coverage-ring.ts`) shows, per live model update, which of 12 azimuth sectors
+× 3 elevation bands (−10–10°, 10–40°, > 40°) around the cameras' convergence point have ≥ 2 registered
+keyframes, the phone's cell from `framePose` (none while tracking is lost), and one prompt (other side / gaps /
+raise the phone and look down / lower the phone / done; low + mid count as one level loop, so an object at eye
+level is circled in the low band); azimuth only without the motion sensor. After 5 keyframes the Finish hint
+shows the readiness ("Coverage 62 % · top not captured", not a live region); it never blocks Finish.

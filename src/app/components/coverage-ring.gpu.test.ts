@@ -60,8 +60,25 @@ describe('coverage ring', () => {
     expect(cls(marker)).toContain('shown');
     expect(Number(marker.getAttribute('cx'))).toBeCloseTo(29, 1); // 90°: right, mid band radius (23 + 35) / 2
     expect(Math.abs(Number(marker.getAttribute('cy')))).toBeLessThan(0.01);
-    ring.setCurrent({ sector: 3, band: -1 }); // below the horizon: no band to mark
+    ring.setCurrent({ sector: 3, band: -1 }); // below the low band: no band to mark
     expect(cls(marker)).not.toContain('shown');
+
+    // half a loop at the object's height: the low band is the one circled, its empty cells pulse
+    const eye = computeCoverage(arc(20, 180, 0));
+    ring.update(eye);
+    expect([eye.primaryBand, eye.prompt]).toEqual([0, 'other_side']);
+    const low = cells().filter((c) => cls(c).includes('b0'));
+    expect(low.filter((c) => cls(c).includes('c2')).length).toBe(eye.covered[0]);
+    expect(low.filter((c) => cls(c).includes('target')).length).toBe(12 - eye.covered[0]);
+    expect(cells().filter((c) => !cls(c).includes('b0') && cls(c).includes('target')).length).toBe(0);
+    // the same keyframes split between the low and mid bands: a sector either band covers is no gap
+    const split = computeCoverage([...arc(10, 180, 3), ...arc(10, 180, 15)]);
+    ring.update(split);
+    const loopGaps = split.loop.filter((k) => k < 2).length;
+    expect(split.prompt).toBe('other_side');
+    // neither band alone covers the half loop
+    expect(Math.max(split.covered[0], split.covered[1])).toBeLessThan(12 - loopGaps);
+    expect(cells().filter((c) => cls(c).includes('target')).length).toBe(loopGaps);
 
     // a full level loop: the high band is what is missing
     const loop = computeCoverage(arc(40, 360 - 9, 25));

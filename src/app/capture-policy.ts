@@ -79,6 +79,11 @@ export interface GuidanceGateOptions {
   confirmFrames?: number;
   /** A shown code stays at least this long (ms, default 1500) unless a higher-priority code replaces it. */
   dwellMs?: number;
+  /**
+   * Frames in a row without the shown code after which it is stale (default 3): the most frequent
+   * code of those frames (the latest on a tie) replaces it even when none persisted `confirmFrames`.
+   */
+  staleFrames?: number;
 }
 
 export interface GuidanceGateResult {
@@ -96,19 +101,27 @@ export interface GuidanceGateResult {
  * banner that follows every frame flickers and floods VoiceOver. The gate shows a new code only
  * after it persisted `confirmFrames` frames, and keeps a shown code for `dwellMs` unless a
  * higher-priority one (GUIDANCE_PRIORITY) replaces it. 'tracking_lost' and 'too_dark' show at
- * once. Feed it one code per analysed frame (not the engine's extra model updates).
+ * once. A shown code that no frame reported for `staleFrames` frames in a row gives way to the
+ * most frequent code of those frames (dwell and priority still apply): codes that alternate
+ * (blur rejects every other frame) would otherwise never confirm and leave a stale "Tracking
+ * lost" up for good. Feed it one code per analysed frame — the frame responses, not the engine's
+ * model updates (those repeat the previous frame's code under the in-flight frame's index).
  */
 export class GuidanceGate {
   private readonly confirmFrames: number;
   private readonly dwellMs: number;
+  private readonly staleFrames: number;
   private shown: Guidance | null = null;
   private shownAt = -Infinity;
   private candidate: Guidance | null = null;
   private candidateFrames = 0;
+  /** The codes of the frames since the shown code was last reported (the newest `staleFrames`). */
+  private readonly absent: Guidance[] = [];
 
   constructor(opts: GuidanceGateOptions = {}) {
     this.confirmFrames = Math.max(1, opts.confirmFrames ?? 2);
     this.dwellMs = Math.max(0, opts.dwellMs ?? 1500);
+    this.staleFrames = Math.max(1, opts.staleFrames ?? 3);
   }
 
   /** The code on the banner (null: none). */
@@ -122,6 +135,7 @@ export class GuidanceGate {
     this.shownAt = now;
     this.candidate = null;
     this.candidateFrames = 0;
+    this.absent.length = 0;
   }
 
   /** One analysed frame's guidance at time `now` (ms). */
@@ -130,6 +144,7 @@ export class GuidanceGate {
     if (code === prev) {
       this.candidate = null;
       this.candidateFrames = 0;
+      this.absent.length = 0;
       return { code, changed: false, announce: false };
     }
     if (code === this.candidate) this.candidateFrames++;
@@ -137,12 +152,33 @@ export class GuidanceGate {
       this.candidate = code;
       this.candidateFrames = 1;
     }
+    this.absent.push(code);
+    if (this.absent.length > this.staleFrames) this.absent.shift();
+    let next = code;
     const unchanged: GuidanceGateResult = { code: prev, changed: false, announce: false };
     if (prev !== null) {
-      if (!IMMEDIATE.has(code) && this.candidateFrames < this.confirmFrames) return unchanged;
-      if (guidanceRank(code) >= guidanceRank(prev) && now - this.shownAt < this.dwellMs) return unchanged;
+      if (!IMMEDIATE.has(code) && this.candidateFrames < this.confirmFrames) {
+        if (this.absent.length < this.staleFrames) return unchanged;
+        next = mostFrequent(this.absent);
+      }
+      if (guidanceRank(next) >= guidanceRank(prev) && now - this.shownAt < this.dwellMs) return unchanged;
     }
-    this.reset(code, now);
-    return { code, changed: true, announce: prev === null || guidanceSeverity(code) !== guidanceSeverity(prev) };
+    this.reset(next, now);
+    return { code: next, changed: true, announce: prev === null || guidanceSeverity(next) !== guidanceSeverity(prev) };
   }
+}
+
+/** The most frequent code (the latest of the tied ones). */
+function mostFrequent(codes: readonly Guidance[]): Guidance {
+  let best = codes[codes.length - 1],
+    bestN = 0;
+  for (let i = codes.length - 1; i >= 0; i--) {
+    let n = 0;
+    for (const c of codes) if (c === codes[i]) n++;
+    if (n > bestN) {
+      best = codes[i];
+      bestN = n;
+    }
+  }
+  return best;
 }

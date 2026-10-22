@@ -292,9 +292,9 @@ export interface LiveCoverage {
   stable: boolean;
   /** Elevation bands in use (gravity fed). */
   elevation: boolean;
-  /** Covered mid + high cells / 24 (azimuth only: covered sectors / 12). */
+  /** Covered sectors of the level (low + mid) and high tiers / 24 (azimuth only: covered sectors / 12). */
   completeness: number;
-  /** Covered cells (≥ 2 keyframes) of the 12 sectors per band: low < 10°, mid 10–40°, high > 40°. */
+  /** Covered cells (≥ 2 keyframes) of the 12 sectors per band: low −10–10°, mid 10–40°, high > 40°. */
   covered: [number, number, number];
   /** Covered sectors at any height. */
   coveredSectors: number;

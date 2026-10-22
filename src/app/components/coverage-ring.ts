@@ -6,10 +6,12 @@
  * counter-clockwise like an orbit seen from above, so the marker moves the way the user walks),
  * radius = elevation: the high band (looking down) is the inner ring, then mid, then low. Without
  * elevation (no motion sensor) one azimuth ring. A cell is empty, partly covered (one keyframe) or
- * covered; the empty cells of the band the prompt asks for pulse, and a dot marks where the phone
- * is (LiveUpdate.framePose). The cells are built once per layout and only re-classed per update
- * (keyframe rate); the prompt text changes only when the prompt does, so its live region speaks
- * rarely. No inline styles (CSP): colours come from classes in styles.css.
+ * covered; the empty cells of the band the prompt asks for pulse (for 'other_side' / 'fill_gaps':
+ * the circled band's cells whose sector the circled tier misses, Coverage.loop), and a dot marks
+ * where the phone is (LiveUpdate.framePose; the capture screen clears it while tracking is lost).
+ * The cells are built once per layout and only re-classed per update (keyframe rate); the prompt
+ * text changes only when the prompt does, so its live region speaks rarely. No inline styles
+ * (CSP): colours come from classes in styles.css.
  */
 import { COVERAGE_SECTORS, type Coverage, type CoverageCell } from '../coverage';
 import { h } from '../dom';
@@ -106,12 +108,15 @@ export function createCoverageRing(): CoverageRing {
     const stable = !!cov && cov.stable;
     el.classList.toggle('locating', !stable);
     // the band whose empty cells the prompt asks to fill (−1: none)
-    const target = !stable ? -1 : cov.prompt === 'look_down' ? 2 : cov.prompt === 'go_lower' ? 1 : cov.prompt === 'other_side' || cov.prompt === 'fill_gaps' ? (elevation ? cov.primaryBand : 0) : -1;
+    const gaps = stable && (cov.prompt === 'other_side' || cov.prompt === 'fill_gaps');
+    const target = !stable ? -1 : cov.prompt === 'look_down' ? 2 : cov.prompt === 'go_lower' ? 1 : gaps ? (elevation ? cov.primaryBand : 0) : -1;
+    const min = cov?.minPerCell ?? 2;
     for (let b = 0; b < cells.length; b++) {
       for (let s = 0; s < COVERAGE_SECTORS; s++) {
         const k = !stable ? 0 : layout === 'flat' ? cov.sectors[s] : cov.counts[b][s];
-        const state = k >= (cov?.minPerCell ?? 2) ? 'c2' : k > 0 ? 'c1' : 'c0';
-        const pulse = b === target && state !== 'c2';
+        const state = k >= min ? 'c2' : k > 0 ? 'c1' : 'c0';
+        // a gap is a sector the circled tier misses (low + mid merged): not a mid cell of a low loop
+        const pulse = b === target && (gaps ? cov.loop[s] < min : state !== 'c2');
         const cls = `coverage-cell b${layout === 'flat' ? 'f' : b} ${state}${pulse ? ' target' : ''}`;
         if (cells[b][s].getAttribute('class') !== cls) cells[b][s].setAttribute('class', cls);
       }
