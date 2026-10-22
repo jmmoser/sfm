@@ -4,22 +4,30 @@
 // progress lines, streamed files and the final result. e2e/run-e2e.mjs --device phone uses it to
 // score a run made in a browser it does not drive (Safari on an iPhone) exactly like a desktop run.
 //
-//   GET  /__e2e/go                     302 to the harness URL of the run the runner waits for
-//   POST /__e2e/start?run=ID           JSON { userAgent, href, reload } → 204. 409 when the run already
-//                                      started: from another tab (the run goes on) or from a reload of
-//                                      the same tab (`reload`: the run fails, on iOS that is a jetsam kill)
+//   GET  /__e2e/go                     302 to the harness URL of the run the runner waits for (404
+//                                      once its result is in, while the runner scores it)
+//   POST /__e2e/start?run=ID           JSON { userAgent, href, tab } → 204. `tab` is the page's per-tab
+//                                      token (sessionStorage, src/harness/engine/bridge-run.ts); the run
+//                                      keeps the token of the tab that started it. 409 when the run
+//                                      already started: from that same tab, i.e. a reload during the
+//                                      run (the run fails; on iOS that is a jetsam kill), or from any
+//                                      other tab or none (refused, the run goes on)
 //   POST /__e2e/log?run=ID             text, '\n'-separated lines
 //   POST /__e2e/write?run=ID&path=P&append=0|1
 //                                      raw body streamed to <run dir>/<P without the run's prefix>
-//                                      (safeJoin: absolute paths and '..' are rejected)
+//                                      (safeJoin: absolute paths and '..' are rejected; ≤ 512 MB per
+//                                      request, ≤ maxRunBytes (4 GiB) on disk per run, else 413)
 //   GET  /__e2e/poll?run=ID            JSON { abort } (heartbeat; carries the runner's timeout)
 //   POST /__e2e/result?run=ID          JSON { result, error } → settles the run
 //
 // The run id is random (crypto) and known only to the runner and the page it sends the URL to:
-// requests naming another id get 403. Cross-origin pages cannot read the id from /__e2e/go's
-// redirect. The plugin is `apply: 'serve'` and is only added to the runner's inline createServer
-// config (e2e/lib/e2e-browser.mjs startBridgeServer), never to vite.config.ts, so production
-// builds never contain it.
+// requests naming another id get 403, and cross-origin pages cannot read the id from /__e2e/go's
+// redirect, so other web origins (CSRF) cannot write or post a result. It does not keep out other
+// hosts on the network: any of them can GET /__e2e/go and read the id from the Location header,
+// as it can load anything the dev server serves (the per-run byte cap bounds the disk it can fill).
+// The plugin is `apply: 'serve'` and is only added to the runner's inline createServer config
+// (e2e/lib/e2e-browser.mjs startBridgeServer), never to vite.config.ts, so production builds
+// never contain it.
 import { randomBytes } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
@@ -28,6 +36,8 @@ import { pipeline } from 'node:stream/promises';
 import { safeJoin } from './safe-path.mjs';
 
 const LIMITS = { start: 64 << 10, log: 4 << 20, write: 512 << 20, result: 1 << 30 };
+/** Default cap of the bytes one run may hold on disk (a real --splat run writes a few hundred MB). */
+const MAX_RUN_BYTES = 4 * 2 ** 30;
 
 class HttpError extends Error {
   constructor(status, message) {
@@ -78,9 +88,9 @@ export function resolveWritePath(outDir, prefix, path) {
 
 /**
  * The bridge: the runs the runner registered, the connect middleware and the Vite plugin.
- * `now` is injectable for tests.
+ * `now` and `maxRunBytes` (on-disk bytes per run) are injectable for tests.
  */
-export function createBridge({ now = Date.now } = {}) {
+export function createBridge({ now = Date.now, maxRunBytes = MAX_RUN_BYTES } = {}) {
   const runs = new Map();
   let active = null;
 
@@ -119,6 +129,8 @@ export function createBridge({ now = Date.now } = {}) {
       finish(envelope) {
         if (run.settled) return false;
         run.settled = true;
+        // /__e2e/go stops pointing here at once: scoring takes a while and the next run registers itself
+        if (active === run) active = null;
         resolveResult({ result: envelope.result ?? null, error: envelope.error ?? null });
         return true;
       },
@@ -131,8 +143,10 @@ export function createBridge({ now = Date.now } = {}) {
       },
       /**
        * Wait for the run: until a page starts it (startTimeoutMs; a reminder every remindMs), then
-       * until its result. After timeoutMs of running the page is asked to abort (it posts the
-       * partial result); graceMs later the run fails. A page silent for staleMs (locked screen,
+       * until its result. After timeoutMs of running the page is asked to abort: it posts the
+       * partial result, or a snapshot of the unfinished run when the pipeline has not returned
+       * 90 s after it saw the abort (bridge-run.ts SNAPSHOT_MS, inside the default graceMs);
+       * graceMs later the run fails without a result. A page silent for staleMs (locked screen,
        * Safari in the background, a killed tab) is reported, not failed. Resolves
        * { result, error, waitMs, runMs }.
        */
@@ -196,7 +210,7 @@ export function createBridge({ now = Date.now } = {}) {
         return send(
           res,
           404,
-          '<!doctype html><meta name="viewport" content="width=device-width"><body style="font:16px system-ui;padding:16px">No e2e run is waiting. Start <code>node e2e/run-e2e.mjs &lt;dataset&gt; --device phone</code> on the computer, then reload this page.',
+          '<!doctype html><meta name="viewport" content="width=device-width"><body style="font:16px system-ui;padding:16px">No e2e run is waiting (the runner may still be scoring the last one). Start <code>node e2e/run-e2e.mjs &lt;dataset&gt; --device phone</code> on the computer, or wait for its next dataset, then reload this page.',
           'text/html; charset=utf-8',
         );
       }
@@ -221,9 +235,11 @@ export function createBridge({ now = Date.now } = {}) {
           if (e instanceof HttpError) throw e;
           throw new HttpError(400, 'start: body is not JSON');
         }
+        if (!info || typeof info !== 'object' || Array.isArray(info)) throw new HttpError(400, 'start: expected { userAgent, href, tab }');
         if (run.settled) return send(res, 409, 'this run is over; open /__e2e/go for the current one');
         if (run.startedAt !== null) {
-          if (info.reload) {
+          // the tab that started the run came back: sessionStorage survives a reload, not a new tab
+          if (typeof info.tab === 'string' && info.tab !== '' && info.tab === run.info?.tab) {
             run.log('the page was reloaded during the run: the run is lost (tab killed for memory, or reloaded by hand)');
             run.finish({ result: null, error: 'the harness page was reloaded during the run (tab killed: out of memory? or reloaded by hand)' });
             return send(res, 409, 'reloaded during the run: this run is lost, start a new one on the computer');
@@ -244,21 +260,29 @@ export function createBridge({ now = Date.now } = {}) {
         const rel = u.searchParams.get('path');
         const file = resolveWritePath(run.outDir, run.prefix, rel);
         const append = u.searchParams.get('append') === '1';
+        const key = rel.slice(run.prefix.length);
+        // this file's bytes before the request (0 when overwritten) and every other file's
+        const kept = append ? run.files.get(key) ?? 0 : 0;
+        let others = 0;
+        for (const [f, b] of run.files) if (f !== key) others += b;
         await mkdir(dirname(file), { recursive: true });
         let n = 0;
-        await pipeline(
-          req,
-          async function* (src) {
-            for await (const c of src) {
-              n += c.length;
-              if (n > LIMITS.write) throw new HttpError(413, `write over ${LIMITS.write} bytes per request`);
-              yield c;
-            }
-          },
-          createWriteStream(file, { flags: append ? 'a' : 'w' }),
-        );
-        const key = rel.slice(run.prefix.length);
-        run.files.set(key, (append ? run.files.get(key) ?? 0 : 0) + n);
+        try {
+          await pipeline(
+            req,
+            async function* (src) {
+              for await (const c of src) {
+                if (n + c.length > LIMITS.write) throw new HttpError(413, `write over ${LIMITS.write} bytes per request`);
+                if (others + kept + n + c.length > maxRunBytes) throw new HttpError(413, `the run's files would exceed ${maxRunBytes} bytes`);
+                n += c.length;
+                yield c;
+              }
+            },
+            createWriteStream(file, { flags: append ? 'a' : 'w' }),
+          );
+        } finally {
+          run.files.set(key, kept + n);
+        }
         return send(res, 204);
       }
       case 'poll':

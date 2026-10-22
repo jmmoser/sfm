@@ -148,18 +148,36 @@ export async function startBridgeServer({ root, bridge, host = '127.0.0.1', port
 
 /**
  * `--device local-bridge`: a headless Chromium that opens bridge URLs with no Playwright bindings,
- * exactly what the phone does. Returns { open(url, { onConsole }) → { page, state, close }, close() }.
+ * exactly what the phone does. Returns { open(url, { onConsole, onGone }) → { page, state, close }, close() }.
+ * onGone(reason) fires once when the page's renderer crashes or the page closes before close():
+ * nothing will post the result then, so the caller settles the run (the bridge would only time out).
  */
 export async function startBridgeBrowser({ verbose = false, headed = false }) {
   const browser = await chromium.launch(launchOptions(CHROMIUM_ARGS, { headless: !headed }));
-  async function open(url, { onConsole } = {}) {
+  async function open(url, { onConsole, onGone = () => {} } = {}) {
     // self-signed / mkcert certificates of an HTTPS bridge server
     const context = await browser.newContext({ viewport: { width: 1100, height: 800 }, ignoreHTTPSErrors: true });
     const page = await context.newPage();
     page.setDefaultTimeout(0);
     const state = watchPage(page, { verbose, onConsole });
+    let closing = false;
+    let gone = false;
+    const goneOnce = (reason) => {
+      if (closing || gone) return;
+      gone = true;
+      onGone(reason);
+    };
+    page.once('crash', () => goneOnce('page crashed (renderer died; out of memory?)'));
+    page.once('close', () => goneOnce('the page closed before it sent a result'));
     await page.goto(url);
-    return { page, state, close: () => context.close().catch(() => {}) };
+    return {
+      page,
+      state,
+      close: () => {
+        closing = true;
+        return context.close().catch(() => {});
+      },
+    };
   }
   return { open, close: () => browser.close().catch(() => {}) };
 }

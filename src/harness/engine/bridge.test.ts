@@ -120,8 +120,8 @@ describe('createBridgeClient', () => {
     });
     const warns: string[] = [];
     const b = createBridgeClient({ run: 'r1', fetch: ff.f, retryMs: 0, warn: (m) => warns.push(m) });
-    expect(await b.start({ userAgent: 'ua', href: 'h', reload: false })).toEqual({ ok: false, status: 409, message: 'this run is already running in another tab' });
-    expect(JSON.parse(ff.calls[0].body as string)).toEqual({ userAgent: 'ua', href: 'h', reload: false });
+    expect(await b.start({ userAgent: 'ua', href: 'h', tab: 'tab-1' })).toEqual({ ok: false, status: 409, message: 'this run is already running in another tab' });
+    expect(JSON.parse(ff.calls[0].body as string)).toEqual({ userAgent: 'ua', href: 'h', tab: 'tab-1' });
     expect(await b.poll()).toEqual({ abort: 'runner timeout' });
     await expect(b.result({ result: null, error: 'x' })).rejects.toThrow(/HTTP 403/);
     expect(ff.calls.filter((c) => c.route === 'result')).toHaveLength(3);

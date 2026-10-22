@@ -14,11 +14,16 @@
  *
  * Phone runs (`e2e/run-e2e.mjs --device phone`): `?bridge=1&run=<id>&config=<JSON>` with no
  * Playwright binding installs the fetch bridge (./bridge.ts) as `__e2eLog` / `__e2eWrite` /
- * `__e2eWriteBlob`, forwards page errors and console warnings to the runner, announces the run
- * (a reload of the same tab during the run is reported and nothing runs again: on iOS that is a
- * jetsam kill), polls for the runner's abort, and posts `{ result, error }` at the end.
+ * `__e2eWriteBlob`, forwards page errors and console warnings to the runner, and runs
+ * ./bridge-run.ts: announce the run with this tab's token (a reload of the same tab during the
+ * run fails it and nothing runs again: on iOS that is a jetsam kill; another tab is refused),
+ * hold a screen wake lock (a "Keep the screen on" button when the request needs a tap), poll for
+ * the runner's abort (a snapshot is sent when the pipeline does not return), post
+ * `{ result, error }`.
  */
+import { WakeLock } from '../../sensors/wakelock';
 import { createBridgeClient, type BridgeClient } from './bridge';
+import { runBridged } from './bridge-run';
 import { startPipeline, writeBinary, type RunHandle } from './pipeline';
 import { bridgeFromQuery, configFromQuery } from './query';
 import { replaySplat, type ReplaySplatConfig, type ReplaySplatResult } from './replay';
@@ -39,8 +44,6 @@ declare global {
 const statusEl = document.getElementById('status');
 const logEl = document.getElementById('log');
 const LOG_LINES = 400;
-/** Poll period of a bridged run (heartbeat + abort). */
-const POLL_MS = 5000;
 
 function log(msg: string): void {
   if (window.__e2eLog) void window.__e2eLog(msg);
@@ -113,59 +116,45 @@ function showResult(r: HarnessResult): void {
   if (out) out.textContent = JSON.stringify({ ...r, frames: `${r.frames.length} frames`, progress: `${r.progress.length} events`, densePoints: r.densePoints ? `${r.densePoints.count} points` : undefined }, null, 2);
 }
 
+/** An element above the result (the "Next run" link, the wake-lock button). */
+function insertAboveResult(el: HTMLElement): void {
+  const out = document.getElementById('result');
+  out?.parentElement?.insertBefore(el, out);
+}
+
 /** "Open the next run" link after a bridged run (the runner serves the current one at /__e2e/go). */
 function showNextLink(): void {
-  const out = document.getElementById('result');
-  if (!out?.parentElement) return;
   const a = document.createElement('a');
   a.href = '/__e2e/go';
   a.textContent = 'Next run (/__e2e/go)';
   a.style.cssText = 'display:block;margin:12px 0;color:#9cf;font-size:16px';
-  out.parentElement.insertBefore(a, out);
+  insertAboveResult(a);
 }
 
-async function runBridged(b: BridgeClient, run: string, config: HarnessConfig | null, queryError: string | null): Promise<void> {
-  // a reload of this tab keeps sessionStorage: tell the runner, which then fails the run (jetsam)
-  const key = 'sfm-e2e-bridge-run';
-  let reload = false;
-  try {
-    reload = sessionStorage.getItem(key) === run;
-    sessionStorage.setItem(key, run);
-  } catch {
-    /* storage blocked: a reload looks like a new tab (the runner then only times out) */
-  }
-  const st = await b.start({ userAgent: navigator.userAgent, href: location.href, reload }).catch((e: unknown) => ({ ok: false as const, status: 0, message: (e as Error)?.message ?? String(e) }));
-  if (!st.ok) {
-    log(`[bridge] the runner did not accept this page (${st.status || 'network error'}): ${st.message}`);
-    showNextLink();
-    return;
-  }
-  log(`[bridge] connected (run ${run.slice(0, 8)}…); keep this tab in front and the screen on until the result is sent`);
-  let result: HarnessResult | null = null;
-  let error: string | null = queryError;
-  const timer = setInterval(() => {
-    void b.poll().then((p) => {
-      if (p?.abort && current) window.harnessAbort(p.abort);
+let wakeButton: HTMLButtonElement | null = null;
+
+/** The wake lock was refused without a gesture: a tap on this button requests it again (removed with the run). */
+function showWakeButton(wake: WakeLock): void {
+  if (wakeButton) return;
+  const btn = document.createElement('button');
+  wakeButton = btn;
+  btn.textContent = 'Keep the screen on';
+  btn.style.cssText = 'display:block;margin:12px 0;padding:10px 16px;font:600 16px system-ui,sans-serif';
+  btn.addEventListener('click', () => {
+    void wake.acquire().then(() => {
+      log(wake.active ? '[bridge] screen wake lock held' : `[bridge] the screen wake lock was refused again (${wake.lastError}): set Auto-Lock to Never`);
+      if (wake.active) btn.remove();
     });
-  }, POLL_MS);
+  });
+  insertAboveResult(btn);
+}
+
+function sessionStore(): Storage | null {
   try {
-    if (config) {
-      result = await runPipeline(config);
-      showResult(result);
-    } else error ??= 'harness.html: the query has no dataset';
-  } catch (e) {
-    error = `runPipeline failed: ${(e as Error)?.message ?? e}`;
-    log(`[harness] ${error}`);
-  } finally {
-    clearInterval(timer);
+    return window.sessionStorage;
+  } catch {
+    return null;
   }
-  try {
-    await b.result({ result, error });
-    log('[bridge] result sent to the runner');
-  } catch (e) {
-    log(`[bridge] could not send the result: ${(e as Error)?.message ?? e}`);
-  }
-  showNextLink();
 }
 
 // ---- autorun from the query: harness.html?dataset=object&engine=mock&… ----
@@ -181,8 +170,27 @@ try {
 const bridgeMode = !window.__e2eWrite && query.get('bridge') === '1';
 if (bridgeMode) {
   try {
-    const bq = bridgeFromQuery(query)!;
-    void runBridged(installBridge(bq.run), bq.run, auto, queryError);
+    const { run } = bridgeFromQuery(query)!;
+    const wake = new WakeLock();
+    void runBridged({
+      client: installBridge(run),
+      run,
+      config: auto,
+      queryError,
+      runPipeline,
+      abort: (reason) => window.harnessAbort(reason),
+      snapshot: () => window.harnessSnapshot(),
+      log,
+      storage: sessionStore(),
+      userAgent: navigator.userAgent,
+      href: location.href,
+      wakeLock: wake,
+      onWakeLockFailed: () => showWakeButton(wake),
+    }).then((o) => {
+      wakeButton?.remove();
+      if (o.result) showResult(o.result);
+      showNextLink();
+    });
   } catch (e) {
     log(`[bridge] ${(e as Error).message}`);
   }

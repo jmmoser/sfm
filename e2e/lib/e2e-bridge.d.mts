@@ -43,7 +43,7 @@ export interface Bridge {
   plugin(): { name: string; apply: 'serve'; configureServer: (server: unknown) => void; configurePreviewServer: (server: unknown) => void };
 }
 
-export function createBridge(opts?: { now?: () => number }): Bridge;
+export function createBridge(opts?: { now?: () => number; maxRunBytes?: number }): Bridge;
 export function bridgePlugin(middleware: Middleware): ReturnType<Bridge['plugin']>;
 export function harnessPath(id: string, config: unknown): string;
 export function resolveWritePath(outDir: string, prefix: string, path: unknown): string;

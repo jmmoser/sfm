@@ -326,6 +326,8 @@ export interface HarnessDevice {
   } | null;
   /** Why `adapter` is null. */
   adapterError?: string;
+  /** Bridged runs (./bridge-run.ts): the screen wake lock when the result was sent, and its last request error. */
+  wakeLock?: { active: boolean; error: string | null };
 }
 
 export interface HarnessResult {

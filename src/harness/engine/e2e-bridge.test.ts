@@ -2,13 +2,17 @@
  * The dev-server side of the e2e bridge (e2e/lib/e2e-bridge.mjs, e2e/lib/safe-path.mjs) on a real
  * node:http server, driven by the page-side client (./bridge.ts) over Node's fetch: path safety
  * (absolute paths, '..' and paths outside the run's prefix are rejected), files streamed into the
- * run's directory, ordered logs, /__e2e/go, start / reload semantics, the runner's timeout →
- * abort through /poll, and the plugin never applying to a build.
+ * run's directory, the per-run byte cap, ordered logs, /__e2e/go (none once the result is in),
+ * start semantics by tab token (only the starting tab's reload fails the run; also through the
+ * page flow ./bridge-run.ts with per-tab storages), the runner's timeout → abort through /poll,
+ * and the plugin never applying to a build.
  */
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createBridge, harnessPath, resolveWritePath, type Bridge } from '../../../e2e/lib/e2e-bridge.mjs';
 import { safeJoin } from '../../../e2e/lib/safe-path.mjs';
 import { createBridgeClient } from './bridge';
+import { runBridged, type BridgedRunDeps } from './bridge-run';
+import type { HarnessResult } from './types';
 
 // Node built-ins through an untyped dynamic import: the main tsconfig is browser-typed (no @types/node).
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -39,6 +43,7 @@ let server: ReturnType<typeof createServer>;
 beforeAll(async () => {
   root = mkdtempSync(join(tmpdir(), 'sfm-bridge-'));
   bridge = createBridge();
+  // `bridge` is read per request: a test may swap in one with other options
   server = createServer((req, res) =>
     bridge.middleware(req, res, () => {
       res.statusCode = 418; // not a bridge route
@@ -84,7 +89,7 @@ describe('bridge server + page client', () => {
     expect((await fetch(`${base}/harness.html`)).status).toBe(418); // everything else passes through
 
     const c = createBridgeClient({ run: run.id, base, chunkBytes: 1000 });
-    expect(await c.start({ userAgent: 'iPhone test', href: 'x', reload: false })).toEqual({ ok: true });
+    expect(await c.start({ userAgent: 'iPhone test', href: 'x', tab: 'tab-a' })).toEqual({ ok: true });
     expect(run.info).toMatchObject({ userAgent: 'iPhone test' });
     for (let i = 0; i < 50; i++) c.log(`line ${i}`);
     const bytes = Uint8Array.from({ length: 2500 }, (_, i) => (i * 31) & 255);
@@ -98,6 +103,11 @@ describe('bridge server + page client', () => {
     await expect(c.writeBlob('yard-phone/x.bin', new Blob([bytes]), false)).rejects.toThrow(/not under object-phone/);
     expect(await c.poll()).toEqual({ abort: null });
     await c.result({ result: { ok: true, files: ['object-phone/sparse.ply'] }, error: null });
+    // the result is in: /go no longer leads to this run while the runner scores it
+    const goDone = await fetch(`${base}/__e2e/go`, { redirect: 'manual' });
+    expect(goDone.status).toBe(404);
+    expect(await goDone.text()).toMatch(/No e2e run is waiting/);
+    expect(bridge.active).toBeNull();
 
     expect(await run.result).toEqual({ result: { ok: true, files: ['object-phone/sparse.ply'] }, error: null });
     expect(lines).toEqual(Array.from({ length: 50 }, (_, i) => `line ${i}`));
@@ -120,6 +130,7 @@ describe('bridge server + page client', () => {
     expect((await fetch(`${base}/__e2e/write?run=${run.id}&path=x`)).status).toBe(405);
     expect((await post(`/__e2e/poll?run=${run.id}`, '')).status).toBe(405);
     expect((await post(`/__e2e/start?run=${run.id}`, '{nope', 'application/json')).status).toBe(400);
+    expect((await post(`/__e2e/start?run=${run.id}`, 'null', 'application/json')).status).toBe(400);
     expect((await post(`/__e2e/result?run=${run.id}`, 'nope', 'application/json')).status).toBe(400);
     expect((await post(`/__e2e/write?run=${run.id}`, 'abc')).status).toBe(400); // no path
     expect((await post(`/__e2e/bogus?run=${run.id}`, 'abc')).status).toBe(404);
@@ -127,24 +138,109 @@ describe('bridge server + page client', () => {
     run.close();
   });
 
-  it('start: another tab is refused and the run goes on; a reload of the same tab fails the run', async () => {
+  it('start: other tabs (and their reloads) are refused and the run goes on; only a reload of the starting tab fails it', async () => {
     const run = bridge.expectRun({ outDir: join(root, 'r3'), config: { dataset: 'object' } });
     const c = createBridgeClient({ run: run.id, base });
-    expect((await c.start({ userAgent: 'a', href: 'x', reload: false })).ok).toBe(true);
-    const other = await c.start({ userAgent: 'b', href: 'x', reload: false });
-    expect(other).toMatchObject({ ok: false, status: 409, message: 'this run is already running in another tab' });
+    expect((await c.start({ userAgent: 'a', href: 'x', tab: 'tab-a' })).ok).toBe(true);
+    const busy = { ok: false, status: 409, message: 'this run is already running in another tab' };
+    // a second tab, then the same second tab reloaded (it kept its token): refused both times
+    expect(await c.start({ userAgent: 'b', href: 'x', tab: 'tab-b' })).toEqual(busy);
+    expect(await c.start({ userAgent: 'b', href: 'x', tab: 'tab-b' })).toEqual(busy);
+    // a tab without storage (no token) can never claim to be the starting tab
+    expect(await c.start({ userAgent: 'c', href: 'x', tab: null })).toEqual(busy);
     expect(run.settled).toBe(false);
-    const again = await c.start({ userAgent: 'a', href: 'x', reload: true });
-    expect(again).toMatchObject({ ok: false, status: 409 });
+    const again = await c.start({ userAgent: 'a', href: 'x', tab: 'tab-a' });
+    expect(again).toMatchObject({ ok: false, status: 409, message: expect.stringMatching(/reloaded during the run/) });
     expect((await run.result).error).toMatch(/reloaded during the run/);
     run.close();
+    // a run started by a tab without a token: a null start is never taken for its reload
+    const r2 = bridge.expectRun({ outDir: join(root, 'r3b'), config: { dataset: 'object' } });
+    const c2 = createBridgeClient({ run: r2.id, base });
+    expect((await c2.start({ userAgent: 'a', href: 'x', tab: null })).ok).toBe(true);
+    expect(await c2.start({ userAgent: 'a', href: 'x', tab: null })).toEqual(busy);
+    expect(r2.settled).toBe(false);
+    r2.close();
+  });
+
+  it('page flow: a second tab and its reload are refused while the first runs; only a reload of the first fails the run', async () => {
+    const storage = (): BridgedRunDeps['storage'] => {
+      const m = new Map<string, string>();
+      return { getItem: (k) => m.get(k) ?? null, setItem: (k, v) => void m.set(k, v) };
+    };
+    const page = (run: string, tab: BridgedRunDeps['storage'], runPipeline: BridgedRunDeps['runPipeline']): BridgedRunDeps => ({
+      client: createBridgeClient({ run, base, retryMs: 0, warn: () => {} }),
+      run,
+      config: { dataset: 'object', engine: 'mock' },
+      queryError: null,
+      runPipeline,
+      abort: () => false,
+      snapshot: () => null,
+      log: () => {},
+      storage: tab,
+      userAgent: 'ua',
+      href: 'x',
+      pollMs: 60_000,
+    });
+    const done = { ok: true } as unknown as HarnessResult;
+    const run = bridge.expectRun({ outDir: join(root, 'tabs'), config: { dataset: 'object' } });
+    const tab1 = storage();
+    const tab2 = storage();
+    let finish!: (r: HarnessResult) => void;
+    const first = runBridged(page(run.id, tab1, () => new Promise((r) => (finish = r))));
+    await vi.waitFor(() => expect(run.startedAt).not.toBeNull());
+    const others = vi.fn(async () => done);
+    expect(await runBridged(page(run.id, tab2, others))).toMatchObject({ started: false, error: 'this run is already running in another tab' });
+    // the user reloads the refused tab: still another tab, the run in tab 1 is untouched
+    expect(await runBridged(page(run.id, tab2, others))).toMatchObject({ started: false, error: 'this run is already running in another tab' });
+    expect(others).not.toHaveBeenCalled();
+    expect(run.settled).toBe(false);
+    finish(done);
+    expect(await first).toMatchObject({ started: true, sent: true });
+    expect(await run.result).toEqual({ result: { ok: true }, error: null });
+    run.close();
+
+    // tab 1 reloaded during a run it started (jetsam): the run fails, nothing runs again
+    const r2 = bridge.expectRun({ outDir: join(root, 'tabs2'), config: { dataset: 'object' } });
+    const tab = storage();
+    let finish2!: (r: HarnessResult) => void;
+    const killed = runBridged(page(r2.id, tab, () => new Promise((r) => (finish2 = r))));
+    await vi.waitFor(() => expect(r2.startedAt).not.toBeNull());
+    expect(await runBridged(page(r2.id, tab, others))).toMatchObject({ started: false, error: expect.stringMatching(/reloaded during the run/) });
+    expect((await r2.result).error).toMatch(/reloaded during the run/);
+    expect(others).not.toHaveBeenCalled();
+    // (in a real reload the old page is gone; here its late result is refused)
+    finish2(done);
+    expect(await killed).toMatchObject({ started: true, sent: false });
+    r2.close();
+  });
+
+  it('caps the bytes a run holds on disk (overwrites count once)', async () => {
+    const saved = bridge;
+    bridge = createBridge({ maxRunBytes: 100 });
+    try {
+      const run = bridge.expectRun({ outDir: join(root, 'cap'), prefix: 'cap/', config: { dataset: 'object' } });
+      const c = createBridgeClient({ run: run.id, base, chunkBytes: 1 << 20 });
+      await c.writeBlob('cap/a.bin', new Blob([new Uint8Array(60)]), false);
+      // overwriting a.bin replaces its 60 bytes: 60 + 30 ≤ 100
+      await c.writeBlob('cap/a.bin', new Blob([new Uint8Array(60)]), false);
+      await c.writeBlob('cap/b.bin', new Blob([new Uint8Array(30)]), false);
+      await expect(c.writeBlob('cap/c.bin', new Blob([new Uint8Array(20)]), false)).rejects.toThrow(/HTTP 413 the run's files would exceed 100 bytes/);
+      await expect(c.writeBlob('cap/b.bin', new Blob([new Uint8Array(20)]), true)).rejects.toThrow(/HTTP 413/);
+      expect(Object.fromEntries(run.files)).toEqual({ 'a.bin': 60, 'b.bin': 30, 'c.bin': 0 });
+      await c.writeBlob('cap/b.bin', new Blob([new Uint8Array(10)]), true);
+      expect(run.files.get('b.bin')).toBe(40);
+      expect(readFileSync(join(root, 'cap', 'b.bin')).length).toBe(40);
+      run.close();
+    } finally {
+      bridge = saved;
+    }
   });
 
   it('wait: runner timeout → abort via poll → the partial result arrives flagged as timeout', async () => {
     const lines: string[] = [];
     const run = bridge.expectRun({ outDir: join(root, 'r4'), config: { dataset: 'object' }, log: (m) => lines.push(m) });
     const c = createBridgeClient({ run: run.id, base });
-    await c.start({ userAgent: 'a', href: 'x', reload: false });
+    await c.start({ userAgent: 'a', href: 'x', tab: 't' });
     const waiting = run.wait({ timeoutMs: 40, tickMs: 5, graceMs: 5000 });
     // the page polls until it sees the abort, then posts its partial result
     let p = await c.poll();
@@ -168,7 +264,7 @@ describe('bridge server + page client', () => {
     a.close();
     const lines: string[] = [];
     const b = bridge.expectRun({ outDir: join(root, 'r6'), config: { dataset: 'object' }, log: (m) => lines.push(m) });
-    await createBridgeClient({ run: b.id, base }).start({ userAgent: 'a', href: 'x', reload: false });
+    await createBridgeClient({ run: b.id, base }).start({ userAgent: 'a', href: 'x', tab: 't' });
     expect(await b.wait({ timeoutMs: 30, graceMs: 30, staleMs: 10, tickMs: 5 })).toMatchObject({ result: null, error: 'timeout (no result from the page after the abort)' });
     expect(lines.join('\n')).toMatch(/no contact with the page for 0 s/);
     b.close();

@@ -123,7 +123,11 @@ function printTimings(r, log) {
   }
   if (r.device) {
     const a = r.device.adapter;
-    log(`device: ${r.device.userAgent}; adapter ${a ? `${[a.vendor, a.architecture, a.description].filter(Boolean).join(' ') || '?'} (maxBufferSize ${fmtNum((a.limits.maxBufferSize ?? 0) / 1048576, 0)} MB)` : `none (${r.device.adapterError})`}`);
+    const wl = r.device.wakeLock;
+    log(
+      `device: ${r.device.userAgent}; adapter ${a ? `${[a.vendor, a.architecture, a.description].filter(Boolean).join(' ') || '?'} (maxBufferSize ${fmtNum((a.limits.maxBufferSize ?? 0) / 1048576, 0)} MB)` : `none (${r.device.adapterError})`}` +
+        `${wl ? `; screen wake lock ${wl.active ? 'held' : `NOT held (${wl.error ?? 'released'})`} at the end` : ''}`,
+    );
   }
   if (r.engine?.respawns) log(`WARNING: the engine worker was respawned ${r.engine.respawns} time(s) (state lost)`);
   for (const e of r.errors ?? []) log(`error [${e.step}] ${e.name}: ${e.message}`);
@@ -198,6 +202,8 @@ async function runDatasetOnDevice(device, name, opts, outRoot, thresholdsSpec) {
         onConsole: (type, text) => {
           if (type === 'error' || type === 'warning' || opts.verbose) log(`[page:${type}] ${text}`);
         },
+        // a dead page posts nothing: fail now, as runOnPage does, not after --timeout-min + grace
+        onGone: (reason) => br.finish({ result: null, error: reason }),
       });
     }
     void br.started.then((info) => log(`page connected: ${info?.userAgent ?? '?'}`));
@@ -207,7 +213,6 @@ async function runDatasetOnDevice(device, name, opts, outRoot, thresholdsSpec) {
       startTimeoutMs: device.browser ? 180_000 : Infinity,
       remind: tell,
     });
-    if (local?.state.crashed) out.error ??= 'page crashed (renderer died; out of memory?)';
     const files = [...br.files].map(([f, n]) => `${f} ${fmtNum(n / 1048576, 1)} MB`);
     if (files.length) log(`received through the bridge: ${files.join(', ')}`);
     return scoreRun(run, out, out.runMs / 1000, opts, thresholdsSpec, { device: opts.device, waitSeconds: Math.round(out.waitMs / 100) / 10, page: br.info });

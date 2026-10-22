@@ -1,12 +1,13 @@
 /**
  * Fetch transport of the e2e bridge (harness.html?bridge=1&run=<id>, unit-tested in
- * ./bridge.test.ts). It does over HTTP what Playwright's exposed `__e2eLog` / `__e2eWrite` do for
+ * ./bridge.test.ts; the run's flow on top of it is ./bridge-run.ts). It does over HTTP what Playwright's exposed `__e2eLog` / `__e2eWrite` do for
  * desktop runs, so the harness runs unchanged in a browser nothing automates (Safari on an
  * iPhone) and e2e/run-e2e.mjs --device phone still gets the logs, the PLY files and the result.
  * The server side is the dev-server plugin e2e/lib/e2e-bridge.mjs; every request names the run:
  *
- *   POST /__e2e/start?run=   JSON { userAgent, href, reload }  → 204, or 409 (refused: the run is
- *                            already running in another tab, or this tab reloaded mid-run)
+ *   POST /__e2e/start?run=   JSON { userAgent, href, tab }  → 204, or 409 (refused: the run is
+ *                            already running in another tab, or this tab (same `tab` token)
+ *                            reloaded mid-run)
  *   POST /__e2e/log?run=     text lines, in order: batched, one request in flight
  *   POST /__e2e/write?run=&path=&append=0|1   raw bytes (no base64), ≤ 16 MB per request
  *   GET  /__e2e/poll?run=    JSON { abort } every few seconds: heartbeat + the runner's timeout
@@ -20,6 +21,11 @@ export type WriteFn = (path: string, data: string, encoding: 'base64' | 'utf8', 
 export type WriteBlobFn = (path: string, data: Blob, append: boolean) => Promise<void>;
 
 export type StartAnswer = { ok: true } | { ok: false; status: number; message: string };
+export interface StartInfo {
+  userAgent: string;
+  href: string;
+  tab: string | null;
+}
 
 export interface BridgeClient {
   /** `__e2eWrite`-compatible (base64 / utf8 strings). */
@@ -30,7 +36,8 @@ export interface BridgeClient {
   log(msg: string): void;
   /** Resolves when every queued line was sent (or dropped). */
   flush(): Promise<void>;
-  start(info: { userAgent: string; href: string; reload: boolean }): Promise<StartAnswer>;
+  /** `tab`: this tab's token (./bridge-run.ts), null when sessionStorage is blocked. */
+  start(info: StartInfo): Promise<StartAnswer>;
   /** null when the server could not be reached. */
   poll(): Promise<{ abort: string | null } | null>;
   /** Flushes the logs, then posts the final result. */

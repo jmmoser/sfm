@@ -1,6 +1,7 @@
 /**
  * harness.html query parsing (./query.ts): the manual keys, the new splat / splatIterations /
- * engineConfig keys, the whole-config `config` JSON a phone run sends, and the bridge switch.
+ * engineConfig keys, the whole-config `config` JSON a phone run sends, malformed values throwing
+ * instead of falling back, and the bridge switch.
  */
 import { describe, expect, it } from 'vitest';
 import { harnessPath } from '../../../e2e/lib/e2e-bridge.mjs';
@@ -25,8 +26,22 @@ describe('configFromQuery', () => {
       headingNorth: 'app',
       mockSpeed: 8,
     });
-    // absent keys stay absent (pipeline defaults apply), unknown values are ignored
-    expect(configFromQuery(q('dataset=yard&quality=ultra&engine=gpu'))).toEqual({ dataset: 'yard', engine: 'worker' });
+    // absent keys stay absent (pipeline defaults apply)
+    expect(configFromQuery(q('dataset=yard'))).toEqual({ dataset: 'yard', engine: 'worker' });
+    expect(configFromQuery(q('dataset=yard&engine=inline&headingNorth=true&mode=auto&quality=max&fps=7.5'))).toEqual({ dataset: 'yard', engine: 'inline', headingNorth: 'true', mode: 'auto', quality: 'max', fps: 7.5 });
+  });
+
+  it('a typo throws instead of running another configuration', () => {
+    expect(() => configFromQuery(q('dataset=yard&engine=gpu'))).toThrow('harness query: engine=gpu is not one of worker, inline, mock');
+    expect(() => configFromQuery(q('dataset=yard&quality=ultra'))).toThrow(/quality=ultra is not one of fast, balanced, max/);
+    expect(() => configFromQuery(q('dataset=yard&mode=room'))).toThrow(/mode=room is not one of/);
+    expect(() => configFromQuery(q('dataset=yard&headingNorth=grid'))).toThrow(/headingNorth=grid is not one of/);
+    expect(() => configFromQuery(q('dataset=yard&engine='))).toThrow(/engine= is not one of/);
+    expect(() => configFromQuery(q('dataset=yard&maxFrames=4o'))).toThrow('harness query: maxFrames=4o is not a number');
+    expect(() => configFromQuery(q('dataset=yard&stride='))).toThrow(/stride= is not a number/);
+    expect(() => configFromQuery(q('dataset=yard&mockSpeed=Infinity'))).toThrow(/mockSpeed=Infinity is not a number/);
+    // the JSON config is not re-validated here (the runner built it), but a bad single key on top still throws
+    expect(() => configFromQuery(q(`config=${encodeURIComponent('{"dataset":"object"}')}&engine=Mock`))).toThrow(/engine=Mock/);
   });
 
   it('splat, splatIterations (implies splat) and engineConfig JSON', () => {
@@ -34,7 +49,8 @@ describe('configFromQuery', () => {
     expect(configFromQuery(q('dataset=object-real&splat=0'))!.splat).toBe(false);
     expect(configFromQuery(q('dataset=object-real&splatIterations=500'))!.splat).toEqual({ iterations: 500 });
     expect(configFromQuery(q('dataset=object-real&splat=0&splatIterations=500'))!.splat).toEqual({ iterations: 500 });
-    expect(configFromQuery(q('dataset=object-real&splatIterations=0'))!.splat).toBeUndefined();
+    expect(() => configFromQuery(q('dataset=object-real&splatIterations=0'))).toThrow(/splatIterations=0 must be an integer ≥ 1/);
+    expect(() => configFromQuery(q('dataset=object-real&splatIterations=2.5'))).toThrow(/splatIterations=2.5/);
     const ec = configFromQuery(q(`dataset=object&engineConfig=${encodeURIComponent('{"featureBackend":"cpu","mapping":"inline"}')}`))!;
     expect(ec.engineConfig).toEqual({ featureBackend: 'cpu', mapping: 'inline' });
     expect(() => configFromQuery(q('dataset=object&engineConfig={bad'))).toThrow(/engineConfig is not JSON/);
