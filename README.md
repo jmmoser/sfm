@@ -124,7 +124,12 @@ Scans (photos, models, GPS fixes) live in the origin's IndexedDB. On a shared or
 own origin (custom domain). The production build ships only the app (the e2e harness pages are dev-server
 only), with a Content-Security-Policy and a versioned service worker (offline after the first visit).
 
-CI (`.github/workflows/ci.yml`) runs typecheck, unit tests and the build.
+CI (`.github/workflows/ci.yml`) runs typecheck, unit tests and the build on pushes to `main` and `claude/**` and
+on pull requests.
+The nightly workflow (`.github/workflows/nightly.yml`, scheduled or started by hand) runs the slow tier: the
+SwiftShader GPU tests in 6 shards, a mock-engine e2e smoke on 40-frame datasets (desktop runner and the phone
+bridge, `--device local-bridge`) and `npm run ui:smoke`. It installs Playwright's Chromium with
+`node e2e/ensure-chromium.mjs` unless the runner already has it (`PLAYWRIGHT_BROWSERS_PATH`).
 
 ### End-to-end evaluation with ground truth
 

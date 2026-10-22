@@ -660,7 +660,7 @@ node e2e/run-e2e.mjs yard-real --device phone --public-url https://<name>.tryclo
   12-frame object set (`generate-synth.mjs object --frames 12`; 2026-10-22, SwiftShader) it matched the desktop
   runner exactly: the mock engine gave byte-identical `sparse.ply` / `dense.ply` / `mesh.ply`, the worker engine
   (`--no-dense --set 'engineConfig={"featureBackend":"cpu"}'`) a byte-identical `sparse.ply`, both identical
-  metrics and checks.
+  metrics and checks. The nightly CI runs `run-e2e.mjs all --engine mock --device local-bridge`.
 * **Limits.** The phone loads the dev server's unbundled modules, so it measures the engine on real Metal and
   real jetsam but not the production worker bundle (the cd7a534 class needs a built-harness run). Runs are
   manual: note battery level, charger and thermal state with each result, and do not quote a warm phone's
