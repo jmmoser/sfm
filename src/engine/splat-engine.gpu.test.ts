@@ -4,10 +4,13 @@
  *  - persistent session (real IndexedDB): densify, splat cancelled mid-training (the readbacks of
  *    its checkpoint dropped first: read again, never stored stale), the engine dropped without
  *    cleanup ("killed"), a NEW engine reports the resumable iteration, resumes from the
- *    checkpoint, persists the model, clears the checkpoints and exports 'ply-splat';
- *  - in-memory session without a dense cloud: dropped GPU work rolls back to the last checkpoint,
- *    a destroyed device is replaced and training continues from the checkpoint; dropped readbacks
- *    of the appearance normalisation are read again.
+ *    checkpoint (its first preview shows the checkpoint) and is ended early ("Use it now"): the
+ *    model is persisted with its checkpoint kept (and its run key); a third engine reports it as
+ *    continuable, continues to the end, clears the checkpoints and exports 'ply-splat';
+ *  - in-memory session without a dense cloud: previews (the first before the training, PSNR
+ *    rising to the final model's), dropped GPU work rolls back to the last checkpoint, a destroyed device is replaced
+ *    and training continues from the checkpoint; dropped readbacks of the appearance normalisation
+ *    are read again.
  */
 import { beforeAll, describe, expect, it } from 'vitest';
 import type { ProgressEvent } from '../core/types';
@@ -16,7 +19,7 @@ import { SessionStore } from '../io/storage';
 import { decodeSplatPLY } from '../splat/ply';
 import type { SplatTrainer } from '../splat/trainer';
 import { COLOUR_FLOATS } from '../splat/wgsl/loss';
-import type { EngineOptions, SplatTrainingDetail } from '../workers/protocol';
+import type { EngineOptions, SplatPreviewDetail, SplatTrainingDetail } from '../workers/protocol';
 import { createCpuFeaturePipeline } from './cpu-pipeline';
 import { PhotogrammetryEngine } from './engine';
 import { unpackSplatParams, type EngineStateRecord } from './persistence';
@@ -61,6 +64,7 @@ async function captureAndRefine(e: PhotogrammetryEngine): Promise<void> {
 }
 
 const training = (p: ProgressEvent): SplatTrainingDetail | null => (p.stage === 'splat_training' && p.detail ? (p.detail as SplatTrainingDetail) : null);
+const preview = (p: ProgressEvent): SplatPreviewDetail | null => (p.stage === 'splat_preview' && p.detail && p.image ? (p.detail as SplatPreviewDetail) : null);
 /** The training reports of a run from iteration `from` to `to` (one per `SPLAT.chunk`; no chunk crosses a checkpoint). */
 const reports = (from: number, to: number): number[] => Array.from({ length: (to - from) / SPLAT.chunk + 1 }, (_, i) => from + i * SPLAT.chunk);
 
@@ -106,45 +110,86 @@ describe('engine splat stage', () => {
       expect(params.means.every((x) => Number.isFinite(x) && Math.abs(x) < 100)).toBe(true);
       a.dispose(); // "killed": no cleanup
 
-      // reload: a new engine opens the session and resumes
+      // reload: a new engine opens the session, resumes (its first preview shows the checkpoint)
+      // and is ended early ("Use it now" at the report of iteration 130, past finishFrom = 60)
       const b = new PhotogrammetryEngine({ mode: 'auto', quality: 'fast' }, config());
       const sum = await b.loadSession(id);
       expect(sum.stats.splatResumableIteration).toBe(100);
       expect(sum.splat ?? null).toBeNull();
+      const finish = { cancelled: false, finishEarly: false };
       const resumed: SplatTrainingDetail[] = [];
-      const info = await b.splat(undefined, (p) => {
+      const order: string[] = [];
+      const previewsB: SplatPreviewDetail[] = [];
+      const early = await b.splat(
+        { preview: true },
+        (p) => {
+          const d = training(p);
+          const v = preview(p);
+          if (d || v) order.push(p.stage);
+          if (v) previewsB.push(v);
+          if (!d) return;
+          resumed.push(d);
+          if (d.iteration >= 130) finish.finishEarly = true;
+        },
+        finish,
+      );
+      console.log(`[splat-engine] resumed, ended early: ${JSON.stringify(early)}`);
+      expect(previewsB[0].iteration).toBe(100);
+      expect(order[0]).toBe('splat_preview');
+      expect(resumed[0]).toMatchObject({ iteration: 110, finishFrom: 60 });
+      expect(resumed.map((d) => d.iteration)).toEqual([110, 120, 130]);
+      expect(early.iterations).toBe(130);
+      expect(early.stats).toMatchObject({ splatResumedFrom: 100, splatFinishedEarly: 1, splatContinueFrom: 130, splatIterations: 200 });
+      // the model is persisted, the checkpoint at 130 kept (its run key with the model)
+      const progB = await b.engineStore!.getValue<{ iteration: number; key: string }>('splat/progress');
+      expect(progB?.iteration).toBe(130);
+      expect(early.stats.splatContinueKey).toBe(progB!.key);
+      expect((await b.engineStore!.getValue<EngineStateRecord>('engine/state'))?.hasSplat).toBe(true);
+      expect((await b.splatModel())?.model.count).toBe(early.count);
+      b.dispose();
+
+      // a third engine: the stored model is continuable; it continues to the end
+      const c = new PhotogrammetryEngine({ mode: 'auto', quality: 'fast' }, config());
+      const sumC = await c.loadSession(id);
+      expect(sumC.splat).toMatchObject({ count: early.count, iterations: 130 });
+      expect(sumC.stats.splatResumableIteration).toBe(130);
+      expect(sumC.stats.splatContinuesModel).toBe(1);
+      const continued: SplatTrainingDetail[] = [];
+      const info = await c.splat(undefined, (p) => {
         const d = training(p);
-        if (d) resumed.push(d);
+        if (d) continued.push(d);
       });
-      console.log(`[splat-engine] resumed: ${JSON.stringify(info)}`);
+      console.log(`[splat-engine] continued: ${JSON.stringify(info)}`);
       expect(info.iterations).toBe(200);
-      expect(info.stats.splatResumedFrom).toBe(100);
+      expect(info.stats.splatResumedFrom).toBe(130);
+      expect(info.stats.splatFinishedEarly).toBeUndefined();
       // default geometry supervision: the persisted filtered depth maps of the reloaded session
       expect(Number(info.stats.splatDepthViews)).toBeGreaterThan(0);
-      expect(resumed[0].iteration).toBe(110);
+      expect(continued[0].iteration).toBe(140);
       // the resumed trainer refines again (MCMC at 150)
-      expect(resumed[resumed.length - 1].gaussians).toBeGreaterThan(resumed[0].gaussians);
+      expect(continued[continued.length - 1].gaussians).toBeGreaterThan(continued[0].gaussians);
       expect(info.count).toBeGreaterThan(1000);
       expect(Number(info.stats.splatLoss)).toBeLessThan(0.25);
       expect(info.bytes).toBe(56 * info.count);
       // checkpoints cleared, model persisted
-      expect(await b.engineStore!.getValue('splat/progress')).toBeNull();
-      expect(await b.engineStore!.listBinaryKeys('splat/ckpt')).toEqual([]);
-      expect((await b.engineStore!.getValue<EngineStateRecord>('engine/state'))?.hasSplat).toBe(true);
-      const payload = await b.splatModel();
+      expect(await c.engineStore!.getValue('splat/progress')).toBeNull();
+      expect(await c.engineStore!.listBinaryKeys('splat/ckpt')).toEqual([]);
+      expect((await c.engineStore!.getValue<EngineStateRecord>('engine/state'))?.hasSplat).toBe(true);
+      const payload = await c.splatModel();
       expect(payload?.model.count).toBe(info.count);
       expect(payload?.antialiased).toBe(true);
-      const ply = decodeSplatPLY(new Uint8Array(await (await b.exportModel('ply-splat')).arrayBuffer()));
+      const ply = decodeSplatPLY(new Uint8Array(await (await c.exportModel('ply-splat')).arrayBuffer()));
       expect(ply.model.count).toBe(info.count);
-      b.dispose();
-
-      // a third engine sees the stored model
-      const c = new PhotogrammetryEngine({ mode: 'auto', quality: 'fast' }, config());
-      const sum2 = await c.loadSession(id);
-      expect(sum2.splat?.count).toBe(info.count);
-      expect(sum2.stats.splatResumableIteration).toBeUndefined();
-      expect((await c.splatModel())?.model.count).toBe(info.count);
       c.dispose();
+
+      // a fourth engine sees the stored model
+      const d = new PhotogrammetryEngine({ mode: 'auto', quality: 'fast' }, config());
+      const sum2 = await d.loadSession(id);
+      expect(sum2.splat).toMatchObject({ count: info.count, iterations: 200 });
+      expect(sum2.stats.splatResumableIteration).toBeUndefined();
+      expect(sum2.stats.splatContinuesModel).toBeUndefined();
+      expect((await d.splatModel())?.model.count).toBe(info.count);
+      d.dispose();
     } finally {
       const s = await SessionStore.open();
       await s.deleteSession(id).catch(() => undefined);
@@ -152,7 +197,7 @@ describe('engine splat stage', () => {
     }
   }, 600_000);
 
-  it('rolls back dropped work and survives a device loss (sparse init + sky shell)', async () => {
+  it('previews; rolls back dropped work and survives a device loss (sparse init + sky shell)', async () => {
     let drops = 0;
     let current: SplatTrainer | null = null;
     const e = new PhotogrammetryEngine(
@@ -170,10 +215,15 @@ describe('engine splat stage', () => {
     await captureAndRefine(e);
     let lost = false;
     const iters: number[] = [];
-    const info = await e.splat({ backgroundShell: true }, (p) => {
+    const order: string[] = [];
+    const previews: { d: SplatPreviewDetail; width: number; height: number; sum: number }[] = [];
+    const info = await e.splat({ backgroundShell: true, preview: true }, (p) => {
       // the colour-state readbacks of the appearance normalisation are dropped twice
       if (p.stage === 'splat_finishing' && p.progress === 0) current!.simulateDroppedWork({ readbacks: 2 });
+      const v = preview(p);
+      if (v) previews.push({ d: v, width: p.image!.width, height: p.image!.height, sum: Array.from(p.image!.data).reduce((s, x) => s + x, 0) });
       const d = training(p);
+      if (d || v) order.push(p.stage);
       if (d) iters.push(d.iteration);
       if (d && d.iteration >= 120 && !lost) {
         lost = true;
@@ -195,6 +245,18 @@ describe('engine splat stage', () => {
     expect(Number(info.stats.splatShell)).toBeGreaterThan(0);
     expect(drops).toBe(2); // the trainer was rebuilt once
     expect((await e.splatModel())?.model.count).toBe(info.count);
+    // previews: the initial Gaussians before the first training report, then between chunks
+    // (≥ 2 s apart; a chunk takes longer here) at the training size (≤ 400 px: factor 1)
+    console.log(`[splat-engine] previews: ${previews.map((p) => `${p.d.iteration}: ${p.d.psnr} dB`).join(', ')}`);
+    expect(previews.length).toBeGreaterThanOrEqual(3);
+    expect(order[0]).toBe('splat_preview');
+    expect(previews[0].d.iteration).toBe(0);
+    expect(info.stats.splatPreviews).toBe(previews.length);
+    for (const p of previews) expect([p.width, p.height, p.d.viewId]).toEqual([info.stats.splatWidth, info.stats.splatHeight, previews[0].d.viewId]);
+    expect(new Set(previews.map((p) => p.sum)).size).toBeGreaterThan(2);
+    expect(previews[previews.length - 1].d.psnr).toBeGreaterThan(previews[0].d.psnr + 3);
+    // the trained model from that view (not posted): what the previews converge to
+    expect(Number(info.stats.splatPreviewFinalPsnr)).toBeGreaterThan(previews[previews.length - 1].d.psnr - 1);
     e.dispose();
   }, 600_000);
 

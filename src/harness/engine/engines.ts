@@ -7,7 +7,7 @@
  *    src/engine does not exist yet);
  *  - 'mock': the in-page MockEngine of the app (plumbing checks; results are meaningless).
  */
-import type { CancelToken, PointCloud, ProgressCallback, ProgressEvent, TriangleMesh } from '../../core/types';
+import type { CancelToken, PointCloud, ProgressCallback, ProgressEvent } from '../../core/types';
 import { EngineClient, type EngineErrorInfo, type EngineStatus } from '../../app/engine-client';
 import { MockEngine } from '../../app/mock-engine';
 import type {
@@ -19,6 +19,7 @@ import type {
   LiveUpdate,
   LogMessage,
   MeshOptions,
+  MeshResult,
   SparseResult,
   SplatOptions,
   SplatResult,
@@ -32,7 +33,7 @@ export interface HarnessEngine {
   finishCapture(): Promise<void>;
   refine(onProgress?: ProgressCallback): Promise<SparseResult>;
   densify(options?: DenseOptions, onProgress?: ProgressCallback): Promise<PointCloud>;
-  mesh(options?: MeshOptions, onProgress?: ProgressCallback): Promise<TriangleMesh>;
+  mesh(options?: MeshOptions, onProgress?: ProgressCallback): Promise<MeshResult>;
   splat(options?: SplatOptions, onProgress?: ProgressCallback): Promise<SplatResult>;
   exportModel(format: ExportFormat): Promise<Blob>;
   /** Cancel the running long operation. */
@@ -61,7 +62,7 @@ interface InlineEngineInstance {
   finishCapture(progress?: ProgressCallback, cancel?: CancelToken): Promise<void>;
   refine(progress?: ProgressCallback, cancel?: CancelToken): Promise<SparseResult>;
   densify(opts?: DenseOptions, progress?: ProgressCallback, cancel?: CancelToken): Promise<PointCloud>;
-  mesh(opts?: MeshOptions, progress?: ProgressCallback, cancel?: CancelToken): Promise<TriangleMesh>;
+  mesh(opts?: MeshOptions, progress?: ProgressCallback, cancel?: CancelToken): Promise<MeshResult>;
   splat?(opts?: SplatOptions, progress?: ProgressCallback, cancel?: CancelToken): Promise<SplatResult>;
   exportModel(format: ExportFormat): Promise<Blob>;
   dispose(): void;
@@ -163,7 +164,7 @@ class InlineEngine implements HarnessEngine {
   densify(options?: DenseOptions, onProgress?: ProgressCallback): Promise<PointCloud> {
     return this.e.densify(options, this.progress(onProgress), this.fresh());
   }
-  mesh(options?: MeshOptions, onProgress?: ProgressCallback): Promise<TriangleMesh> {
+  mesh(options?: MeshOptions, onProgress?: ProgressCallback): Promise<MeshResult> {
     return this.e.mesh(options, this.progress(onProgress), this.fresh());
   }
   splat(options?: SplatOptions, onProgress?: ProgressCallback): Promise<SplatResult> {

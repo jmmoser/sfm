@@ -7,6 +7,9 @@ depth, dense surface samples) for headless end-to-end tests of the whole pipelin
 * Browser code: `src/harness/synth/**` (three.js, WebGL2), page `synth.html`.
 * Generator: `node e2e/generate-synth.mjs` (Vite dev server + headless Chromium/SwiftShader).
 * Scorer: `node e2e/metrics.mjs` (plain Node, no browser).
+* Real captures: raw capture recordings from the phone (Setup › Options › Record raw capture),
+  imported with `node e2e/import-recording.mjs`, replayed verbatim and scored without ground truth.
+  See "Raw capture recordings".
 * Datasets land in `e2e/data/<name>/`, which is gitignored. The Vite dev server also serves
   them at `/e2e/data/<name>/…`, and `src/harness/synth/dataset.ts` provides a typed
   `loadSynthDataset(url)` for browser harnesses.
@@ -65,6 +68,9 @@ node e2e/generate-synth.mjs real                # object-real + yard-real (iPhon
 | `gt_normals.i8` | face normals of those samples, int8 xyz = round(127·n) |
 | `gt_visibility.u8` | number of frames that see each sample unoccluded (saturating at 255) |
 | `gt_focus_*.{bin,i8,u8}` | object only: 1 M extra area-uniform samples over the object of interest (object, pedestal, table top, placemat, magazine, mug, pen) |
+
+A raw capture recording uses the same layout without the ground truth. It adds `frames.jsonl` (the
+verbatim FrameInputs), `live.jsonl` and `recording.json`. See "Raw capture recordings".
 
 ### Conventions (docs/ARCHITECTURE.md §2)
 
@@ -236,6 +242,14 @@ Metrics (printed as a table and written to `metrics.json`):
     (accuracy / precision use at most `--max-points`, default 3 M, read with a stride).
   * F-score combines precision and completeness.
   * τ defaults to `meta.denseTau`: 1 % of `sceneExtent` for object (about 1.35 cm), 0.1 m for yard.
+* focus box (object isolation; `meta.focus` is the box of the object alone, without the table, its
+  placemat or the mug): with `focusPoints` (run-e2e passes the `mesh.ply` vertices), mapped by the camera
+  Sim3, `focus.outsideFraction` is the share outside `meta.focus` ± 2 cm and `focus.completeness` the share of
+  the visible `gt_focus` samples inside `meta.focus` with a point within τ. With `objectRoi` in the result
+  (the engine's object box, `result.mesh.objectRoi`), `objectRoi` reports its IoU with `meta.focus`
+  (48³-sample estimate of the Sim3-mapped box), the share of the focus box it covers, whether it contains
+  `meta.focus` shrunk by 1 cm, and the plane height under it in the GT frame; `present: false` when the
+  engine proposed no box.
 
 Library use: `import { evaluate, computeMetrics, formatTable, loadDataset } from './e2e/metrics.mjs'`.
 Typed helpers for tests live in `e2e/lib/*.mjs` + `*.d.mts`.
@@ -448,14 +462,17 @@ node e2e/run-e2e.mjs [object|yard|all|<dataset> ...] [--engine worker|inline|moc
      [--max-frames N] [--fps F] [--no-imu] [--no-gps] [--no-heading] [--hfov DEG|gt|none]
      [--no-dense] [--no-mesh] [--dense-size N] [--dense-views N] [--mesh-voxel V]
      [--mesh-triangles N] [--splat] [--splat-iterations N] [--splat-max N] [--splat-size N] [--splat-views N]
+     [--splat-previews]
      [--no-export | --export fmt,fmt] [--nvs] [--nvs-views N] [--mapping inline|background]
      [--timeout-min M] [--out DIR] [--tag NAME] [--thresholds FILE] [--no-thresholds]
      [--enforce] [--mock-speed X] [--set key=json ...] [--quiet] [--verbose] [--headed]
+     [--device desktop|phone|local-bridge] [--public-url URL] [--port N]
 
 node e2e/run-e2e.mjs all --engine mock                                  # plumbing check, ~40 s
 node e2e/run-e2e.mjs object --stride 4 --max-frames 40 --no-dense       # short real run
 node e2e/run-e2e.mjs yard --dense-size 480 --dense-views 30 --timeout-min 240
 E2E_GPU=host node e2e/run-e2e.mjs object-real --splat --nvs              # + Gaussian splats, scored as novel views
+node e2e/run-e2e.mjs object-real --device phone --splat                 # in Safari on an iPhone (see "On a real iPhone")
 ```
 
 Defaults: dataset `object`, engine `worker`, quality `fast`, every frame, all sensors, dense, mesh
@@ -498,10 +515,22 @@ reports for an iPhone main camera; the datasets use 65°. `--hfov gt` uses the e
 The harness waits for every `LiveUpdate` before it sends the next frame, so there is one frame in
 flight. Then it runs `finishCapture`, `refine`, `densify`, `mesh`, with `--splat` the Gaussian-splatting stage
 (`engine.splat()`, after densify / mesh, or after refine with `--no-dense`; `--splat-iterations`, `--splat-max`,
-`--splat-size`, `--splat-views` set `SplatOptions` and imply `--splat`) and the exports, collecting the
+`--splat-size`, `--splat-views`, `--splat-previews` set `SplatOptions` and imply `--splat`) and the exports, collecting the
 progress events. A failing step is recorded in `errors`, the steps that depend on it are skipped,
 and a partial result is still written. On `--timeout-min` the runner calls `harnessAbort()`, which
 cancels the long operation, and saves what was done.
+
+**Continued capture (`--extend-at F [--extend-skip-s S]`).** Reproduces "Add more views" after a
+page reload (`EngineOptions.extend`, docs/ENGINE.md "Extend"): the first F of the planned frames
+are delivered, then `finishCapture` and `refine` end that segment, and the engine is initialised
+again with `{ sessionId, resume: true, extend: true }` (forces `persist`: the session is restored
+from IndexedDB). S seconds of frames are skipped, and the rest is delivered with every time —
+frame `t`, IMU, GPS fix — moved so that the first one is at 500 ms, like a reloaded page's
+`performance.now()` (the IMU of that frame is its last second; a GPS fix older than the split is
+withheld). `index` keeps counting, so cameras still map to dataset frames. Then `finishCapture`,
+`refine` and the rest as usual, on all keyframes. `result.extend` reports the split, the first
+refine, the restored keyframes and the second segment's keyframes, how many the live model
+registered and how many are in the final model (also logged as `extend: …`).
 
 `EngineClient` timeouts are raised for SwiftShader: init 600 s, frame 300 s, long operations
 30 min of inactivity. Set them with `--set timeouts.frameMs=…`.
@@ -511,30 +540,54 @@ cancels the long operation, and saves what was done.
 | File | Content |
 |---|---|
 | `result.json` | Harness result plus the `metrics.mjs` input fields. See below. |
-| `sparse.ply`, `dense.ply`, `mesh.ply` | Streamed from the page through `window.__e2eWrite`. |
+| `sparse.ply`, `dense.ply`, `mesh.ply` | Streamed from the page through `window.__e2eWrite` (Playwright), or the HTTP bridge with `--device phone` / `local-bridge`. |
 | `splats.ply` | With `--splat`: `exportModel('ply-splat')` (INRIA 3DGS PLY, run world frame); `--nvs` scores it as the `splat` renderer. |
+| `previews/NNN-it<i>.png` | With `--splat-previews` (`SplatOptions.preview`): the training snapshots of the splat stage (the training view nearest the middle photo, ≤ 400 px, raw trainer colours). |
+| `splats.spz` | With `--splat` and the `spz` export (in the default export list): `exportModel('spz')` (SPZ v3); `nvs.mjs --splat-file splats.spz` scores the decoded SPZ. |
 | `metrics.json` | `computeMetrics` output, sparse-cloud accuracy, live-trajectory metrics and threshold checks (+ the `nvs` summary with `--nvs`). |
 | `nvs/nvs.json` | With `--nvs [--nvs-views N]`: the novel-view evaluation of the output (see "Novel-view evaluation"). |
 
 The harness fields of `result.json` are:
 
-* `config` (resolved), `dataset`, `engine` (init result, respawns, status changes).
+* `config` (resolved), `dataset`, `engine` (init result, respawns, status changes; `init.adapter` is
+  the engine's adapter string from its own realm).
+* `device` (`src/harness/engine/device.ts`): `userAgent`, `platform`, `hardwareConcurrency`, `devicePixelRatio`,
+  `screen`, `secureContext`, and the page's WebGPU `adapter` (vendor, architecture, description, features,
+  `limits.maxBufferSize` (the RAM class on Apple GPUs) and other limits; requested only, no device), or `adapterError`.
+* `runner`: `wallSeconds`, `error`; device runs add `device`, `waitSeconds` (until the page connected) and
+  `page` (its user agent and URL).
 * `timings`: harness steps in ms. `stageTimings`: per engine progress stage, with the
   `src/app/stages.ts` UI stage and its duration.
 * `frames`: one record per delivered frame, with the decision, guidance, tracking, counters,
   overlay count, engine `timings`, wall and decode ms, and any error.
 * `decisions`, `guidance` and `tracking`: counts.
-* `live`: keyframes, registered images, points, `timeToInit`, frame and keyframe ms stats, and the
-  last live cameras.
+* `live`: keyframes, registered images, points, `timeToInit`, frame and keyframe ms stats, the
+  last live cameras, and their `coverage`: the capture screen's object-mode ring
+  (`src/app/coverage.ts`) — `stable`, `completeness`, covered sectors per elevation band
+  (`covered`: low −10–10°, mid 10–40°, high > 40°, of 12 each), the `prompt` and the per-cell
+  keyframe `counts`. Elevation bands need gravity (`useImu` + `useGravity`), else `elevation: false`
+  (azimuth only). A scene capture usually stays `stable: false`.
 * `progress`: decimated progress events.
 * `sparse`: intrinsics normalised to the dataset size, mapped `images`, `metric`, `stats`,
   `pointsCount`, and the `unmapped` / `duplicates` camera ids.
 * `dense`, `mesh` and `exports` (sizes only), plus `logs`, `errors` and page `memory`.
+* `extend` (with `--extend-at`): `firstFrames`, `resumeIndex`, `skippedFrames`, `rebaseMs`, `first`
+  (keyframes, live-registered, refined images, refine ms, error), the re-init `init`,
+  `resumedKeyframes`, `secondKeyframes`, `secondRegisteredLive`, `secondRegisteredFinal`.
+* `dense`, `mesh` and `exports` (sizes only), plus `logs`, `errors` and page `memory`. `mesh` also
+  carries `objectRoi` (the engine's object box, null without one) and the mesh stage's `stats` (TSDF
+  `voxelSize`, `tsdfAutoVoxelSize`, `tsdfCoarsenLevels`, `tsdfBlocks` / `tsdfMaxBlocks`, `objectRoi` as text
+  or `none: <reason>` / `off`, `objectRoiConfidence`, `meshingMs`). `--no-object-roi` meshes the whole scene
+  in object mode (the baseline of the focus-box scores).
 * `splat` (with `--splat`): the `SplatResult` (count, iterations, ms, `stats`: views, size, init, it/s, memory
   plan, checkpoints, …), `lastDetail` (the last training progress `detail`) and the `splats.ply` path; also
-  copied to `metrics.json`.
+  copied to `metrics.json`. With `--splat-previews`: `previews` (iteration, arrival ms after the stage
+  started, PSNR against that training photo, file) and `firstTrainingMs`; the summary line gives the first
+  arrival, the largest gap while training and the PSNR first → last, next to `stats.splatPreviewFinalPsnr`
+  (the trained model rendered from the same view in the same raw colours: what the previews converge to).
 
-The `metrics.mjs` fields are `intrinsics`, `images`, `metric`, `numInputImages` and `pointsFile`.
+The `metrics.mjs` fields are `intrinsics`, `images`, `metric`, `numInputImages`, `pointsFile` and (with a
+mesh) `objectRoi`.
 To re-score a run, use `node e2e/metrics.mjs e2e/data/object e2e/out/e2e/object/result.json`.
 
 **SparseCamera → dataset frame.** Each camera is mapped by its `frameIndex` (the `FrameInput.index`
@@ -547,15 +600,21 @@ flagged in `sparse.intrinsicsNote`.
 **Diagnostics** (off by default; large results):
 
 * `--set liveTrace=true` (any engine): `result.liveTrace` keeps the camera poses of every
-  `LiveUpdate` that carries the model (frame index, keyframe / registered / point counts). Poses
-  are the registered keyframes sorted by id, so they map to `live.keyframeIndices` only while every
-  keyframe is registered.
+  `LiveUpdate` that carries the model (frame index, keyframe / registered / point counts, and the
+  coverage ring of that update without the counts). Poses are the registered keyframes sorted by
+  id, so they map to `live.keyframeIndices` only while every keyframe is registered.
 * `--engine inline --set debugDump=true --set 'engineConfig={"mapping":"inline",…}'`:
   `result.debug` (`src/harness/engine/debug-dump.ts`, reads engine internals) has, after every
   keyframe frame, each keyframe's live registration state, 3D-point count and pose
   (`keyframeTrace`), and after finishCapture and after refine the live model plus every verified
   pair (keyframe ids, frame indices, model, inliers, median triangulation angle, R, t). Comparing
   R / t with the GT relative pose separates wrong pairs from wrong registrations.
+* `--set 'densifyRepeat={"overlap":false}'` (any `DenseOptions`): after densify, the same sparse
+  model is densified again with these options and the clouds are compared bit for bit
+  (`result.denseRepeat`, log `densify repeat … bit-identical to the first` or the first
+  difference; stage timings under step `densifyRepeat`). Two separate runs cannot be compared
+  that way: the sparse model already differs between runs of the same code (see "Dense CPU/GPU
+  overlap" below).
 
 ### Checks and thresholds (`e2e/thresholds.json`)
 
@@ -576,7 +635,13 @@ are defined in `e2e/lib/e2e-checks.mjs` (`CHECKS`). Initial values:
 The yard dense limits are lower because even with exact poses the dense stage reaches only
 0.23–0.34 completeness on that scene (see the reference run above). A check that applies but
 has no value fails; for example, a missing trajectory fails `ateRelative`. Dense checks are
-skipped with `--no-dense`.
+skipped with `--no-dense`. The object-isolation checks `meshFocusOutside`, `objectRoiIoU` and
+`objectRoiContainsFocus` (1 = the box contains `meta.focus` − 1 cm) apply to mesh runs with the object box on
+(skipped with `--no-mesh` or `--no-object-roi`), `meshFocusCompleteness` to every mesh run. object-real has the
+object box acceptance as limits: IoU ≥ 0.6, the box contains `meta.focus` − 1 cm, mesh vertices outside
+`meta.focus` ± 2 cm ≤ 5 %. `meshFocusCompleteness` has no limit: compare it with a `--no-object-roi` baseline run
+(within 0.01), and compare `voxelSize` / `meshingMs` rather than `tsdfCoarsenLevels` (the bounded TSDF takes its
+auto voxel from the depths inside the box, so the coarsening ladder starts elsewhere).
 
 The exit code is 0 when every pipeline finished without errors and every enforced check passed,
 1 otherwise, and 2 for usage errors. Mock runs report the checks but do not enforce them unless
@@ -591,10 +656,90 @@ The exit code is 0 when every pipeline finished without errors and every enforce
 ### By hand
 
 Open `harness.html?dataset=object&engine=mock&maxFrames=40&densify=1` on the dev server
-(`npm run dev`). It runs on load and shows the result. The query keys are `engine`, `quality`, `mode`, `stride`,
-`maxFrames`, `start`, `fps`, `imu`, `gps`, `heading`, `headingNorth`, `densify`, `mesh`, `exports` and `mockSpeed`.
-From the console, `await runPipeline({...})` returns the same `HarnessResult`. When `window.__e2eWrite`
-is missing, the dense cloud is embedded as base64 in `densePoints`.
+(`npm run dev`). It runs on load and shows the result. The query keys (`src/harness/engine/query.ts`) are
+`engine`, `quality`, `mode`, `stride`, `maxFrames`, `start`, `fps`, `imu`, `gps`, `heading`, `headingNorth`,
+`densify`, `mesh`, `splat`, `splatIterations` (implies `splat`), `exports`, `mockSpeed`, `engineConfig=<JSON object>`
+(e.g. `{"featureBackend":"cpu"}`) and `config=<JSON>`, a whole `HarnessConfig` that the single keys override.
+Malformed input stops the page with an error instead of running a default: bad JSON, an unknown `engine`,
+`quality`, `mode` or `headingNorth`, a number key that is not a number, `splatIterations` below 1. From the console,
+`await runPipeline({...})` returns the same `HarnessResult`. When `window.__e2eWrite` is missing, the dense
+cloud is embedded as base64 in `densePoints`.
+
+### On a real iPhone (`--device phone`)
+
+The same harness page runs in a Safari tab on the phone, on the phone's GPU (Metal), memory limits and jetsam.
+Nothing on the phone is automated: you open one URL and keep the tab in front. The results come back to the
+computer through an HTTP bridge on the dev server and are scored exactly like a desktop run. Needs Safari on
+iOS 26+ (WebGPU), the phone on the computer's network (or a tunnel), and the dataset in `e2e/data/` on the
+computer (the phone fetches it from the dev server).
+
+```sh
+# once: a certificate the phone trusts (WebGPU, motion sensors and storage need a secure context)
+brew install mkcert && mkcert -install
+mkdir -p e2e/out/cert && mkcert -cert-file e2e/out/cert/dev.pem -key-file e2e/out/cert/dev-key.pem \
+  "$(ipconfig getifaddr en0)" "$(scutil --get LocalHostName).local" localhost 127.0.0.1
+#   AirDrop "$(mkcert -CAROOT)/rootCA.pem" to the phone, install the profile (Settings > General > VPN & Device
+#   Management) and enable full trust (Settings > General > About > Certificate Trust Settings).
+
+export E2E_HTTPS_CERT=e2e/out/cert/dev.pem E2E_HTTPS_KEY=e2e/out/cert/dev-key.pem
+node e2e/run-e2e.mjs object-real --device phone --splat               # → e2e/out/e2e/object-real-phone/
+node e2e/run-e2e.mjs object-real --device phone --engine mock          # plumbing check (also works over plain HTTP)
+# or behind an HTTPS tunnel to the port (no certificate on the phone; Vite then listens on 127.0.0.1 only)
+node e2e/run-e2e.mjs yard-real --device phone --public-url https://<name>.trycloudflare.com --port 5180
+```
+
+* **What happens.** The runner starts Vite on `0.0.0.0:5180` (`--port`) with the bridge plugin
+  (`e2e/lib/e2e-bridge.mjs`; added to the runner's inline config only, `apply: 'serve'`, never in `vite.config.ts`
+  or a build) and prints `https://<LAN address>:5180/__e2e/go` for each dataset. That link redirects to
+  `harness.html?bridge=1&run=<id>&config=<the whole HarnessConfig>`. The page has no Playwright binding, so it
+  installs the fetch bridge (`src/harness/engine/bridge.ts`, the run's flow in `bridge-run.ts`): progress lines,
+  page errors and console warnings go to the runner's stdout; `sparse.ply`, `dense.ply`, `mesh.ply` and `splats.ply` are POSTed as raw bytes
+  (16 MB requests, no base64) into the run's directory; at the end the page posts `{ result, error }`. Then the
+  runner scores it with the desktop code (`scoreRun`: metrics, `thresholds.json` checks, `--nvs`, summary) and
+  moves on to the next dataset. The page shows a "Next run" link to `/__e2e/go`.
+* **Output.** The same layout as a desktop run, in `<dataset>-phone/` (the tag defaults to the device name;
+  `--tag` overrides it). `result.json` has the phone's `device` block (user agent, adapter, `maxBufferSize`,
+  `wakeLock`: whether the screen lock was held when the result was sent),
+  the engine's `init.adapter`, `stageTimings`, and for `--splat` `splat.stats.splatItPerSec` (ms per iteration
+  = 1000 / it/s) and `splatMemPeakMB`.
+* **Keep the phone awake.** Set Settings > Display & Brightness > Auto-Lock > Never for the session (and back
+  afterwards): a locked phone suspends the Safari tab, its timers, fetches and GPU work. The page also requests a
+  screen wake lock once the runner accepts it. Whether WebKit wants a tap for that is [U]; if the request fails,
+  the runner prints a warning and the page shows a "Keep the screen on" button that asks again. The page polls
+  the runner every 5 s. The runner warns after 60 s without contact (screen locked, Safari in the background,
+  or the tab was killed) and says when the page is back.
+* **Timeouts.** At `--timeout-min` the runner asks the page to abort and scores the partial result. If the
+  pipeline has not returned 90 s after the page saw the abort (an engine call that ignores it), the page sends
+  `harnessSnapshot()` with the error `timeout (snapshot of the unfinished run)`, as the desktop runner does. Only a
+  page that sends nothing within 120 s of the abort ends the run without a result.
+* **Reloads and second tabs.** Each tab keeps a random token in `sessionStorage`, and the runner remembers the
+  token of the tab that started the run. When that tab comes back during the run, it was reloaded (iOS reloads
+  a tab that jetsam killed, "A problem repeatedly occurred"), so the run fails with that message instead of
+  running again. Any other tab is refused and the run goes on, even when it is reloaded. This covers a second
+  tap on the link or a link opened in a new tab. Whether `sessionStorage` survives a WebContent kill is [U]; if
+  not, the reloaded tab is refused like a second tab and the run ends at the timeout. Once the result is in,
+  `/__e2e/go` shows "No e2e run is waiting" until the runner registers the next dataset (it may still be
+  scoring); reload it then.
+* **Security.** While the runner runs, the dev server is open to the whole LAN, just like `npm run dev`. The
+  run's random id (crypto, 128 bit) only stops other web origins: a page on another site cannot read it from
+  `/__e2e/go`'s redirect, so it cannot write files or post a result. It does not stop another host on the
+  network, which can `curl -i …/__e2e/go` and read the id from the `Location` header. The bridge writes only
+  under that run's output directory (`safeJoin`: no absolute paths, no `..`), at most 512 MB per request and
+  4 GiB on disk per run. It forgets the run once its result is in. Vite's Host check (plain HTTP only; Vite skips
+  it over HTTPS) allows IP addresses, localhost, this machine's host name and, with `--public-url`, the
+  tunnel's host name. Run it only on a network you trust.
+* **Proving the path without a phone.** `--device local-bridge` runs the identical server and page code with
+  headless Chromium here opening the `/__e2e/go` URL (no bindings; HTTPS too when `E2E_HTTPS_*` is set). On a
+  12-frame object set (`generate-synth.mjs object --frames 12`; 2026-10-22, SwiftShader) it matched the desktop
+  runner exactly: the mock engine gave byte-identical `sparse.ply` / `dense.ply` / `mesh.ply`, the worker engine
+  (`--no-dense --set 'engineConfig={"featureBackend":"cpu"}'`) a byte-identical `sparse.ply`, both identical
+  metrics and checks. The nightly CI runs `run-e2e.mjs all --engine mock --device local-bridge`. A renderer
+  crash or a closed page fails the run at once (as on the desktop), not at the timeout.
+* **Limits.** The phone loads the dev server's unbundled modules, so it measures the engine on real Metal and
+  real jetsam but not the production worker bundle (the cd7a534 class needs a built-harness run). Runs are
+  manual: note battery level, charger and thermal state with each result, and do not quote a warm phone's
+  numbers as sustained. Measured numbers go into a dated `docs/research/` report and a measured row under
+  "iPhone estimate (not measured)" below; none has been recorded yet.
 
 ### Engine end-to-end results (2026-10, SwiftShader)
 
@@ -686,6 +831,33 @@ p50 8.3 mm; yard-real balanced (6.3 M) P 0.962, C 0.494, F 0.653, p50 7.1 mm (co
 * `metrics-core` scores completeness on every ROI point now; accuracy and precision still use a ≤ `maxPoints`
   (3 M) strided subsample. Clouds above 3 M points only appear with the new point cap at balanced / max (the global
   voxel kept ≤ 2.3 M).
+
+### Dense CPU/GPU overlap (2026-10-22, SwiftShader, worker engine)
+
+```sh
+node e2e/run-e2e.mjs object-real --dense-size 480 --no-mesh --no-export --tag dov-<x> \
+     --set 'engineConfig={"featureBackend":"cpu","mapping":"inline"}' [--set 'densifyRepeat={"overlap":false}']
+```
+
+Base `18d73c9` ("before") vs the overlap ("after"), back to back, then one run with the same-model A/B
+(`densifyRepeat`). 4 shared cores (load 2.5–13); SwiftShader runs PatchMatch on the CPU, so it is 99 % of the
+stage and its time follows the host load. Engine thread = what the engine worker itself spends on each step.
+
+| run | depth maps s | engine thread: view loads / pass inputs / PatchMatch / halo / store s | helpers: decodes / halo + serialise s | fusion s | points | dense P / C / F | checks |
+|---|---|---|---|---|---|---|---|
+| before | 961.7 | 2.7 / 1.0 / 952.5 / 3.9 / 1.5 | — | 3.7 | 1 269 875 | 0.9995 / 0.9923 / 0.9959 | pass |
+| after | 819.2 | 0.2 / 1.6 / 816.5 / 0.0 / 0.1 | 5.2 / 3.3 | 4.2 | 1 269 989 | 0.9994 / 0.9921 / 0.9958 | pass |
+| A/B, overlap on | 1143.6 | 0.2 / 2.6 / 1139.6 / 0.0 / 0.2 | 5.9 / 5.2 | 5.3 | 1 269 253 | 0.9995 / 0.9928 / 0.9961 | pass |
+| A/B, overlap off (same model) | 1037.4 | 2.8 / 1.2 / 1027.1 / 4.6 / 1.7 | — | 8.4 | 1 269 253, bit-identical | (same cloud) | |
+
+Before / after differ in the sparse model (the captures diverge at the live initialisation, frame 10: 700 vs
+750 points, refine 12 079 vs 12 094 points), hence the 114-point difference; on one model the clouds are
+bit-identical. The wall-time differences are SwiftShader PatchMatch time (the same-model 'on' run took 10 %
+longer); the pass inputs (IndexedDB reads) rose 1.2 → 2.6 s with the overlap, the reads contending with the
+writes in flight. The overlap's effect on a real GPU is unmeasured: the M4 table above bounds it at ≈ −52 to
+−55 % depth maps at fast if the helpers keep up, and an `E2E_GPU=host` `densifyRepeat` A/B at fast and balanced
+is still to run.
+Analysis: ../docs/research/dense-tuning.md "CPU/GPU overlap of the depth-map stage".
 
 ### Real-capture baselines (2026-10, sparse, CPU features, worker engine)
 
@@ -850,7 +1022,8 @@ that what these datasets were built for is caught (checked on the stored runs: t
 object-real also `expl` and the rotation-only `final3`; `final4` / `rst2` pass with a 2–6× margin, completeness
 0.35 vs 0.28 on yard-real): registration ≥ 0.95, ATE / extent
 ≤ 7e-4 / 1e-3, rotation p50 ≤ 0.25° / 0.3°, focal ≤ 0.5 / 1 %, scale ≤ 2.5 / 5 %, gravity ≤ 0.5°, heading ≤ 3°,
-dense accuracy p50 ≤ 6e-4 of the extent (0.8 mm) / 2 cm, completeness ≥ 0.98 / 0.28.
+dense accuracy p50 ≤ 6e-4 of the extent (0.8 mm) / 2 cm, completeness ≥ 0.98 / 0.28; object-real also the
+object box checks above.
 
 Refine time (SwiftShader host, two runs in parallel): object-real 77 s (baseline 65 s: ≈ 25 BAs of the
 rolling-shutter passes, two live-model re-adjustments, the per-image focal rounds), yard-real 65 s (baseline
@@ -1005,6 +1178,151 @@ SfM run and chosen (87.6 %), ATE 2.31e-4 — as the baseline run (offline chosen
 unclosed live model of these runs (gaps 12–15 px, 50–255 px and beyond 0.4 f) exceeded at least one limit (by 1.2–10×);
 every closed live or offline model stayed ≥ 1.3× below both.
 
+## Raw capture recordings (real iPhone data, `import-recording.mjs`)
+
+A recording is a real capture saved on the phone so a desktop can replay it through the identical
+engine: every `FrameInput` the app sent to the engine, with the pixels as a JPEG. It is a dataset
+without ground truth, so it is scored GT-free.
+
+**Recording (phone).** Setup › Options › **Record raw capture** (developer option, off by default).
+From the engine's init until the capture ends, `CaptureRecorder` (`src/app/recorder.ts`) is a
+`FrameTap` on the engine client (`src/app/frame-tap.ts`). It sees every frame the engine client
+accepts, not the ones the FramePump skipped while the engine was busy. For each frame it sends the
+pixels and every `FrameInput` field to the recorder worker (`src/workers/recorder.worker.ts`). The
+worker encodes a JPEG at q 0.9, at most 1280 px on the long side. It writes to OPFS through sync
+access handles, or to IndexedDB where OPFS is missing (`src/io/recording-store.ts`). A frame the
+engine client rejected before posting it (engine disposed or stopped after repeated failures,
+worker not startable) is flagged `notSent` in `live.jsonl`: the engine never got it.
+
+* **Size:** about 0.1–0.35 MB per frame. At the pump's ≤ 10 Hz that is 1–3 MB/s.
+* **Sensor log:** next to the frames, `sensors.jsonl` records the raw DeviceMotion and
+  DeviceOrientation events with every field iOS gives (rotation rate, both accelerations,
+  `interval`, `webkitCompassHeading` / `webkitCompassAccuracy`, arrival time and event
+  `timeStamp`) and every GPS fix. It is posted to the worker in 500 ms batches, an estimated
+  10–20 KB/s. It is for characterising the sensors (rates, jitter, duplicates, GNSS accuracy:
+  docs/research/ios-sensors.md §8), and it also holds the IMU drained into frames the capture
+  dropped while paused. Replays do not use it.
+* **Free space:** a recording needs 1 GB of free origin quota to start (the capture screen warns at
+  300 MB). It stops by itself on low storage, a write error, or a worker that falls 8 s behind
+  (time with the page hidden does not count: iOS suspends the worker too). This stops only the
+  recording, not the scan, and a toast says so.
+* **Back-pressure:** when more than 3 frames are in the recorder worker, the frame just sent
+  resolves its `processFrame` only when the worker caught up, so at most 4 are in it. The
+  FramePump then skips camera frames as when the engine is busy, and the recording still equals
+  the engine's input. `live.jsonl` keeps the wait per frame.
+
+**Export (phone).** Diagnostics › **Raw capture recordings** lists each recording with its frames,
+duration and size. **Export** builds STORE ZIP parts of at most 200 MB each, because the iOS share
+sheet reads every file fully into memory (about 2×, docs/research/ios-platform.md §3). For each part,
+tap **Prepare**, then **Share / Save**. The GPS fixes are left out unless **Include location** is
+on. **Delete** frees the space.
+
+**Import (desktop).**
+
+```sh
+node e2e/import-recording.mjs ~/Downloads/sfm-rec-20261021-140210-ab12cd34-part*.zip   # → e2e/data/sfm-rec-20261021-140210-ab12cd34/
+node e2e/import-recording.mjs <parts or a folder of them> --name kitchen-1 [--out DIR] [--force]
+```
+
+The importer extracts every part into one directory. It checks the CRCs and the entry names, that
+no part is missing, and that every frame in `frames.jsonl` has its JPEG (rows recorded without
+pixels, `image: null`, are only counted). The dataset name must be a plain name that does not
+start with '.', so `--force` can only replace a directory inside the output directory. Extracting
+the parts with any unzip tool into one folder gives the same result.
+
+**Layout** (the synthetic layout without ground truth, plus the verbatim stream):
+
+| File | Content |
+|---|---|
+| `meta.json` | `scene: 'recording'`, `source: 'sfm-raw-capture'`, `gt: null`, `intrinsics: null`, `sceneExtent: null`; the recorded `mode`, `quality`, `hfovPriorDeg`, `createdAt` (the replay defaults); `width × height` (first recorded JPEG), `srcWidth × srcHeight` (what the engine got), `fps` (delivered rate), `numFrames` (frames a replay sends), `duration`, `screenAngle`, `originLatLonAlt` (first fix, null without location), `locationStripped`, `camera` (no device ids), `app`, `recorder`, `summary`, `missingImages` (frames recorded without pixels), `notSent`, `badLines` |
+| `frames.jsonl` | one line per frame sent, in order: `{seq, sentAt, input, image: {file, width, height, srcWidth, srcHeight, kind, bytes}}`. `input` is the `FrameInput` without pixels, VERBATIM: `t, screenAngle, screenAngleSince, imu, geo, heading, index, segment, gravityDevice, attitude, imuCalibrationVersion, timeSource, rawBuffer, maxSide`. It is JSON-safe (`src/io/serialize.ts`): typed arrays are `{"$typed": "Float64Array", "data": […]}`, and −∞ / NaN / −0 are `{"$num": "-Infinity"}`. `image: null` (with `error`): the engine got the frame, but its pixels could not be recorded. `notSent: true` (from `live.jsonl`): the engine never got the frame. |
+| `frames/NNNNNN.jpg` | the pixels the engine got, ≤ 1280 px, in the same pixel layout. A raw sensor-landscape VideoFrame stays landscape, and `rawBuffer` says so. `kind` is VideoFrame / ImageBitmap / RGBAImage. |
+| `frames.json` | `[{index, file, t}]` of the frames a replay sends (the engine got them, with pixels): `index` is `FrameInput.index`, or `seq` when those are not unique. There is no `pose`. |
+| `imu.json`, `geo.json`, `heading.json` | derived from the frames the engine got (those without pixels included): the IMU slices concatenated, the distinct GPS fixes, and the per-frame headings with `north` / `declinationDeg`. This is what the engine got; the raw sensor streams are `sensors.jsonl`. |
+| `live.jsonl` | the device's answer per frame: `{seq, index, ms, waitMs, update: {decision, guidance, tracking, numKeyframes, numRegistered, numPoints, timings, debug}, error, notSent?}` |
+| `sensors.jsonl` | the raw sensor log, one reading per line: `{k: 'motion', t, ts, interval, rot: [α, β, γ], acc: [x, y, z], accG: [x, y, z]}`, `{k: 'orientation', t, ts, absolute, alpha, beta, gamma, absoluteFlag, compassHeading, compassAccuracy}`, `{k: 'geo', t, fix}`. `t` is the arrival time (performance.now()), `ts` the event's `timeStamp`, null a value the platform did not give. The `geo` rows are left out unless the export includes the location. |
+| `recording.json` | the recorder header: app / device, EngineOptions, camera, capture settings, stop reason, and the summary (frames, bytes, sensor rows, FramePump stats) |
+
+**Replay.** `node e2e/run-e2e.mjs <name>` works like any dataset, but in VERBATIM mode
+(`src/harness/engine/pipeline.ts`, `feed.ts verbatimInput`):
+
+* Each `FrameInput` is the recorded one, in the order it was sent. There is no synthesized screen
+  angle, segment, time source or gravity, and no WMM heading conversion. The bitmap is the decoded
+  JPEG.
+* The recorded mode, quality, hfov prior and date are the defaults. `--mode`, `--quality` and
+  `--hfov` override them.
+* `--start`, `--stride` and `--fps` still select frames. The IMU samples of the skipped rows are
+  prepended to the next replayed frame, as the FramePump drains everything since its last frame;
+  with `--start` the first frame gets those of every row before it.
+* A frame recorded without pixels cannot be sent. Its IMU samples go to the next replayed frame,
+  because the device engine had them. A `notSent` frame is left out with its IMU, because the
+  device engine never got it.
+* `--no-imu`, `--no-gps` and `--no-heading` withhold a stream the way the app would without that
+  sensor: no samples and calibration version −1; no fix; no heading and no attitude. Without GPS
+  the compass also goes back to magnetic north: a heading the app had turned to true north with
+  the declination of a fix becomes `heading − declinationDeg`, flagged `north: 'magnetic'`, and an
+  absolute attitude is rotated back by the same declination.
+* `--set replaySize='"original"'` resizes each JPEG back to the size the engine got: a VideoFrame
+  fitted to its `maxSide`, else the bitmap size.
+* `--set verbatim=false` synthesizes the inputs from `frames.json` / `imu.json` like a synthetic
+  dataset.
+* `result.recording` counts the rows replayed (`rows`), the rows not replayed (`skipped`: no pixels,
+  not sent, unparseable) and the `notSent` ones. With `live.jsonl` it also holds the device's
+  decision histogram, its last counts, its frame ms and recorder wait, and the per-frame agreement
+  of the replay's decisions with the device's (`rate`, keyframes on each side, and a
+  `device>replay` confusion count).
+
+**GT-free scoring.** A dataset whose `meta.source` is `sfm-raw-capture`, or whose frames lack
+`pose`, gets self-consistency metrics instead of `computeMetrics` (`e2e/lib/self-metrics.mjs`;
+`e2e/metrics.mjs` does the same when re-scoring). They are:
+
+* registered / input images and the registered fraction;
+* mean reprojection error and mean / median track length;
+* gyro breaks and outliers of the model refine chose, and deregistered gyro outliers;
+* explained correspondences, and whether offline SfM ran;
+* the scale source and uncertainty, gravity / north alignment with the yaw source, and the
+  camera–IMU time offset;
+* the focal against the hfov prior;
+* live init, lost frames and frame ms;
+* the device comparison.
+
+Every threshold check is skipped ('no ground truth'), and so is `--nvs`. The exit code reflects
+pipeline errors only, and the summary row shows `SKIP`. These are proxies: a gyro-consistent
+model can still be off in scale or shape, so accuracy claims need ground truth.
+
+**Fidelity limits.**
+
+* The JPEG is a re-encode of what the engine converted. A 'balanced' capture on iOS gets native
+  1920 × 1440 frames but is recorded at 1280 × 960, so features come from a smaller image unless
+  you use `replaySize: 'original'` (which upsamples).
+* Background keyframe mapping depends on timing. Compare decisions with `--mapping inline` and
+  expect approximate agreement.
+* Recording costs time on the device: the main-thread clone / blit and the worker encode. The
+  per-frame `waitMs` and the FramePump stats in `recording.json` show it.
+
+**UI check.** `node e2e/ui/recorder.mjs` runs Setup (record on, VideoFrame grab) → capture with the
+mock engine and the fake camera → Diagnostics → Export (Prepare + Save) → `import-recording.mjs`
+→ Delete.
+
+**Plumbing run (2026-10-22, headless Chromium, this machine).** The UI flow recorded 11 frames
+(VideoFrame grab, 1920 × 1080 recorded at 1280 × 720, 160 KB, one 0.16 MB part). Every frame
+waited 0 ms for the recorder except the first (19 ms in total). The FramePump skipped 5 frames as
+busy.
+
+* `run-e2e.mjs ui-recording --engine mock` replayed the 11 frames verbatim. Decisions agreed with
+  the device's for 11 of 11 (7 keyframes on each side). The GT-free table printed, all 8 checks
+  were skipped, and the run exited 0 in 5 s.
+* `--engine worker --no-dense` ran the real engine on SwiftShader on the same 11 verbatim frames,
+  at 4.6 s per frame (p50). The fake camera shows a flat test pattern, so the engine made no
+  keyframe: all 11 frames were 'skip', and they agreed with the mock device's decisions for 4 of
+  11. Refine then failed ("needs at least 2 keyframes"), as it would on the phone. The GT-free
+  scoring still wrote metrics.json without a crash, and the exit code was 1 for the pipeline
+  error.
+
+**Not yet measured on an iPhone:** the encode cost per frame next to the engine, the OPFS write
+rate, how many frames back-pressure costs at 10 Hz, the sensor log's event rates and size, and
+sharing 200 MB parts from a Safari tab and from a Home Screen app.
+
 ## Novel-view evaluation (`nvs.mjs`)
 
 `node e2e/nvs.mjs` scores what the user sees. It renders a finished run (the output directory of
@@ -1084,7 +1402,7 @@ Individual squares are within 0.2 px; the spread comes from MSAA.
 | `points-edl` | the same with Eye-Dome Lighting, the app default when there is no mesh |
 | `mesh-lit` | the `Viewer` drawing `mesh.ply` with vertex colours under the hemisphere light and headlight (the app default until the unlit switch below) |
 | `mesh-unlit` | the same unlit (vertex colours only), the app default since 2026-10 (Display sheet "Mesh lighting" off) |
-| `splat` | `splats.ply` (INRIA 3DGS PLY layout: `x y z nx ny nz f_dc_0..2 f_rest_* opacity scale_0..2 rot_0..3`, run world frame), drawn by `src/splat/nvs.ts` |
+| `splat` | `splats.ply` (INRIA 3DGS PLY layout: `x y z nx ny nz f_dc_0..2 f_rest_* opacity scale_0..2 rot_0..3`, run world frame), drawn by `src/splat/nvs.ts`; `--splat-file splats.spz`: the SPZ export, decoded (`decodeSplatSPZ`) and handed over as that PLY, output `<runDir>/nvs-spz/` |
 
 The splat module plugs in through
 `export async function createNvsRenderer({ ply, width, height }): Promise<{ render(cam), dispose?() }>`.
@@ -1266,6 +1584,26 @@ M4, headless Chrome, host load 5–8. Seen side by side, the splats at 'open' an
 the capture shows floaters and the sky shell as blurred blobs — why the app starts from the photos. The splats and
 the unlit mesh line up pixel for pixel at the same pose (the GPU test measures ≤ 0.06 px between Gaussian centroids
 and three.js's projection of their means).
+
+### Fly-through video (`e2e/ui/flythrough.mjs`)
+
+The same run directory and page set-up as splat-shots.mjs, then the fly-through MP4 export twice. First through its
+pieces in the page (src/app/video-export.ts: the camera path of the sparse model, the splat layer's offscreen
+frames, WebCodecs H.264, src/io/mp4.ts). That MP4 is decoded again with VideoDecoder: the frame count, the PSNR of
+every 10th decoded frame against the same pose read back directly (encode loss only), wall time per frame, peak JS
+heap and the layer's GPU memory. Then through the UI (Export → "Fly-through video (MP4)" → Prepare → Save, a
+download). Both files and `<name>-flythrough.json` go to `--out` (default `/tmp/sfm-flythrough/`), counted by
+ffprobe when it is installed. It fails outside 180–300 frames or below 34 dB, and warns above 100 ms per frame (the
+30 s / 300 frames target). It needs a hardware adapter and Chrome's H.264 encoder (Playwright's Chromium has none).
+`--probe` runs only the Diagnostics "Test video encoding" probe, in any browser.
+
+```sh
+E2E_GPU=host node e2e/ui/flythrough.mjs e2e/out/e2e/object-real-int-object --name object-real
+E2E_GPU=host node e2e/ui/flythrough.mjs e2e/out/e2e/yard-real-viewer-yard --name yard-real
+node e2e/ui/flythrough.mjs --probe       # SwiftShader Chromium: frame path 'canvas', no H.264 encoder
+```
+
+No host results yet.
 
 ## Breakthrough results (2026-10-20, Apple M4, Metal)
 
@@ -1481,7 +1819,8 @@ and 34 % faster without it. The 1063 MB memory plan leaves 137 MB of the 1.2 GB 
 
 ### iPhone estimate (not measured)
 
-These are estimates scaled from the M4 means of the two runs, not measurements. Each M4 time is multiplied by
+These are estimates scaled from the M4 means of the two runs, not measurements (measure them with
+`run-e2e.mjs <dataset> --device phone --splat`, "On a real iPhone"). Each M4 time is multiplied by
 peak ratio / sustained fraction, using the given M4 GPU ≈ 1.26× A19 Pro and 1.76× A18 Pro peak, sustained at
 0.55–0.68 of peak: ×1.85–2.29 for an A19 Pro and ×2.59–3.20 for an A18 Pro. The factor is applied to every stage. That
 is optimistic for the CPU-bound parts (refine's bundle adjustment on the CPU pool, view decoding and undistortion in
@@ -1552,7 +1891,11 @@ E2E_GPU=host node e2e/run-e2e.mjs object-real --engine worker --splat --tag gr-b
 E2E_GPU=host node e2e/splat-replay.mjs e2e/out/e2e/object-real-gr-base --out e2e/out/replay/object \
   --variant before='{"colourCorrection":{},"geometry":false}' --variant ccoff='{"colourCorrection":false}'
 #   --variants FILE (name → overrides JSON), --tests held,sim3,<test datasets> (default: held, sim3 and every
-#   e2e/data/<dataset>-* set), --skip-nvs (train only), --nvs-only (score what is missing; resumes), --repeat N
+#   e2e/data/<dataset>-* set), --skip-nvs (train only), --nvs-only (score what is missing; resumes), --repeat N,
+#   --splat-previews (every variant trains with SplatOptions.preview, as the app does)
+# preview cost: two sequential invocations into the same --out, without and with previews (compare "stage s")
+E2E_GPU=host node e2e/splat-replay.mjs e2e/out/e2e/object-real-gr-base --out e2e/out/replay/previews --variant off='{}' --skip-nvs
+E2E_GPU=host node e2e/splat-replay.mjs e2e/out/e2e/object-real-gr-base --out e2e/out/replay/previews --variant on='{}' --splat-previews --skip-nvs
 ```
 
 * **Faithfulness**: the page (`harness.html`, `window.replaySplat`, src/harness/engine/replay.ts) loads the dump into
@@ -1562,7 +1905,9 @@ E2E_GPU=host node e2e/splat-replay.mjs e2e/out/e2e/object-real-gr-base --out e2e
   stage 59.8 s (59.7 s).
 * **Output**: `<out>/<variant>/{splats.ply, result.json (copied from the run), replay.json, nvs*/nvs.json}` and
   `<out>/summary.json`; the script prints full-frame PSNR per test set, the off-trajectory mean and the stage times.
-  `profile: true` in a variant adds per-pass GPU ms per iteration.
+  `profile: true` in a variant adds per-pass GPU ms per iteration. With `--splat-previews`, `replay.json` holds the
+  snapshots (`previews`: iteration, arrival ms, PSNR; `firstTrainingMs`) and the summary their count, first arrival,
+  largest gap while training and PSNR first → last → final model.
 * **Noise**: five replays of the unchanged stage spread 0.11 dB held-out (object 31.21–31.32, yard 31.07–31.14),
   up to 0.2 dB on single off-trajectory sets (yard +0.75 m: 20.48–20.68) and 0.05 (object) / 0.09 dB (yard) in the
   off-trajectory means (the GPU's float CAS adds make runs non-deterministic). Stage times are only comparable within a sequential run (see below): the

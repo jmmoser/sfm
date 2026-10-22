@@ -1,10 +1,11 @@
 /**
  * runPipeline (Node) against a scripted stub engine (./engines is mocked): the live summary built
- * from frame responses and unsolicited background model updates, and the delivered count of an
- * aborted capture. fetch serves meta.json / frames.json / the frames (other files 404),
+ * from frame responses and unsolicited background model updates, its object coverage, and the
+ * delivered count of an aborted capture. fetch serves meta.json / frames.json / the frames (other files 404),
  * createImageBitmap is stubbed, and refine throws so the run ends after finishCapture.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { lookAt } from '../../app/mock-scene';
 import type { InitResult, LiveCamera, LiveUpdate } from '../../workers/protocol';
 import type { HarnessEngine } from './engines';
 import type { HarnessConfig } from './types';
@@ -162,6 +163,35 @@ describe('runPipeline live summary', () => {
         [9, 3],
       ]);
     });
+  });
+
+  it('records the coverage ring of the last live cameras (and of every model update with liveTrace)', async () => {
+    // a level orbit (25° elevation) of 36 keyframes, one per delivery, mapped inline
+    serveDataset(36);
+    const e = (25 * Math.PI) / 180;
+    const orbit: LiveCamera[] = Array.from({ length: 36 }, (_, i) => {
+      const a = (2 * Math.PI * i) / 36;
+      return { pose: lookAt([Math.cos(a) * Math.cos(e), Math.sin(a) * Math.cos(e), Math.sin(e)], [0, 0, 0]), intrinsics: cam(0).intrinsics };
+    });
+    const r = await run(
+      { frame: (k) => update(k, { decision: 'keyframe', numKeyframes: k + 1, numRegistered: k + 1, cameras: orbit.slice(0, k + 1) }) },
+      { liveTrace: true, useImu: false },
+    );
+    const c = r.live.coverage!;
+    expect(c.cameras).toBe(36);
+    expect(c.stable).toBe(true);
+    // no IMU fed ⇒ no gravity ⇒ azimuth only (the app's rule without the motion sensor)
+    expect(c.elevation).toBe(false);
+    expect(c.coveredSectors).toBe(12);
+    expect(c.covered).toEqual([0, 12, 0]);
+    expect(c.prompt).toBe('done');
+    expect(c.counts[1].every((n) => n === 3)).toBe(true);
+    const trace = r.liveTrace!;
+    expect(trace).toHaveLength(36);
+    expect(trace[2].coverage.stable).toBe(false); // < 6 cameras
+    expect(trace[17].coverage.prompt).toBe('other_side'); // half the orbit
+    const { counts: _counts, ...summary } = c;
+    expect(trace[35].coverage).toEqual(summary);
   });
 
   it('counts the frame that aborted the capture as delivered', async () => {

@@ -7,6 +7,10 @@
  * self-calibration (f, k1, k2), re-triangulation and filtering → world alignment (IMU gravity /
  * time offset / metric scale, GPS, compass; verified R_cam_device) → SparseModel.
  *
+ * The offline SfM can return several models: only the largest is kept (no merging); stats
+ * `offlineModels` / `offlineDroppedImages` report the others, and `unconnectedImages` the
+ * keyframes missing from the final model (the viewer offers "Add more views" for them).
+ *
  * Progress stages: 'matching', 'reconstruction', 'alignment' (src/app/stages.ts).
  */
 import type { CancelToken, MatchPairs, PointCloud, ProgressCallback, TwoViewGeometry } from '../core/types';
@@ -134,9 +138,18 @@ export function modelPointCloud(m: SparseModel): PointCloud {
 }
 
 /**
- * When the only reason the IMU scale was rejected is low excitation, but the fit itself is
- * excellent, return the relaxed threshold to retry with: relative σ ≤ 3 % and either R² ≥ 0.9 with
- * excitation ≥ 0.03 m/s², or R² ≥ 0.95 with excitation ≥ 0.015 m/s².
+ * When the only reason the band-pass IMU scale was rejected is low excitation, but the fit itself
+ * is excellent, return the relaxed threshold to retry with: relative σ ≤ 3 % and either R² ≥ 0.9
+ * with excitation ≥ 0.03 m/s², or R² ≥ 0.95 with excitation ≥ 0.015 m/s². Reached when the
+ * alignment found no metric scale at all — the keyframe-interval estimate that
+ * `computeWorldAlignment` falls back to (`estimateMetricScaleFromIntervals`, not limited by the
+ * keyframe rate) was unreliable as well and no GPS scale exists, e.g. a gentle orbit, whose slow
+ * centripetal acceleration is degenerate with a device-frame accelerometer bias — or when the scale
+ * is that interval estimate alone and the retry would claim a smaller σ (`lowExcitationSigma`):
+ * the more precise of the two wins, not the one `computeWorldAlignment` happens to try first
+ * (e2e object-real: interval σ 2.4 % with κ just above its 2 % gate vs the retry's 2.0 %). Not
+ * when the interval regression also supplied the time offset (`intervalTimeOffset`): the re-run
+ * at the relaxed threshold takes the band-pass path and would fall back to the default offset.
  *
  * The excitation the inertial module measures is the band-limited IMU acceleration AS SAMPLED AT
  * THE KEYFRAMES: it falls with the keyframe rate, not only with the hand motion (e2e `object`, GT
@@ -148,7 +161,13 @@ export function modelPointCloud(m: SparseModel): PointCloud {
  */
 export function lowExcitationRetry(a: WorldAlignment): { minExcitation: number; excitation: number; r2: number } | null {
   const s = a.details.imuScale;
-  if (!s || s.reliable || a.metric.metric) return null;
+  if (!s || s.reliable) return null;
+  if (a.metric.metric) {
+    // (not when the interval regression also found the time offset: the re-run would lose it)
+    const iv = a.details.imuScaleIntervals;
+    if (a.metric.source !== 'imu' || !iv || !iv.reliable || a.details.intervalTimeOffset?.reliable) return null;
+    if (!(lowExcitationSigma(s.relUncertainty, s.r2) < iv.relUncertainty)) return null;
+  }
   const reasons = s.reason.split(';').map((r) => r.trim()).filter(Boolean);
   if (reasons.length !== 1 || !reasons[0].startsWith('insufficient excitation')) return null;
   if (!(s.scale > 0 && s.relUncertainty <= 0.03)) return null;
@@ -831,6 +850,15 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
         cancel,
       );
       offline = models[0] ?? null;
+      // only the largest model is kept: report what the others held (split frequency on real captures)
+      stats.offlineModels = models.length;
+      if (models.length > 1) {
+        const kept = new Set(models[0].registeredImageIds());
+        const dropped = new Set<number>();
+        for (const m of models.slice(1)) for (const id of m.registeredImageIds()) if (!kept.has(id)) dropped.add(id);
+        stats.offlineDroppedImages = dropped.size;
+        deps.log('warn', `refine: offline SfM found ${models.length} models; ${dropped.size} keyframes only in the ${models.length - 1} smaller one(s) were dropped`);
+      }
     } catch (e) {
       if ((e as Error)?.name === 'CancelledError') throw e;
       deps.log('warn', `offline SfM failed: ${(e as Error)?.message ?? e}`);
@@ -1012,11 +1040,17 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     const lowEx = lowExcitationRetry(alignment);
     if (lowEx) {
       // gentle hand-held motion (smooth orbits) or sparse keyframes: the IMU scale fit is excellent
-      // but below the excitation floor of the inertial module → accept it with an inflated σ
+      // but below the excitation floor of the inertial module → accept it with an inflated σ, unless
+      // the keyframe-interval scale already used is more precise
       const a2 = computeWorldAlignment(input, { timeOffsetMs: st.timeOffsetMs ?? 0, scale: { minExcitation: lowEx.minExcitation } });
-      if (a2.metric.metric && a2.metric.source === 'imu') {
-        a2.metric.relativeUncertainty = lowExcitationSigma(a2.metric.relativeUncertainty, lowEx.r2);
-        a2.details.warnings.push(`IMU scale accepted at low excitation (${lowEx.excitation.toFixed(3)} m/s², R² ${lowEx.r2.toFixed(2)})`);
+      const sigma = lowExcitationSigma(a2.metric.relativeUncertainty, lowEx.r2);
+      const prior = alignment.metric.metric ? alignment.metric.relativeUncertainty : null;
+      if (a2.metric.metric && a2.metric.source === 'imu' && (prior === null || sigma < prior)) {
+        a2.metric.relativeUncertainty = sigma;
+        a2.details.warnings.push(
+          `IMU scale accepted at low excitation (${lowEx.excitation.toFixed(3)} m/s², R² ${lowEx.r2.toFixed(2)}, σ ${(100 * sigma).toFixed(1)} %)` +
+            (prior !== null ? ` instead of the keyframe-interval scale (σ ${(100 * prior).toFixed(1)} %)` : ''),
+        );
         alignment = a2;
       }
     }
@@ -1026,6 +1060,8 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
     stats.timeOffsetMs = Math.round(alignment.details.offsetMs * 10) / 10;
     stats.timeOffsetSource = alignment.details.offsetSource;
     stats.scaleSource = alignment.metric.source;
+    if (alignment.metric.source === 'imu' || alignment.metric.source === 'imu+gps')
+      stats.scaleMethod = alignment.details.imuScale?.reliable ? 'bandpass' : 'intervals';
     stats.yawSource = alignment.details.yawSource;
     Object.assign(stats, alignment.details.headingStats); // north reference, declination, yaw σ / fusion
     if (alignment.metric.relativeUncertainty !== null) stats.scaleUncertainty = alignment.metric.relativeUncertainty;
@@ -1061,9 +1097,13 @@ export async function runRefine(deps: RefineDeps, progress?: ProgressCallback, c
   const cam0 = cameras[0]?.intrinsics;
   const trackLens: number[] = [];
   for (let i = 0; i < model.numPoints; i++) trackLens.push(model.trackOffsets[i + 1] - model.trackOffsets[i]);
+  // keyframes the final model could not connect (the viewer says so and offers to add views)
+  const unconnected = order.length - model.images.length;
+  if (unconnected > 0) deps.log('warn', `refine: ${unconnected} of ${order.length} keyframes could not be connected to the model`);
   Object.assign(stats, {
     images: order.length,
     registeredImages: model.images.length,
+    unconnectedImages: unconnected,
     points: model.numPoints,
     meanReprojErrorPx: Math.round(chosen.meanReprojectionError() * 1000) / 1000,
     meanTrackLength: Math.round(chosen.meanTrackLength() * 100) / 100,

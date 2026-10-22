@@ -177,6 +177,52 @@ describe('computeWorldAlignment', () => {
     expect(rotationAngle(mat3Mul(res.R, sim.R))).toBeLessThan(5 * DEG);
   });
 
+  it('walk at 1.2 keyframes/s (60 Hz IMU): metric scale from keyframe intervals when the band-pass one lacks excitation', () => {
+    const rng = new Rng(17);
+    const traj = walkTrajectory(rng);
+    const Rcd = cameraFromDevice(90);
+    const imu = simulateImu(traj, Rcd, rng, { rateHz: 60 });
+    const sim = simulateKeyframes(traj, Rcd, rng, { offsetMs: 25, s: 0.7, posNoise: 0.002, minIntervalS: 0.62, maxIntervalS: 1.04 });
+    const kfs = toWorldKeyframes(sim);
+    const res = computeWorldAlignment({ keyframes: kfs, imu });
+    const d = res.details;
+    if (LOG) console.log('walk 1.2 Hz world: s err %', (100 * (res.s * sim.s - 1)).toFixed(2), res.metric, d.warnings);
+    expect(d.imuScale!.reliable).toBe(false);
+    expect(d.imuScale!.reason).toMatch(/excitation/);
+    expect(d.imuScaleIntervals!.reliable).toBe(true);
+    expect(res.metric.source).toBe('imu');
+    expect(res.metric.relativeUncertainty).toBe(d.imuScaleIntervals!.relUncertainty);
+    expect(Math.abs(res.s * sim.s - 1)).toBeLessThan(0.025);
+    expect(d.warnings.some((w) => w.startsWith('IMU scale from keyframe intervals'))).toBe(true);
+    // a reliable band-pass scale (keyframes every 0.25–0.5 s) is used as before, without the interval estimate
+    const sim2 = simulateKeyframes(traj, Rcd, rng, { offsetMs: 25, s: 0.7, posNoise: 0.002 });
+    const res2 = computeWorldAlignment({ keyframes: toWorldKeyframes(sim2), imu });
+    expect(res2.details.imuScale!.reliable).toBe(true);
+    expect(res2.details.imuScaleIntervals).toBeNull();
+    expect(res2.metric.relativeUncertainty).toBe(res2.details.imuScale!.relUncertainty);
+  });
+
+  it('walk at 1.2 keyframes/s without a gyro time offset: the interval regression finds the offset (a 60 ms error would bias the scale)', () => {
+    const rng = new Rng(18);
+    const traj = walkTrajectory(rng);
+    const Rcd = cameraFromDevice(90);
+    const imu = simulateImu(traj, Rcd, rng, { rateHz: 60 });
+    const sim = simulateKeyframes(traj, Rcd, rng, { offsetMs: 40, s: 1.3, posNoise: 0.002, minIntervalS: 0.62, maxIntervalS: 1.04 });
+    // maxStdMs < 0: the gyro offset is never reliable (as for a smooth constant-rate rotation)
+    const res = computeWorldAlignment({ keyframes: toWorldKeyframes(sim), imu }, { timeOffsetMs: -20, timeOffset: { maxStdMs: -1 } });
+    const d = res.details;
+    if (LOG) console.log('walk 1.2 Hz, no gyro offset: s err %', (100 * (res.s * sim.s - 1)).toFixed(2), d.offsetMs, d.warnings);
+    expect(d.timeOffset!.reliable).toBe(false);
+    expect(d.accelTimeOffset === null || !d.accelTimeOffset.reliable).toBe(true);
+    expect(d.intervalTimeOffset!.reliable).toBe(true);
+    expect(d.offsetSource).toBe('accel');
+    expect(Math.abs(d.offsetMs - 40)).toBeLessThan(10);
+    expect(d.imuScaleIntervals!.reliable).toBe(true);
+    expect(d.imuScaleIntervals!.intervals!.offsetSensitivity).toBeLessThan(0.005);
+    expect(res.metric.source).toBe('imu');
+    expect(Math.abs(res.s * sim.s - 1)).toBeLessThan(0.025);
+  });
+
   it('walk + GPS only (gravity from gravityCam), and without any sensor', () => {
     const rng = new Rng(4);
     const traj = walkTrajectory(rng);

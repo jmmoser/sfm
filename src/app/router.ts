@@ -7,6 +7,9 @@
  *     ▲  ◀──BACK/CANCEL──┘          │ CANCEL                                  │ CANCELLED           │ BUILD
  *     └─────────────────────────────┴──────────────────(refine cancelled)─────┘◀────────────────────┘
  *   home ──OPEN_SESSION──▶ viewer (sparse/dense/meshed) | processing (captured)
+ *   home/viewer ──EXTEND_CAPTURE──▶ capture (extend: the stored session) ──FINISH_CAPTURE──▶ processing (refine…)
+ *                                          └──BACK (stopped, nothing added)──▶ (where it came from)
+ *   viewer ──OPEN_SESSION (its scan is a capture to process: new views the record missed)──▶ processing
  *   home/setup/viewer ──OPEN_DIAGNOSTICS──▶ diagnostics ──BACK──▶ (where it came from)
  */
 import type { SessionStatus } from '../io/storage';
@@ -17,7 +20,8 @@ export type ProcessingStep = 'refine' | 'densify' | 'mesh';
 export type Route =
   | { screen: 'home' }
   | { screen: 'setup' }
-  | { screen: 'capture'; sessionId: string | null }
+  /** `extendFrom`: continue the stored session `sessionId` ("Add more views"), opened from there. */
+  | { screen: 'capture'; sessionId: string | null; extendFrom?: 'home' | 'viewer' }
   | { screen: 'processing'; sessionId: string | null; steps: ProcessingStep[] }
   | { screen: 'viewer'; sessionId: string | null }
   | { screen: 'diagnostics'; back: 'home' | 'setup' | 'viewer'; sessionId: string | null };
@@ -31,6 +35,7 @@ export type NavEvent =
   | { type: 'PROCESSING_CANCELLED'; hasModel: boolean }
   | { type: 'OPEN_SESSION'; sessionId: string; status: SessionStatus; numFrames: number }
   | { type: 'BUILD'; steps: ProcessingStep[] }
+  | { type: 'EXTEND_CAPTURE'; sessionId: string }
   | { type: 'OPEN_DIAGNOSTICS' }
   | { type: 'BACK' }
   | { type: 'HOME' };
@@ -76,6 +81,7 @@ export function nextRoute(cur: Route, ev: NavEvent): Route | null {
     case 'home':
       if (ev.type === 'NEW_SCAN') return { screen: 'setup' };
       if (ev.type === 'OPEN_SESSION') return routeForSession(ev.sessionId, ev.status, ev.numFrames);
+      if (ev.type === 'EXTEND_CAPTURE') return { screen: 'capture', sessionId: ev.sessionId, extendFrom: 'home' };
       return null;
     case 'setup':
       if (ev.type === 'START_CAPTURE') return { screen: 'capture', sessionId: ev.sessionId };
@@ -87,6 +93,8 @@ export function nextRoute(cur: Route, ev: NavEvent): Route | null {
         return { screen: 'processing', sessionId: cur.sessionId, steps };
       }
       if (ev.type === 'CANCEL') return { screen: 'home' };
+      // a continued capture stopped without new views: back to the stored scan
+      if (ev.type === 'BACK' && cur.extendFrom) return cur.extendFrom === 'viewer' ? { screen: 'viewer', sessionId: cur.sessionId } : { screen: 'home' };
       return null;
     case 'processing':
       if (ev.type === 'PROCESSING_DONE') return { screen: 'viewer', sessionId: cur.sessionId };
@@ -101,6 +109,11 @@ export function nextRoute(cur: Route, ev: NavEvent): Route | null {
       if (ev.type === 'BUILD') {
         const steps = normalizeSteps(ev.steps.filter((s) => s !== 'refine'));
         return steps.length ? { screen: 'processing', sessionId: cur.sessionId, steps } : null;
+      }
+      if (ev.type === 'EXTEND_CAPTURE' && cur.sessionId === ev.sessionId) return { screen: 'capture', sessionId: ev.sessionId, extendFrom: 'viewer' };
+      // its scan turned out to be a capture to process (new views the record missed): processing
+      if (ev.type === 'OPEN_SESSION' && cur.sessionId === ev.sessionId && (ev.status === 'capturing' || ev.status === 'captured')) {
+        return routeForSession(ev.sessionId, ev.status, ev.numFrames);
       }
       return null;
     case 'diagnostics':

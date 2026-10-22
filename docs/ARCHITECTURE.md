@@ -24,7 +24,9 @@ source file headers. Measurements behind the defaults are dated reports in `docs
 * Sensors: gyroscope (rotation priors, blur rejection, guided matching, time-offset
   calibration), accelerometer (gravity alignment, metric scale), compass (north),
   GPS (metric scale and geo-referencing at large scale).
-* Exports: PLY (points / mesh), GLB, COLMAP text model (+ images) in a ZIP.
+* Exports: PLY (points / mesh), GLB, USDZ for AR Quick Look ("View in AR" at true scale on
+  iPhone / iPad), COLMAP text model (+ images) in a ZIP, Gaussian splats (INRIA PLY, SPZ), and a
+  fly-through MP4 video of the splats rendered on the device.
 
 ## 2. Conventions (MUST follow)
 
@@ -42,7 +44,7 @@ source file headers. Measurements behind the defaults are dated reports in `docs
 | Quaternion | `[w, x, y, z]`, Hamilton, unit. |
 | Rotation update in optimisers | Left-multiplicative: `R ← exp([δω]×) R`, `t ← t + δt`. |
 | Angles | Radians unless the identifier ends in `Deg`. |
-| Time | Milliseconds, `performance.now()` domain. |
+| Time | Milliseconds, `performance.now()` domain. A stored capture is on its session time base: FrameInput time + the shift of its capture segment (`EngineStateRecord.timeSegments`), so a capture continued after a page reload stays in time order (src/engine/live.ts). |
 | Device frame (W3C DeviceMotion) | +x right edge, +y top edge, +z out of screen (portrait natural orientation). |
 | Camera ← device rotation | Rear camera, processed image upright for the UI rotated by screen angle θ (device turned θ counter-clockwise from natural portrait as seen by the user; θ ∈ {0, 90, 180, 270}): `R_cam_device(θ) = diag(1, −1, −1) · Rz(θ)` where `Rz(θ) = [[cosθ, −sinθ, 0], [sinθ, cosθ, 0], [0, 0, 1]]`. θ=0: `diag(1,−1,−1)`; θ=90: rows `(0,−1,0), (−1,0,0), (0,0,−1)`. `v_cam = R_cam_device · v_device`. (iOS mapping of `screen.orientation.angle` / `window.orientation` to θ is verified in `src/sensors/frame-orientation.ts`.) |
 | Device attitude | `R_wd` = device-to-world rotation; camera pose rotation `R = R_cam_device · R_wdᵀ`. Gyro `ω_dev`: `dR_wd/dt = R_wd [ω_dev]×`. `accel_dev = R_wdᵀ a_world`, `accelG_dev = R_wdᵀ (a_world − g_world)`, `g_world = (0, 0, −9.81)` in the Z-up world. |
@@ -111,12 +113,15 @@ src/
   dense/                 undistortion, view selection, PatchMatch MVS (WebGPU + CPU),
                          depth-map fusion, TSDF + marching cubes, point-cloud filters
   splat/                 3D Gaussian Splatting: WebGPU trainer + renderer, CPU reference,
-                         splat PLY, point-cloud initialisation, MCMC densification
+                         splat PLY / SPZ, point-cloud initialisation, MCMC densification
   sensors/               camera capture, motion, compass, geolocation, wake lock, frame orientation
-  io/                    PLY / GLB / COLMAP export, ZIP writer, IndexedDB session storage, share/download
-  viewer/                three.js viewer (points as splats + EDL, mesh, cameras, measure tool)
+  io/                    PLY / GLB / USDZ / COLMAP export, ZIP writer, MP4 (H.264) writer, IndexedDB session
+                         storage, share/download, raw capture recordings (format, OPFS / IndexedDB
+                         store, dataset export)
+  viewer/                three.js viewer (points as splats + EDL, mesh, cameras, measure tool), WebGPU
+                         splat layer, fly-through camera path
   engine/                PhotogrammetryEngine (pipeline orchestration, runs in a worker)
-  workers/               engine.worker.ts + typed message protocol
+  workers/               engine.worker.ts + typed message protocol, recorder.worker.ts (raw capture)
   app/                   mobile UI (vanilla TS + CSS), screens, state machine
   harness/               test harness pages: synthetic dataset generator, engine e2e, dense GT,
                          splat GT, novel-view evaluation
@@ -283,6 +288,7 @@ alignSim3Ransac(src: Float64Array, dst: Float64Array, n, maxError: number, opts?
 // convergence.ts — where the cameras look (object centre for classification, coverage, crop, fly-through)
 opticalAxisConvergence(poses: Pose[]): { point: Vec3 | null; spreadRad: number; inFront: number;
   distMedian: number; offAxisMedian: number; converging: boolean }   // least-squares point closest to all optical axes
+convergenceMode(c: AxisConvergence, medianDepth: number): 'object' | 'scene'   // the engine's classifyScene and the fly-through's 'auto'
 ```
 
 ### 4.3 `src/ba`  (depends on math)
@@ -430,7 +436,7 @@ runIncrementalSfM(db: FeatureDatabase, opts?: Partial<MapperOptions>, progress?:
 // keyframes.ts, pairs.ts, vocab.ts, inertial.ts, geo.ts, live.ts — see §5.
 ```
 
-### 4.6 `src/dense`  (depends on math, core, gpu)
+### 4.6 `src/dense`  (depends on math, geometry, core, gpu)
 
 ```ts
 interface DenseView { id: number; cam: CameraIntrinsics /* pinhole, k1=k2=0 */; pose: Pose;
@@ -451,9 +457,18 @@ class PatchMatchGPU { static create(ctx: GPUContext, opts?): Promise<PatchMatchG
 patchMatchCPU(ref, sources, range, opts?, geometric?): DepthMap    // slow reference / fallback
 fuseDepthMaps(views: DenseView[], store: DepthMapStore, neighbours: Map<number, number[]>, opts?, progress?, cancel?)
   : Promise<PointCloud>
-tsdfMesh(views: DenseView[], store: DepthMapStore, opts?: { voxelSize?: number; truncation?: number; maxDepth?: number },
-  progress?, cancel?): Promise<TriangleMesh>
+tsdfMesh(views: DenseView[], store: DepthMapStore, opts?: { voxelSize?: number; truncation?: number; maxDepth?: number;
+  bounds?: { min: ArrayLike<number>; max: ArrayLike<number> } /* world AABB: no vertex outside */ }, progress?, cancel?): Promise<TriangleMesh>
 filterPointCloud(pc: PointCloud, opts?: { voxelSize?: number; statistical?: { k: number; std: number } }): PointCloud
+// object-roi.ts — object box of an orbit capture (gravity-aligned world): orbit centre + support plane
+proposeObjectRoi(model: { images: { pose: Pose }[]; xyz: ArrayLike<number>; numPoints: number; trackOffsets?: ArrayLike<number> },
+  opts: { gravityAligned: boolean; minClearance?: number | { perDistance: number }; minConfidence?: number /* 0.3 */ })
+  : { roi: ObjectRoi | null; reason: string; … }   // ObjectRoi {min, max, planeZ, centre, confidence} (core/types.ts)
+objectRoiPivot(roi: ObjectRoi): [x, y, planeZ]      // bottom centre: the origin for exports that stand the object on the ground
+buildColourAtlas(mesh: TriangleMesh, opts?: { maxTriangles?: number /*100 000*/; size?: number /*2048*/; gutter?: number /*1*/ })
+  : { mesh: TriangleMesh /* simplified */; uvs: Float32Array /* 6 per triangle, (0,0) = texture top-left, v down */;
+      texture: RGBAImage /* colours of the UNSIMPLIFIED mesh */; stats /* overBudget, gutter, … */ }
+buildColourAtlasAsync(mesh, opts?, cancel?): Promise<same>   // yields ≈ every 40 ms; CancelledError on cancel
 ```
 
 ### 4.7 `src/sensors`
@@ -505,13 +520,33 @@ class WakeLock { acquire(): Promise<void>; release(): Promise<void> }
 encodePLY(pc: PointCloud): ArrayBuffer;  encodeMeshPLY(mesh: TriangleMesh): ArrayBuffer   // binary_little_endian
 decodePLY(buf: ArrayBuffer): { points?: PointCloud; mesh?: TriangleMesh }
 encodeGLB(input: { mesh?: TriangleMesh; points?: PointCloud; yUp?: boolean }): ArrayBuffer
+encodeUSDZ(input: { mesh: TriangleMesh; uvs: Float32Array; texture: Uint8Array /* JPEG/PNG bytes */; pivot?: ArrayLike<number>;
+  metric?: boolean; name?: string; material?: 'diffuse' | 'emissive' }): Uint8Array   // USDA, Y-up, metres, (x,y,z) → (x,z,−y) about pivot
+selectArPivot(mesh, roi?: { centre; planeZ } | null): Float64Array   // AR origin: ROI centre on its plane, else footprint centre at the 2nd-percentile z
 interface ColmapModelInput { cameras: { id: number; cam: CameraIntrinsics }[];
   images: { id: number; cameraId: number; name: string; pose: Pose; points2D: { x: number; y: number; point3D: number }[] }[];
   points: { id: number; xyz: ArrayLike<number>; color: ArrayLike<number>; error: number; track: { image: number; point2D: number }[] }[] }
 exportColmapText(model: ColmapModelInput): { name: string; data: string }[]   // cameras.txt, images.txt, points3D.txt
-createZip(files: { name: string; data: Uint8Array | string }[]): Uint8Array   // STORE, CRC32, UTF-8
+createZip(files: { name: string; data: Uint8Array | string }[], opts?: { comment?: string; align?: number }): Uint8Array
+  // STORE, CRC32, UTF-8; align: every entry's data at a multiple of `align` bytes (USDZ: 64)
+class Mp4Writer { constructor(o: { width: number; height: number; fps: number /*integer*/ });   // single-track H.264, faststart
+  setDecoderConfig(avcC: AllowSharedBufferSource): void; addChunk(data: Uint8Array, o: { key: boolean; timestampUs: number }): void;
+  finish(): Blob }                                     // chunks in decode order (VideoEncoder output)
+readMp4(data: Uint8Array): Mp4Info                     // box tree, avcC, timing, sample offsets (tests, e2e)
 class SessionStore { static open(): Promise<SessionStore>; … IndexedDB sessions, frame JPEG blobs, JSON & binary blobs }
 saveFile(data: Blob, filename: string): Promise<'shared' | 'downloaded'>    // Web Share (files) or <a download>
+// recording.ts — raw capture recordings (developer option; docs/ENGINE.md §5, e2e/README.md)
+interface RecordedFrame { seq: number; sentAt: number; input: Omit<FrameInput, 'bitmap'> /* verbatim */;
+  image: { file: string; width: number; height: number; srcWidth: number; srcHeight: number;
+           kind: 'VideoFrame' | 'ImageBitmap' | 'RGBAImage'; bytes: number } | null /* engine got it, pixels not recorded */;
+  error?: string; notSent?: boolean /* the engine never got it */ }
+encodeFrameRow(r: RecordedFrame): string; decodeFrameRow(line: string): RecordedFrame   // frames.jsonl, exact (JSON-safe)
+type RecordedSensorRow = { k: 'motion' | 'orientation' | 'geo'; t: number; … }          // sensors.jsonl, raw readings
+buildDatasetFiles(header, framesJsonl, liveJsonl, { stripLocation?, sensorsText? }): { meta, texts, images }   // e2e dataset, no GT
+planZipParts(entries: { name; size }[], maxBytes = 200e6): { part; names; bytes }[]
+// recording-store.ts
+class RecordingStore { static open(); list(): Promise<StoredRecording[]>; reader(info); delete(info) }
+prepareRecordingExport(store, info, { stripLocation? = true, maxPartBytes? }): Promise<{ meta; parts: { fileName; bytes; build(): Promise<Blob> }[] }>
 ```
 
 ### 4.9 `src/viewer`
@@ -529,7 +564,13 @@ class Viewer {
   startMeasure(onResult: (distance: number, a: Vec3, b: Vec3) => void): void; stopMeasure(): void
   setUnits(metric: boolean): void
   resize(): void; dispose(): void; screenshot(): Promise<Blob>
+  openSplatFrames(o: { width: number; height: number; background?: [number, number, number] })
+    : SplatOffscreen | null   // offscreen VideoFrames / pixels of the splats at a fixed size (video export)
 }
+// flythrough.ts (pure): video camera path from the registered keyframes (capture order); opts.mode
+// 'object' | 'scene' | 'auto' (convergenceMode); object: one azimuth pass replayed, scene: the walk
+buildFlythrough(cams: { pose: Pose; intrinsics: { width; height; f } }[], opts?: FlythroughOptions): FlythroughPath | null
+  // { mode: 'object' | 'scene'; width; height; fps; fx; fy; cx; cy; near; poses: Pose[] /*world-to-camera*/; … }
 ```
 
 ### 4.10 Contract deviations
@@ -577,13 +618,19 @@ retrieval for loop closure, spatial neighbours) → verify (pairs and vocabulary
 workers) → refined live model → only when it is unhealthy, a full incremental SfM from scratch
 on the enriched graph (keep the better of live/offline model) → global
 BA with self-calibration → retriangulate → final BA → inertial alignment (time
-offset, gravity, metric scale), GPS Sim3 alignment, compass yaw → world frame per §2
-(timings: docs/research/refine-performance.md).
+offset, gravity, metric scale: band-pass regression, or keyframe-interval preintegration when
+that lacks excitation, docs/research/imu-scale.md), GPS Sim3 alignment, compass yaw → world
+frame per §2 (timings: docs/research/refine-performance.md).
 
 **Dense**: undistort keyframes (≤ 1600 px by preset) → source-view selection →
 PatchMatch at ½ resolution (multi-scale) → PatchMatch (photometric) for all views →
 PatchMatch (geometric consistency) → halo / sky filter → fusion → filtered coloured
-point cloud → optional TSDF mesh.
+point cloud → optional TSDF mesh (object mode with a gravity-aligned model: bounded to the automatic
+object box from the sparse model — orbit centre + support plane, `dense/object-roi.ts` — which the mesh
+result and `mesh/meta` carry for later ground-placed exports; the dense cloud and splats are not cropped). Keyframe decoding and the halo filter run on CPU
+helper workers while the GPU computes the next views (bit-identical results; docs/ENGINE.md).
 
 **Splat**: dense (else sparse) cloud → 3D Gaussians → WebGPU training against all keyframes
-(MCMC densification, depth supervision from the dense maps, per-view colour correction).
+(MCMC densification, depth supervision from the dense maps, per-view colour correction; optional
+snapshot previews between chunks; "finish early" from the end of the coarse-to-fine schedule keeps
+the model and a checkpoint to continue from).

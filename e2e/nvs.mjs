@@ -14,9 +14,10 @@
  * default. Ground truth: the dataset JPEG undistorted with the run's intrinsics to the run's dense
  * view size and rolling-shutter corrected with the run's model, exactly like the engine's dense
  * views. Renderers: the app's Viewer drawing dense.ply / mesh.ply, and the splat module's renderer
- * for splats.ply when it exists (src/harness/nvs). Metrics: e2e/lib/nvs-metrics.mjs (--common adds
- * every renderer's score on the pixels all of them cover).
- * Writes <out>/nvs.json (default <runDir>/nvs/, <runDir>/nvs-<test dataset>/) and, with --save-images,
+ * for splats.ply when it exists (src/harness/nvs; --splat-file splats.spz scores the decoded SPZ
+ * export instead). Metrics: e2e/lib/nvs-metrics.mjs (--common adds every renderer's score on the
+ * pixels all of them cover).
+ * Writes <out>/nvs.json (default <runDir>/nvs/, <runDir>/nvs-<test dataset>/, + '-spz' for an SPZ) and, with --save-images,
  * view-<frame>-<renderer>.png panels (GT | render | |diff|·3).
  *
  * Starts Vite (root = repo, free port) and headless Chromium (SwiftShader; E2E_GPU=host: the
@@ -153,7 +154,8 @@ export async function runNvs(o, { log = (m) => console.log(`[nvs] ${m}`) } = {})
   }
   const gtDir = testDir ?? dsDir;
   const gtMeta = test?.meta ?? meta;
-  const outDir = resolve(o.out ?? join(runDir, test ? `nvs-${test.meta.name}` : 'nvs'));
+  const spz = /\.spz$/i.test(o.splatFile);
+  const outDir = resolve(o.out ?? join(runDir, `${test ? `nvs-${test.meta.name}` : 'nvs'}${spz ? '-spz' : ''}`));
 
   const tv = testViews({ meta, frames, imu }, result, { views: o.views, frames: o.frames ?? undefined, pose: o.pose, focal: o.focal, keepBlurred: o.keepBlurred, rsTranslation: o.rsTranslation, test });
   const maxSize = o.maxSize === 'full' ? 0 : o.maxSize === 'dense' ? (denseImageSize(result) ?? 0) : o.maxSize;
@@ -165,11 +167,11 @@ export async function runNvs(o, { log = (m) => console.log(`[nvs] ${m}`) } = {})
     rs = gtRollingShutter(gtMeta);
     if (!rs) log('WARNING: --rs gt, but the dataset has no rolling shutter: no correction');
   }
-  const files = { dense: await exists(join(runDir, 'dense.ply')), mesh: await exists(join(runDir, 'mesh.ply')), splats: await exists(join(runDir, 'splats.ply')) };
+  const files = { dense: await exists(join(runDir, 'dense.ply')), mesh: await exists(join(runDir, 'mesh.ply')), splats: await exists(join(runDir, o.splatFile)) };
   const renderers =
     o.renderers ??
     [...(files.dense ? ['points', 'points-edl'] : []), ...(files.mesh ? ['mesh-lit', 'mesh-unlit'] : []), ...(files.splats ? ['splat'] : [])];
-  if (!renderers.length) throw new Error(`nothing to render in ${runDir} (no dense.ply, mesh.ply or splats.ply)`);
+  if (!renderers.length) throw new Error(`nothing to render in ${runDir} (no dense.ply, mesh.ply or ${o.splatFile})`);
   const dist = distanceSummary(tv.views);
   log(
     `${meta.name}: ${tv.views.length} of ${tv.candidates} ${test ? `frames of the test dataset ${test.meta.name}` : 'held-out frames'} (${result.images?.length ?? 0} registered), ` +
@@ -221,6 +223,7 @@ export async function runNvs(o, { log = (m) => console.log(`[nvs] ${m}`) } = {})
         saveImages: o.saveImages,
         ssim: o.ssim,
         common: o.common,
+        splatFile: o.splatFile,
         camera: tv.views[0]?.camera ?? { ...result.intrinsics, width: meta.width, height: meta.height },
       },
     );

@@ -25,9 +25,9 @@ import type { DensePresetConfig, SplatPresetConfig } from './presets';
  * keep the extra fields, so they also arrive through the worker / EngineClient.
  */
 export type SparseCameraEx = SparseCamera & {
-  /** Capture time of the keyframe (ms, FrameInput.t). */
+  /** Capture time of the keyframe (ms, FrameInput.t on the session time base: + its segment's shift). */
   t?: number;
-  /** FrameInput.index of the frame that became this keyframe. */
+  /** FrameInput.index of the frame that became this keyframe (+ its segment's index offset). */
   frameIndex?: number;
 };
 
@@ -128,6 +128,12 @@ export interface EngineConfig {
    */
   gyroAidedRegistration?: boolean;
   /**
+   * Shift the frames of a restored / extended capture past the stored capture times (default true:
+   * `LiveSession` time segments, EngineStateRecord.timeSegments). false only in tests that prove
+   * the hazard (a reloaded page's performance.now() interleaves new IMU samples with stored ones).
+   */
+  extendTimeShift?: boolean;
+  /**
    * Estimate the gyro bias / camera–IMU offset from the live keyframes every 10 registrations
    * during capture (default false; refine always calibrates once before the rolling-shutter estimation).
    * Off because it changes the keyframe selection and measured equal or worse (yard-real ATE 7.0e-4
@@ -180,10 +186,18 @@ export interface EngineConfig {
   refineOfflineSfM?: 'auto' | 'always';
   /**
    * CPU helper workers (nested in the engine worker) that verify refine's candidate pairs and
-   * quantise its vocabulary in parallel (default: hardware threads − 2, at most 3; 0 = everything
+   * quantise its vocabulary in parallel, and in densify decode the next views and halo-filter the
+   * final depth maps while the GPU runs (default: hardware threads − 2, at most 3; 0 = everything
    * on the engine thread). Same results either way.
    */
   cpuWorkers?: number;
+  /**
+   * CPU/GPU overlap of densify's depth-map stage (src/engine/dense.ts; default true): keyframe
+   * decoding ahead and the final maps' halo filter on the CPU helper workers, and map writes in
+   * flight, while the GPU computes the next views — within the memory plan's headroom. false =
+   * serial (every CPU step on the engine thread between GPU passes). Bit-identical results.
+   */
+  denseOverlap?: boolean;
   /** Per-image focal lengths tied to the shared focal in the final refinement (default true; kept only if it helps). */
   perImageFocal?: boolean;
   /** Prior σ of the per-image focal (relative, default 0.005) and the required reprojection improvement (default 0.005). */
@@ -229,8 +243,9 @@ export interface EngineConfig {
 /** What the engine knows about one keyframe (persisted with its JPEG as the frame `info`). */
 export interface KeyframeRecord {
   id: number;
-  /** FrameInput.index (or the engine's frame counter). */
+  /** FrameInput.index (or the engine's frame counter), + an offset in a continued capture's segment. */
   frameIndex: number;
+  /** FrameInput.t on the session time base (+ the shift of its capture segment, EngineStateRecord.timeSegments). */
   t: number;
   /** Canonical full-resolution size. */
   width: number;

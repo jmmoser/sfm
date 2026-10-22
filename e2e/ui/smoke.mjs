@@ -4,7 +4,9 @@
  *   Home → Setup → Start (fake camera) → Capture (wait for keyframes) → Finish → Processing →
  *   Viewer (info, display, measure, build mesh, build the photoreal model in the viewer: progress
  *   card, layer pill Splats / Points / Mesh) → Export (prepare + save → download, incl. the
- *   Gaussian-splat PLY) → Home → reopen (the splats are back) → Diagnostics
+ *   Gaussian-splat PLY and the USDZ) → Home → reopen (the splats are back) → Add more views (Build sheet →
+ *   confirm sheet → Capture continues at the stored keyframes → Finish → Processing re-runs
+ *   refine and the dense cloud + mesh the scan had → Viewer) → Diagnostics
  * Asserts no console errors / page exceptions and writes screenshots of every screen to
  * e2e/out/ui/. The splat layer needs a hardware WebGPU adapter: with E2E_GPU=host the splats must
  * be shown; on SwiftShader the viewer refuses the software adapter and keeps the points.
@@ -269,6 +271,17 @@ try {
   const [dl3] = await Promise.all([page.waitForEvent('download', { timeout: 15000 }), byTest('export-save-colmap-zip').tap()]);
   const zip = await readFile(await dl3.path());
   check(zip.readUInt32LE(0) === 0x04034b50, 'ZIP magic');
+  // USDZ (AR): the layer first, its data 64-byte aligned; no "View in AR" outside iOS Safari
+  await byTest('export-prepare-usdz').tap();
+  await byTest('export-save-usdz').waitFor({ timeout: 30000 });
+  check((await byTest('export-ar-usdz').count()) === 0, 'no View in AR without AR Quick Look');
+  const [dl5] = await Promise.all([page.waitForEvent('download', { timeout: 15000 }), byTest('export-save-usdz').tap()]);
+  const usdz = await readFile(await dl5.path());
+  check(dl5.suggestedFilename().endsWith('_ar.usdz'), 'USDZ filename');
+  const usdzName = usdz.subarray(30, 30 + usdz.readUInt16LE(26)).toString();
+  check(usdz.readUInt32LE(0) === 0x04034b50 && usdzName === 'model.usda', 'USDZ: model.usda first');
+  check((30 + usdz.readUInt16LE(26) + usdz.readUInt16LE(28)) % 64 === 0, 'USDZ: 64-byte aligned data');
+  step(`downloaded ${dl5.suggestedFilename()} (${usdz.length} bytes)`);
   await closeSheet();
 
   step('home with session');
@@ -278,6 +291,7 @@ try {
   await shot(page, '18-home-sessions');
   await byTest('session-more').first().tap();
   await sleep(400);
+  check(/Add more views/.test((await byTest('session-extend').textContent()) ?? ''), 'a processed scan offers "Add more views" on Home');
   await shot(page, '19-session-actions');
   await page.locator('.sheet-close').last().tap();
   await sleep(400);
@@ -291,6 +305,39 @@ try {
     check(true, 'a reopened scan opens on its splats');
   }
   await sleep(1000);
+
+  step('add more views: continue the capture of the scan, then it is processed again');
+  await byTest('tool-build').tap();
+  await byTest('sheet-build').waitFor();
+  await byTest('build-extend').tap();
+  await byTest('sheet-extend').waitFor();
+  const extendSheet = (await byTest('sheet-extend').textContent()) ?? '';
+  check(/processed again/.test(extendSheet), 'the sheet says the scan is processed again');
+  check(/the dense cloud and the mesh are rebuilt/.test(extendSheet), 'the sheet names the stages Finish rebuilds');
+  check(/photoreal model is removed/.test(extendSheet), 'the sheet says the photoreal model is removed');
+  await sleep(400);
+  await shot(page, '19b-extend-sheet');
+  await byTest('extend-start').tap();
+  await page.waitForSelector('.capture');
+  await page.waitForFunction(() => document.querySelector('.capture')?.getAttribute('data-phase') === 'running', null, { timeout: 45000 });
+  const storedKf = Number(await byTest('kf-count').textContent());
+  check(storedKf >= 8, `the capture continues at the stored keyframes (${storedKf})`);
+  check(await byTest('finish').isDisabled(), 'Finish needs a new view');
+  await page.waitForFunction((k) => Number(document.querySelector('[data-testid="kf-count"]')?.textContent) >= k + 2, storedKf, { timeout: 60000 });
+  await captureShot('19c-extend-capture');
+  check(!(await byTest('finish').isDisabled()), 'Finish enabled after new views');
+  await byTest('finish').tap();
+  await page.waitForSelector('.processing', { timeout: 20000 });
+  await page.waitForSelector('[data-testid="stage-matching"][data-status="active"], [data-testid="stage-reconstruction"][data-status="active"]', { timeout: 20000 });
+  const meshStage = await page.locator('[data-testid="stage-meshing"]').getAttribute('data-status');
+  check(meshStage !== 'done' && meshStage !== 'skipped', `the mesh the scan had is built again (stage ${meshStage})`);
+  await page.waitForSelector('.viewer-screen', { timeout: 120000 });
+  await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+  const extendedSub = (await page.locator('.viewer-sub').textContent()) ?? '';
+  const photos = Number(/(\d+) photos/.exec(extendedSub)?.[1] ?? 0);
+  check(photos >= storedKf + 2, `the refined model covers the new views (${extendedSub}; ${storedKf} stored)`);
+  await sleep(800);
+  await shot(page, '19d-viewer-extended');
   await byTest('viewer-back').tap();
   await byTest('session-item').first().waitFor();
 

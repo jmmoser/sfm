@@ -9,8 +9,12 @@
  *   window.replaySplat(cfg)  — loads such a dump into memory stores and runs the engine's splat
  *     stage (`runSplat`, src/engine/splat.ts: the same function `PhotogrammetryEngine.splat` runs)
  *     with the given trainer overrides; writes `<outPrefix>splats.ply` exactly like the engine's
- *     'ply-splat' export (stored f16 model → INRIA PLY) and returns the stage stats.
+ *     'ply-splat' export (stored f16 model → INRIA PLY) and returns the stage stats. With
+ *     `splat: { preview: true }` (splat-replay.mjs --splat-previews) the run gets a progress callback
+ *     — runSplat renders previews only for one — and returns the snapshots' arrival times and PSNR
+ *     (`previews`, `firstTrainingMs`): the preview cost is the stage time with and without.
  */
+import type { ProgressEvent } from '../../core/types';
 import type { DepthMap } from '../../dense/types';
 import { MemoryDepthMapStore } from '../../dense/types';
 import { getGPU } from '../../gpu/device';
@@ -20,7 +24,7 @@ import { runSplat } from '../../engine/splat';
 import type { EngineConfig, KeyframeRecord } from '../../engine/types';
 import { encodeSplatPLY } from '../../splat/ply';
 import type { SplatTrainer } from '../../splat/trainer';
-import type { QualityPreset, SplatOptions } from '../../workers/protocol';
+import { SPLAT_STAGES, type QualityPreset, type SplatOptions } from '../../workers/protocol';
 
 type WriteBinary = (path: string, data: ArrayBuffer | Blob) => Promise<void>;
 
@@ -115,6 +119,12 @@ export interface ReplaySplatResult {
   /** With trainer `profile: true`: accumulated GPU ms per pass and the iterations they cover. */
   gpuMs?: Record<string, number>;
   profiledIterations?: number;
+  /**
+   * With `splat.preview`: each 'splat_preview' snapshot (iteration, arrival in ms after the stage
+   * started, PSNR against that training photo) and the arrival of the first training report.
+   */
+  previews?: { iteration: number; ms: number; psnr: number }[];
+  firstTrainingMs?: number | null;
 }
 
 const loaded = new Map<string, Promise<{ store: MemoryEngineStore; depth: MemoryDepthMapStore; manifest: DumpManifest }>>();
@@ -165,6 +175,16 @@ export async function replaySplat(cfg: ReplaySplatConfig, log: (m: string) => vo
   if (!ctx) throw new Error('no WebGPU');
   const t0 = performance.now();
   let trainer: SplatTrainer | null = null;
+  // previews need a progress callback (runSplat renders none without one): record their arrival
+  const previews: NonNullable<ReplaySplatResult['previews']> = [];
+  let firstTrainingMs: number | null = null;
+  const progress = cfg.splat?.preview
+    ? (p: ProgressEvent): void => {
+        const ms = Math.round(10 * (performance.now() - t0)) / 10;
+        if (p.stage === SPLAT_STAGES.preview && p.detail) previews.push({ iteration: p.detail.iteration, ms, psnr: p.detail.psnr });
+        else if (p.stage === SPLAT_STAGES.training) firstTrainingMs ??= ms;
+      }
+    : undefined;
   const out = await runSplat(
     {
       store,
@@ -185,6 +205,7 @@ export async function replaySplat(cfg: ReplaySplatConfig, log: (m: string) => vo
       gpu: async () => ctx,
     },
     cfg.splat ?? {},
+    progress,
   );
   const ms = performance.now() - t0;
   // exactly what the engine stores and exports: f16 model → INRIA PLY
@@ -193,5 +214,13 @@ export async function replaySplat(cfg: ReplaySplatConfig, log: (m: string) => vo
   const file = `${cfg.outPrefix}splats.ply`;
   await write(file, new Blob([ply as Uint8Array<ArrayBuffer>]));
   const st = (trainer as SplatTrainer | null)?.stats();
-  return { ms, count: out.model.count, iterations: out.iterations, stats: out.stats, file, ...(st?.profiledIterations ? { gpuMs: st.gpuMs, profiledIterations: st.profiledIterations } : {}) };
+  return {
+    ms,
+    count: out.model.count,
+    iterations: out.iterations,
+    stats: out.stats,
+    file,
+    ...(st?.profiledIterations ? { gpuMs: st.gpuMs, profiledIterations: st.profiledIterations } : {}),
+    ...(progress ? { previews, firstTrainingMs } : {}),
+  };
 }

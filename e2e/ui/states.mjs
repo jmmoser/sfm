@@ -33,7 +33,8 @@
  *   memory-limit     the engine's capture memory cap → "Memory limit reached — finish scan now?",
  *                    Continue (tracking only) adds no keyframes, Finish works
  *   dense-resume     an interrupted densify (loadSession stats.denseResumablePass) → "Resume dense
- *                    reconstruction" in the viewer + Build sheet; a densify cancelled here too
+ *                    reconstruction" in the viewer + Build sheet; a densify cancelled here too (the
+ *                    Stop closes its run journal entry: no "run interrupted" card after a reload)
  *   dense-resume-quality  the interrupted run used another preset than the scan (stats
  *                    denseResumableQuality): the resume uses that preset
  *   info-sheet       Model info: magnetic-north note for compass yaw, engine memory section
@@ -47,11 +48,31 @@
  *                    camera" starts the scan
  *   memory-limit-background  the memory cap is reached by the frame in flight when the app goes to
  *                    the background → the prompt comes after Resume
- *   splat-build      "Photoreal model" from the viewer's Build sheet: progress card, Cancel →
- *                    "Photoreal model interrupted" card → Resume continues → layer pill offers Splats,
- *                    the export sheet the Gaussian-splat PLY; after a reload the scan reopens with its
- *                    splats (E2E_GPU=host: shown by default; SwiftShader: refused, points shown)
+ *   splat-build      "Photoreal model" from the viewer's Build sheet: progress card with the training
+ *                    preview (its pixels change; "Use it now" disabled until finishFrom), Cancel →
+ *                    "Photoreal model interrupted" card → Resume continues → the preview opens larger
+ *                    → "Use it now" stores the model early (no resume card; Build: Continue) →
+ *                    Continue trains to the end → layer pill offers Splats, the export sheet the
+ *                    Gaussian-splat PLY; after a reload the scan reopens with its splats
+ *                    (E2E_GPU=host: shown by default; SwiftShader: refused, points shown)
  *   splat-no-webgpu  no WebGPU in the browser: the photoreal build is disabled with an explanation
+ *   coverage         object mode: the coverage ring fills along the mock's level orbit ("Walk to the
+ *                    other side" → "Raise the phone, loop looking down" with the elevation bands, or
+ *                    "All sides covered" azimuth-only without motion), then its higher loop → "Done";
+ *                    the Finish hint shows "Coverage N %"; auto mode shows the ring only once the
+ *                    engine resolved 'object' (8 keyframes). Screenshots state-coverage-*.png
+ *   killed-dense     the page is killed (reload) during depth maps → Home's "run interrupted" card names
+ *                    the scan and the dense cloud; Resume → the viewer's dense-resume card → the resumed
+ *                    densify runs in light mode and completes; no card afterwards
+ *   killed-splat     killed during the photoreal training after a checkpoint → the card; Resume → the
+ *                    viewer's splat-resume card → continues from the checkpoint in light mode (≤ 1.5 M
+ *                    points shown, no mesh) → the full cloud and the mesh come back
+ *   evicted-refine   the page goes to the background during refine, then is killed → the card says it
+ *                    stopped in the background; Resume reconstructs the scan
+ *   killed-splat-early  killed while the photoreal build prepares (no checkpoint yet) on a sparse scan →
+ *                    the card promises no saved training and no lighter view; Resume → no splat-resume
+ *                    card, a hint whose Build opens the Build sheet
+ * Every other scenario must not show the "run interrupted" card (a watcher in each page).
  * Usage: node e2e/ui/states.mjs [name ...] [--verbose]
  */
 import { launch, layoutAudit, shot, sleep } from './lib.mjs';
@@ -91,7 +112,14 @@ const SCENARIOS = [
   'empty-dense',
   'splat-build',
   'splat-no-webgpu',
+  'coverage',
+  'killed-dense',
+  'killed-splat',
+  'evicted-refine',
+  'killed-splat-early',
 ];
+/** Scenarios that kill a run on purpose: the only ones where the "run interrupted" card may appear. */
+const EXPECTS_RUN_CARD = new Set(['killed-dense', 'killed-splat', 'evicted-refine', 'killed-splat-early']);
 const args = process.argv.slice(2).filter((a) => !a.startsWith('--'));
 // A misspelled name would run nothing and still pass.
 const unknown = args.filter((a) => !SCENARIOS.includes(a));
@@ -101,7 +129,29 @@ if (unknown.length) {
 }
 const want = (n) => !args.length || args.includes(n);
 const ran = new Set();
-const { newPage, close, consoleErrors, base } = await launch({ verbose: process.argv.includes('--verbose') });
+const launched = await launch({ verbose: process.argv.includes('--verbose') });
+const { close, consoleErrors, base } = launched;
+/** The running scenario (pages report the "run interrupted" card to it). */
+let current = null;
+/** Scenarios whose pages showed the "run interrupted" card. */
+const runCardSeen = new Set();
+/** launched.newPage + a watcher that reports Home's "run interrupted" card (no false positives). */
+async function newPage(opts) {
+  const r = await launched.newPage(opts);
+  const name = current;
+  await r.context.exposeFunction('__sfmRunCardShown', () => {
+    if (name) runCardSeen.add(name);
+  });
+  await r.context.addInitScript(() => {
+    let sent = false;
+    new MutationObserver((records) => {
+      if (sent || !records.some((r) => r.addedNodes.length) || !document.querySelector('[data-testid="run-interrupted"]')) return;
+      sent = true;
+      globalThis.__sfmRunCardShown?.();
+    }).observe(document, { childList: true, subtree: true });
+  });
+  return r;
+}
 const failures = [];
 const check = (cond, msg) => {
   if (!cond) {
@@ -130,13 +180,67 @@ async function scenario(name, fn) {
   if (!want(name)) return;
   ran.add(name);
   console.log(`[states] — ${name}`);
+  current = name;
   try {
     await fn();
   } catch (e) {
     failures.push(`${name}: ${e?.message ?? e}`);
     console.error(e);
   }
+  current = null;
+  if (!EXPECTS_RUN_CARD.has(name)) check(!runCardSeen.has(name), `${name}: no "run interrupted" card`);
+  else check(runCardSeen.has(name), `${name}: the card watcher saw the card (it works)`);
 }
+
+/** The run journal in the page's localStorage (src/app/run-journal.ts). */
+const journal = (page) => page.evaluate(() => JSON.parse(localStorage.getItem('sfm.run.v1') ?? 'null'));
+
+/**
+ * Kill the page while a run is going: a reload (no code of the run gets to end it, like an iOS
+ * kill). The beforeunload prompt of a running job (desktop browsers only; iOS shows none) is accepted.
+ */
+async function killPage(page) {
+  const accept = (d) => void d.accept().catch(() => {});
+  page.on('dialog', accept);
+  try {
+    await page.reload();
+  } finally {
+    page.off('dialog', accept);
+  }
+}
+
+/** Page visibility as iOS reports it for the app going to / coming back from the background. */
+const setPageHidden = (page, hidden) =>
+  page.evaluate((h) => {
+    Object.defineProperty(document, 'hidden', { value: h, configurable: true });
+    Object.defineProperty(document, 'visibilityState', { value: h ? 'hidden' : 'visible', configurable: true });
+    document.dispatchEvent(new Event('visibilitychange'));
+  }, hidden);
+
+/** Poll `fn` (async, in Node) until it returns a truthy value. */
+async function until(fn, timeoutMs, what) {
+  const t0 = Date.now();
+  for (;;) {
+    const v = await fn();
+    if (v) return v;
+    if (Date.now() - t0 > timeoutMs) throw new Error(`timed out waiting for ${what}`);
+    await sleep(200);
+  }
+}
+
+/** A stored session's stats (the MockEngine keeps its resume markers there, like the engine's stored progress). */
+const storedStats = (page, id) =>
+  page.evaluate(async (i) => {
+    const { SessionStore } = await import('/src/io/storage.ts');
+    return (await (await SessionStore.open()).getSession(i))?.stats ?? null;
+  }, id);
+
+const viewerLoaded = (page) => page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
+const viewerStats = (page) =>
+  page.evaluate(() => {
+    const s = globalThis.__sfmApp.debug.viewer?.getStats();
+    return s ? { densePoints: s.densePoints, triangles: s.triangles } : null;
+  });
 
 await scenario('engine-missing', async () => {
   const { page, context } = await newPage();
@@ -256,6 +360,12 @@ await scenario('processing-error', async () => {
   check(/Not enough overlap/.test(text ?? ''), 'processing error message shown');
   await sleep(400);
   await shot(page, 'state-processing-error');
+  // the reported error closed the run: the next launch shows no "run interrupted" card
+  check((await journal(page))?.step === null, 'the failed run is closed in the run journal');
+  await killPage(page);
+  await by(page, 'session-item').first().waitFor({ timeout: 15000 });
+  await sleep(500);
+  check((await by(page, 'run-interrupted').count()) === 0, 'no "run interrupted" card after a reported error');
   await context.close();
 });
 
@@ -677,6 +787,15 @@ await scenario('dense-resume', async () => {
   await page.waitForSelector('.viewer-screen', { timeout: 20000 });
   await by(page, 'dense-resume').waitFor({ state: 'visible', timeout: 10000 });
   check(true, 'a densify cancelled in Processing is resumable from the viewer');
+  // the Stop closed the run in the journal: the next launch reports no interruption
+  check((await journal(page))?.step === null, 'the stopped densify is closed in the run journal');
+  await page.reload();
+  await by(page, 'session-item').first().waitFor({ timeout: 15000 });
+  await sleep(500);
+  check((await by(page, 'run-interrupted').count()) === 0, 'no "run interrupted" card after a Processing Stop');
+  await by(page, 'session-item').first().tap();
+  await viewerLoaded(page);
+  await by(page, 'dense-resume').waitFor({ state: 'visible', timeout: 10000 });
   await by(page, 'dense-resume-button').tap();
   await page.waitForSelector('.processing', { timeout: 20000 });
   await page.waitForSelector('.viewer-screen', { timeout: 120000 });
@@ -1025,14 +1144,26 @@ await scenario('empty-dense', async () => {
 await scenario('splat-build', async () => {
   const hostGpu = process.env.E2E_GPU === 'host';
   const { page, context } = await newPage();
-  // slow stages: Cancel lands during the training
-  await page.goto(`${base}?mock=1&mockSpeed=0.25`);
+  // slow stages (7.8 s of training at fast): Cancel lands during the training
+  await page.goto(`${base}?mock=1&mockSpeed=0.2`);
   await by(page, 'new-scan').waitFor();
   await page.evaluate(async () => {
     const { SessionStore } = await import('/src/io/storage.ts');
     const s = await SessionStore.open();
     await s.createSession({ id: 'seed-splat', name: 'Garden bench', mode: 'object', status: 'dense', stats: { quality: 'fast', keyframes: 24 } });
   });
+  /** Pause / resume the mock's training (it pauses while hidden): slow screenshots and audits must not outlast it. */
+  const freeze = (on) => page.evaluate((v) => globalThis.__sfmApp.engine.setHidden(v), on);
+  /** A hash of the card's preview pixels ('' before the first snapshot). */
+  const previewPixels = () =>
+    page.evaluate(() => {
+      const c = document.querySelector('[data-testid="splat-preview"]');
+      if (!c || !c.width || c.closest('[hidden]')) return '';
+      const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+      let hash = 0;
+      for (let i = 0; i < d.length; i += 3) hash = (Math.imul(hash, 31) + d[i]) >>> 0;
+      return `${c.width}×${c.height}:${hash}`;
+    });
   await page.reload();
   await by(page, 'session-item').first().tap();
   await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
@@ -1046,7 +1177,19 @@ await scenario('splat-build', async () => {
   await by(page, 'build-splat').tap();
   await by(page, 'splat-progress').waitFor({ state: 'visible', timeout: 10000 });
   await page.waitForFunction(() => /iterations/.test(document.querySelector('[data-testid="splat-progress-text"]')?.textContent ?? ''), null, { timeout: 30000 });
-  await sleep(400);
+  // "Use it now" waits for the end of the coarse-to-fine schedule (30 %: iteration 900 of 3000)
+  check(await by(page, 'splat-use-now').isDisabled(), '"Use it now" disabled early in the training');
+  check(/Usable from iteration 900/.test((await by(page, 'splat-use-note').textContent()) ?? ''), 'its note says from when');
+  // the preview snapshot replaces the spinner; its pixels change as the model trains
+  await by(page, 'splat-preview').waitFor({ state: 'visible', timeout: 10000 });
+  const seenPixels = new Set([await previewPixels()]);
+  for (const t0 = Date.now(); seenPixels.size < 3 && Date.now() - t0 < 15000; ) {
+    await sleep(150);
+    seenPixels.add(await previewPixels());
+  }
+  seenPixels.delete('');
+  check(seenPixels.size >= 3, `the preview's pixels change at least twice before Cancel (${seenPixels.size} distinct)`);
+  await freeze(true);
   await shot(page, 'state-splat-progress');
   await audit(page, 'splat progress');
   // the other builds wait while it runs
@@ -1054,6 +1197,7 @@ await scenario('splat-build', async () => {
   await by(page, 'sheet-build').waitFor();
   check(await by(page, 'build-mesh').isDisabled(), 'mesh build disabled while the photoreal model trains');
   await page.keyboard.press('Escape');
+  await freeze(false);
   await by(page, 'sheet-build').waitFor({ state: 'detached' });
   await by(page, 'splat-cancel').tap();
   await by(page, 'dialog-confirm').tap();
@@ -1075,23 +1219,62 @@ await scenario('splat-build', async () => {
   }, null, { timeout: 30000 });
   const it0 = Number(((await firstText.jsonValue()) ?? '').replace(/,/g, '').match(/^(\d+)/)?.[1] ?? 0);
   check(it0 > 0, `the resumed run continues (first progress at iteration ${it0})`);
+  // the preview, larger: a sheet that follows the snapshots, with its own "Use it now"
+  await by(page, 'splat-preview-open').waitFor({ state: 'visible', timeout: 10000 });
+  await freeze(true);
+  await by(page, 'splat-preview-open').tap();
+  await by(page, 'sheet-splat-preview').waitFor({ state: 'visible', timeout: 5000 });
+  check(/^(Iteration [\d,]+ of 3,000|Initial Gaussians)/.test((await by(page, 'splat-preview-caption').textContent()) ?? ''), 'the larger preview has the iteration as its caption');
+  await sleep(400);
+  await shot(page, 'state-splat-preview');
+  await audit(page, 'splat preview sheet');
+  await page.keyboard.press('Escape');
+  await by(page, 'sheet-splat-preview').waitFor({ state: 'detached' });
+  await freeze(false);
+  // "Use it now" from iteration 900 on: the model is stored where it is, continuable later
+  await page.waitForFunction(() => document.querySelector('[data-testid="splat-use-now"]')?.disabled === false, null, { timeout: 30000 });
+  await by(page, 'splat-use-now').tap();
+  await by(page, 'splat-progress').waitFor({ state: 'hidden', timeout: 30000 });
+  check(await by(page, 'splat-resume').isHidden(), 'no "interrupted" card for a model ended early');
+  await by(page, 'tool-build').tap();
+  await by(page, 'build-splat').waitFor({ timeout: 5000 });
+  const early = (await by(page, 'sheet-build').textContent()) ?? '';
+  check(/Continue/.test((await by(page, 'build-splat').textContent()) ?? '') && /Stopped early at [\d,]+ of 3,000 iterations/.test(early), 'Build sheet: Continue the training of the model ended early');
+  await shot(page, 'state-splat-continue');
+  await by(page, 'build-splat').tap();
+  await by(page, 'splat-progress').waitFor({ state: 'visible', timeout: 10000 });
   await by(page, 'splat-progress').waitFor({ state: 'hidden', timeout: 90000 });
   check(await by(page, 'splat-resume').isHidden(), 'no resume card once the model exists');
-  await by(page, 'layer-switch').waitFor({ state: 'visible', timeout: 15000 });
-  const segs = await page.locator('[data-testid="layer-switch"] .segment').evaluateAll((els) => els.map((e) => e.dataset.value));
+  await by(page, 'tool-build').tap();
+  await by(page, 'sheet-build').waitFor();
+  check(!/Stopped early/.test((await by(page, 'sheet-build').textContent()) ?? ''), 'the continued model is complete (no Continue)');
+  await page.keyboard.press('Escape');
+  await by(page, 'sheet-build').waitFor({ state: 'detached' });
+  const segments = () => page.locator('[data-testid="layer-switch"] .segment').evaluateAll((els) => els.map((e) => e.dataset.value));
   if (hostGpu) {
+    await by(page, 'layer-switch').waitFor({ state: 'visible', timeout: 15000 });
+    const segs = await segments();
     check(segs.join(',') === 'splats,points', `layer pill Splats / Points (got ${segs})`);
     await page.waitForFunction(() => document.querySelector('[data-testid="layer-switch"]')?.dataset.layer === 'splats', null, { timeout: 30000 });
     await sleep(500);
     await shot(page, 'state-splat-shown');
     await audit(page, 'splats shown');
-  } else console.log(`[states] software adapter: layer pill ${segs}`);
+  } else {
+    // SwiftShader: the splat layer refuses the software adapter (for good, since the model ended
+    // early was loaded): the points stay, and the layer pill has nothing to switch to
+    await page.waitForFunction(() => document.querySelector('.viewer-screen')?.dataset.splats === 'unavailable', null, { timeout: 30000 });
+    const segs = await segments();
+    check((await by(page, 'layer-switch').isHidden()) && !segs.includes('splats'), `software adapter: splats refused, points only (layer pill hidden, segments ${segs})`);
+  }
   await by(page, 'tool-export').tap();
   await by(page, 'export-ply-splat').waitFor();
   check(!(await by(page, 'export-ply-splat').getAttribute('class'))?.includes('disabled'), 'export sheet offers the Gaussian-splat PLY');
   await page.keyboard.press('Escape');
   // reopened later: the stored splats come back (and are the default view)
   await page.reload();
+  await by(page, 'session-item').first().waitFor();
+  await sleep(300);
+  check((await by(page, 'run-interrupted').count()) === 0, 'no "run interrupted" card after a cancelled and a finished build');
   await by(page, 'session-item').first().tap();
   await page.waitForFunction(() => document.querySelector('.viewer-loading')?.hasAttribute('hidden'), null, { timeout: 30000 });
   if (hostGpu) {
@@ -1115,6 +1298,237 @@ await scenario('splat-no-webgpu', async () => {
   await by(page, 'build-splat').waitFor({ timeout: 5000 });
   check(await by(page, 'build-splat').isDisabled(), 'photoreal build disabled without WebGPU');
   check(/Needs WebGPU/.test((await by(page, 'sheet-build').textContent()) ?? ''), 'the item says it needs WebGPU');
+  await context.close();
+});
+
+await scenario('coverage', async () => {
+  const { page, context } = await newPage();
+  await startCapture(page, `${base}?mock=1&mockSpeed=4`);
+  await page.waitForFunction(() => document.querySelector('.capture')?.getAttribute('data-phase') === 'running', null, { timeout: 45000 });
+  check(await by(page, 'coverage').isVisible(), 'object mode: the coverage ring is shown');
+  const prompt = () => page.evaluate(() => document.querySelector('[data-testid="coverage-prompt"]')?.textContent ?? '');
+  const covered = () => page.evaluate(() => document.querySelectorAll('.coverage-cell.c2').length);
+  const hint = () => page.evaluate(() => document.querySelector('.finish-hint:not([hidden])')?.textContent ?? '');
+  const waitPrompt = (re, timeout) =>
+    page.waitForFunction((src) => new RegExp(src).test(document.querySelector('[data-testid="coverage-prompt"]')?.textContent ?? ''), re.source, { timeout });
+  // part of the first loop
+  await waitPrompt(/other side/, 60000);
+  await page.waitForFunction(() => document.querySelectorAll('.coverage-cell.c2').length >= 4, null, { timeout: 30000 });
+  const part = await covered();
+  check(part >= 4 && part < 12, `partial orbit: some sectors covered (${part}), prompt "${await prompt()}"`);
+  check(/^Coverage \d+ % · sides missing$/.test(await hint()), `partial orbit: the Finish hint shows the coverage ("${await hint()}")`);
+  check((await page.evaluate(() => document.querySelector('.finish-hint')?.getAttribute('aria-live'))) === 'off', 'the readiness hint is not a live region (it changes per covered cell)');
+  check(await page.evaluate(() => document.querySelector('.coverage-marker')?.classList.contains('shown')), 'the phone is marked on the ring');
+  await holdShot(page, 'state-coverage-partial');
+  // the cloud view keeps the ring above the Overview / Follow buttons
+  await by(page, 'cloud-toggle').tap();
+  await page.waitForSelector('.capture.cloud-view');
+  const [ringBox, actionsBox] = await Promise.all([by(page, 'coverage').boundingBox(), page.locator('.cloud-actions').boundingBox()]);
+  check(!!ringBox && !!actionsBox && ringBox.y + ringBox.height <= actionsBox.y + 1, 'cloud view: the ring sits above the Overview button');
+  await audit(page, 'coverage-cloud');
+  await by(page, 'cloud-toggle').tap();
+  await page.waitForFunction(() => !document.querySelector('.capture.cloud-view'));
+  // Headless only: SwiftShader's WebGL draw of the 3D thumbnail starves the frame grabs once the
+  // mock cloud is fully revealed (measured: 0–2 frames per 5 s with it, 29–46 without), so the
+  // two loops would take minutes. Hide it for the rest of the capture.
+  await page.addStyleTag({ content: '.mini-view { display: none !important; }' });
+  const flat = await page.evaluate(() => document.querySelector('.coverage')?.classList.contains('flat'));
+  if (flat) {
+    // no motion sensor in this browser: azimuth only, one loop completes it
+    await waitPrompt(/All sides covered/, 90000);
+    check(true, 'azimuth only (no motion): one loop covers all sides');
+    await holdShot(page, 'state-coverage-full');
+  } else {
+    await waitPrompt(/Raise the phone/, 90000);
+    check(/top not captured/.test(await hint()), `after the level loop: "${await hint()}"`);
+    await waitPrompt(/^Done/, 120000);
+    check(/ready to finish/.test(await hint()), `after the higher loop: "${await hint()}"`);
+    await holdShot(page, 'state-coverage-full');
+  }
+  await audit(page, 'coverage');
+  await context.close();
+
+  // auto: no ring until the engine resolved 'object'
+  const a = await newPage();
+  await a.page.goto(`${base}?mock=1&mockSpeed=4`);
+  await by(a.page, 'new-scan').tap();
+  await by(a.page, 'mode-auto').tap();
+  await by(a.page, 'start-capture').tap();
+  await a.page.waitForFunction(() => document.querySelector('.capture')?.getAttribute('data-phase') === 'running', null, { timeout: 45000 });
+  check(!(await by(a.page, 'coverage').isVisible()), 'auto: no coverage ring before the mode is resolved');
+  await a.page.waitForFunction(() => Number(document.querySelector('[data-testid="kf-count"]')?.textContent) >= 9, null, { timeout: 60000 });
+  check(await by(a.page, 'coverage').isVisible(), "auto: the ring appears once the engine resolved 'object'");
+  await a.context.close();
+});
+
+await scenario('killed-dense', async () => {
+  const id = 'seed-killed-dense';
+  const { page, context } = await newPage();
+  // slow stages: the densify is still running when the page is killed
+  await page.goto(`${base}?mock=1&mockSpeed=0.3`);
+  await by(page, 'new-scan').waitFor();
+  await seedSession(page, { id, name: 'Stone wall', mode: 'scene', status: 'sparse', stats: { quality: 'fast', keyframes: 30 } });
+  await page.reload();
+  await by(page, 'session-item').first().tap();
+  await viewerLoaded(page);
+  await by(page, 'tool-build').tap();
+  await by(page, 'build-dense').tap();
+  await page.waitForSelector('[data-testid="stage-depth_maps"][data-status="active"]', { timeout: 20000 });
+  const open = await journal(page);
+  check(open?.step === 'densify' && open?.visible === true && open?.sessionId === id, `the run journal holds the running densify (${JSON.stringify(open)})`);
+  check(!(await by(page, 'processing-preview').getAttribute('data-light')), 'the first densify is not in light mode');
+  // the engine stored its first depth map (MockEngine: the resume marker in the scan record)
+  await until(async () => (await storedStats(page, id))?.denseResumablePass === 1, 20000, 'a stored depth map');
+  await killPage(page);
+  const card = by(page, 'run-interrupted');
+  await card.waitFor({ timeout: 15000 });
+  const text = (await card.textContent()) ?? '';
+  check(/Stone wall/.test(text) && /dense cloud/.test(text), `the card names the scan and the dense cloud ("${text}")`);
+  check((await card.getAttribute('data-kind')) === 'killed' && /while the app was open/.test(text), 'stopped while the app was open (killed, not evicted)');
+  await sleep(400);
+  await shot(page, 'state-killed-dense');
+  await audit(page, 'killed-dense card');
+  await by(page, 'run-interrupted-resume').tap();
+  await viewerLoaded(page);
+  await by(page, 'dense-resume').waitFor({ state: 'visible', timeout: 10000 });
+  check(true, 'Resume opens the viewer with its dense-resume card');
+  const acked = await journal(page);
+  check(acked?.kills?.densify === 1 && !acked?.interrupted && acked?.step === null, `the kill is counted and the card answered (${JSON.stringify(acked)})`);
+  await by(page, 'dense-resume-button').tap();
+  await page.waitForSelector('.processing', { timeout: 20000 });
+  check((await page.locator('.proc-title').textContent()) === 'Resuming dense cloud', 'the densify resumes from the saved depth maps');
+  check((await by(page, 'processing-preview').getAttribute('data-light')) === '1', 'the retry after the kill runs in light mode');
+  // (not the viewer screen still fading out)
+  await page.waitForSelector('.viewer-screen:not(.screen-exit)', { timeout: 120000 });
+  await viewerLoaded(page);
+  await sleep(500);
+  check(await by(page, 'dense-resume').isHidden(), 'the resumed densify completed (no resume offer)');
+  const done = await journal(page);
+  check(done?.step === null && !done?.kills?.densify, `the clean run closed the journal and reset the kill count (${JSON.stringify(done)})`);
+  await page.reload();
+  await by(page, 'session-item').first().waitFor();
+  await sleep(500);
+  check((await by(page, 'run-interrupted').count()) === 0, 'no card once the resumed run finished');
+  await context.close();
+});
+
+await scenario('killed-splat', async () => {
+  const id = 'seed-killed-splat';
+  const { page, context } = await newPage();
+  await page.goto(`${base}?mock=1&mockSpeed=0.25`);
+  await by(page, 'new-scan').waitFor();
+  await seedSession(page, { id, name: 'Garden bench', mode: 'object', status: 'meshed', stats: { quality: 'fast', keyframes: 24 } });
+  await page.reload();
+  await by(page, 'session-item').first().tap();
+  await viewerLoaded(page);
+  // (the 3D view is created after "Loading model…" hides: its module loads first)
+  await page.waitForFunction(() => !!globalThis.__sfmApp.debug.viewer, null, { timeout: 30000 });
+  const full = await viewerStats(page);
+  check(!!full && full.densePoints > 0 && full.triangles > 0, `the viewer shows the dense cloud and the mesh (${JSON.stringify(full)})`);
+  await by(page, 'tool-build').tap();
+  await by(page, 'build-splat').tap();
+  await by(page, 'splat-progress').waitFor({ state: 'visible', timeout: 10000 });
+  check((await journal(page))?.step === 'splat', 'the run journal holds the photoreal build');
+  check(!(await page.locator('.viewer-screen').getAttribute('data-light')), 'the first build is not in light mode');
+  check((await viewerStats(page))?.triangles === full?.triangles, 'the first build keeps the mesh');
+  // a checkpoint is stored (MockEngine: the scan record's splatResumableIteration)
+  await until(async () => (await storedStats(page, id))?.splatResumableIteration >= 500, 30000, 'a splat checkpoint');
+  await killPage(page);
+  const card = by(page, 'run-interrupted');
+  await card.waitFor({ timeout: 15000 });
+  const text = (await card.textContent()) ?? '';
+  check(/Garden bench/.test(text) && /photoreal model/.test(text) && (await card.getAttribute('data-kind')) === 'killed', `the card names the scan and the photoreal build ("${text}")`);
+  await sleep(400);
+  await shot(page, 'state-killed-splat');
+  await by(page, 'run-interrupted-resume').tap();
+  await viewerLoaded(page);
+  await by(page, 'splat-resume').waitFor({ state: 'visible', timeout: 10000 });
+  check(true, 'Resume opens the viewer with its splat-resume card');
+  await by(page, 'splat-resume-button').tap();
+  await by(page, 'splat-progress').waitFor({ state: 'visible', timeout: 10000 });
+  const firstText = await page.waitForFunction(() => {
+    const t = document.querySelector('[data-testid="splat-progress-text"]')?.textContent ?? '';
+    return /iterations/.test(t) ? t : null;
+  }, null, { timeout: 30000 });
+  const it0 = Number(((await firstText.jsonValue()) ?? '').replace(/,/g, '').match(/^(\d+)/)?.[1] ?? 0);
+  check(it0 >= 500, `the resumed build continues from the checkpoint (first progress at iteration ${it0})`);
+  check((await page.locator('.viewer-screen').getAttribute('data-light')) === '1', 'the rebuild after the kill runs in light mode');
+  const light = await viewerStats(page);
+  check(!!light && light.densePoints > 0 && light.densePoints <= 1_500_000 && light.triangles === 0, `light mode: ≤ 1.5 M points shown and no mesh (${JSON.stringify(light)})`);
+  const segs = await page.locator('[data-testid="layer-switch"] .segment').evaluateAll((els) => els.map((e) => e.dataset.value));
+  check(!segs.includes('mesh'), `no mesh layer offered during the light build (${segs})`);
+  await by(page, 'splat-progress').waitFor({ state: 'hidden', timeout: 90000 });
+  check(!(await page.locator('.viewer-screen').getAttribute('data-light')), 'light mode ends with the build');
+  const after = await viewerStats(page);
+  check(after?.densePoints === full?.densePoints && after?.triangles === full?.triangles, `the full cloud and the mesh are back (${JSON.stringify(after)})`);
+  const done = await journal(page);
+  check(done?.step === null && !done?.kills?.splat, `the finished build closed the journal and reset the kill count (${JSON.stringify(done)})`);
+  await page.reload();
+  await by(page, 'session-item').first().waitFor();
+  await sleep(500);
+  check((await by(page, 'run-interrupted').count()) === 0, 'no card once the resumed build finished');
+  await context.close();
+});
+
+await scenario('evicted-refine', async () => {
+  const { page, context } = await newPage();
+  await page.goto(`${base}?mock=1&mockSpeed=0.3`);
+  await by(page, 'new-scan').waitFor();
+  await seedSession(page, { id: 'seed-evicted', name: 'Back yard', mode: 'scene', status: 'captured', stats: { quality: 'fast', keyframes: 20 } });
+  await page.reload();
+  await by(page, 'session-item').first().tap();
+  await page.waitForSelector('[data-testid="stage-matching"][data-status="active"]', { timeout: 20000 });
+  check((await journal(page))?.step === 'refine', 'the run journal holds the running refine');
+  // the app goes to the background, and iOS evicts it there
+  await setPageHidden(page, true);
+  check((await journal(page))?.visible === false, 'the journal records that the page is hidden');
+  await killPage(page);
+  const card = by(page, 'run-interrupted');
+  await card.waitFor({ timeout: 15000 });
+  const text = (await card.textContent()) ?? '';
+  check(/Back yard/.test(text) && /in the background/.test(text) && (await card.getAttribute('data-kind')) === 'evicted', `the card says the run stopped in the background ("${text}")`);
+  await sleep(400);
+  await shot(page, 'state-evicted-refine');
+  await audit(page, 'evicted-refine card');
+  await by(page, 'run-interrupted-resume').tap();
+  await page.waitForSelector('.processing', { timeout: 20000 });
+  check((await page.locator('.proc-title').textContent()) === 'Reconstructing', 'Resume reconstructs the captured scan');
+  await page.waitForSelector('.viewer-screen:not(.screen-exit)', { timeout: 120000 });
+  const done = await journal(page);
+  check(done?.step === null && !done?.interrupted, `the refine finished and closed the journal (${JSON.stringify(done)})`);
+  await context.close();
+});
+
+await scenario('killed-splat-early', async () => {
+  const id = 'seed-killed-splat-early';
+  const { page, context } = await newPage();
+  // slow stages: the build is still preparing (no checkpoint) when the page is killed
+  await page.goto(`${base}?mock=1&mockSpeed=0.25`);
+  await by(page, 'new-scan').waitFor();
+  await seedSession(page, { id, name: 'Old gate', mode: 'object', status: 'sparse', stats: { quality: 'fast', keyframes: 24 } });
+  await page.reload();
+  await by(page, 'session-item').first().tap();
+  await viewerLoaded(page);
+  await by(page, 'tool-build').tap();
+  await by(page, 'build-splat').tap();
+  await by(page, 'splat-progress').waitFor({ state: 'visible', timeout: 10000 });
+  check((await journal(page))?.stage === 'splat_prepare', 'the run journal holds the preparing photoreal build');
+  await killPage(page);
+  check(typeof (await storedStats(page, id))?.splatResumableIteration !== 'number', 'no checkpoint was stored');
+  const card = by(page, 'run-interrupted');
+  await card.waitFor({ timeout: 15000 });
+  const text = (await card.textContent()) ?? '';
+  check(/or starts again if none was saved/.test(text) && !/lighter/.test(text), `the card promises no saved training and, for a sparse scan, no lighter view ("${text}")`);
+  await by(page, 'run-interrupted-resume').tap();
+  await viewerLoaded(page);
+  const hint = page.locator('.toast:not(.hide)', { hasText: 'before any training was saved' });
+  await hint.waitFor({ timeout: 10000 });
+  check(await by(page, 'splat-resume').isHidden(), 'nothing to resume: no splat-resume card');
+  await sleep(400);
+  await shot(page, 'state-killed-splat-early');
+  await hint.locator('.toast-action').tap();
+  await by(page, 'sheet-build').waitFor({ timeout: 5000 });
+  check((await by(page, 'build-splat').count()) === 1, 'the hint opens the Build sheet with the photoreal build');
   await context.close();
 });
 

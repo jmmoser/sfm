@@ -3,21 +3,27 @@
 export const USAGE = `usage: node e2e/run-e2e.mjs [object|yard|all|<dataset> ...] [options]
 
   --engine worker|inline|mock   engine back-end (default worker = EngineClient + engine worker)
-  --quality fast|balanced|max   quality preset (default fast)
-  --mode object|scene|auto      capture mode (default: object for object datasets, scene otherwise)
+  --quality fast|balanced|max   quality preset (default fast; a recording: its recorded preset)
+  --mode object|scene|auto      capture mode (default: object for object datasets, scene otherwise;
+                                a recording: its recorded mode)
   --stride N                    replay every Nth frame (default 1)
   --start N                     first frame (default 0)
   --max-frames N                deliver at most N frames
   --fps F                       simulated FramePump rate limit in Hz (drops frames closer than 1/F)
   --no-imu | --no-gps | --no-heading   withhold a sensor stream
-  --hfov DEG|gt|none            hfovPriorDeg passed to the engine (default 67.3, iPhone main camera)
+  --hfov DEG|gt|none            hfovPriorDeg passed to the engine (default 67.3, iPhone main camera;
+                                a recording: its recorded prior)
   --no-dense | --no-mesh        skip densify / mesh (mesh needs dense)
   --dense-size N                DenseOptions.maxImageSize       --dense-views N   DenseOptions.maxViews
   --mesh-voxel V                MeshOptions.voxelSize (world units) --mesh-triangles N MeshOptions.targetTriangles
+  --no-object-roi               MeshOptions.objectRoi = false: object mode meshes the whole scene (baseline for
+                                the object-box scores in metrics.json; the object-box checks are skipped)
   --splat                       Gaussian splatting after densify / mesh (after refine with --no-dense):
                                 engine.splat() → <dir>/splats.ply (scored by --nvs as the 'splat' renderer)
   --splat-iterations N          SplatOptions.iterations         --splat-max N   SplatOptions.maxGaussians
   --splat-size N                SplatOptions.maxImageSize       --splat-views N SplatOptions.maxViews
+  --splat-previews              SplatOptions.preview: the training snapshots → <dir>/previews/NNN-it<i>.png,
+                                arrival times and PSNR in result.json (splat.previews) and the summary
   --no-export | --export a,b    exports (sizes only); default: every applicable format
   --nvs                         novel-view evaluation of the output (e2e/nvs.mjs: held-out frames,
                                 PSNR / SSIM of the points / mesh renders) → <dir>/nvs/nvs.json
@@ -29,17 +35,31 @@ export const USAGE = `usage: node e2e/run-e2e.mjs [object|yard|all|<dataset> ...
   --no-thresholds               report the checks but never fail on them
   --enforce                     enforce thresholds also for --engine mock (off by default: mock metrics are meaningless)
   --mapping inline|background   src/engine EngineConfig.mapping (sent as engineConfig; default: engine default)
+  --extend-at F                 continue the capture after a simulated page reload (EngineOptions.extend): at
+                                fraction F (0 < F < 1) of the frames finishCapture + refine, re-init with
+                                resume + extend (persist on), the rest with every time rebased to start near 0
+  --extend-skip-s S             seconds of frames skipped after the --extend-at split (default 0)
   --mock-speed X                MockEngine time multiplier (default 4)
   --set key=json                any other harness config field by dotted path (e.g. --set timeouts.frameMs=600000)
   --quiet                       log every 10th frame only     --verbose   page console + Vite logs
-  --headed                      show the browser`;
+  --headed                      show the browser
+  --device desktop|phone|local-bridge
+                                where the harness runs (default desktop: headless Chromium here).
+                                phone: serve Vite on 0.0.0.0 with the HTTP bridge, print the URL to
+                                open in Safari on the phone, wait for its result, score it like a
+                                desktop run (HTTPS from E2E_HTTPS_CERT / E2E_HTTPS_KEY, or --public-url).
+                                local-bridge: the same, with headless Chromium here opening the URL.
+                                Output tag defaults to the device name (e.g. <dataset>-phone)
+  --public-url URL              phone: HTTPS tunnel URL forwarding to --port (Vite then listens on 127.0.0.1)
+  --port N                      phone / local-bridge: dev server port (default 5180 for phone, free for local-bridge)`;
 
 export class ArgError extends Error {}
 
 const ENGINES = ['worker', 'inline', 'mock'];
 const QUALITIES = ['fast', 'balanced', 'max'];
 const MODES = ['object', 'scene', 'auto'];
-const FORMATS = ['ply-points', 'ply-mesh', 'glb', 'colmap-zip', 'ply-splat'];
+const FORMATS = ['ply-points', 'ply-mesh', 'glb', 'colmap-zip', 'ply-splat', 'usdz', 'spz'];
+const DEVICES = ['desktop', 'phone', 'local-bridge'];
 
 function setPath(obj, path, val) {
   const ks = path.split('.');
@@ -51,12 +71,13 @@ function setPath(obj, path, val) {
 
 /**
  * Parse argv → { datasets, config (harness config without `dataset`), nvs, nvsViews, timeoutMin,
- * out, tag, thresholds, noThresholds, enforce, quiet, verbose, headed, help }.
+ * out, tag, thresholds, noThresholds, enforce, quiet, verbose, headed, help, device, publicUrl, port }.
  */
 export function parseArgs(argv) {
   const o = {
     datasets: [],
-    config: { engine: 'worker', quality: 'fast' },
+    // quality: the harness default ('fast'), or a recording's own preset
+    config: { engine: 'worker' },
     dense: true,
     mesh: true,
     denseOpts: {},
@@ -77,6 +98,9 @@ export function parseArgs(argv) {
     headed: false,
     help: false,
     sets: [],
+    device: 'desktop',
+    publicUrl: null,
+    port: null,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -128,11 +152,13 @@ export function parseArgs(argv) {
       case '--dense-views': o.denseOpts.maxViews = int(2); break;
       case '--mesh-voxel': o.meshOpts.voxelSize = num(0); break;
       case '--mesh-triangles': o.meshOpts.targetTriangles = int(4); break;
+      case '--no-object-roi': o.meshOpts.objectRoi = false; break;
       case '--splat': o.splat = true; break;
       case '--splat-iterations': o.splatOpts.iterations = int(1); break;
       case '--splat-max': o.splatOpts.maxGaussians = int(1000); break;
       case '--splat-size': o.splatOpts.maxImageSize = int(64); break;
       case '--splat-views': o.splatOpts.maxViews = int(2); break;
+      case '--splat-previews': o.splatOpts.preview = true; break;
       case '--no-export': o.exports = false; break;
       case '--export': {
         const v = next();
@@ -155,6 +181,20 @@ export function parseArgs(argv) {
       case '--enforce': o.enforce = true; break;
       case '--mock-speed': o.config.mockSpeed = num(0); break;
       case '--mapping': o.config.engineConfig = { ...(o.config.engineConfig ?? {}), mapping: oneOf(['inline', 'background']) }; break;
+      case '--extend-at': {
+        const s = next();
+        const v = Number(s);
+        if (!(v > 0 && v < 1)) throw new ArgError(`--extend-at needs a fraction in (0, 1), got ${s}`);
+        o.config.extendAt = v;
+        break;
+      }
+      case '--extend-skip-s': {
+        const s = next();
+        const v = Number(s);
+        if (!Number.isFinite(v) || v < 0) throw new ArgError(`--extend-skip-s needs seconds ≥ 0, got ${s}`);
+        o.config.extendSkipS = v;
+        break;
+      }
       case '--set': {
         const kv = next();
         const eq = kv.indexOf('=');
@@ -171,6 +211,26 @@ export function parseArgs(argv) {
       case '--quiet': o.quiet = true; break;
       case '--verbose': o.verbose = true; break;
       case '--headed': o.headed = true; break;
+      case '--device': o.device = oneOf(DEVICES); break;
+      case '--public-url': {
+        const v = next();
+        let u;
+        try {
+          u = new URL(v);
+        } catch {
+          throw new ArgError(`--public-url needs a URL, got ${v}`);
+        }
+        if (u.protocol !== 'https:' && u.protocol !== 'http:') throw new ArgError(`--public-url must be http(s), got ${v}`);
+        // the harness and the bridge are served at the origin's root
+        if (u.pathname !== '/' || u.search || u.hash) throw new ArgError(`--public-url must be an origin (https://host[:port]), got ${v}`);
+        o.publicUrl = u.origin;
+        break;
+      }
+      case '--port': {
+        o.port = int(1);
+        if (o.port > 65535) throw new ArgError(`--port needs 1–65535, got ${o.port}`);
+        break;
+      }
       case '--help':
       case '-h': o.help = true; break;
       default:
@@ -182,6 +242,9 @@ export function parseArgs(argv) {
   if (o.datasets.includes('all')) o.datasets = [...new Set(o.datasets.flatMap((d) => (d === 'all' ? ['object', 'yard'] : [d])))];
   for (const d of o.datasets) if (!/^[\w.-]+$/.test(d)) throw new ArgError(`bad dataset name ${d}`);
   if (o.tag !== null && !/^[\w.-]+$/.test(o.tag)) throw new ArgError('--tag must be a plain name');
+  if (o.device === 'desktop' && (o.publicUrl !== null || o.port !== null)) throw new ArgError('--public-url / --port need --device phone or local-bridge');
+  if (o.device === 'local-bridge' && o.publicUrl !== null) throw new ArgError('--public-url is for --device phone');
+  if (o.device === 'phone' && o.headed) throw new ArgError('--headed has no effect with --device phone');
   if (!o.dense && o.mesh) o.mesh = false; // mesh needs the dense cloud
   o.config.densify = o.dense ? (Object.keys(o.denseOpts).length ? { ...o.denseOpts } : true) : false;
   o.config.mesh = o.mesh ? (Object.keys(o.meshOpts).length ? { ...o.meshOpts } : true) : false;

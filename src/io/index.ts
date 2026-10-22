@@ -8,6 +8,7 @@ export {
   type PLYDecodeResult,
 } from './ply';
 export { encodeGLB, parseGLB, GLB_GENERATOR, type GLBInput, type GLBColorFormat, type ParsedGLB } from './glb';
+export { encodeUSDZ, buildUSDA, selectArPivot, usdString, USDZ_GENERATOR, USDZ_LAYER_NAME, type USDZInput, type ArPivotRoi } from './usdz';
 export {
   exportColmapText,
   importColmapText,

@@ -1,14 +1,22 @@
 // Evaluation of a reconstruction result against a synthetic dataset (pure; no fs).
 //
 // Result format: { intrinsics: {f,cx,cy,k1,k2}, images: [{index, pose: {R: number[9], t: number[3]}}],
-//   metric: {metric, gravityAligned, northAligned}, pointsFile?, numInputImages? }
+//   metric: {metric, gravityAligned, northAligned}, pointsFile?, numInputImages?,
+//   objectRoi?: {min, max, planeZ, centre, confidence} | null (the mesh's object box; null = none) }
 // Poses are world-to-camera (x_cam = R X + t), row-major, OpenCV camera frame.
+//
+// Focus-box scoring (object isolation; meta.focus = the box of the object alone, without the table):
+// `opts.focusPoints` (e.g. mesh.ply vertices) → `focus` {outsideFraction of meta.focus ± focusMargin
+// (2 cm), completeness of the gt_focus samples inside meta.focus}; `result.objectRoi` → `objectRoi`
+// {IoU with meta.focus, containsFocusShrunk: contains meta.focus shrunk by focusShrink (1 cm)}. Both
+// map the result through the camera-centre Sim3 first.
 
 import {
   applySim3,
   chordalMean,
   mat3Mul,
   mat3T,
+  mat3Vec,
   mean,
   percentile,
   rms,
@@ -62,7 +70,7 @@ function undistortRadius(k1, k2, rd) {
  * @param {object} dataset  { meta, frames, gt?: {points, normals?, visibility?}, gtFocus?: {...} }
  * @param {object} result   parsed result JSON
  * @param {object} [opts]   { points?: Float32Array, tau?, roi?: boolean, minVisibility?, denseAlign?: 'sim3'|'sim3+icp'|'se3'|'none',
- *                            maxPoints?, maxDistFactor? }
+ *                            maxPoints?, maxDistFactor?, focusPoints?: Float32Array, focusMargin?, focusShrink? }
  */
 export function computeMetrics(dataset, result, opts = {}) {
   const { meta, frames } = dataset;
@@ -208,14 +216,121 @@ export function computeMetrics(dataset, result, opts = {}) {
   // ---------------- dense ----------------
   out.dense = null;
   if (opts.points && dataset.gt) out.dense = denseMetrics(dataset, opts.points, sim, se3, opts);
+
+  // ---------------- focus box (object isolation) ----------------
+  out.focus = null;
+  if (opts.focusPoints && meta.focus && sim) out.focus = focusBoxMetrics(dataset, opts.focusPoints, sim, opts);
+  out.objectRoi = null;
+  if (result.objectRoi !== undefined && meta.focus && sim) out.objectRoi = objectRoiMetrics(meta.focus, result.objectRoi, sim, opts);
   return out;
+}
+
+function denseTauOf(meta, opts) {
+  return opts.tau ?? meta.denseTau ?? (meta.scene === 'object' ? 0.01 * meta.sceneExtent : 0.1);
+}
+
+/**
+ * Points (result frame, mapped by `sim`) against meta.focus: the fraction outside the box grown by
+ * `focusMargin` (default 0.02 m), and the completeness of the gt_focus samples (visible) inside
+ * meta.focus: a result point within tau.
+ */
+export function focusBoxMetrics(dataset, rawPoints, sim, opts = {}) {
+  const { meta } = dataset;
+  const box = meta.focus;
+  const margin = opts.focusMargin ?? 0.02;
+  const tau = denseTauOf(meta, opts);
+  const grown = { min: box.min.map((v) => v - margin), max: box.max.map((v) => v + margin) };
+  const n = Math.floor(rawPoints.length / 3);
+  const P = new Float64Array(3 * n);
+  let m = 0;
+  let outside = 0;
+  for (let i = 0; i < n; i++) {
+    const p0 = [rawPoints[3 * i], rawPoints[3 * i + 1], rawPoints[3 * i + 2]];
+    if (!Number.isFinite(p0[0] + p0[1] + p0[2])) continue;
+    const p = applySim3(sim, p0);
+    P[3 * m] = p[0];
+    P[3 * m + 1] = p[1];
+    P[3 * m + 2] = p[2];
+    m++;
+    if (!inBox(grown, p[0], p[1], p[2])) outside++;
+  }
+  let nEval = 0;
+  let covered = 0;
+  const gt = dataset.gtFocus;
+  if (gt && m > 0) {
+    const grid = new HashGrid(P.subarray(0, 3 * m), tau);
+    const minVis = opts.minVisibility ?? 1;
+    const nG = gt.points.length / 3;
+    for (let i = 0; i < nG; i++) {
+      if (gt.visibility && gt.visibility[i] < minVis) continue;
+      const x = gt.points[3 * i], y = gt.points[3 * i + 1], z = gt.points[3 * i + 2];
+      if (!inBox(box, x, y, z)) continue;
+      nEval++;
+      if (grid.hasWithin(x, y, z, tau)) covered++;
+    }
+  }
+  return {
+    margin,
+    tau,
+    numPoints: m,
+    numOutside: outside,
+    outsideFraction: m ? outside / m : null,
+    numGtEvaluated: nEval,
+    completeness: nEval ? covered / nEval : null,
+  };
+}
+
+/**
+ * The engine's object box (result frame: an AABB, mapped by `sim` to an oriented box) against the
+ * GT focus box: IoU (the intersection from `grid`³ samples of the focus box, the volumes exact),
+ * the share of the focus box it covers, and whether it contains the focus box shrunk by
+ * `focusShrink` (default 0.01 m) per side.
+ * `roi` null (no box was proposed) → { present: false, iou: 0, … }.
+ */
+export function objectRoiMetrics(focus, roi, sim, opts = {}) {
+  const shrink = opts.focusShrink ?? 0.01;
+  if (!roi) return { present: false, iou: 0, focusCoverage: 0, containsFocusShrunk: false, shrink, confidence: null, planeZGt: null };
+  const RT = mat3T(sim.R);
+  // GT point → result frame: p = Rᵀ (q − t) / s
+  const toResult = (q) => mat3Vec(RT, [q[0] - sim.t[0], q[1] - sim.t[1], q[2] - sim.t[2]]).map((v) => v / sim.s);
+  const inRoi = (q) => {
+    const p = toResult(q);
+    return inBox(roi, p[0], p[1], p[2]);
+  };
+  const vol = (b) => Math.max(0, b.max[0] - b.min[0]) * Math.max(0, b.max[1] - b.min[1]) * Math.max(0, b.max[2] - b.min[2]);
+  const volF = vol(focus);
+  const volR = vol(roi) * sim.s ** 3;
+  const N = opts.grid ?? 48;
+  const at = (a, f) => focus.min[a] + ((f + 0.5) / N) * (focus.max[a] - focus.min[a]);
+  let hits = 0;
+  for (let i = 0; i < N; i++)
+    for (let j = 0; j < N; j++)
+      for (let k = 0; k < N; k++) if (inRoi([at(0, i), at(1, j), at(2, k)])) hits++;
+  const coverage = hits / N ** 3;
+  const inter = coverage * volF;
+  const union = volF + volR - inter;
+  let contains = true;
+  for (let c = 0; c < 8 && contains; c++) {
+    const q = [0, 1, 2].map((a) => ((c >> a) & 1 ? focus.max[a] - shrink : focus.min[a] + shrink));
+    if (!inRoi(q)) contains = false;
+  }
+  const pivot = applySim3(sim, [0.5 * (roi.min[0] + roi.max[0]), 0.5 * (roi.min[1] + roi.max[1]), roi.planeZ]);
+  return {
+    present: true,
+    iou: union > 0 ? inter / union : 0,
+    focusCoverage: coverage,
+    containsFocusShrunk: contains,
+    shrink,
+    confidence: roi.confidence,
+    planeZGt: pivot[2],
+  };
 }
 
 const DENSE_ALIGN_MODES = ['sim3', 'sim3+icp', 'se3', 'none'];
 
 function denseMetrics(dataset, rawPoints, sim, se3, opts) {
   const { meta } = dataset;
-  const tau = opts.tau ?? meta.denseTau ?? (meta.scene === 'object' ? 0.01 * meta.sceneExtent : 0.1);
+  const tau = denseTauOf(meta, opts);
   const useRoi = opts.roi !== false && meta.roi;
   const minVis = opts.minVisibility ?? 1;
   const mode = opts.denseAlign ?? 'sim3';
@@ -423,6 +538,18 @@ export function formatTable(m) {
     add('precision (< tau)', m.dense.precision);
     add(`completeness (${m.dense.completenessSet})`, m.dense.completeness);
     add('F-score', m.dense.fscore);
+  }
+  if (m.focus) {
+    add(`focus box: points outside ± ${fmt(m.focus.margin, 3)} m`, m.focus.outsideFraction);
+    add('focus box: completeness (gt_focus in the box)', m.focus.completeness);
+  }
+  if (m.objectRoi) {
+    if (!m.objectRoi.present) add('object box', 'none');
+    else {
+      add('object box IoU with the focus box', m.objectRoi.iou);
+      add(`object box contains the focus box − ${fmt(m.objectRoi.shrink, 3)} m`, String(m.objectRoi.containsFocusShrunk));
+      add('object box confidence', m.objectRoi.confidence);
+    }
   }
   const w = Math.max(...rows.map((r) => r[0].length));
   return rows.map(([k, v]) => `${k.padEnd(w)}  ${v}`).join('\n');

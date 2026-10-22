@@ -1,7 +1,12 @@
 /**
  * App shell: owns the engine (EngineClient or MockEngine), the session store, the shared
- * capture configuration and results, and hosts the screens behind the pure navigation state
+ * capture configuration and results, the raw capture recorder of a running scan (developer
+ * option, ./recorder.ts, loaded on demand), and hosts the screens behind the pure navigation state
  * machine of router.ts. Single document, no History API (see router.ts).
+ *
+ * Also owns the run journal (run-journal.ts): at start it classifies a long run that never ended
+ * (killed while visible / stopped in the background) for Home's "run interrupted" card, and it
+ * feeds the journal the page's visibility (visibilitychange, pagehide / pageshow) while a run is open.
  */
 import type { PointCloud, TriangleMesh } from '../core/types';
 import { SessionStore, type SessionMeta, type SessionPatch } from '../io/storage';
@@ -25,7 +30,9 @@ import { createHomeScreen } from './screens/home';
 import { createProcessingScreen } from './screens/processing';
 import { createSetupScreen } from './screens/setup';
 import { createViewerScreen } from './screens/viewer';
+import { RunJournal } from './run-journal';
 import { prefetchViewer } from './viewer-loader';
+import type { CaptureRecorder, RecorderStartInfo } from './recorder';
 
 export interface Screen {
   readonly el: HTMLElement;
@@ -54,6 +61,11 @@ export interface CaptureConfig {
   /** Capture shows the live point cloud full screen, following the phone, instead of the camera preview. */
   cloudView: boolean;
   /**
+   * Developer option: record every frame sent to the engine (≤ 1280 px JPEG + the FrameInput
+   * verbatim) for desktop replay (./recorder.ts; export / delete in Diagnostics). Default off.
+   */
+  recordRaw: boolean;
+  /**
    * Version of the stored defaults. Options saved before version 2 kept `videoFrameGrab: false`
    * from when it was opt-in: they get the current default once.
    */
@@ -75,6 +87,13 @@ export interface Results {
   liveSparse: { positions: Float32Array; colors: Uint8Array } | null;
   liveCameras: LiveCamera[] | null;
   stats: Record<string, number | string>;
+  /**
+   * Set by ensureSessionLoaded: the scan has keyframes its stored model does not cover (loadSession
+   * status 'capturing' / 'captured' with a model — a continued capture not processed yet). It is to
+   * be processed, not shown as built: its old model is only the preview (`liveSparse`), not `sparse`.
+   * Cleared by the refine.
+   */
+  toProcess?: { status: 'capturing' | 'captured'; numFrames: number };
 }
 
 export interface AppState {
@@ -114,6 +133,8 @@ export class App {
   readonly mock: boolean;
   readonly store: Store<AppState>;
   readonly wakeLock = new WakeLock();
+  /** The long run in progress (localStorage): written by Processing / the viewer's photoreal build. */
+  readonly journal = RunJournal.local();
   config: CaptureConfig;
   results: Results;
   /** Session whose state the engine currently holds (init or loadSession). */
@@ -137,6 +158,10 @@ export class App {
   /** Bumped by each ensureSessionLoaded and by what supersedes it (new scan, release, delete): a stale load is not applied. */
   private loadSeq = 0;
   private permissions: Promise<CapturePermissionStatus> | null = null;
+  /** Raw capture recorder of the running scan (startRecording). */
+  private recorder: CaptureRecorder | null = null;
+  /** Bumped by each startRecording / stopRecording: a start still opening when superseded stops its recorder. */
+  private recordSeq = 0;
   private sessionsP: Promise<SessionStore | null> | null = null;
   private screen: Screen | null = null;
   private readonly host: HTMLElement;
@@ -145,6 +170,8 @@ export class App {
     this.root = root;
     this.engine = opts.engine;
     this.mock = !!opts.mock;
+    // a run still open in the journal was stopped by a kill / eviction: Home reports it
+    this.journal.recover();
     this.config = loadConfig();
     this.results = App.emptyResults(this.config);
     const env = detectEnvironment();
@@ -174,7 +201,13 @@ export class App {
     });
 
     // Workers cannot see page visibility; iOS drops GPU work submitted while hidden.
-    document.addEventListener('visibilitychange', () => this.engine.setHidden(document.hidden));
+    document.addEventListener('visibilitychange', () => {
+      this.engine.setHidden(document.hidden);
+      // a run stopped while hidden was evicted, not killed in front of the user
+      this.journal.setVisible(!document.hidden);
+    });
+    window.addEventListener('pagehide', (e: PageTransitionEvent) => this.journal.pageHide(e.persisted));
+    window.addEventListener('pageshow', () => this.journal.pageShow());
     // Desktop / Android: the browser Back button or closing the tab would silently drop a running
     // capture or processing job (there is no History API state to go back to) — ask first.
     // (iOS Safari shows no beforeunload prompt; the capture itself is persisted as it goes.)
@@ -336,6 +369,52 @@ export class App {
     return p;
   }
 
+  // ---- raw capture recorder (Setup › Options › Record raw capture; ./recorder.ts) -------------------
+
+  /**
+   * Record the frames the engine gets from now on (a FrameTap on the engine) until
+   * stopRecording. Never throws: when it cannot record (no OPFS / IndexedDB, too little storage)
+   * a toast says why and the scan goes on without it. The module is loaded on demand. A start
+   * superseded while it opens (stopRecording — the capture closed — or a newer start) never
+   * installs its recorder: it is stopped once open.
+   */
+  async startRecording(info: RecorderStartInfo): Promise<void> {
+    await this.stopRecording();
+    const my = ++this.recordSeq;
+    try {
+      const { CaptureRecorder } = await import('./recorder');
+      if (my !== this.recordSeq) return;
+      const rec = await CaptureRecorder.start(info, {
+        onStop: (reason, auto) => {
+          if (this.recorder === rec) {
+            this.recorder = null;
+            this.engine.setFrameTap(null);
+          }
+          if (auto) toast(`Raw capture recording stopped: ${reason}. The scan continues.`, { tone: 'warn', durationMs: 7000 });
+        },
+      });
+      if (my !== this.recordSeq) {
+        await rec.stop('the capture ended while the recording started').catch((e: unknown) => console.warn('[app] stopping the recorder failed', e));
+        return;
+      }
+      this.recorder = rec;
+      this.engine.setFrameTap(rec);
+      toast('Recording raw capture — export or delete it in Diagnostics.', { tone: 'info', icon: 'storage' });
+    } catch (e) {
+      if (my === this.recordSeq) toast(`Raw capture recording is off: ${(e as Error)?.message ?? e}`, { tone: 'warn', durationMs: 7000 });
+    }
+  }
+
+  /** End the running recording (its last frames are written first), or the start still opening. */
+  async stopRecording(): Promise<void> {
+    this.recordSeq++;
+    const rec = this.recorder;
+    if (!rec) return;
+    this.recorder = null;
+    this.engine.setFrameTap(null);
+    await rec.stop().catch((e: unknown) => console.warn('[app] stopping the recorder failed', e));
+  }
+
   /** Begin a new scan from the Setup screen's tap handler. */
   startNewScan(): void {
     const id = this.env.indexedDB ? newSessionId() : null;
@@ -344,6 +423,28 @@ export class App {
     this.loadedSessionId = null;
     this.loadSeq++;
     this.navigate({ type: 'START_CAPTURE', sessionId: id });
+  }
+
+  /**
+   * Continue the capture of the stored scan `sessionId` ("Add more views" / "Continue scanning";
+   * from the tap that called requestCapturePermissions). The page lets go of the scan's dense
+   * cloud, mesh and splat info (the capture needs the memory and the next refine replaces them; a
+   * capture stopped without new views loads the scan again); its sparse model stays for the
+   * capture's preview.
+   */
+  startExtendScan(sessionId: string): boolean {
+    if (!nextRoute(this.route, { type: 'EXTEND_CAPTURE', sessionId })) return false;
+    this.loadSeq++; // a load still running is superseded by the capture's engine init
+    if (this.results.sessionId === sessionId) {
+      this.results.dense = null;
+      this.results.mesh = null;
+      this.results.splat = null;
+      delete this.results.toProcess;
+    } else {
+      this.results = { ...App.emptyResults(this.config), sessionId };
+      this.loadedSessionId = null;
+    }
+    return this.navigate({ type: 'EXTEND_CAPTURE', sessionId });
   }
 
   // ---- sessions -----------------------------------------------------------------------------------
@@ -413,6 +514,7 @@ export class App {
     // later engine restart may replay its init (`resume` would re-create the deleted scan).
     await this.engine.closeSession(id).catch(() => undefined);
     if (this.loadedSessionId === id) this.loadedSessionId = null;
+    this.journal.forget(id);
     try {
       await s.deleteSession(id);
       if (this.results.sessionId === id) this.results = App.emptyResults(this.config);
@@ -448,6 +550,9 @@ export class App {
    * Make the engine hold `sessionId` (loadSession when it holds another one) and copy the
    * stored models into `results`. Returns false when it failed (a toast explains) or was
    * superseded before it ended (another scan opened, a new scan, a release): its result is dropped.
+   * The engine's status wins over the session record's: a continued capture whose new keyframes
+   * the page never recorded (killed, or a frame answered after Stop) is still processed/sparse/
+   * meshed in the record — it is set back to the capture to process (`results.toProcess`).
    */
   async ensureSessionLoaded(sessionId: string | null): Promise<boolean> {
     if (!sessionId || this.loadedSessionId === sessionId) return true;
@@ -468,6 +573,18 @@ export class App {
         splat: sum.splat ?? null,
         stats: sum.stats,
       };
+      if ((sum.status === 'capturing' || sum.status === 'captured') && sum.sparse) {
+        const r = this.results;
+        r.toProcess = { status: sum.status, numFrames: sum.numFrames };
+        r.liveSparse = { positions: sum.sparse.points.positions, colors: sum.sparse.points.colors };
+        r.liveCameras = sum.sparse.cameras.map((c) => ({ pose: c.pose, intrinsics: c.intrinsics, ...(c.upCam ? { upCam: c.upCam } : {}) }));
+        r.sparse = null;
+        const cur = await this.sessions()
+          .then((s) => s?.getSession(sessionId) ?? null)
+          .catch(() => null);
+        if (cur && cur.status !== sum.status && cur.status !== 'capturing' && cur.status !== 'captured') await this.updateSession(sessionId, { status: sum.status });
+        if (seq !== this.loadSeq) return false;
+      }
       return true;
     } catch (e) {
       if (seq !== this.loadSeq) return false;

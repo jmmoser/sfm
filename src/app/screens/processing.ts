@@ -3,6 +3,12 @@
  * six stages (Matching, Reconstruction, Alignment, Depth maps, Fusion, Meshing) with per-stage
  * progress bars, elapsed time and an ETA, a live 3D preview of the sparse model, and Cancel.
  * Continues to the Viewer when done. Holds the wake lock (iOS suspends a hidden page).
+ *
+ * Each step of a stored scan is a run in the run journal (src/app/run-journal.ts: begun at the
+ * step's start, its stage on progress, ended on success / cancel / error or when the screen is
+ * left), so a kill shows Home's "run interrupted" card on the next launch. A densify / mesh after a
+ * kill of that step runs in light mode: the preview shows at most LIGHT_MODE_MAX_POINTS of the
+ * dense cloud (`data-light` on the preview); the engine's plan is unchanged.
  */
 import type { PointCloud, ProgressEvent } from '../../core/types';
 import type { Viewer } from '../../viewer';
@@ -19,6 +25,7 @@ import type { ProcessingStep, Route } from '../router';
 import { STAGES, estimateRemainingMs, stageIdFor, stageWeights, type StageId, type StageState } from '../stages';
 import { decimate } from './capture';
 import { clearDenseResume as clearResumeMarkers, clearSplatResume, denseResumable } from '../model-info';
+import { LIGHT_MODE_MAX_POINTS, type RunHandle } from '../run-journal';
 
 interface StageRow {
   el: HTMLElement;
@@ -50,7 +57,9 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
   /** Stages of steps that are not part of this run: already built earlier ('done', no time) or not requested ('skipped'). */
   function initStates(): void {
     const r = app.results;
-    const built: Record<ProcessingStep, boolean> = resultsStale ? { refine: false, densify: false, mesh: false } : { refine: !!r.sparse, densify: !!r.dense, mesh: !!r.mesh };
+    // (a refine — also again, after "Add more views" — replaces every later stage)
+    const built: Record<ProcessingStep, boolean> =
+      resultsStale || steps.includes('refine') ? { refine: false, densify: false, mesh: false } : { refine: !!r.sparse, densify: !!r.dense, mesh: !!r.mesh };
     for (const s of STAGES) {
       const run = steps.includes(s.step);
       states.set(s.id, { id: s.id, status: run ? 'pending' : built[s.step] ? 'done' : 'skipped', progress: run ? 0 : 1, startedAt: null, endedAt: null });
@@ -61,6 +70,38 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
   /** The dense cloud was (re)built, or refine invalidated the stored depth maps: nothing to resume. */
   function clearDenseResume(): void {
     clearResumeMarkers(app.results.stats);
+  }
+
+  /** The run journal's entry of the step running now (stored scans only: route.sessionId). */
+  let journalRun: RunHandle | null = null;
+  function endRun(outcome: 'done' | 'stopped'): void {
+    journalRun?.end(outcome);
+    journalRun = null;
+  }
+  /** Light mode of the running densify / mesh (a run of that step was killed): a lighter preview. */
+  let light = false;
+  /** The light-mode subset of the dense cloud shown (kept while light: not decimated twice; dropped when light ends). */
+  let lightView: { src: PointCloud; pc: PointCloud } | null = null;
+  /** Light mode for step `s` of this scan; true when it changed (the preview must be shown again). */
+  function setLight(s: ProcessingStep): boolean {
+    const on = s !== 'refine' && !!route.sessionId && app.journal.lightMode(route.sessionId, s);
+    if (on === light) return false;
+    light = on;
+    if (on) preview.dataset.light = '1';
+    else {
+      delete preview.dataset.light;
+      lightView = null;
+    }
+    return true;
+  }
+  /** What the preview shows of the dense cloud: in light mode at most LIGHT_MODE_MAX_POINTS. */
+  function previewCloud(dense: PointCloud): PointCloud {
+    if (!light) return dense;
+    if (lightView?.src !== dense) {
+      const dec = decimate(dense.positions, dense.colors, LIGHT_MODE_MAX_POINTS);
+      lightView = { src: dense, pc: dec.positions === dense.positions ? dense : { count: dec.positions.length / 3, positions: dec.positions, colors: dec.colors } };
+    }
+    return lightView.pc;
   }
 
   // ---- DOM ---------------------------------------------------------------------------------------
@@ -175,6 +216,7 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
     const id = stageIdFor(e.stage) ?? DEFAULT_STAGE[step];
     const def = STAGES.find((s) => s.id === id)!;
     if (def.step !== step) return; // a stage of another step: ignore
+    journalRun?.stage(id);
     setActive(id);
     const st = states.get(id)!;
     st.progress = e.progress;
@@ -235,9 +277,12 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
       const v = ensureViewer();
       if (!v) return;
       v.setWorldUp(r.sparse?.metric.gravityAligned ? 'z' : 'auto');
-      v.setPointCloud(r.dense);
+      // light mode: a subset of a large cloud (the full one is not uploaded to the GPU)
+      const shown = previewCloud(r.dense);
+      if (shown !== r.dense) v.setPointCloud(shown, { pointSizePx: 2.5, splats: false });
+      else v.setPointCloud(r.dense);
       if (r.sparse) v.setCameras(r.sparse.cameras.map((c) => ({ pose: c.pose, intrinsics: c.intrinsics, upCam: c.upCam })), false);
-      previewCaption.textContent = `Dense cloud · ${formatCount(r.dense.count)} points`;
+      previewCaption.textContent = `Dense cloud · ${formatCount(r.dense.count)} points${shown !== r.dense ? ` (${formatCount(shown.count)} shown)` : ''}`;
     } else if (r.sparse) {
       const v = ensureViewer();
       if (!v) return;
@@ -281,6 +326,8 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
       initStates();
       for (const st of STAGES) renderStage(st.id);
     }
+    // (light mode of the first step before the preview: the full cloud is not uploaded first)
+    setLight(steps[0]);
     showPreview();
     let step: ProcessingStep | null = null;
     try {
@@ -293,6 +340,8 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
           return;
         }
         step = s;
+        if (s !== 'refine' && setLight(s)) showPreview();
+        journalRun = route.sessionId ? app.journal.begin({ sessionId: route.sessionId, name: app.results.name, step: s, stage: DEFAULT_STAGE[s], quality }) : null;
         if (s === 'refine') {
           setActive('matching');
           renderStage('matching');
@@ -301,10 +350,15 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
           app.results.sparse = sparse;
           app.results.stats = { ...app.results.stats, ...sparse.stats };
           clearDenseResume(); // refine deletes the depth maps of the old poses
-          // … and the splats + their checkpoints (trained for the old poses)
+          // … the dense cloud and mesh of a refine run again ("Add more views"), and the splats +
+          // their checkpoints (trained for the old poses)
+          app.results.dense = null;
+          app.results.mesh = null;
           app.results.splat = null;
+          delete app.results.toProcess;
           clearSplatResume(app.results.stats);
           completeStep('refine');
+          endRun('done');
           showPreview();
           void app.updateSession(route.sessionId, { status: 'sparse', stats: { ...numericStats(sparse.stats), splatGaussians: 0 } });
         } else if (s === 'densify') {
@@ -317,7 +371,11 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
           app.results.mesh = null; // the engine dropped the mesh of the previous cloud
           app.results.stats = { ...app.results.stats, denseQuality: quality };
           clearDenseResume();
+          // the engine dropped the splat checkpoints of the previous cloud (a new run: no resume /
+          // continue); the stored splat model stays
+          clearSplatResume(app.results.stats);
           completeStep('densify');
+          endRun('done');
           showPreview();
           void app.updateSession(route.sessionId, { status: 'dense', stats: { densePoints: dense.count, denseQuality: quality } });
         } else {
@@ -328,11 +386,13 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
           app.results.mesh = mesh;
           app.results.stats = { ...app.results.stats, meshQuality: quality };
           completeStep('mesh');
+          endRun('done');
           void app.updateSession(route.sessionId, { status: 'meshed', stats: { triangles: mesh.triangleCount, meshQuality: quality } });
         }
       }
     } catch (e) {
       running = false;
+      endRun('stopped');
       // An interrupted densify of a stored scan continues from its saved depth maps next time
       // (the viewer offers "Resume dense reconstruction").
       // The run's preset is kept with the marker: a resume must use it (another one starts over).
@@ -472,6 +532,8 @@ export function createProcessingScreen(app: App, route: Extract<Route, { screen:
     },
     leave() {
       closed = true;
+      // left while a step runs (Stop that the engine did not acknowledge): not an interruption
+      endRun('stopped');
       viewer?.dispose();
       viewer = null;
       d.dispose();

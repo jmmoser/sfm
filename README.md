@@ -28,8 +28,11 @@ geo-referenced point cloud and mesh that you can measure and export.
 * **Viewer**: the trained splats drawn with the trainer's own WebGPU rasteriser, a three.js point
   view with eye-dome lighting, an unlit mesh view, camera frustums, and a tap-to-measure tool
   (metric when scale is known).
-* **Exports**: PLY (points, mesh, and Gaussian splats in the common 3DGS layout), GLB, and a COLMAP
-  text model with images in a ZIP. Exports go through the iOS share sheet.
+* **Exports**: PLY (points, mesh, and Gaussian splats in the common 3DGS layout), compact SPZ
+  splats (about 4× smaller than the PLY), GLB, USDZ (the textured mesh for AR Quick Look: "View in
+  AR" places it at its measured size in iPhone / iPad Safari), a COLMAP text model with images in a
+  ZIP, and a 6–10 s fly-through MP4 of the splats along the capture path (H.264, encoded on the
+  phone). Exports go through the iOS share sheet.
 * **Robust on iPhone**:
   * Memory planner that keeps the tab within ≤ 1.2 GB (iOS kills it at ~1.5–2 GB), with resume
     after the tab is killed.
@@ -47,14 +50,18 @@ and geolocation need a secure context.
    web app is persistent; a Safari tab's storage can be evicted after 7 days without use.
 2. Tap **New scan**, then choose:
    * **Object**: move slowly around it at a roughly constant distance, keeping ~70 % overlap. Cover
-     it from 2–3 heights.
+     it from 2–3 heights. A coverage ring at the bottom left fills in as you go — which sides and
+     heights already have photos, with a dot where the phone is — and says what is missing: walk to
+     the other side, then raise the phone for a second loop looking down. The hint above **Finish**
+     shows the coverage (e.g. "Coverage 62 % · top not captured"); it is advice, Finish always works.
    * **Large area**: walk slowly and sidestep rather than only turning on the spot. Look at
      structures from several places and come back to the start (loop closure). GPS adds scale and
      geo-referencing.
-   * **Auto**: lets the app decide.
+   * **Auto**: lets the app decide (the coverage ring appears once it has decided on an object).
    * **Quality**: *Fast / Balanced / Max* trades processing time and memory for resolution.
 3. Tap **Start**. iOS asks for motion access, then camera, then location. Follow the on-screen
-   guidance, and tap **Finish** when the live model covers what you need.
+   guidance, and tap **Finish** when the live model covers what you need. In a dark room the
+   guidance says so and points at the torch button.
    Tap the 3D thumbnail, or the cube button at the top right, to swap the camera preview for the
    live point cloud, full screen and seen from where the phone is. The view moves with every
    tracked frame, and the gyroscope keeps it turning smoothly in between. Drag to look around the
@@ -113,12 +120,24 @@ To test on a phone you need HTTPS. Either:
   workflow in `.github/workflows/pages.yml` deploys `dist/`, or
 * run `npm run dev` behind any HTTPS tunnel.
 
+To run the engine harness on an iPhone and score it on the computer, use
+`node e2e/run-e2e.mjs object-real --device phone --splat` with an mkcert certificate
+(`E2E_HTTPS_CERT` / `E2E_HTTPS_KEY`) or `--public-url` of a tunnel, and open the printed `/__e2e/go` link in
+Safari. Logs, PLY files and the result come back through a dev-server bridge, and the run is scored like a
+desktop run (e2e/README.md "On a real iPhone").
+
 Scans (photos, models, GPS fixes) live in the origin's IndexedDB. On a shared origin such as
 `<user>.github.io/<repo>/`, every other project of that user can read them, so give a real deployment its
 own origin (custom domain). The production build ships only the app (the e2e harness pages are dev-server
 only), with a Content-Security-Policy and a versioned service worker (offline after the first visit).
 
-CI (`.github/workflows/ci.yml`) runs typecheck, unit tests and the build.
+CI (`.github/workflows/ci.yml`) runs typecheck, unit tests and the build on pushes to `main` and `claude/**` and
+on pull requests.
+The nightly workflow (`.github/workflows/nightly.yml`, scheduled or started by hand) runs the slow tier: the
+SwiftShader GPU tests in 6 shards (with a cached 40-frame `e2e/data/object`, so the engine worker test in
+`src/engine/engine.gpu.test.ts` runs instead of skipping), a mock-engine e2e smoke on 40-frame datasets
+(desktop runner and the phone bridge, `--device local-bridge`) and `npm run ui:smoke`. It installs Playwright's Chromium with
+`node e2e/ensure-chromium.mjs` unless the runner already has it (`PLAYWRIGHT_BROWSERS_PATH`).
 
 ### End-to-end evaluation with ground truth
 
@@ -135,6 +154,7 @@ node e2e/run-splat-gt.mjs object-real --cloud <dense-gt ply> --sparse 20000   # 
 npm run ui:smoke                     # full UI flow with the mock engine at iPhone size
 node e2e/ui/states.mjs               # UI edge states; also e2e/ui/layouts.mjs (sizes), bench.mjs
 E2E_GPU=host node e2e/ui/splat-shots.mjs <e2e run dir>   # viewer screenshots of a real run: splats / points / mesh
+E2E_GPU=host node e2e/ui/flythrough.mjs <e2e run dir>    # fly-through MP4 of a real run (API + UI), decoded and scored
 ```
 
 See [`e2e/README.md`](e2e/README.md) for options, dataset layout, metrics and recorded results.
@@ -186,7 +206,8 @@ UI ◀──────── progress / results ──────────
                                               │ geometric) → fusion → filters → TSDF mesh
                                               │ splat: dense cloud → 3D Gaussians → WebGPU training
                                               │ (MCMC, colour correction, depth supervision)
-                                              └ exports: PLY · splat PLY · GLB · COLMAP ZIP
+                                              └ exports: PLY · splat PLY / SPZ · GLB · USDZ · COLMAP ZIP
+                                                (fly-through MP4: rendered in the page from the viewer)
 ```
 
 * [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): goals, conventions, module contracts and

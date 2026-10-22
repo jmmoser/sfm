@@ -1,6 +1,23 @@
 import { describe, expect, it } from 'vitest';
-import type { SparseResult } from '../workers/protocol';
-import { builtQuality, clearDenseResume, clearSplatResume, denseResumable, denseResumeQuality, memoryStatRows, northInfo, splatProgressView, splatResumable, splatResumeQuality } from './model-info';
+import type { SparseResult, SplatResult } from '../workers/protocol';
+import {
+  builtQuality,
+  clearDenseResume,
+  clearSplatResume,
+  denseResumable,
+  denseResumeQuality,
+  memoryStatRows,
+  northInfo,
+  splatBuildResume,
+  splatContinuable,
+  splatInterruptedStats,
+  splatIterationsText,
+  splatPreviewCaption,
+  splatProgressView,
+  splatResumable,
+  splatResumeQuality,
+  splatUseNow,
+} from './model-info';
 
 const sparse = { points: { count: 0, positions: new Float32Array(0), colors: new Uint8Array(0) }, cameras: [], stats: {} } as unknown as SparseResult;
 const cloud = { count: 1, positions: new Float32Array(3), colors: new Uint8Array(3) };
@@ -97,7 +114,7 @@ describe('splat resume / progress', () => {
     expect(splatResumeQuality({ stats: { splatResumableQuality: 'max' } })).toBe('max');
     expect(splatResumeQuality({ stats: { splatInterruptedQuality: 'fast', splatResumableQuality: 'max' } })).toBe('fast');
     expect(splatResumeQuality({ stats: {} })).toBeNull();
-    const st: Record<string, number | string> = { splatResumableIteration: 5, splatResumableQuality: 'max', splatInterrupted: 1, splatInterruptedQuality: 'fast', keyframes: 3 };
+    const st: Record<string, number | string> = { splatResumableIteration: 5, splatResumableQuality: 'max', splatContinuesModel: 1, splatInterrupted: 1, splatInterruptedQuality: 'fast', keyframes: 3 };
     clearSplatResume(st);
     expect(st).toEqual({ keyframes: 3 });
   });
@@ -115,5 +132,58 @@ describe('splat resume / progress', () => {
       '2,900 / 3,000 iterations · < 1 min left',
     );
     expect(splatProgressView({ stage: 'splat_finishing', progress: 1 })).toEqual({ progress: 1, text: 'Saving the model' });
+  });
+  it('preview caption and "Use it now" (from finishFrom; disabled without a note while preparing)', () => {
+    expect(splatPreviewCaption({ iteration: 0, iterations: 3000, viewId: 4, psnr: 19 })).toBe('Initial Gaussians, before training');
+    expect(splatPreviewCaption({ iteration: 1250, iterations: 3000, viewId: 4, psnr: 27 })).toBe('Iteration 1,250 of 3,000');
+    expect(splatPreviewCaption({ iteration: 3000, iterations: 3000 })).toBe('Iteration 3,000');
+    expect(splatPreviewCaption()).toBe('Preview');
+    expect(splatUseNow()).toEqual({ ready: false, note: '' });
+    expect(splatUseNow({ iteration: 400, iterations: 3000, finishFrom: 900 })).toEqual({ ready: false, note: 'Usable from iteration 900' });
+    expect(splatUseNow({ iteration: 900, iterations: 3000, finishFrom: 900 })).toEqual({ ready: true, note: '' });
+    // an older engine without finishFrom: never offered
+    expect(splatUseNow({ iteration: 2000, iterations: 3000 }).ready).toBe(false);
+  });
+  it('a model ended early stays continuable (not "interrupted") until a build of it is interrupted', () => {
+    const splat = { count: 10, iterations: 1250, stats: { splatIterations: 3000 } } as unknown as SplatResult;
+    const kept = { splatResumableIteration: 1250, splatResumableQuality: 'fast', splatContinuesModel: 1 };
+    expect(splatContinuable({ sparse, splat, stats: kept })).toBe(true);
+    // a continuation cancelled later (checkpoint further on) or here (app marker): interrupted
+    expect(splatContinuable({ sparse, splat, stats: { ...kept, splatResumableIteration: 1600 } })).toBe(false);
+    expect(splatContinuable({ sparse, splat, stats: { ...kept, splatInterrupted: 1 } })).toBe(false);
+    expect(splatContinuable({ sparse, splat: null, stats: kept })).toBe(false);
+    expect(splatContinuable({ sparse, splat, stats: {} })).toBe(false);
+    // (review) another run's checkpoint at the same iteration — a rebuild at Balanced interrupted at
+    // 1,250 after a reload — is an interruption, not this model's: the engine reports no marker
+    expect(splatContinuable({ sparse, splat, stats: { splatResumableIteration: 1250, splatResumableQuality: 'balanced' } })).toBe(false);
+    expect(splatIterationsText(1250, 3000)).toBe('1,250 of 3,000 iterations');
+    expect(splatIterationsText(3000, 3000)).toBe('3,000 iterations');
+    expect(splatIterationsText(1250, undefined)).toBe('1,250 iterations');
+  });
+  it('Build sheet: Resume / Continue at the checkpoint’s quality; a model ended early without its checkpoint is not "Built" (review)', () => {
+    const splat = { count: 10, iterations: 1000, stats: { splatIterations: 3000, splatFinishedEarly: 1 } } as unknown as SplatResult;
+    const base = { sparse, splat, quality: 'balanced' as const };
+    const kept = { splatQuality: 'fast', splatResumableIteration: 1000, splatResumableQuality: 'fast', splatContinuesModel: 1 };
+    expect(splatBuildResume({ ...base, stats: kept }, 'fast')).toEqual({ label: 'Continue', sub: 'Stopped early at 1,000 of 3,000 iterations — continues the training.' });
+    expect(splatBuildResume({ ...base, stats: kept }, 'balanced')).toBeNull();
+    // a Balanced rebuild interrupted at 1,000 (reload: no marker): Resume at Balanced, Rebuild at Fast
+    const other = { splatQuality: 'fast', splatResumableIteration: 1000, splatResumableQuality: 'balanced' };
+    expect(splatBuildResume({ ...base, stats: other }, 'balanced')).toEqual({ label: 'Resume', sub: 'Interrupted — continues from the saved training.' });
+    expect(splatBuildResume({ ...base, stats: other }, 'fast')).toEqual({ label: 'Rebuild', sub: 'Stopped early at 1,000 of 3,000 iterations — retrains from the start.' });
+    // the checkpoint dropped by a new dense cloud: Rebuild at its quality, the plain item elsewhere
+    expect(splatBuildResume({ ...base, stats: { splatQuality: 'fast' } }, 'fast')?.label).toBe('Rebuild');
+    expect(splatBuildResume({ ...base, stats: { splatQuality: 'fast' } }, 'max')).toBeNull();
+    // a complete model: "Built" (null); nothing without a sparse model
+    const full = { count: 10, iterations: 3000, stats: { splatIterations: 3000 } } as unknown as SplatResult;
+    expect(splatBuildResume({ ...base, splat: full, stats: { splatQuality: 'fast' } }, 'fast')).toBeNull();
+    expect(splatBuildResume({ ...base, sparse: null, stats: { splatQuality: 'fast' } }, 'fast')).toBeNull();
+  });
+  it('an interrupted build drops the iteration reported before (review: a continued run cancelled later)', () => {
+    const before = { splatResumableIteration: 900, splatResumableQuality: 'fast', splatContinuesModel: 1, splatQuality: 'fast', keyframes: 3 };
+    const after = splatInterruptedStats(before, 'fast');
+    expect(after).toEqual({ splatInterrupted: 1, splatInterruptedQuality: 'fast', splatQuality: 'fast', keyframes: 3 });
+    expect(before.splatResumableIteration).toBe(900); // a new object
+    expect(splatResumable({ sparse, stats: after })).toBe(true);
+    expect(splatResumeQuality({ stats: after })).toBe('fast');
   });
 });
