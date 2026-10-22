@@ -1,7 +1,7 @@
 /**
  * 3D Gaussian Splatting: WebGPU trainer and renderer seeded from the metric SfM + MVS
- * reconstruction, a CPU reference, INRIA-layout PLY import / export, initialisation from point
- * clouds and the MCMC densification planner. Nothing here touches WebGPU globals at module load,
+ * reconstruction, a CPU reference, INRIA-layout PLY import / export, SPZ v3 export (spz.ts),
+ * initialisation from point clouds and the MCMC densification planner. Nothing here touches WebGPU globals at module load,
  * so the module can be imported where WebGPU is missing. The engine stage is
  * src/engine/splat.ts; the viewer draws models with `SplatRenderer` + `SplatPresenter`
  * (present.ts); the novel-view harness with nvs.ts.
@@ -42,6 +42,7 @@ export {
   type SplatTrainerStats,
 } from './trainer';
 export { encodeSplatPLY, decodeSplatPLY, type SplatPLYOptions } from './ply';
+export { encodeSplatSPZ, decodeSplatSPZ, packSplatSPZ, unpackSplatSPZ, spzFractionalBits, SPZ_VERSION, type SpzEncodeOptions, type SpzDecoded } from './spz';
 export { initFromPointCloud, backgroundShell, concatModels, quatFromZ, type SplatInitOptions, type BackgroundShellOptions, type ColourSource } from './init';
 export { planMcmc, relocation, type McmcPlan, type McmcPlanOptions } from './mcmc';
 export { packParams, unpackParams, paramOffsets, type ParamOffsets } from './layout';

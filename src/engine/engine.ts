@@ -838,6 +838,8 @@ export class PhotogrammetryEngine {
       this.model = out.model;
       this.sparse = out.result;
       out.result.stats.refineMs = Math.round(now() - t0);
+      // (the viewer's fly-through follows the mode the capture was keyframed for)
+      out.result.stats.captureMode = this.resolvedMode();
       this.stats = { ...out.result.stats };
       // later stages are invalidated
       this.denseOut = null;

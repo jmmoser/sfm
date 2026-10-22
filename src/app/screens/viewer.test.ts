@@ -32,4 +32,12 @@ describe('exportAvailability', () => {
     // AR Quick Look opens USDZ, not GLB
     expect(exportAvailability({ sparse, dense: null, mesh }, 'glb').sub).not.toMatch(/AR/);
   });
+  it('splat exports (PLY and SPZ) need the photoreal model', () => {
+    const splat = { count: 1200 } as unknown as NonNullable<Parameters<typeof exportAvailability>[0]['splat']>;
+    for (const f of ['ply-splat', 'spz'] as const) {
+      expect(exportAvailability({ sparse, dense: null, mesh: null }, f)).toEqual({ ok: false, sub: 'Build the photoreal model first' });
+      expect(exportAvailability({ sparse, dense: null, mesh: null, splat }, f).ok).toBe(true);
+    }
+    expect(exportAvailability({ sparse, dense: null, mesh: null, splat }, 'spz').sub).toMatch(/^1.2k Gaussians · compact/);
+  });
 });

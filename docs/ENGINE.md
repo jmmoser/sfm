@@ -85,7 +85,7 @@ class PhotogrammetryEngine {
   mesh(opts?, progress?, cancel?): Promise<MeshResult>   // TriangleMesh + objectRoi (object box or null) + stats
   splat(opts?: SplatOptions, progress?, cancel?): Promise<SplatResult>   // Gaussian splats (§2 "Splat")
   splatModel(): Promise<SplatModelPayload | null>                        // the stored splat model
-  exportModel(format: 'ply-points' | 'ply-mesh' | 'glb' | 'colmap-zip' | 'ply-splat' | 'usdz', cancel?): Promise<Blob>
+  exportModel(format: 'ply-points' | 'ply-mesh' | 'glb' | 'colmap-zip' | 'ply-splat' | 'usdz' | 'spz', cancel?): Promise<Blob>
   loadSession(id: string, options?: Partial<EngineOptions>): Promise<SessionSummary>
   dispose(): void
   // worker / harness hooks: setHidden, flush, recoverGPU, memoryReport, releaseResultMemory,
@@ -297,6 +297,7 @@ Request/response RPC with ids, plus unsolicited events:
 | `finishEarly` (short, fire and forget) | `{target?}` → — | the running `splat` stops at its current iteration (from `finishFrom`), resolves with that model (`iterations` < the schedule) and keeps its checkpoint: the next `splat` of the same settings continues from it. |
 | `splatModel` (short) | — → `SplatModelPayload \| null` | {model: SplatModel, antialiased, background, iterations}; arrays freshly decoded and TRANSFERRED (≈ 56 B per Gaussian at SH 0). |
 | `export` | `{format: 'ply-splat'}` → Blob | INRIA 3DGS PLY (`encodeSplatPLY`; SuperSplat / Brush / Spark), appearance-normalised, comment `antialiased`. |
+| `export` | `{format: 'spz'}` → Blob | Niantic SPZ v3 (`encodeSplatSPZ`: one gzip stream from `CompressionStream`, RUB axes, flag 0x1 antialiased; ≈ 20 B per Gaussian before gzip at SH 0; SuperSplat / Spark / the reference spz library). |
 | `loadSession` | → `SessionSummary.splat` (SplatResult of the stored model, or null) | `stats.splatResumableIteration` (+ `splatResumableQuality`) when a checkpoint can resume; `splatContinuesModel = 1` when it is the stored model's, ended early (it can continue). |
 
 `SplatModel` conventions (world frame of the sparse model: +Z up, metres when metric): per Gaussian i, mean
@@ -332,13 +333,20 @@ stage runs from the viewer itself ("Photoreal model" in the Build sheet → `spl
 (`finishEarly`: the model is stored, the Build sheet offers Continue — Rebuild once a new dense cloud or another
 run dropped its checkpoint), Cancel, Resume after an interruption),
 the model is fetched with `splatModel` into the
-viewer's WebGPU splat layer and shown by default, and the export sheet offers 'ply-splat' (src/viewer/splat-layer.ts,
+viewer's WebGPU splat layer and shown by default, and the export sheet offers 'ply-splat' and 'spz' (src/viewer/splat-layer.ts,
 research/viewer-rendering.md). The export sheet's 'usdz' (AR model: the mesh simplified to ≤ 100 k triangles with its
 colours baked into a 2048² JPEG atlas, built in the engine worker: seconds on a phone, so it yields between steps and
 honours cancel — leaving the viewer cancels an export still being prepared) adds "View in AR" once prepared, in an
 iPhone / iPad Safari tab only (not in the Home Screen app until the device check, ios-platform.md §8 item 11): a hidden
 `<a rel="ar">` on the Blob's URL opens AR Quick Look, and a hint toast follows when the page neither hides nor loses
-focus within 2 s (src/app/ar-quicklook.ts).
+focus within 2 s (src/app/ar-quicklook.ts). With a splat model and an H.264 encoder (`VideoEncoder.isConfigSupported`) the export
+sheet also offers "Fly-through video (MP4)". This is no engine call: the page renders it from the viewer's splat
+layer (`Viewer.openSplatFrames`, one command buffer per frame). The camera path is src/viewer/flythrough.ts (an orbit
+or a walk as the user chose the capture mode, else as the engine resolved it: `refine` reports it as
+`stats.captureMode`), the encoder WebCodecs H.264 at 30 fps and 6 Mbit/s, and the muxer src/io/mp4.ts
+(src/app/video-export.ts). The row shows progress (updated in place, the sheet is not rebuilt per frame) and Cancel
+and then the two-tap Share / Save. The export stops when the page is hidden, when a photoreal
+build starts, or when the viewer is left. Diagnostics has "Test video encoding" (codec, frame path, encode speed).
 
 Capture guidance (`src/app/screens/capture.ts`): the banner shows the engine's per-frame `guidance` (from the
 `processFrame` results, not the model updates) through a `GuidanceGate` (`src/app/capture-policy.ts`): priority

@@ -25,7 +25,8 @@ source file headers. Measurements behind the defaults are dated reports in `docs
   calibration), accelerometer (gravity alignment, metric scale), compass (north),
   GPS (metric scale and geo-referencing at large scale).
 * Exports: PLY (points / mesh), GLB, USDZ for AR Quick Look ("View in AR" at true scale on
-  iPhone / iPad), COLMAP text model (+ images) in a ZIP.
+  iPhone / iPad), COLMAP text model (+ images) in a ZIP, Gaussian splats (INRIA PLY, SPZ), and a
+  fly-through MP4 video of the splats rendered on the device.
 
 ## 2. Conventions (MUST follow)
 
@@ -112,11 +113,13 @@ src/
   dense/                 undistortion, view selection, PatchMatch MVS (WebGPU + CPU),
                          depth-map fusion, TSDF + marching cubes, point-cloud filters
   splat/                 3D Gaussian Splatting: WebGPU trainer + renderer, CPU reference,
-                         splat PLY, point-cloud initialisation, MCMC densification
+                         splat PLY / SPZ, point-cloud initialisation, MCMC densification
   sensors/               camera capture, motion, compass, geolocation, wake lock, frame orientation
-  io/                    PLY / GLB / USDZ / COLMAP export, ZIP writer, IndexedDB session storage, share/download,
-                         raw capture recordings (format, OPFS / IndexedDB store, dataset export)
-  viewer/                three.js viewer (points as splats + EDL, mesh, cameras, measure tool)
+  io/                    PLY / GLB / USDZ / COLMAP export, ZIP writer, MP4 (H.264) writer, IndexedDB session
+                         storage, share/download, raw capture recordings (format, OPFS / IndexedDB
+                         store, dataset export)
+  viewer/                three.js viewer (points as splats + EDL, mesh, cameras, measure tool), WebGPU
+                         splat layer, fly-through camera path
   engine/                PhotogrammetryEngine (pipeline orchestration, runs in a worker)
   workers/               engine.worker.ts + typed message protocol, recorder.worker.ts (raw capture)
   app/                   mobile UI (vanilla TS + CSS), screens, state machine
@@ -281,6 +284,7 @@ alignSim3Ransac(src: Float64Array, dst: Float64Array, n, maxError: number, opts?
 // convergence.ts — where the cameras look (object centre for classification, coverage, crop, fly-through)
 opticalAxisConvergence(poses: Pose[]): { point: Vec3 | null; spreadRad: number; inFront: number;
   distMedian: number; offAxisMedian: number; converging: boolean }   // least-squares point closest to all optical axes
+convergenceMode(c: AxisConvergence, medianDepth: number): 'object' | 'scene'   // the engine's classifyScene and the fly-through's 'auto'
 ```
 
 ### 4.3 `src/ba`  (depends on math)
@@ -521,6 +525,10 @@ interface ColmapModelInput { cameras: { id: number; cam: CameraIntrinsics }[];
 exportColmapText(model: ColmapModelInput): { name: string; data: string }[]   // cameras.txt, images.txt, points3D.txt
 createZip(files: { name: string; data: Uint8Array | string }[], opts?: { comment?: string; align?: number }): Uint8Array
   // STORE, CRC32, UTF-8; align: every entry's data at a multiple of `align` bytes (USDZ: 64)
+class Mp4Writer { constructor(o: { width: number; height: number; fps: number /*integer*/ });   // single-track H.264, faststart
+  setDecoderConfig(avcC: AllowSharedBufferSource): void; addChunk(data: Uint8Array, o: { key: boolean; timestampUs: number }): void;
+  finish(): Blob }                                     // chunks in decode order (VideoEncoder output)
+readMp4(data: Uint8Array): Mp4Info                     // box tree, avcC, timing, sample offsets (tests, e2e)
 class SessionStore { static open(): Promise<SessionStore>; … IndexedDB sessions, frame JPEG blobs, JSON & binary blobs }
 saveFile(data: Blob, filename: string): Promise<'shared' | 'downloaded'>    // Web Share (files) or <a download>
 // recording.ts — raw capture recordings (developer option; docs/ENGINE.md §5, e2e/README.md)
@@ -552,7 +560,13 @@ class Viewer {
   startMeasure(onResult: (distance: number, a: Vec3, b: Vec3) => void): void; stopMeasure(): void
   setUnits(metric: boolean): void
   resize(): void; dispose(): void; screenshot(): Promise<Blob>
+  openSplatFrames(o: { width: number; height: number; background?: [number, number, number] })
+    : SplatOffscreen | null   // offscreen VideoFrames / pixels of the splats at a fixed size (video export)
 }
+// flythrough.ts (pure): video camera path from the registered keyframes (capture order); opts.mode
+// 'object' | 'scene' | 'auto' (convergenceMode); object: one azimuth pass replayed, scene: the walk
+buildFlythrough(cams: { pose: Pose; intrinsics: { width; height; f } }[], opts?: FlythroughOptions): FlythroughPath | null
+  // { mode: 'object' | 'scene'; width; height; fps; fx; fy; cx; cy; near; poses: Pose[] /*world-to-camera*/; … }
 ```
 
 ### 4.10 Contract deviations

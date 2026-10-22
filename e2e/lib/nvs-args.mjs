@@ -22,13 +22,16 @@ export const NVS_USAGE = `usage: node e2e/nvs.mjs <dataset> <runDir> [options]
   --background R,G,B        full-frame background (default 0,0,0)
   --no-ssim                 skip SSIM (faster)
   --common                  also score every renderer on the pixels all of them cover
+  --splat-file NAME         the run's splat model for 'splat': splats.ply (default) or splats.spz
+                            (decoded first: scores the SPZ export, run-e2e --export spz writes it);
+                            default output <runDir>/nvs-spz/ for an .spz
   --save-images             write GT | render | |diff|·3 PNGs per view and renderer
   --out DIR                 output directory (default <runDir>/nvs)
   --verbose | --headed`;
 
 export class NvsArgError extends Error {}
 
-/** Parse argv → { dataset, runDir, testDataset|null, renderers|null, views, frames|null, maxSize, pose, focal, rs, rsTranslation, keepBlurred, background, ssim, common, saveImages, out, verbose, headed, help }. */
+/** Parse argv → { dataset, runDir, testDataset|null, renderers|null, views, frames|null, maxSize, pose, focal, rs, rsTranslation, keepBlurred, background, ssim, common, splatFile, saveImages, out, verbose, headed, help }. */
 export function parseNvsArgs(argv) {
   const o = {
     dataset: null,
@@ -46,6 +49,7 @@ export function parseNvsArgs(argv) {
     background: [0, 0, 0],
     ssim: true,
     common: false,
+    splatFile: 'splats.ply',
     saveImages: false,
     out: null,
     verbose: false,
@@ -113,6 +117,12 @@ export function parseNvsArgs(argv) {
       }
       case '--no-ssim': o.ssim = false; break;
       case '--common': o.common = true; break;
+      case '--splat-file': {
+        const v = next();
+        if (!/^[\w.-]+\.(ply|spz)$/i.test(v)) throw new NvsArgError(`--splat-file needs a file name in the run directory ending in .ply or .spz, got ${v}`);
+        o.splatFile = v;
+        break;
+      }
       case '--save-images': o.saveImages = true; break;
       case '--out': o.out = next(); break;
       case '--verbose': o.verbose = true; break;

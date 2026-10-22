@@ -2,11 +2,12 @@
  * Splat stage, the parts that run without a GPU: presets (quality table, dense-size clamp,
  * overrides), the memory plan (`planSplat` = the trainer's own estimate + host transients) and its
  * degradation (`fitSplatPlan`), the stored encodings (compact f16 model, exact checkpoint
- * parameters, bf16 Adam moments), the run key and the 'ply-splat' export.
+ * parameters, bf16 Adam moments), the run key and the 'ply-splat' / 'spz' exports.
  */
 import { describe, expect, it } from 'vitest';
 import { Rng } from '../math/random';
-import { decodeSplatPLY } from '../splat/ply';
+import { decodeSplatPLY, encodeSplatPLY } from '../splat/ply';
+import { decodeSplatSPZ } from '../splat/spz';
 import { SplatTrainer } from '../splat/trainer';
 import { randomScene } from '../splat/testutil';
 import type { SplatModel } from '../splat/types';
@@ -184,5 +185,28 @@ describe('splat run key and export', () => {
     await expect(buildExport('ply-splat', { name: 'scan', sparse: null, model, dense: null, mesh: null, store: null, features: async () => null, splat: async () => null })).rejects.toThrow(
       /No Gaussian splats/,
     );
+  });
+
+  it("exportModel('spz') writes the stored model as SPZ v3 (≤ 30 % of the PLY)", async () => {
+    const m = randomScene({ count: 400, seed: 10 });
+    const src = {
+      name: 'scan',
+      sparse: null,
+      model,
+      dense: null,
+      mesh: null,
+      store: null,
+      features: async () => null,
+      splat: async () => ({ model: m, antialiased: true, background: [0, 0, 0] as [number, number, number], iterations: 10 }),
+    };
+    const blob = await buildExport('spz', src);
+    const d = await decodeSplatSPZ(new Uint8Array(await blob.arrayBuffer()));
+    expect(d.version).toBe(3);
+    expect(d.antialiased).toBe(true);
+    expect(d.model.count).toBe(400);
+    for (let i = 0; i < 3 * m.count; i++) expect(Math.abs(d.model.means[i] - m.means[i])).toBeLessThanOrEqual(2 ** -(d.fractionalBits + 1) + 1e-9);
+    // random Gaussians barely compress: the 20 B record against the PLY's 68 B
+    expect(blob.size).toBeLessThan(0.3 * encodeSplatPLY(m).length);
+    await expect(buildExport('spz', { ...src, splat: async () => null })).rejects.toThrow(/No Gaussian splats/);
   });
 });

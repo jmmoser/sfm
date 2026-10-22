@@ -20,7 +20,7 @@
  * (continue a stored capture: "Add more views"; `InitResult.resumedKeyframes` / `captureMemory` /
  * `storedModel`, `LiveUpdate.modelRebuild`),
  * optional FramePump metadata on `FrameInput`, `SessionSummary` carries the stored models, the
- * Gaussian splatting stage (`splat`, `splatModel`, export 'ply-splat', `ProgressEvent.detail`, the
+ * Gaussian splatting stage (`splat`, `splatModel`, exports 'ply-splat' / 'spz', `ProgressEvent.detail`, the
  * 'splat_preview' snapshots in `ProgressEvent.image`, the `finishEarly` request), the
  * object box of object-mode meshes (`MeshOptions.objectRoi`, `MeshResult`, `SessionSummary.objectRoi`), export
  * 'usdz' (AR Quick Look).
@@ -281,6 +281,7 @@ export interface SparseResult {
   /**
    * Free-form statistics for the info sheet. Well-known keys (all optional): `images`,
    * `registeredImages`, `points`, `meanReprojErrorPx`, `meanTrackLength`, `focalPx`, `k1`, `k2`,
+   * `captureMode` (refine: 'object' | 'scene' as the capture resolved it, 'auto' when it never did),
    * and timings `<stage>Ms` (e.g. `matchingMs`, `reconstructionMs`, `alignmentMs`).
    */
   stats: Record<string, number | string>;
@@ -324,9 +325,11 @@ export interface MeshResult extends TriangleMesh {
  * SuperSplat, Brush, Spark and most splat viewers.
  * 'usdz': the mesh for AR Quick Look (≤ 100 k triangles, colours baked into a 2048² JPEG atlas,
  * Y-up metres, origin at the AR pivot, horizontal-plane anchoring; src/io/usdz.ts) — needs a mesh.
+ * 'spz': the same model as a Niantic SPZ v3 file (gzip, ≈ 20 B per Gaussian before compression,
+ * RUB axes; src/splat/spz.ts) — SuperSplat, Spark and the reference spz library read it.
  */
-export type ExportFormat = 'ply-points' | 'ply-mesh' | 'glb' | 'colmap-zip' | 'ply-splat' | 'usdz';
-export const EXPORT_FORMATS: readonly ExportFormat[] = ['ply-points', 'ply-mesh', 'glb', 'colmap-zip', 'ply-splat', 'usdz'];
+export type ExportFormat = 'ply-points' | 'ply-mesh' | 'glb' | 'colmap-zip' | 'ply-splat' | 'usdz' | 'spz';
+export const EXPORT_FORMATS: readonly ExportFormat[] = ['ply-points', 'ply-mesh', 'glb', 'colmap-zip', 'ply-splat', 'usdz', 'spz'];
 
 // ---------------------------------------------------------------------------------------------
 // Gaussian splatting stage (extension; docs/ENGINE.md "Splat")

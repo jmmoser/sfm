@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { decodePLY, parseGLB, readZip } from '../io';
 import type { FrameInput, LiveUpdate, SplatResult } from '../workers/protocol';
 import { computeCoverage } from './coverage';
+import { decodeSplatSPZ } from '../splat/spz';
 import { MockEngine } from './mock-engine';
 import { MockScene, lookAt, poseCenter } from './mock-scene';
 
@@ -312,7 +313,7 @@ describe('MockEngine', () => {
     expect(sum.stats.yawSource).toBe('compass');
   });
 
-  it('splat: prepare → training (detail) → finishing; a cancel is resumable; model and ply-splat export', async () => {
+  it('splat: prepare → training (detail) → finishing; a cancel is resumable; model and ply-splat / spz exports', async () => {
     const e = new MockEngine({ speed: 2, sessions: async () => null });
     await e.init({ mode: 'object', quality: 'fast', sessionId: 's1' });
     for (let i = 0; i < 40; i++) await e.processFrame(frame(100 + i * 400));
@@ -344,6 +345,8 @@ describe('MockEngine', () => {
     const ply = new TextDecoder().decode(new Uint8Array(await (await e.exportModel('ply-splat')).arrayBuffer()).subarray(0, 400));
     expect(ply).toContain(`element vertex ${info.count}`);
     expect(ply).toContain('property float f_dc_0');
+    const spz = await decodeSplatSPZ(new Uint8Array(await (await e.exportModel('spz')).arrayBuffer()));
+    expect(spz.model.count).toBe(info.count);
     await e.refine(); // new poses: the splats are gone
     await expect(e.splatModel()).resolves.toBeNull();
   });

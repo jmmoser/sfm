@@ -49,7 +49,7 @@
 import type { CameraIntrinsics, CancelToken, FeatureSet, FrameInfo, GeoFix, ImuSample, Mat3, MatchPairs, Pose, TwoViewGeometry } from '../core/types';
 import type { FeaturePipeline } from '../features/extractor';
 import { deserializeFeatureSet, serializeFeatureSet } from '../io/serialize';
-import { opticalAxisConvergence } from '../geometry/convergence';
+import { convergenceMode, opticalAxisConvergence } from '../geometry/convergence';
 import { solvePnPRansac } from '../geometry/pnp';
 import { estimateTwoViewGeometry, type TwoViewOptions } from '../geometry/twoview';
 import { mat3Mul, mat3MulTranspose } from '../math/mat3';
@@ -368,11 +368,7 @@ export function keyframeUpCam(r: KeyframeRecord): [number, number, number] | und
 /** Decide 'object' vs 'scene' from the registered cameras (optical-axis convergence). */
 export function classifyScene(poses: readonly Pose[], medianDepth: number): 'object' | 'scene' | null {
   if (poses.length < 6) return null;
-  const c = opticalAxisConvergence(poses);
-  if (!c.point) return 'scene';
-  const dMed = c.distMedian;
-  const depthOk = !(medianDepth > 0) || (dMed < 2.5 * medianDepth && dMed > 0.3 * medianDepth);
-  return c.converging && depthOk ? 'object' : 'scene';
+  return convergenceMode(opticalAxisConvergence(poses), medianDepth);
 }
 
 /**

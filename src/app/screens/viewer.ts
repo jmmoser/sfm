@@ -4,11 +4,13 @@
  * metric models; on the points / mesh also while the splats are shown), Build sheet (dense cloud
  * / mesh with a quality picker, and the photoreal model: `engine.splat()` runs HERE with a
  * progress card and Cancel, the model is shown when it finishes), Export sheet (PLY points, PLY
- * mesh, GLB, USDZ for AR, Gaussian splats PLY, COLMAP + images ZIP: the first tap builds the file
- * through the engine and shows its size, a second tap "Share / Save" calls saveFile directly in
- * the tap handler — iOS allows navigator.share only within ~5 s of a user activation; a prepared
- * USDZ also gets "View in AR" where AR Quick Look exists: src/app/ar-quicklook.ts; leaving the
- * screen cancels the exports still being prepared), Info sheet
+ * mesh, GLB, USDZ for AR, Gaussian splats PLY / SPZ, COLMAP + images ZIP: the first tap builds the
+ * file through the engine and shows its size, a second tap "Share / Save" calls saveFile directly
+ * in the tap handler — iOS allows navigator.share only within ~5 s of a user activation; a prepared
+ * USDZ also gets "View in AR" where AR Quick Look exists: src/app/ar-quicklook.ts; with a splat
+ * model and an H.264 encoder also "Fly-through video (MP4)", which src/app/video-export.ts renders
+ * from the splat layer with progress and Cancel, stopped by a photoreal build, a hidden page or
+ * leaving; leaving the screen cancels the exports still being prepared), Info sheet
  * (scale source and uncertainty, gravity / north alignment with the yaw source — the compass
  * gives MAGNETIC north —, counts, reprojection error, engine memory, timings). A densify that
  * was interrupted (stats.denseResumablePass from loadSession, or cancelled / failed here) offers
@@ -41,6 +43,7 @@ import type { ProgressEvent, RGBAImage } from '../../core/types';
 import { SPLAT_STAGES, isCancelledError, type ExportFormat, type QualityPreset } from '../../workers/protocol';
 import type { App, Results, Screen } from '../app';
 import { arQuickLookAvailable, createARQuickLook, withViewInAR } from '../ar-quicklook';
+import { createVideoExport } from '../video-export';
 import { button, chip, group, iconButton, kvRow, progressBar, section, segmented, setButtonLabel, spinner, switchRow } from '../components/controls';
 import { confirmDialog } from '../components/dialog';
 import { openSheet, type SheetHandle } from '../components/sheet';
@@ -99,6 +102,7 @@ const EXPORTS: { format: ExportFormat; title: string; icon: IconName; ext: strin
   { format: 'glb', title: '3D model (GLB)', icon: 'cube', ext: 'glb', suffix: '' },
   { format: 'usdz', title: 'AR model (USDZ)', icon: 'object', ext: 'usdz', suffix: 'ar' },
   { format: 'ply-splat', title: 'Gaussian splats (.ply)', icon: 'splats', ext: 'ply', suffix: 'splats' },
+  { format: 'spz', title: 'Gaussian splats (.spz)', icon: 'splats', ext: 'spz', suffix: 'splats' },
   { format: 'colmap-zip', title: 'COLMAP project (ZIP)', icon: 'zip', ext: 'zip', suffix: 'colmap' },
 ];
 
@@ -529,6 +533,8 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     splatState = st;
     if (closed) return;
     el.dataset.splats = st;
+    // (the fly-through video needs the loaded layer)
+    renderExports?.();
     if (st === 'unavailable') {
       if (!splatUnavailableToast) {
         splatUnavailableToast = true;
@@ -792,11 +798,28 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
    *  sheet. Time-limited because a share promise that never settles must not disable the button. */
   let sharingUntil = 0;
 
+  /** The fly-through video row of the Export sheet (own state: src/app/video-export.ts). */
+  const video = createVideoExport({
+    app,
+    openFrames: (o) => viewer?.openSplatFrames(o) ?? null,
+    blocked: () =>
+      building
+        ? 'Not while the photoreal model is being built'
+        : !viewer || splatState === 'unavailable'
+          ? 'The photoreal model cannot be shown in this browser'
+          : splatFetching || splatState !== 'ready'
+            ? 'Loading the photoreal model…'
+            : null,
+    othersBusy: () => building,
+    rerender: () => renderExports?.(),
+  });
+
   function openExport(): void {
     if (!ready) return;
     const list = h('div', { class: 'export-list' });
     const render = (): void => {
-      replaceChildren(list, ...EXPORTS.map((e) => exportRow(e)));
+      const videoRow = video.row();
+      replaceChildren(list, ...EXPORTS.map((e) => exportRow(e)), ...(videoRow ? [videoRow] : []));
     };
     const sheet: SheetHandle = openSheet({
       title: 'Export',
@@ -971,6 +994,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
     void app.wakeLock.acquire();
     // the previous model's layer is freed while the trainer runs (the points / mesh show meanwhile)
     const wasSplats = display.layer === 'splats';
+    video.cancel();
     releaseSplats();
     let built = false;
     resetPreview();
@@ -1011,6 +1035,8 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
       if (typeof cont === 'number') Object.assign(r.stats, { splatResumableIteration: cont, splatResumableQuality: q, splatContinuesModel: 1 });
       // a splat PLY prepared before (or still being prepared) holds the previous model
       exports.delete('ply-splat');
+      exports.delete('spz');
+      video.invalidate();
       void app.updateSession(sessionId, { stats: { splatGaussians: res.count, splatIterations: res.iterations, splatQuality: q } });
       if (closed) return;
       renderExports?.();
@@ -1213,6 +1239,7 @@ export function createViewerScreen(app: App, route: Extract<Route, { screen: 'vi
         app.busy = false;
         void app.wakeLock.release();
       }
+      video.dispose();
       if (app.debug.viewer === viewer) app.debug.viewer = undefined;
       cancelExports();
       arQuickLook?.dispose();
@@ -1246,6 +1273,10 @@ export function exportAvailability(r: Pick<Results, 'sparse' | 'dense' | 'mesh'>
     case 'ply-splat':
       return r.splat
         ? { ok: true, sub: `${formatCount(r.splat.count)} Gaussians · opens in SuperSplat, Spark and most splat viewers` }
+        : { ok: false, sub: 'Build the photoreal model first' };
+    case 'spz':
+      return r.splat
+        ? { ok: true, sub: `${formatCount(r.splat.count)} Gaussians · compact, about 4× smaller than the .ply · SuperSplat, Spark` }
         : { ok: false, sub: 'Build the photoreal model first' };
   }
 }

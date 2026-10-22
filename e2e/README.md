@@ -543,6 +543,7 @@ registered and how many are in the final model (also logged as `extend: …`).
 | `sparse.ply`, `dense.ply`, `mesh.ply` | Streamed from the page through `window.__e2eWrite` (Playwright), or the HTTP bridge with `--device phone` / `local-bridge`. |
 | `splats.ply` | With `--splat`: `exportModel('ply-splat')` (INRIA 3DGS PLY, run world frame); `--nvs` scores it as the `splat` renderer. |
 | `previews/NNN-it<i>.png` | With `--splat-previews` (`SplatOptions.preview`): the training snapshots of the splat stage (the training view nearest the middle photo, ≤ 400 px, raw trainer colours). |
+| `splats.spz` | With `--splat` and the `spz` export (in the default export list): `exportModel('spz')` (SPZ v3); `nvs.mjs --splat-file splats.spz` scores the decoded SPZ. |
 | `metrics.json` | `computeMetrics` output, sparse-cloud accuracy, live-trajectory metrics and threshold checks (+ the `nvs` summary with `--nvs`). |
 | `nvs/nvs.json` | With `--nvs [--nvs-views N]`: the novel-view evaluation of the output (see "Novel-view evaluation"). |
 
@@ -1351,7 +1352,7 @@ Individual squares are within 0.2 px; the spread comes from MSAA.
 | `points-edl` | the same with Eye-Dome Lighting, the app default when there is no mesh |
 | `mesh-lit` | the `Viewer` drawing `mesh.ply` with vertex colours under the hemisphere light and headlight (the app default until the unlit switch below) |
 | `mesh-unlit` | the same unlit (vertex colours only), the app default since 2026-10 (Display sheet "Mesh lighting" off) |
-| `splat` | `splats.ply` (INRIA 3DGS PLY layout: `x y z nx ny nz f_dc_0..2 f_rest_* opacity scale_0..2 rot_0..3`, run world frame), drawn by `src/splat/nvs.ts` |
+| `splat` | `splats.ply` (INRIA 3DGS PLY layout: `x y z nx ny nz f_dc_0..2 f_rest_* opacity scale_0..2 rot_0..3`, run world frame), drawn by `src/splat/nvs.ts`; `--splat-file splats.spz`: the SPZ export, decoded (`decodeSplatSPZ`) and handed over as that PLY, output `<runDir>/nvs-spz/` |
 
 The splat module plugs in through
 `export async function createNvsRenderer({ ply, width, height }): Promise<{ render(cam), dispose?() }>`.
@@ -1533,6 +1534,26 @@ M4, headless Chrome, host load 5–8. Seen side by side, the splats at 'open' an
 the capture shows floaters and the sky shell as blurred blobs — why the app starts from the photos. The splats and
 the unlit mesh line up pixel for pixel at the same pose (the GPU test measures ≤ 0.06 px between Gaussian centroids
 and three.js's projection of their means).
+
+### Fly-through video (`e2e/ui/flythrough.mjs`)
+
+The same run directory and page set-up as splat-shots.mjs, then the fly-through MP4 export twice. First through its
+pieces in the page (src/app/video-export.ts: the camera path of the sparse model, the splat layer's offscreen
+frames, WebCodecs H.264, src/io/mp4.ts). That MP4 is decoded again with VideoDecoder: the frame count, the PSNR of
+every 10th decoded frame against the same pose read back directly (encode loss only), wall time per frame, peak JS
+heap and the layer's GPU memory. Then through the UI (Export → "Fly-through video (MP4)" → Prepare → Save, a
+download). Both files and `<name>-flythrough.json` go to `--out` (default `/tmp/sfm-flythrough/`), counted by
+ffprobe when it is installed. It fails outside 180–300 frames or below 34 dB, and warns above 100 ms per frame (the
+30 s / 300 frames target). It needs a hardware adapter and Chrome's H.264 encoder (Playwright's Chromium has none).
+`--probe` runs only the Diagnostics "Test video encoding" probe, in any browser.
+
+```sh
+E2E_GPU=host node e2e/ui/flythrough.mjs e2e/out/e2e/object-real-int-object --name object-real
+E2E_GPU=host node e2e/ui/flythrough.mjs e2e/out/e2e/yard-real-viewer-yard --name yard-real
+node e2e/ui/flythrough.mjs --probe       # SwiftShader Chromium: frame path 'canvas', no H.264 encoder
+```
+
+No host results yet.
 
 ## Breakthrough results (2026-10-20, Apple M4, Metal)
 

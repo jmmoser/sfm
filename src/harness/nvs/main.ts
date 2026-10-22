@@ -2,7 +2,8 @@
  * Novel-view evaluation page (nvs.html), driven by e2e/nvs.mjs.
  *
  *   window.nvsSetup(config)  loads the run's dense.ply / mesh.ply / splats.ply (served by the
- *                            runner under config.runBase) into the renderers;
+ *                            runner under config.runBase) into the renderers (config.splatFile
+ *                            splats.spz: the SPZ export, decoded and handed over as a splat PLY);
  *   window.nvsView(view)     one held-out test view: the dataset JPEG (config.dataBase + view.file)
  *                            is decoded, undistorted with the run's intrinsics to ≤ maxSize exactly
  *                            like the engine's dense views (undistortImage, then the rolling-shutter
@@ -18,7 +19,16 @@ import { undistortImage, undistortedSize } from '../../dense/undistort';
 import { decodePLY } from '../../io/ply';
 import { rsCorrectPinholeImage, type RollingShutterModel } from '../../sfm/rolling-shutter';
 import { prepareGroundTruth, scoreCommon, scoreView, triptych } from '../../../e2e/lib/nvs-metrics.mjs';
+import { encodeSplatPLY } from '../../splat/ply';
+import { decodeSplatSPZ } from '../../splat/spz';
 import { VIEWER_RENDERERS, ViewerRenderers, loadSplatRenderer, type NvsCamera, type NvsRenderer } from './renderers';
+
+/** An SPZ file as the splat PLY of its decoded model (the splat renderer reads PLY). */
+async function spzAsPLY(spz: ArrayBuffer): Promise<ArrayBuffer> {
+  const { model, antialiased } = await decodeSplatSPZ(new Uint8Array(spz));
+  const ply = encodeSplatPLY(model, { antialiased });
+  return ply.buffer.slice(ply.byteOffset, ply.byteOffset + ply.byteLength) as ArrayBuffer;
+}
 
 export interface NvsPageConfig {
   /** URL prefix of the run directory (result files) and of the dataset directory. */
@@ -38,6 +48,8 @@ export interface NvsPageConfig {
   ssim: boolean;
   /** Also score every renderer on the pixels all of them cover (scoreCommon). */
   common?: boolean;
+  /** The splat model file in the run directory (default splats.ply; *.spz is decoded first). */
+  splatFile?: string;
   /** Distorted camera of the first view: sizes the viewer before the first render. */
   camera: CameraIntrinsics;
 }
@@ -169,11 +181,13 @@ async function setup(config: NvsPageConfig): Promise<NvsSetupResult> {
   }
   if (config.renderers.includes('splat')) {
     const t0 = performance.now();
-    const ply = await fetchOptional(`${config.runBase}splats.ply`);
-    out.splatFile = !!ply;
-    if (!ply) out.renderers.splat = { ok: false, reason: 'splats.ply missing in the run directory' };
+    const file = config.splatFile ?? 'splats.ply';
+    const buf = await fetchOptional(`${config.runBase}${file}`);
+    out.splatFile = !!buf;
+    if (!buf) out.renderers.splat = { ok: false, reason: `${file} missing in the run directory` };
     else {
       try {
+        const ply = /\.spz$/i.test(file) ? await spzAsPLY(buf) : buf;
         const r = await loadSplatRenderer(ply, und.width, und.height);
         if ('skipped' in r) out.renderers.splat = { ok: false, reason: r.skipped };
         else {

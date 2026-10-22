@@ -39,6 +39,7 @@ import { encodeUSDZ, selectArPivot } from '../io/usdz';
 import { SessionStore, type SessionMeta } from '../io/storage';
 import { Rng } from '../math/random';
 import { encodeSplatPLY } from '../splat/ply';
+import { encodeSplatSPZ } from '../splat/spz';
 import { SH_C0, allocSplatModel, logit, type SplatModel } from '../splat/types';
 import {
   ENGINE_ERRORS,
@@ -976,6 +977,10 @@ export class MockEngine implements EngineLike {
         if (!jpeg) throw new Error('USDZ export needs OffscreenCanvas (JPEG encoding), which this browser lacks');
         const usdz = encodeUSDZ({ mesh: atlas.mesh, uvs: atlas.uvs, texture: jpeg, pivot: selectArPivot(this.meshModel), name });
         return new Blob([usdz as Uint8Array<ArrayBuffer>], { type: 'model/vnd.usdz+zip' });
+      }
+      case 'spz': {
+        if (!this.splatOut) throw new Error('Train Gaussian splats first');
+        return new Blob([(await encodeSplatSPZ(this.splatOut.model)) as Uint8Array<ArrayBuffer>], { type: 'application/octet-stream' });
       }
     }
   }
