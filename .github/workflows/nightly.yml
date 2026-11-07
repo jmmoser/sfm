@@ -8,6 +8,8 @@
 #  * the UI smoke (npm run ui:smoke: the whole app flow on the mock engine at iPhone size).
 # Playwright's Chromium is installed by e2e/ensure-chromium.mjs unless the runner image already
 # has it (PLAYWRIGHT_BROWSERS_PATH).
+# Pinned to ubuntu-24.04: ubuntu-latest is moving to Ubuntu 26.04, where Playwright 1.56 cannot
+# install Chromium's system dependencies (every job failed that way on 2026-11-07).
 name: Nightly
 
 on:
@@ -28,7 +30,7 @@ jobs:
   # alone would spread 40 frames over the whole orbit, 5x the baseline the test was written for.
   gpu-data:
     name: GPU test dataset
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -55,7 +57,7 @@ jobs:
   gpu:
     name: GPU tests (SwiftShader) ${{ matrix.shard }}/6
     needs: gpu-data
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -90,7 +92,7 @@ jobs:
 
   e2e-smoke:
     name: e2e smoke (mock engine; desktop + phone bridge)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -126,7 +128,7 @@ jobs:
 
   ui-smoke:
     name: UI smoke (mock engine)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
