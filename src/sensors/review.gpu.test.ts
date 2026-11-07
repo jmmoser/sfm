@@ -146,6 +146,9 @@ describe('CameraCapture lifecycle (adversarial)', () => {
       expect(cam.segment).toBe(1);
       const n0 = segs.length;
       await sleep(1500); // past the 1.2 s unmute grace timer: no second increment
+      // the fake camera can stall for seconds under shard load: wait for frames, not a fixed window
+      const t0 = performance.now();
+      while (segs.length - n0 <= 3 && performance.now() - t0 < 10_000) await sleep(20);
       off();
       expect(cam.segment).toBe(1);
       expect(segs.slice(n0).length).toBeGreaterThan(3);

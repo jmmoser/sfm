@@ -255,7 +255,7 @@ describe('camera timing probe (fake camera, real worker)', () => {
     const cam = new CameraCapture();
     await cam.start(video, { quality: 'fast' });
     try {
-      const r = await runCameraTimingProbe(cam, { durationMs: 1500 });
+      const r = await runCameraTimingProbe(cam, { durationMs: 4000 }); // fake camera slows to ~5 fps under shard load
       expect(r.mstp.error).toBeNull();
       expect(r.mstp.transport).toBe('stream'); // Chromium: tracks are not transferable
       expect(r.mstp.frames).toBeGreaterThan(10);

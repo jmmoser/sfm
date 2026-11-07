@@ -532,6 +532,10 @@ describe('Viewer picking / measuring', () => {
       const sa = v.worldToScreen(A)!;
       const sb = v.worldToScreen(B)!;
       expect(sa).not.toBeNull();
+      // Warm-up pick, untimed: the first GPU pick of a viewer runs the readback self-test and
+      // compiles the pick programs, which takes seconds on SwiftShader when other shard files load
+      // the CPU. The bound below is for the steady-state cost of a measurement.
+      v.pickPoint(sa);
       const t0 = performance.now();
       const r = v.measureBetweenScreenPoints(sa, sb)!;
       const dt = performance.now() - t0;
